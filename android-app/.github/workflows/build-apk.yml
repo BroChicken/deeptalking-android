@@ -1,0 +1,41 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'android-app/**'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Download offline voice packs
+        working-directory: android-app/app/src/main/assets
+        run: |
+          set -euxo pipefail
+          mkdir -p voices
+          curl -fL --retry 3 --retry-delay 5 -o xiaoya.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-zh_CN-xiao_ya-medium.tar.bz2
+          tar -xjf xiaoya.tar.bz2
+          mv vits-piper-zh_CN-xiao_ya-medium voices/xiaoya
+          curl -fL --retry 3 --retry-delay 5 -o huayan.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-zh_CN-huayan-medium.tar.bz2
+          tar -xjf huayan.tar.bz2
+          mv vits-piper-zh_CN-huayan-medium voices/huayan
+          curl -fL --retry 3 --retry-delay 5 -o matcha.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/matcha-icefall-zh-baker.tar.bz2
+          tar -xjf matcha.tar.bz2
+          mv matcha-icefall-zh-baker voices/matcha
+          curl -fL --retry 3 --retry-delay 5 -o voices/matcha/vocos-22khz-univ.onnx https://github.com/k2-fsa/sherpa-onnx/releases/download/vocoder-models/vocos-22khz-univ.onnx
+      - name: Build debug APK
+        working-directory: android-app
+        run: gradle :app:assembleDebug --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deeptalking-debug-apk
+          path: android-app/app/build/outputs/apk/debug/app-debug.apk
