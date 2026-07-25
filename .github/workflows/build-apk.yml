@@ -43,7 +43,7 @@ jobs:
           rm -rf app/src/main/jniLibs
           cp -R "$jni_dir" app/src/main/jniLibs
           mkdir -p app/src/main/java/com/k2fsa/sherpa/onnx
-          curl -fL --retry 3 --retry-delay 5 -o app/src/main/java/com/k2fsa/sherpa/onnx/Tts.kt https://raw.githubusercontent.com/k2-fsa/sherpa-onnx/master/android/SherpaOnnxTts/app/src/main/java/com/k2fsa/sherpa/onnx/Tts.kt
+          curl -fL --retry 3 --retry-delay 5 -H 'Accept: application/vnd.github.raw+json' -o app/src/main/java/com/k2fsa/sherpa/onnx/Tts.kt 'https://api.github.com/repos/k2-fsa/sherpa-onnx/contents/android/SherpaOnnxTts/app/src/main/java/com/k2fsa/sherpa/onnx/Tts.kt?ref=master'
       - name: Build debug APK
         working-directory: android-app
         run: gradle :app:assembleDebug --stacktrace
