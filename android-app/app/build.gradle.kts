@@ -19,5 +19,4 @@ android {
 dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
-    implementation("com.k2fsa.sherpa-onnx:sherpa-onnx:1.12.16")
 }
