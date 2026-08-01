@@ -27,6 +27,8 @@ android {
     aaptOptions {
         noCompress += "onnx"
         noCompress += "fst"
+        noCompress += "bin"
+        noCompress += "son"
     }
 }
 

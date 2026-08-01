@@ -5,4 +5,13 @@
         android:id="@+id/webView"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
+    <TextView
+        android:id="@+id/statusText"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|center_horizontal"
+        android:padding="8dp"
+        android:background="#CC101318"
+        android:textColor="#8fd3a8"
+        android:textSize="13sp" />
 </FrameLayout>

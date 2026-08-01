@@ -5,6 +5,7 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
 import android.media.PlaybackParams
+import android.util.Log
 import com.k2fsa.sherpa.onnx.OfflineTts
 import com.k2fsa.sherpa.onnx.OfflineTtsConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsKokoroModelConfig
@@ -26,7 +27,9 @@ private data class VoicePack(
     enum class Kind { VITS, MATCHA, KOKORO }
 }
 
-class VoiceManager(context: Context) {
+private const val TAG = "VoiceManager"
+
+class VoiceManager(context: Context, private val onError: (String) -> Unit = {}) {
     private val assets = context.assets
     private val executor = Executors.newSingleThreadExecutor()
     private var activePack: VoicePack? = null
@@ -61,10 +64,16 @@ class VoiceManager(context: Context) {
     fun speak(packId: String, text: String, speed: Float, playbackRate: Float, volume: Float, sid: Int = 0) {
         if (text.isBlank()) return
         executor.execute {
-            val pack = packs[packId] ?: packs.getValue("xiaoya")
-            ensurePack(pack)
-            val audio = tts?.generate(text = text, sid = sid, speed = speed.coerceIn(0.75f, 1.25f)) ?: return@execute
-            play(audio.samples, audio.sampleRate, playbackRate.coerceIn(0.85f, 1.15f), volume.coerceIn(0f, 1f))
+            try {
+                val pack = packs[packId] ?: packs.getValue("xiaoya")
+                ensurePack(pack)
+                val audio = tts?.generate(text = text, sid = sid, speed = speed.coerceIn(0.75f, 1.25f))
+                    ?: throw IllegalStateException("generate returned null")
+                play(audio.samples, audio.sampleRate, playbackRate.coerceIn(0.85f, 1.15f), volume.coerceIn(0f, 1f))
+            } catch (t: Throwable) {
+                Log.e(TAG, "speak failed for pack=$packId", t)
+                onError("speak($packId) failed: ${t.message ?: t.javaClass.simpleName}")
+            }
         }
     }
 
@@ -91,7 +100,14 @@ class VoiceManager(context: Context) {
             if (activePack?.id == pack.id && tts != null) return
             stop()
             tts?.release()
-            tts = OfflineTts(assets, createConfig(pack))
+            tts = null
+            activePack = null
+            try {
+                tts = OfflineTts(assets, createConfig(pack))
+            } catch (t: Throwable) {
+                Log.e(TAG, "OfflineTts init failed for ${pack.id}", t)
+                throw IllegalStateException("初始化 ${pack.id} 模型失败: ${t.message ?: t.javaClass.simpleName}", t)
+            }
             activePack = pack
         }
     }
