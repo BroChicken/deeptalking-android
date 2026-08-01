@@ -7,6 +7,7 @@ import android.media.AudioTrack
 import android.media.PlaybackParams
 import com.k2fsa.sherpa.onnx.OfflineTts
 import com.k2fsa.sherpa.onnx.OfflineTtsConfig
+import com.k2fsa.sherpa.onnx.OfflineTtsKokoroModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsMatchaModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig
@@ -22,7 +23,7 @@ private data class VoicePack(
     val dataDir: String = "",
     val vocoder: String = ""
 ) {
-    enum class Kind { VITS, MATCHA }
+    enum class Kind { VITS, MATCHA, KOKORO }
 }
 
 class VoiceManager(context: Context) {
@@ -48,15 +49,21 @@ class VoiceManager(context: Context) {
             model = "model-steps-3.onnx", lexicon = "lexicon.txt",
             vocoder = "voices/matcha/vocos-22khz-univ.onnx",
             ruleFsts = "voices/matcha/phone.fst,voices/matcha/date.fst,voices/matcha/number.fst"
+        ),
+        "kokoro" to VoicePack(
+            id = "kokoro", basePath = "voices/kokoro", kind = VoicePack.Kind.KOKORO,
+            model = "model.int8.onnx", lexicon = "lexicon-zh.txt",
+            dataDir = "espeak-ng-data",
+            ruleFsts = "voices/kokoro/date-zh.fst,voices/kokoro/number-zh.fst,voices/kokoro/phone-zh.fst"
         )
     )
 
-    fun speak(packId: String, text: String, speed: Float, playbackRate: Float, volume: Float) {
+    fun speak(packId: String, text: String, speed: Float, playbackRate: Float, volume: Float, sid: Int = 0) {
         if (text.isBlank()) return
         executor.execute {
             val pack = packs[packId] ?: packs.getValue("xiaoya")
             ensurePack(pack)
-            val audio = tts?.generate(text = text, sid = 0, speed = speed.coerceIn(0.75f, 1.25f)) ?: return@execute
+            val audio = tts?.generate(text = text, sid = sid, speed = speed.coerceIn(0.75f, 1.25f)) ?: return@execute
             play(audio.samples, audio.sampleRate, playbackRate.coerceIn(0.85f, 1.15f), volume.coerceIn(0f, 1f))
         }
     }
@@ -116,6 +123,21 @@ class VoiceManager(context: Context) {
                     tokens = "${pack.basePath}/tokens.txt",
                     dataDir = "",
                     noiseScale = 0.667f,
+                    lengthScale = 1.0f
+                ),
+                numThreads = 2,
+                provider = "cpu"
+            )
+            VoicePack.Kind.KOKORO -> OfflineTtsModelConfig(
+                vits = emptyVits,
+                matcha = emptyMatcha,
+                kokoro = OfflineTtsKokoroModelConfig(
+                    model = "${pack.basePath}/${pack.model}",
+                    voices = "${pack.basePath}/voices.bin",
+                    tokens = "${pack.basePath}/tokens.txt",
+                    dataDir = "${pack.basePath}/${pack.dataDir}",
+                    lexicon = "${pack.basePath}/${pack.lexicon}",
+                    lang = "b",
                     lengthScale = 1.0f
                 ),
                 numThreads = 2,

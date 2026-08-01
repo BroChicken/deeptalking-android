@@ -3,7 +3,7 @@ name: Build Android APK
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, cloud-main]
     paths:
       - 'android-app/**'
 
@@ -32,6 +32,23 @@ jobs:
           tar -xjf matcha.tar.bz2
           mv matcha-icefall-zh-baker voices/matcha
           curl -fL --retry 3 --retry-delay 5 -o voices/matcha/vocos-22khz-univ.onnx https://github.com/k2-fsa/sherpa-onnx/releases/download/vocoder-models/vocos-22khz-univ.onnx
+          curl -fL --retry 3 --retry-delay 5 -o kokoro.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-int8-multi-lang-v1_1.tar.bz2
+          tar -xjf kokoro.tar.bz2
+          kokoro_dir="$(find . -maxdepth 1 -type d -name 'kokoro*' | head -1)"
+          test -n "$kokoro_dir"
+          mv "$kokoro_dir" voices/kokoro
+      - name: Download sherpa-onnx Android runtime
+        working-directory: android-app
+        run: |
+          set -euxo pipefail
+          curl -fL --retry 3 --retry-delay 5 -o sherpa-android.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.12.16/sherpa-onnx-v1.12.15-android.tar.bz2
+          tar -xjf sherpa-android.tar.bz2
+          jni_dir="$(find . -type d -name jniLibs -print -quit)"
+          test -n "$jni_dir"
+          rm -rf app/src/main/jniLibs
+          cp -R "$jni_dir" app/src/main/jniLibs
+          mkdir -p app/src/main/java/com/k2fsa/sherpa/onnx
+          curl -fL --retry 3 --retry-delay 5 -H 'Accept: application/vnd.github.raw+json' -o app/src/main/java/com/k2fsa/sherpa/onnx/Tts.kt https://api.github.com/repos/k2-fsa/sherpa-onnx/contents/android/SherpaOnnxTts/app/src/main/java/com/k2fsa/sherpa/onnx/Tts.kt?ref=master
       - name: Build debug APK
         working-directory: android-app
         run: gradle :app:assembleDebug --stacktrace
