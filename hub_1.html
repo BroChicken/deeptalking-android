@@ -5669,15 +5669,6 @@ function formatCompactNumber(value) {
   return String(Math.round(number));
 }
 
-function showVersionToast() {
-  var toast = document.createElement('div');
-  toast.textContent = 'DeepTalking v' + APP_VERSION + ' 已加载';
-  toast.style.cssText = 'position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:9999;background:#2f6fed;color:#fff;padding:8px 18px;border-radius:20px;font-size:13px;box-shadow:0 4px 16px rgba(0,0,0,.3);opacity:0;transition:opacity .3s;';
-  document.body.appendChild(toast);
-  setTimeout(function() { toast.style.opacity = '1'; }, 50);
-  setTimeout(function() { toast.style.opacity = '0'; setTimeout(function() { if (toast.parentNode) toast.parentNode.removeChild(toast); }, 300); }, 4000);
-}
-
 function setActivity(text) {
   state.activityLog = Array.isArray(state.activityLog) ? state.activityLog : [];
   state.activityLog.push({ at: new Date().toISOString(), text: text });
@@ -5896,7 +5887,6 @@ window.addEventListener('DOMContentLoaded', function() {
   var versionBadge = document.getElementById('appVersionBadge');
   if (versionBadge) versionBadge.textContent = 'v' + APP_VERSION;
   renderDebugInfo();
-  showVersionToast();
   applyTheme();
   renderCharacterList();
   renderChat();
