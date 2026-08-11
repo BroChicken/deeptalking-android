@@ -742,7 +742,6 @@ input:focus, textarea:focus, select:focus {
             <select id="apiPlatform" onchange="changePlatform()" class="w-full rounded-lg px-2 py-1.5 text-xs" style="background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text-color);">
               <option value="deepseek">DeepSeek</option>
               <option value="opencode">OpenCode</option>
-              <option value="opencode-local">OpenCode（本地代理）</option>
               <option value="custom">自定义</option>
             </select>
           </div>
@@ -966,7 +965,6 @@ const APP_VERSION = '2.0';
 const PLATFORM_CONFIGS = {
   deepseek: { baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-v4-flash', models: ['deepseek-v4-flash', 'deepseek-chat', 'deepseek-reasoner'] },
   opencode: { baseUrl: 'https://opencode.ai/zen/go/v1', model: 'deepseek-v4-flash', keepV1InResponses: true, models: ['deepseek-v4-flash'] },
-  'opencode-local': { name: 'OpenCode（本地 CORS 代理）', baseUrl: 'http://127.0.0.1:8787/v1', model: 'deepseek-v4-flash', keepV1InResponses: true, models: ['deepseek-v4-flash'] },
   custom: {}
 };
 
