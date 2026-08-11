@@ -3995,46 +3995,32 @@ function buildRequestPayload(char, query) {
     systemPrompt += '11. 记忆归属：每位成员有自己的私人记忆，互相不知道对方记得什么。只有当某件事实是全体都知道的（如用户公开告诉所有人的信息、群内公开讨论的事）才写入共享记忆（longTerm不填memberName）；若某事实只有某位成员知道、或属于某成员对用户的个人印象/私人约定，则在该条longTerm中填memberName记入其私人记忆。引用成员私人记忆时只能用该成员自己的记忆，不得张冠李戴。\n';
   }
 
-  var isDeepSeek = state.config.apiPlatform === 'deepseek';
+  // 稳定前缀请求（所有 /responses 平台统一，实测 opencode-go 同样透传前缀缓存字段）：
+  // 固定 system 在前、全部历史逐字（最旧到最新，不重排），volatile 上下文只附加到当前用户
+  // 消息，保证跨轮次前缀稳定可缓存。历史消息不注入消息 ID，避免内部 ID 暴露给模型/用户。
   var recentMessages = [];
-  var recent = char.memory.instant.filter(function(msg) { return !msg.isLoading; }).slice(-14);
-  if (isDeepSeek) {
-    // Stable-prefix request for DeepSeek caching: fixed system first, all history verbatim
-    // (oldest to newest, never reformatted), volatile context appended only to the current
-    // user message so the cacheable prefix never changes between turns.
-    var historyMessages = char.memory.instant.filter(function(message) { return !message.isLoading; }).slice(-MEMORY_LIMITS.instant);
-    var currentUserMessage = null;
-    for (var historyIndex = historyMessages.length - 1; historyIndex >= 0; historyIndex--) {
-      if (historyMessages[historyIndex].role === 'user') {
-        currentUserMessage = historyMessages[historyIndex];
-        break;
-      }
-    }
-    // 稳定前缀：只按消息数截断（-80），不做按字符数的头部裁剪——
-    // 任何从最旧端裁减都会破坏 DeepSeek 前缀缓存，导致每轮整段未命中
-    historyMessages.forEach(function(message) {
-      if (message.role === 'user') {
-        var userContent = toText(message.content);
-        if (currentUserMessage && message.id === currentUserMessage.id) {
-          recentMessages.push({ role: 'user', content: trimText(userContent, 2000) + '\n\n【系统提供的本轮上下文，仅供角色理解，不代表用户陈述】\n' + volatileContext });
-        } else {
-          recentMessages.push({ role: 'user', content: trimText(userContent, 800) });
-        }
-      } else {
-        recentMessages.push({ role: 'assistant', content: trimText(toText(message.apiContent || message.content), 1200) });
-      }
-    });
-  } else {
-    systemPrompt = volatileContext + systemPrompt;
-    var usedChars = 0;
-    for (var i = recent.length - 1; i >= 0; i--) {
-      var msg = recent[i];
-      var content = '[消息ID ' + msg.id + ']\n' + trimText(msg.content, 1400);
-      if (usedChars + content.length > PROMPT_LIMITS.recentChars && recentMessages.length > 0) break;
-      recentMessages.unshift({ role: msg.role === 'user' ? 'user' : 'assistant', content: trimText(content, PROMPT_LIMITS.recentChars - usedChars) });
-      usedChars += content.length;
+  var historyMessages = char.memory.instant.filter(function(message) { return !message.isLoading; }).slice(-MEMORY_LIMITS.instant);
+  var currentUserMessage = null;
+  for (var historyIndex = historyMessages.length - 1; historyIndex >= 0; historyIndex--) {
+    if (historyMessages[historyIndex].role === 'user') {
+      currentUserMessage = historyMessages[historyIndex];
+      break;
     }
   }
+  // 稳定前缀：只按消息数截断（-80），不做按字符数的头部裁剪——
+  // 任何从最旧端裁减都会破坏前缀缓存，导致每轮整段未命中
+  historyMessages.forEach(function(message) {
+    if (message.role === 'user') {
+      var userContent = toText(message.content);
+      if (currentUserMessage && message.id === currentUserMessage.id) {
+        recentMessages.push({ role: 'user', content: trimText(userContent, 2000) + '\n\n【系统提供的本轮上下文，仅供角色理解，不代表用户陈述】\n' + volatileContext });
+      } else {
+        recentMessages.push({ role: 'user', content: trimText(userContent, 800) });
+      }
+    } else {
+      recentMessages.push({ role: 'assistant', content: trimText(toText(message.apiContent || message.content), 1200) });
+    }
+  });
   return [{ role: 'system', content: systemPrompt }].concat(recentMessages);
 }
 
@@ -4543,7 +4529,7 @@ function extractStreamText(event) {
 }
 
 function recordCacheUsage(usage) {
-  if (state.config.apiPlatform !== 'deepseek' || !usage) return;
+  if (!usage) return;
   var hitTokens = Number(usage.prompt_cache_hit_tokens);
   var missTokens = Number(usage.prompt_cache_miss_tokens);
   var promptTokens = Number(usage.prompt_tokens);
@@ -5644,7 +5630,6 @@ function importData(event) {
       renderChat();
       loadSettingsForm();
       alert('导入成功');
-      autoRepairAvatars();
     } catch (err) {
       alert('导入失败: ' + err.message);
     }
@@ -5732,13 +5717,10 @@ function loadSettingsForm() {
 function renderCacheStats() {
   var element = document.getElementById('cacheStatsBar');
   if (!element) return;
-  if (state.config.apiPlatform !== 'deepseek') {
-    element.classList.add('hidden');
-    return;
-  }
   var stats = state.config.cacheStats;
   if (!stats) {
-    element.classList.add('hidden');
+    element.textContent = '缓存 --';
+    element.classList.remove('hidden');
     return;
   }
   if (stats.hitTokens == null || stats.missTokens == null) {
@@ -5986,7 +5968,6 @@ window.addEventListener('DOMContentLoaded', function() {
   updateAppHeight();
   runInitialMemoryMigration();
   if (/wv|WebView/i.test(navigator.userAgent || '') || typeof navigator.share !== 'function') toggleSidebar(true);
-  autoRepairAvatars();
 
   // Event delegation for character list
   document.getElementById('characterList').addEventListener('click', function(e) {

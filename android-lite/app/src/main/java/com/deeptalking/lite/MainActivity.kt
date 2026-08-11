@@ -120,6 +120,18 @@ class MainActivity : Activity() {
         setContentView(root)
         webView = wv
 
+        // 键盘弹出时窗口真实收缩（adjustResize），配合 IME inset 作为底部 padding，
+        // 让 WebView 底部（输入框所在区）抬升到键盘上方，且不影响页面布局。
+        window.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        if (Build.VERSION.SDK_INT >= 30) {
+            window.setDecorFitsSystemWindows(false)
+            root.setOnApplyWindowInsetsListener { _, insets ->
+                val ime = insets.getInsets(WindowInsets.Type.ime())
+                root.setPadding(0, 0, 0, ime.bottom)
+                insets
+            }
+        }
+
         hideSystemBars()
 
         wv.loadUrl("file:///android_asset/hub.html")
