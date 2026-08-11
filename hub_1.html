@@ -1113,12 +1113,26 @@ function pixelAvatarDataUrl(rows) {
   return canvas.toDataURL('image/png');
 }
 
+function sanitizeAvatar(value, fallback) {
+  var v = typeof value === 'string' ? value.trim() : '';
+  if (!v) return fallback;
+  if (v.indexOf('?') >= 0 || v.indexOf('\ufffd') >= 0) return fallback;
+  var hasNonAscii = false;
+  for (var i = 0; i < v.length; i++) {
+    if (v.charCodeAt(i) > 127) { hasNonAscii = true; break; }
+  }
+  if (!hasNonAscii) return fallback;
+  return v;
+}
+
 function renderAvatarHtml(char, imgClass, emojiClass) {
   var dataUrl = pixelAvatarDataUrl(char && char.basicInfo && char.basicInfo.avatarPixel);
   if (dataUrl) {
     return '<img class="' + imgClass + '" src="' + dataUrl + '" alt="" style="image-rendering:pixelated;object-fit:cover;">';
   }
-  return '<span class="' + emojiClass + '">' + escapeHtml((char && char.basicInfo && char.basicInfo.avatar) || '👤') + '</span>';
+  var fallback = char && char.entityType === 'group' ? '👥' : '👤';
+  var avatar = sanitizeAvatar(char && char.basicInfo && char.basicInfo.avatar, fallback);
+  return '<span class="' + emojiClass + '">' + escapeHtml(avatar) + '</span>';
 }
 
 var PIXEL_AVATAR_PROMPT = '为角色绘制16x16像素头像，字段"avatarPixel"为包含16个字符串的数组，每个字符串恰好16个字符。必须用像素块画出具体的角色形象（发型轮廓、脸、眼睛、服饰主色），不能是纯色块或只有边框。字符与颜色对照：.透明 K黑(#1b1b1f) W白 R红 O橙 Y黄 G绿 C青 B蓝 P紫 M粉 N棕 S肤色 H深灰 L浅灰。字符只允许这些，不得出现其他字符。示例一行可能是"....KKSSSSKK...."，其中KK是深色头发、SS是肤色。';
@@ -1479,6 +1493,10 @@ function normalizeCharacter(rawCharacter, id, strict, skipLegacyRepair) {
       if (Array.isArray(rawBasicInfo.avatarPixel)) character.basicInfo.avatarPixel = normalizePixelAvatar(rawBasicInfo.avatarPixel);
       return;
     }
+    if (key === 'avatar') {
+      character.basicInfo.avatar = sanitizeAvatar(rawBasicInfo[key], character.entityType === 'group' ? '👥' : '👤');
+      return;
+    }
     character.basicInfo[key] = toText(rawBasicInfo[key], character.basicInfo[key]);
   });
 
@@ -1547,7 +1565,7 @@ function normalizeCharacter(rawCharacter, id, strict, skipLegacyRepair) {
     var rawGroupInfo = isPlainObject(rawCharacter.groupInfo) ? rawCharacter.groupInfo : {};
     character.groupInfo = {
       name: toText(rawGroupInfo.name, character.basicInfo.name),
-      avatar: toText(rawGroupInfo.avatar, character.basicInfo.avatar),
+      avatar: sanitizeAvatar(rawGroupInfo.avatar, character.basicInfo.avatar),
       avatarPixel: Array.isArray(rawGroupInfo.avatarPixel) ? normalizePixelAvatar(rawGroupInfo.avatarPixel) : character.basicInfo.avatarPixel,
       description: toText(rawGroupInfo.description, character.basicInfo.personality),
       scene: toText(rawGroupInfo.scene, character.basicInfo.scene),
@@ -1578,6 +1596,10 @@ function normalizeGroupMembers(items) {
     Object.keys(member.basicInfo).forEach(function(key) {
       if (key === 'avatarPixel') {
         if (Array.isArray(source.avatarPixel)) member.basicInfo.avatarPixel = normalizePixelAvatar(source.avatarPixel);
+        return;
+      }
+      if (key === 'avatar') {
+        member.basicInfo.avatar = sanitizeAvatar(source[key], '👤');
         return;
       }
       member.basicInfo[key] = toText(source[key], member.basicInfo[key]);
@@ -5399,13 +5421,27 @@ function fallbackCopy(text, successMsg) {
 }
 
 
+function decodeImportBuffer(buffer) {
+  var bytes = new Uint8Array(buffer);
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch (utfErr) {
+    try {
+      return new TextDecoder('gbk').decode(bytes);
+    } catch (gbkErr) {
+      return new TextDecoder('utf-8').decode(bytes);
+    }
+  }
+}
+
 function importData(event) {
   var file = event.target.files[0];
   if (!file) return;
   var reader = new FileReader();
   reader.onload = function(e) {
     try {
-      var data = JSON.parse(e.target.result);
+      var text = decodeImportBuffer(e.target.result);
+      var data = JSON.parse(text);
       var hasVersion = data && data.version != null;
       var normalizedData = normalizeAppData(data, true, hasVersion);
       if (!confirm('导入将覆盖当前所有数据，确定继续？')) return;
@@ -5423,7 +5459,7 @@ function importData(event) {
   reader.onerror = function() {
     alert('文件读取失败，请重试');
   };
-  reader.readAsText(file);
+  reader.readAsArrayBuffer(file);
   event.target.value = '';
 }
 
