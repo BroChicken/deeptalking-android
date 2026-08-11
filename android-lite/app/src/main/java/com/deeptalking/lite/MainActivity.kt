@@ -20,14 +20,11 @@ class MainActivity : Activity() {
 
     private var webView: WebView? = null
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
-    private var webViewClient: WebViewClient? = null
-    private var webChromeClient: WebChromeClient? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        webViewClient = WebViewClient()
-        webChromeClient = object : WebChromeClient() {
+        val webChromeClient = object : WebChromeClient() {
             override fun onJsAlert(
                 view: WebView,
                 url: String,
@@ -87,7 +84,7 @@ class MainActivity : Activity() {
         wv.settings.setSupportZoom(false)
         wv.settings.textZoom = 100
 
-        wv.webViewClient = webViewClient
+        wv.webViewClient = WebViewClient()
         wv.webChromeClient = webChromeClient
         wv.setDownloadListener { url, _: String?, _: String?, _: String?, _: Long ->
             if (url.startsWith("blob:") || url.startsWith("data:")) {
