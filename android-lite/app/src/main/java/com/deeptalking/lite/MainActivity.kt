@@ -3,14 +3,18 @@ package com.deeptalking.lite
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.ContentValues
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowInsets
 import android.view.WindowInsetsController
+import android.webkit.JavascriptInterface
 import android.webkit.JsResult
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
@@ -18,6 +22,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import android.widget.Toast
+import java.io.File
 
 @SuppressLint("SetJavaScriptEnabled")
 class MainActivity : Activity() {
@@ -90,6 +95,7 @@ class MainActivity : Activity() {
 
         wv.webViewClient = WebViewClient()
         wv.webChromeClient = webChromeClient
+        wv.addJavascriptInterface(BackupBridge(), "AndroidBridge")
         wv.setDownloadListener { url, _: String?, _: String?, _: String?, _: Long ->
             if (url.startsWith("blob:") || url.startsWith("data:")) {
                 Toast.makeText(
@@ -117,6 +123,45 @@ class MainActivity : Activity() {
         hideSystemBars()
 
         wv.loadUrl("file:///android_asset/hub.html")
+    }
+
+    private inner class BackupBridge {
+        @JavascriptInterface
+        fun saveBackup(json: String, fileName: String): String {
+            return try {
+                val name = fileName.ifBlank { "deeptalking_backup.json" }
+                "ok:" + saveBackupToStorage(name, json)
+            } catch (e: Exception) {
+                "err:" + (e.message ?: e.toString())
+            }
+        }
+    }
+
+    private fun saveBackupToStorage(fileName: String, content: String): String {
+        val bytes = content.toByteArray(Charsets.UTF_8)
+        if (Build.VERSION.SDK_INT >= 29) {
+            val values = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                put(MediaStore.Downloads.MIME_TYPE, "application/json")
+                put(MediaStore.Downloads.IS_PENDING, 1)
+            }
+            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                ?: throw IllegalStateException("无法创建下载记录")
+            contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+                ?: run {
+                    contentResolver.delete(uri, null, null)
+                    throw IllegalStateException("无法写入文件")
+                }
+            values.clear()
+            values.put(MediaStore.Downloads.IS_PENDING, 0)
+            contentResolver.update(uri, values, null, null)
+            return "Downloads/$fileName"
+        } else {
+            val dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: filesDir
+            val file = File(dir, fileName)
+            file.writeBytes(bytes)
+            return file.absolutePath
+        }
     }
 
     private fun hideSystemBars() {

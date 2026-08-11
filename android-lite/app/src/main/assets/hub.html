@@ -4994,6 +4994,29 @@ function saveJsonWithPicker(dataStr, fileName) {
 function downloadJsonBlob(dataStr, fileName) {
   fileName = fileName || 'deeptalking_backup.json';
   lastDownloadLog = ['导出触发: ' + fileName];
+
+  // 【原生桥】APK WebView：把 JSON 直接交给原生层写入系统 Downloads，绕过浏览器下载限制
+  if (typeof AndroidBridge !== 'undefined' && typeof AndroidBridge.saveBackup === 'function') {
+    lastDownloadLog.push('使用原生导出 AndroidBridge.saveBackup');
+    var saveResult = '';
+    try {
+      saveResult = AndroidBridge.saveBackup(dataStr, fileName) || '';
+    } catch (e) {
+      saveResult = 'err:' + String(e && e.message ? e.message : e);
+    }
+    lastDownloadLog.push('原生导出结果: ' + saveResult);
+    updateExportDebug();
+    if (saveResult.indexOf('ok:') === 0) {
+      lastNativeSaveOk = true;
+      alert('备份已导出到：' + saveResult.slice(3));
+      var exportModal = document.getElementById('exportTextModal');
+      if (exportModal) exportModal.style.display = 'none';
+      return;
+    }
+    alert('原生导出失败：' + saveResult.slice(4) + '\n请改用"复制全部"，粘贴到备忘录保存为 ' + fileName + '。');
+    return;
+  }
+
   var isWebViewLike = /wv|WebView/i.test(navigator.userAgent || '') || typeof navigator.share !== 'function';
   lastDownloadLog.push('isWebView=' + isWebViewLike);
   lastDownloadLog.push('showSaveFilePicker=' + (typeof window.showSaveFilePicker === 'function' ? 'true' : 'false'));
@@ -5144,8 +5167,9 @@ function exportAllData() {
     // 【方案 2：直接触发浏览器下载（尽力而为，不阻塞）】
     downloadJsonBlob(dataStr, fileName);
 
-    // 【方案 3：兜底弹窗（复制全部 + 手动下载）】始终显示，保证在任何设备上都能拿到数据
-    showExportModal(dataStr, fileName, blob);
+    // 【方案 3：兜底弹窗（复制全部 + 手动下载）】原生导出成功时不再弹，其余情况始终显示
+    if (!lastNativeSaveOk) showExportModal(dataStr, fileName, blob);
+    lastNativeSaveOk = false;
 
   } catch (error) {
     console.error('导出失败:', error);
@@ -5156,6 +5180,7 @@ function exportAllData() {
 var lastExportDataStr = null;
 var lastExportName = '';
 var lastDownloadLog = [];
+var lastNativeSaveOk = false;
 
 // 纯净版的兜底弹窗，带一键复制 + 手动下载按钮
 function showExportModal(dataStr, fileName, blob) {
