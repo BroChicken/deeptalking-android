@@ -1113,16 +1113,20 @@ function pixelAvatarDataUrl(rows) {
   return canvas.toDataURL('image/png');
 }
 
-function sanitizeAvatar(value, fallback) {
+function isAvatarDamaged(value) {
   var v = typeof value === 'string' ? value.trim() : '';
-  if (!v) return fallback;
-  if (v.indexOf('?') >= 0 || v.indexOf('\ufffd') >= 0) return fallback;
+  if (!v) return true;
+  if (v.indexOf('?') >= 0 || v.indexOf('\ufffd') >= 0) return true;
   var hasNonAscii = false;
   for (var i = 0; i < v.length; i++) {
     if (v.charCodeAt(i) > 127) { hasNonAscii = true; break; }
   }
-  if (!hasNonAscii) return fallback;
-  return v;
+  if (!hasNonAscii) return true;
+  return false;
+}
+
+function sanitizeAvatar(value, fallback) {
+  return isAvatarDamaged(value) ? fallback : value.trim();
 }
 
 function renderAvatarHtml(char, imgClass, emojiClass) {
@@ -1494,7 +1498,9 @@ function normalizeCharacter(rawCharacter, id, strict, skipLegacyRepair) {
       return;
     }
     if (key === 'avatar') {
-      character.basicInfo.avatar = sanitizeAvatar(rawBasicInfo[key], character.entityType === 'group' ? '👥' : '👤');
+      var rawAvatar = rawBasicInfo[key];
+      character.basicInfo.avatar = sanitizeAvatar(rawAvatar, character.entityType === 'group' ? '👥' : '👤');
+      if (isAvatarDamaged(rawAvatar)) character.avatarRepairPending = true;
       return;
     }
     character.basicInfo[key] = toText(rawBasicInfo[key], character.basicInfo[key]);
@@ -1571,6 +1577,7 @@ function normalizeCharacter(rawCharacter, id, strict, skipLegacyRepair) {
       scene: toText(rawGroupInfo.scene, character.basicInfo.scene),
       interactionRules: toText(rawGroupInfo.interactionRules)
     };
+    if (isAvatarDamaged(rawGroupInfo.avatar) || isAvatarDamaged(character.basicInfo.avatar)) character.avatarRepairPending = true;
     character.basicInfo.name = character.groupInfo.name;
     character.basicInfo.avatar = character.groupInfo.avatar;
     character.basicInfo.avatarPixel = character.groupInfo.avatarPixel;
@@ -1585,6 +1592,7 @@ function normalizeCharacter(rawCharacter, id, strict, skipLegacyRepair) {
       window.__legacyMemoryRepairs += repairCount;
     }
   }
+  if (rawCharacter.avatarRepairPending) character.avatarRepairPending = true;
   return character;
 }
 
@@ -1600,6 +1608,7 @@ function normalizeGroupMembers(items) {
       }
       if (key === 'avatar') {
         member.basicInfo.avatar = sanitizeAvatar(source[key], '👤');
+        if (isAvatarDamaged(source[key])) member.avatarRepairPending = true;
         return;
       }
       member.basicInfo[key] = toText(source[key], member.basicInfo[key]);
@@ -1608,6 +1617,7 @@ function normalizeGroupMembers(items) {
     Object.keys(member.dynamicState).forEach(function(key) { member.dynamicState[key] = sanitizeDynamicStateField(key, toText(state[key], member.dynamicState[key])); });
     member.dynamicStateMeta = isPlainObject(item.dynamicStateMeta) ? item.dynamicStateMeta : {};
     member.roleInGroup = toText(item.roleInGroup);
+    if (item.avatarRepairPending) member.avatarRepairPending = true;
     var rawMemberMemory = isPlainObject(item.memory) ? item.memory : null;
     if (rawMemberMemory) {
       var memberLongTerm = isPlainObject(rawMemberMemory.longTerm) ? rawMemberMemory.longTerm : {};
@@ -2141,6 +2151,58 @@ function clearPixelAvatarForDraft() {
   if (draft.basicInfo) draft.basicInfo.avatarPixel = null;
   if (draft.entityType === 'group' && draft.groupInfo) draft.groupInfo.avatarPixel = null;
   renderCharacterModalContent(draft);
+}
+
+function buildAvatarDescription(obj, parent) {
+  var bi = obj.basicInfo || {};
+  var parts = [bi.name, bi.appearance, bi.personality, bi.distinctiveFeatures];
+  if (obj.roleInGroup) parts.push(obj.roleInGroup);
+  return parts.map(function(v) { return toText(v); }).filter(Boolean).join('，') || '一个神秘角色';
+}
+
+// 自动修复损坏的 emoji 头像：调用 AI 生成像素头像替换，逐个串行执行避免打爆接口
+async function autoRepairAvatars() {
+  if (window.__autoRepairRunning) return;
+  var chars = Object.values(state.characters || {});
+  var jobs = [];
+  chars.forEach(function(char) {
+    if (char && char.avatarRepairPending && !(char.basicInfo && char.basicInfo.avatarPixel)) {
+      jobs.push({ char: char, target: char });
+    }
+    (char && char.members || []).forEach(function(member) {
+      if (member && member.avatarRepairPending && !(member.basicInfo && member.basicInfo.avatarPixel)) {
+        jobs.push({ char: char, target: member });
+      }
+    });
+  });
+  if (jobs.length === 0) return;
+  window.__autoRepairRunning = true;
+  var done = 0, failed = 0;
+  for (var i = 0; i < jobs.length; i++) {
+    var job = jobs[i];
+    var target = job.target;
+    try {
+      var grid = await requestPixelAvatar(buildAvatarDescription(target, job.char));
+      target.basicInfo = target.basicInfo || {};
+      target.basicInfo.avatarPixel = grid;
+      if (job.char.entityType === 'group' && target === job.char && job.char.groupInfo) {
+        job.char.groupInfo.avatarPixel = grid;
+      }
+      delete target.avatarRepairPending;
+      done++;
+    } catch (error) {
+      failed++;
+      console.warn('自动头像生成失败(' + (target.basicInfo && target.basicInfo.name || '?') + '):', error.message);
+    }
+    renderCharacterList();
+    scheduleSave();
+    if (i < jobs.length - 1) await new Promise(function(resolve) { setTimeout(resolve, 300); });
+  }
+  window.__autoRepairRunning = false;
+  if (done > 0) {
+    renderChat();
+    alert('已自动生成 ' + done + ' 个损坏头像' + (failed ? '，失败 ' + failed + ' 个（下次启动会重试）' : ''));
+  }
 }
 
 // ==================== Chat & API Logic (Streaming/Non-Streaming) ====================
@@ -5452,6 +5514,7 @@ function importData(event) {
       renderChat();
       loadSettingsForm();
       alert('导入成功');
+      autoRepairAvatars();
     } catch (err) {
       alert('导入失败: ' + err.message);
     }
@@ -5803,6 +5866,7 @@ window.addEventListener('DOMContentLoaded', function() {
   updateAppHeight();
   runInitialMemoryMigration();
   if (/wv|WebView/i.test(navigator.userAgent || '') || typeof navigator.share !== 'function') toggleSidebar(true);
+  autoRepairAvatars();
 
   // Event delegation for character list
   document.getElementById('characterList').addEventListener('click', function(e) {
