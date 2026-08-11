@@ -5741,7 +5741,7 @@ window.addEventListener('DOMContentLoaded', function() {
   loadSettingsForm();
   updateAppHeight();
   runInitialMemoryMigration();
-  if (isWebViewLike) toggleSidebar(true);
+  if (/wv|WebView/i.test(navigator.userAgent || '') || typeof navigator.share !== 'function') toggleSidebar(true);
 
   // Event delegation for character list
   document.getElementById('characterList').addEventListener('click', function(e) {
