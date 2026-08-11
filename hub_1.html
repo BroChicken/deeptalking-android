@@ -719,6 +719,9 @@ input:focus, textarea:focus, select:focus {
         <button onclick="openCreateModal()" class="w-full btn-primary text-white py-2.5 rounded-xl flex items-center justify-center gap-2 font-medium text-sm">
           <svg class="icon"><use href="#icon-plus"></use></svg> 新建角色或群组
         </button>
+        <button id="repairAvatarsBtn" onclick="repairAllAvatars()" class="w-full btn-secondary text-secondary-c py-2 mt-2 rounded-lg text-xs flex items-center justify-center gap-1" title="为所有默认/损坏头像一键生成贴切 emoji">
+          <svg class="icon"><use href="#icon-refresh"></use></svg> 补全头像
+        </button>
       </div>
       <div class="flex-1 overflow-y-auto chat-scroll px-2 pb-2" id="characterList"></div>
       <div class="sidebar-footer p-3 border-t border-theme flex gap-2">
@@ -1703,12 +1706,31 @@ function normalizeAppData(data, strict, skipLegacyRepair) {
 }
 
 function applyNormalizedData(data) {
-  // 保留本地 apiKey：导入的备份/分享文件不含 API 密钥，避免覆盖当前已配置的 Key
+  // 保留本地 apiKey（顶层 + 各平台槽）：导入的备份/分享文件不含 API 密钥，优先保留本地已配置的 Key
   var localApiKey = state.config && state.config.apiKey;
+  var localSettings = (state.config && state.config.platformSettings) || {};
+  var localSlotKeys = {};
+  Object.keys(localSettings).forEach(function(plat) {
+    if (localSettings[plat] && localSettings[plat].apiKey) {
+      localSlotKeys[plat] = localSettings[plat].apiKey;
+    }
+  });
   state.config = data.config;
+  if (!state.config.platformSettings) state.config.platformSettings = {};
+  // 各平台槽：优先用本地已有 key，导入文件里的 key 一律不用
+  Object.keys(state.config.platformSettings).forEach(function(plat) {
+    var slot = state.config.platformSettings[plat];
+    if (slot) {
+      if (localSlotKeys[plat]) {
+        slot.apiKey = localSlotKeys[plat];
+      } else {
+        delete slot.apiKey;
+      }
+    }
+  });
   if (!state.config.apiKey && localApiKey) {
     state.config.apiKey = localApiKey;
-    if (state.config.platformSettings && state.config.platformSettings[state.config.apiPlatform]) {
+    if (state.config.platformSettings[state.config.apiPlatform]) {
       state.config.platformSettings[state.config.apiPlatform].apiKey = localApiKey;
     }
   }
@@ -2198,27 +2220,35 @@ function buildAvatarDescription(obj, parent) {
   return parts.map(function(v) { return toText(v); }).filter(Boolean).join('，') || '一个神秘角色';
 }
 
-// 自动修复损坏的 emoji 头像：调用 AI 生成像素头像替换，逐个串行执行避免打爆接口
-async function autoRepairAvatars() {
-  if (window.__autoRepairRunning) return;
-  var chars = Object.values(state.characters || {});
+// 收集所有默认/损坏头像的修复任务（角色 + 群组成员，含 👤/👥 占位与空/损坏值）
+function collectAvatarRepairJobs() {
   var jobs = [];
+  var chars = Object.values(state.characters || {});
   chars.forEach(function(char) {
-    if (char && char.avatarRepairPending) {
-      jobs.push({ char: char, target: char });
-    }
-    (char && char.members || []).forEach(function(member) {
-      if (member && member.avatarRepairPending) {
-        jobs.push({ char: char, target: member });
-      }
+    if (needsAvatarRepair(char)) jobs.push({ char: char, target: char });
+    (char.members || []).forEach(function(member) {
+      if (needsAvatarRepair(member)) jobs.push({ char: char, target: member });
     });
   });
-  if (jobs.length === 0) return;
-  window.__autoRepairRunning = true;
-  var done = 0, failed = 0;
+  return jobs;
+}
+
+// 判断某角色/成员头像是否需要修复：损坏值、空值，或仍是 👤/👥 默认占位
+function needsAvatarRepair(target) {
+  var avatar = target && target.basicInfo ? target.basicInfo.avatar : '';
+  if (typeof avatar !== 'string' || !avatar.trim()) return true;
+  var v = avatar.trim();
+  if (v === '👤' || v === '👥') return true;
+  return isAvatarDamaged(v);
+}
+
+// 串行为每个头像调用 AI 生成贴切 emoji（统一入口，供自动修复与手动补全共用）
+async function repairAvatarJobs(jobs, onProgress) {
+  var done = 0, failed = 0, failNames = [];
   for (var i = 0; i < jobs.length; i++) {
     var job = jobs[i];
     var target = job.target;
+    var name = (target.basicInfo && target.basicInfo.name) || '?';
     try {
       var emoji = await requestEmojiAvatar(buildAvatarDescription(target, job.char));
       target.basicInfo = target.basicInfo || {};
@@ -2230,17 +2260,63 @@ async function autoRepairAvatars() {
       done++;
     } catch (error) {
       failed++;
-      console.warn('自动头像生成失败(' + (target.basicInfo && target.basicInfo.name || '?') + '):', error.message);
+      target.avatarRepairPending = true;
+      failNames.push(name);
+      console.warn('头像生成失败(' + name + '):', error.message);
     }
     renderCharacterList();
     scheduleSave();
+    if (onProgress) onProgress(i + 1, jobs.length);
     if (i < jobs.length - 1) await new Promise(function(resolve) { setTimeout(resolve, 300); });
   }
+  return { done: done, failed: failed, failNames: failNames };
+}
+
+// 自动修复（启动/导入后调用）：静默失败不再吞掉，但仅处理损坏项，不覆盖 👤/👥 占位（留给手动补全）
+async function autoRepairAvatars() {
+  if (window.__autoRepairRunning) return;
+  var jobs = collectAvatarRepairJobs().filter(function(j) {
+    return j.target.avatarRepairPending || isAvatarDamaged(j.target.basicInfo && j.target.basicInfo.avatar);
+  });
+  if (jobs.length === 0) return;
+  if (!state.config || !state.config.apiKey) return; // 无 key 不发起无意义调用，留给手动补全提示
+  window.__autoRepairRunning = true;
+  var result = await repairAvatarJobs(jobs);
   window.__autoRepairRunning = false;
-  if (done > 0) {
-    renderChat();
-    alert('已自动生成 ' + done + ' 个损坏头像' + (failed ? '，失败 ' + failed + ' 个（下次启动会重试）' : ''));
+  renderChat();
+  if (result.done > 0 || result.failed > 0) {
+    var msg = '已自动生成 ' + result.done + ' 个损坏头像';
+    if (result.failed > 0) msg += '，失败 ' + result.failed + ' 个（' + result.failNames.join('、') + '），可稍后在侧边栏点击"补全头像"重试';
+    alert(msg);
   }
+}
+
+// 手动一键补全（侧边栏"补全头像"按钮）：覆盖所有默认/损坏头像，含 👤/👥 占位
+async function repairAllAvatars() {
+  if (window.__autoRepairRunning) {
+    alert('头像补全正在进行中，请稍候…');
+    return;
+  }
+  var jobs = collectAvatarRepairJobs();
+  if (jobs.length === 0) {
+    alert('所有角色与群组成员都已使用 emoji 头像，无需补全');
+    return;
+  }
+  if (!state.config || !state.config.apiKey) {
+    alert('请先在设置页配置 API Key，再补全头像');
+    return;
+  }
+  if (!confirm('将为 ' + jobs.length + ' 个默认/损坏头像生成贴切 emoji，确定继续？')) return;
+  var btn = document.getElementById('repairAvatarsBtn');
+  if (btn) { btn.disabled = true; btn.textContent = '补全中…'; }
+  window.__autoRepairRunning = true;
+  var result = await repairAvatarJobs(jobs);
+  window.__autoRepairRunning = false;
+  if (btn) { btn.disabled = false; btn.innerHTML = '<svg class="icon"><use href="#icon-refresh"></use></svg> 补全头像'; }
+  renderChat();
+  var msg = '已生成 ' + result.done + ' 个 emoji 头像';
+  if (result.failed > 0) msg += '，失败 ' + result.failed + ' 个（' + result.failNames.join('、') + '），请检查网络后重试';
+  alert(msg);
 }
 
 // ==================== Chat & API Logic (Streaming/Non-Streaming) ====================
@@ -5247,10 +5323,26 @@ function copyTextToClipboard(text, successMsg) {
 function exportAllData() {
   var dataStr = '';
   try {
-    // 导出时剔除 apiKey：备份/分享文件不应包含 API 密钥
+    // 导出时剔除 apiKey（顶层 + 各平台槽）：备份/分享文件不应包含 API 密钥
     var exportedConfig = {};
     Object.keys(state.config).forEach(function(cfgKey) {
       if (cfgKey === 'apiKey') return;
+      if (cfgKey === 'platformSettings' && state.config.platformSettings) {
+        var cleanSettings = {};
+        Object.keys(state.config.platformSettings).forEach(function(plat) {
+          var slot = state.config.platformSettings[plat];
+          var cleanSlot = {};
+          if (slot) {
+            Object.keys(slot).forEach(function(slotKey) {
+              if (slotKey === 'apiKey') return;
+              cleanSlot[slotKey] = slot[slotKey];
+            });
+          }
+          cleanSettings[plat] = cleanSlot;
+        });
+        exportedConfig[cfgKey] = cleanSettings;
+        return;
+      }
       exportedConfig[cfgKey] = state.config[cfgKey];
     });
     var data = {
