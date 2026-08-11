@@ -1068,7 +1068,10 @@ function trimText(value, maxLength) {
   return maxLength && text.length > maxLength ? text.slice(0, maxLength) + '…' : text;
 }
 
-// ==================== Pixel Avatar ====================
+// ==================== Pixel Avatar（试验失败品，已弃用） ====================
+// ⚠️ 像素头像生成不稳定（模型输出的 16x16 网格常缺行/缺色/尺寸错误），与 TTS 一样属于
+//    试验失败品。仅保留 normalizePixelAvatar / avatarPixel 字段做数据兼容，
+//    不再用于头像展示，也不再作为自动修复的生成方式（自动修复改用 AI 生成 emoji）。
 var PIXEL_AVATAR_PALETTE = {
   '.': null, 'K': '#1b1b1f', 'W': '#ffffff', 'R': '#e74c3c', 'O': '#e67e22',
   'Y': '#f1c40f', 'G': '#2ecc71', 'C': '#1abc9c', 'B': '#3498db', 'P': '#9b59b6',
@@ -1129,11 +1132,8 @@ function sanitizeAvatar(value, fallback) {
   return isAvatarDamaged(value) ? fallback : value.trim();
 }
 
+// 头像一律使用 emoji（像素头像为试验失败品，不稳定，已弃用展示；仅保留数据兼容）
 function renderAvatarHtml(char, imgClass, emojiClass) {
-  var dataUrl = pixelAvatarDataUrl(char && char.basicInfo && char.basicInfo.avatarPixel);
-  if (dataUrl) {
-    return '<img class="' + imgClass + '" src="' + dataUrl + '" alt="" style="image-rendering:pixelated;object-fit:cover;">';
-  }
   var fallback = char && char.entityType === 'group' ? '👥' : '👤';
   var avatar = sanitizeAvatar(char && char.basicInfo && char.basicInfo.avatar, fallback);
   return '<span class="' + emojiClass + '">' + escapeHtml(avatar) + '</span>';
@@ -1141,6 +1141,7 @@ function renderAvatarHtml(char, imgClass, emojiClass) {
 
 var PIXEL_AVATAR_PROMPT = '为角色绘制16x16像素头像，字段"avatarPixel"为包含16个字符串的数组，每个字符串恰好16个字符。必须用像素块画出具体的角色形象（发型轮廓、脸、眼睛、服饰主色），不能是纯色块或只有边框。字符与颜色对照：.透明 K黑(#1b1b1f) W白 R红 O橙 Y黄 G绿 C青 B蓝 P紫 M粉 N棕 S肤色 H深灰 L浅灰。字符只允许这些，不得出现其他字符。示例一行可能是"....KKSSSSKK...."，其中KK是深色头发、SS是肤色。';
 
+// 试验失败品：像素头像生成接口，已弃用（不稳定，输出网格常残缺）。保留仅供历史数据使用。
 async function requestPixelAvatar(desc) {
   var response = await callAPI([
     { role: 'system', content: '你是像素头像设计师。只返回JSON：{"avatarPixel":[16个字符串，每个16字符]}。' },
@@ -1151,6 +1152,23 @@ async function requestPixelAvatar(desc) {
   var grid = normalizePixelAvatar(data.avatarPixel);
   if (!grid) throw new Error('像素头像格式无效');
   return grid;
+}
+
+function extractEmoji(text) {
+  if (!text) return '';
+  var match = String(text).match(/([\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}\u{2190}-\u{21FF}])/u);
+  return match ? match[1] : '';
+}
+
+// 自动修复/手动选择的头像生成方式：调用 AI 挑选一个贴切的 emoji 字符（稳定、无渲染负担）
+async function requestEmojiAvatar(desc) {
+  var response = await callAPI([
+    { role: 'system', content: '你是头像设计师。根据角色描述，从常见 emoji 中挑选一个最贴切、最能代表该角色形象的单字符 emoji（例如 🌸 🐱 🌙 ⚡ 🔥 💧 🍀 👑 🎀 ⭐）。只输出这一个 emoji 字符本身，不要任何文字、解释或标点。' },
+    { role: 'user', content: '角色:' + desc }
+  ]);
+  var emoji = extractEmoji(response.choices[0].message.content);
+  if (!emoji) throw new Error('模型未返回有效 emoji');
+  return emoji;
 }
 
 // 相对时间词（今晚/今早/明天/昨天…）替换为具体日期+时段，供 recentDevelopment 等需要长期可读的字段使用
@@ -2022,10 +2040,8 @@ function renderCharacterModalContent(char) {
     basicContainer.insertAdjacentHTML('afterbegin', '<div class="mb-4 pb-4 border-b border-theme"><label class="block text-xs text-muted-c mb-1">一句话补全空字段</label><div class="flex gap-2"><input id="memberFillInput" placeholder="例如：她是负责医疗支持的沉稳护士" class="flex-1 rounded-lg px-2 py-1.5 text-xs" style="background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text-color);"><button type="button" onclick="fillGroupMemberFields()" class="btn-secondary px-3 rounded-lg text-xs text-secondary-c">补全</button></div><p class="text-xs text-muted-c mt-1">只填充当前为空的字段，不覆盖已编辑内容。</p></div>');
   }
 
-  var pixelPreview = pixelAvatarDataUrl(char.basicInfo && char.basicInfo.avatarPixel)
-    ? '<img class="w-10 h-10 rounded-full" src="' + pixelAvatarDataUrl(char.basicInfo && char.basicInfo.avatarPixel) + '" alt="" style="image-rendering:pixelated;object-fit:cover;border:1px solid var(--border-color);">'
-    : '<span class="text-lg text-muted-c">' + escapeHtml(char.basicInfo && char.basicInfo.avatar || '👤') + '</span>';
-  basicContainer.insertAdjacentHTML('beforeend', '<div class="mt-4 pt-3 border-t border-theme"><label class="block text-xs text-muted-c mb-1">像素头像（由 AI 生成，替换 emoji）</label><div class="flex items-center gap-2"><span class="w-10 h-10 rounded-full bg-accent-soft flex items-center justify-center overflow-hidden">' + pixelPreview + '</span><button type="button" onclick="generatePixelAvatarForDraft()" class="btn-secondary px-3 rounded-lg text-xs text-secondary-c">生成像素头像</button>' + ((char.basicInfo && char.basicInfo.avatarPixel) ? '<button type="button" onclick="clearPixelAvatarForDraft()" class="text-xs text-muted-c hover-accent">清除</button>' : '') + '</div></div>');
+  var currentAvatar = sanitizeAvatar(char.basicInfo && char.basicInfo.avatar, char.entityType === 'group' ? '👥' : '👤');
+  basicContainer.insertAdjacentHTML('beforeend', '<div class="mt-4 pt-3 border-t border-theme"><label class="block text-xs text-muted-c mb-1">头像（emoji）</label><div class="flex items-center gap-2"><span class="w-10 h-10 rounded-full bg-accent-soft flex items-center justify-center overflow-hidden text-lg">' + escapeHtml(currentAvatar) + '</span><button type="button" onclick="generateEmojiAvatarForDraft()" class="btn-secondary px-3 rounded-lg text-xs text-secondary-c">AI 生成 emoji 头像</button></div></div>');
 
   var stateContainer = document.getElementById('modal-content-state');
   var stateHtml = '<p class="text-xs text-muted-c mb-3">这些字段反映角色当前状态。你可以直接修改；AI 只会根据对话中明确的用户信息更新。</p><div class="space-y-3">';
@@ -2120,6 +2136,7 @@ async function fillGroupMemberFields() {
   }
 }
 
+// 试验失败品：像素头像编辑器按钮，已从 UI 移除，保留实现仅供历史调用。不稳定。
 async function generatePixelAvatarForDraft() {
   var draft = state.editingCharacterDraft;
   if (!draft) return;
@@ -2145,12 +2162,35 @@ async function generatePixelAvatarForDraft() {
   }
 }
 
+// 试验失败品：像素头像清除，与像素头像一并弃用。
 function clearPixelAvatarForDraft() {
   var draft = state.editingCharacterDraft;
   if (!draft) return;
   if (draft.basicInfo) draft.basicInfo.avatarPixel = null;
   if (draft.entityType === 'group' && draft.groupInfo) draft.groupInfo.avatarPixel = null;
   renderCharacterModalContent(draft);
+}
+
+// 编辑器里的头像生成入口：调用 AI 生成贴切 emoji，稳定可靠
+async function generateEmojiAvatarForDraft() {
+  var draft = state.editingCharacterDraft;
+  if (!draft) return;
+  var desc = buildAvatarDescription(draft, draft);
+  var btn = document.activeElement && document.activeElement.tagName === 'BUTTON' ? document.activeElement : null;
+  if (btn) btn.disabled = true;
+  try {
+    var emoji = await requestEmojiAvatar(desc);
+    draft.basicInfo = draft.basicInfo || {};
+    draft.basicInfo.avatar = emoji;
+    if (draft.entityType === 'group' && draft.groupInfo) {
+      draft.groupInfo.avatar = emoji;
+    }
+    renderCharacterModalContent(draft);
+  } catch (error) {
+    alert('emoji 头像生成失败：' + error.message);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 function buildAvatarDescription(obj, parent) {
@@ -2166,11 +2206,11 @@ async function autoRepairAvatars() {
   var chars = Object.values(state.characters || {});
   var jobs = [];
   chars.forEach(function(char) {
-    if (char && char.avatarRepairPending && !(char.basicInfo && char.basicInfo.avatarPixel)) {
+    if (char && char.avatarRepairPending) {
       jobs.push({ char: char, target: char });
     }
     (char && char.members || []).forEach(function(member) {
-      if (member && member.avatarRepairPending && !(member.basicInfo && member.basicInfo.avatarPixel)) {
+      if (member && member.avatarRepairPending) {
         jobs.push({ char: char, target: member });
       }
     });
@@ -2182,11 +2222,11 @@ async function autoRepairAvatars() {
     var job = jobs[i];
     var target = job.target;
     try {
-      var grid = await requestPixelAvatar(buildAvatarDescription(target, job.char));
+      var emoji = await requestEmojiAvatar(buildAvatarDescription(target, job.char));
       target.basicInfo = target.basicInfo || {};
-      target.basicInfo.avatarPixel = grid;
+      target.basicInfo.avatar = emoji;
       if (job.char.entityType === 'group' && target === job.char && job.char.groupInfo) {
-        job.char.groupInfo.avatarPixel = grid;
+        job.char.groupInfo.avatar = emoji;
       }
       delete target.avatarRepairPending;
       done++;
