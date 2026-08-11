@@ -1,0 +1,15 @@
+# 归档的试验失败品（体积大，不进仓库）
+archive/
+
+# 敏感文件
+android-lite/keystore/*.jks
+**/signing.properties
+
+# 构建产物
+android-lite/build/
+android-lite/app/build/
+android-lite/local.properties
+
+# 本地数据
+save/
+apk/
