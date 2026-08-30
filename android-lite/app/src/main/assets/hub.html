@@ -1009,8 +1009,20 @@ const DYNAMIC_STATE_FIELDS = [
   { key: 'currentLocation', label: '当前位置/场景' },
   { key: 'currentMood', label: '当前情绪' },
   { key: 'currentFocus', label: '当前关注事项' },
-  { key: 'recentDevelopment', label: '近期进展', type: 'textarea' }
+  { key: 'recentDevelopment', label: '近期进展', type: 'textarea' },
+  { key: 'currentOccupation', label: '当前职业/身份' },
+  { key: 'currentGoal', label: '当前目标' },
+  { key: 'currentRelationship', label: '当前关系' },
+  { key: 'currentSocialStyle', label: '当前社交风格' },
+  { key: 'currentImportantOthers', label: '当前重要他人' },
+  { key: 'currentEmotionalTendency', label: '当前情感倾向' }
 ];
+const STATIC_PROFILE_FIELDS = {
+  gender: { label: '性别' }, age: { label: '年龄' }, race: { label: '种族' },
+  appearance: { label: '外貌特征' }, personality: { label: '性格特征' }, values: { label: '价值观' },
+  fears: { label: '恐惧/弱点' }, background: { label: '背景故事' }, keyEvents: { label: '关键过往' },
+  speakingStyle: { label: '说话风格' }, language: { label: '语言/方言' }, worldView: { label: '时代/世界观' }
+};
 
 function createMemoryId(prefix) {
   return (prefix || 'mem') + '_' + Date.now() + '_' + Math.random().toString(36).slice(2, 9);
@@ -1526,9 +1538,31 @@ function normalizeCharacter(rawCharacter, id, strict, skipLegacyRepair) {
   });
 
   var rawDynamicState = isPlainObject(rawCharacter.dynamicState) ? rawCharacter.dynamicState : {};
+  // 旧版本数据迁移：曾存于 basicInfo 的可变字段迁入 dynamicState（空才回填，幂等）
+  var legacyStaticToDynamic = {
+    occupation: 'currentOccupation',
+    goals: 'currentGoal',
+    relationshipWithUser: 'currentRelationship',
+    socialStyle: 'currentSocialStyle',
+    importantOthers: 'currentImportantOthers',
+    emotionalTendency: 'currentEmotionalTendency'
+  };
+  Object.keys(legacyStaticToDynamic).forEach(function(legacyKey) {
+    var dynKey = legacyStaticToDynamic[legacyKey];
+    if (toText(character.dynamicState[dynKey]).trim() && !toText(rawDynamicState[dynKey]).trim()) return;
+    if (!toText(rawDynamicState[dynKey]).trim() && toText(rawBasicInfo[legacyKey]).trim()) {
+      character.dynamicState[dynKey] = sanitizeDynamicStateField(dynKey, toText(rawBasicInfo[legacyKey]));
+    }
+  });
+  // scene/sceneNotes 曾存于 basicInfo，合并进 currentLocation
+  if (!toText(character.dynamicState.currentLocation).trim() && !toText(rawDynamicState.currentLocation).trim()) {
+    var mergedScene = [toText(rawBasicInfo.scene), toText(rawBasicInfo.sceneNotes)].map(function(v) { return v.trim(); }).filter(Boolean).join('\n');
+    if (mergedScene) character.dynamicState.currentLocation = mergedScene;
+  }
   Object.keys(character.dynamicState).forEach(function(key) {
     var fallback = key === 'currentSituation' ? rawBasicInfo.currentSituation : character.dynamicState[key];
-    character.dynamicState[key] = sanitizeDynamicStateField(key, toText(rawDynamicState[key], fallback));
+    var rawVal = rawDynamicState[key];
+    character.dynamicState[key] = sanitizeDynamicStateField(key, (rawVal == null || (typeof rawVal === 'string' && !rawVal.trim())) ? toText(fallback) : toText(rawVal));
   });
   character.dynamicStateMeta = isPlainObject(rawCharacter.dynamicStateMeta) ? rawCharacter.dynamicStateMeta : {};
 
@@ -1542,7 +1576,8 @@ function normalizeCharacter(rawCharacter, id, strict, skipLegacyRepair) {
        content: toText(message.content),
        timestamp: toText(message.timestamp, new Date().toISOString()),
        extractedAt: message.extractedAt ? normalizeTimestamp(message.extractedAt, null) : null,
-       apiContent: message.role === 'assistant' ? toText(message.apiContent, message.content) : ''
+       apiContent: message.role === 'assistant' ? toText(message.apiContent, message.content) : '',
+       staticChanges: Array.isArray(message.staticChanges) ? message.staticChanges.map(function(label) { return toText(label); }).filter(Boolean) : undefined
     };
   }) : [];
   character.memory.shortTerm = Array.isArray(rawMemory.shortTerm) ? rawMemory.shortTerm.filter(isPlainObject).map(function(item) {
@@ -1593,7 +1628,7 @@ function normalizeCharacter(rawCharacter, id, strict, skipLegacyRepair) {
       avatar: sanitizeAvatar(rawGroupInfo.avatar, character.basicInfo.avatar),
       avatarPixel: Array.isArray(rawGroupInfo.avatarPixel) ? normalizePixelAvatar(rawGroupInfo.avatarPixel) : character.basicInfo.avatarPixel,
       description: toText(rawGroupInfo.description, character.basicInfo.personality),
-      scene: toText(rawGroupInfo.scene, character.basicInfo.scene),
+      scene: toText(rawGroupInfo.scene, character.dynamicState.currentLocation),
       interactionRules: toText(rawGroupInfo.interactionRules)
     };
     if (isAvatarDamaged(rawGroupInfo.avatar) || isAvatarDamaged(character.basicInfo.avatar)) character.avatarRepairPending = true;
@@ -1601,6 +1636,9 @@ function normalizeCharacter(rawCharacter, id, strict, skipLegacyRepair) {
     character.basicInfo.avatar = character.groupInfo.avatar;
     character.basicInfo.avatarPixel = character.groupInfo.avatarPixel;
     character.basicInfo.personality = character.groupInfo.description;
+    if (toText(character.groupInfo.scene).trim() && !toText(character.dynamicState.currentLocation).trim()) {
+      character.dynamicState.currentLocation = character.groupInfo.scene;
+    }
     character.members = normalizeGroupMembers(rawCharacter.members);
   }
   if (!skipLegacyRepair) {
@@ -1633,7 +1671,29 @@ function normalizeGroupMembers(items) {
       member.basicInfo[key] = toText(source[key], member.basicInfo[key]);
     });
     var state = isPlainObject(item.dynamicState) ? item.dynamicState : {};
-    Object.keys(member.dynamicState).forEach(function(key) { member.dynamicState[key] = sanitizeDynamicStateField(key, toText(state[key], member.dynamicState[key])); });
+    // 旧版本群组成员数据迁移：曾存于 basicInfo 的可变字段迁入 dynamicState（空才回填）
+    var legacyStaticToDynamic = {
+      occupation: 'currentOccupation',
+      goals: 'currentGoal',
+      relationshipWithUser: 'currentRelationship',
+      socialStyle: 'currentSocialStyle',
+      importantOthers: 'currentImportantOthers',
+      emotionalTendency: 'currentEmotionalTendency'
+    };
+    Object.keys(legacyStaticToDynamic).forEach(function(legacyKey) {
+      var dynKey = legacyStaticToDynamic[legacyKey];
+      if (!toText(member.dynamicState[dynKey]).trim() && toText(source[legacyKey]).trim()) {
+        member.dynamicState[dynKey] = sanitizeDynamicStateField(dynKey, toText(source[legacyKey]));
+      }
+    });
+    if (!toText(member.dynamicState.currentLocation).trim()) {
+      var mergedScene = [toText(source.scene), toText(source.sceneNotes)].map(function(v) { return v.trim(); }).filter(Boolean).join('\n');
+      if (mergedScene) member.dynamicState.currentLocation = mergedScene;
+    }
+    Object.keys(member.dynamicState).forEach(function(key) {
+      var rawVal = state[key];
+      member.dynamicState[key] = sanitizeDynamicStateField(key, (rawVal == null || (typeof rawVal === 'string' && !rawVal.trim())) ? toText(member.dynamicState[key]) : toText(rawVal));
+    });
     member.dynamicStateMeta = isPlainObject(item.dynamicStateMeta) ? item.dynamicStateMeta : {};
     member.roleInGroup = toText(item.roleInGroup);
     if (item.avatarRepairPending) member.avatarRepairPending = true;
@@ -1780,14 +1840,13 @@ function createCharacterObj(name, avatar, personality, background) {
     id: id,
     entityType: 'character',
     basicInfo: {
-      name: name || '新角色', avatar: avatar || '👤', avatarPixel: null, gender: '', age: '', race: '', occupation: '',
-      appearance: '', distinctiveFeatures: '', personality: personality || '', values: '',
-      emotionalTendency: '', fears: '', goals: '', background: background || '', keyEvents: '',
-      relationshipWithUser: '', socialStyle: '', importantOthers: '',
-      speakingStyle: '', catchphrases: '', nonVerbalHabits: '', language: '', scene: '',
-      worldView: '', sceneNotes: ''
+      name: name || '新角色', avatar: avatar || '👤', avatarPixel: null, gender: '', age: '', race: '',
+      appearance: '', personality: personality || '', values: '',
+      fears: '', background: background || '', keyEvents: '',
+      speakingStyle: '', language: '',
+      worldView: ''
     },
-    dynamicState: { currentSituation: '', currentLocation: '', currentMood: '', currentFocus: '', recentDevelopment: '' },
+    dynamicState: { currentSituation: '', currentLocation: '', currentMood: '', currentFocus: '', recentDevelopment: '', currentOccupation: '', currentGoal: '', currentRelationship: '', currentSocialStyle: '', currentImportantOthers: '', currentEmotionalTendency: '' },
     dynamicStateMeta: {},
     memory: {
       instant: [], shortTerm: [],
@@ -1928,7 +1987,7 @@ function renderChat(forceFollow) {
     return;
   }
   var safeName = escapeHtml(char.basicInfo.name || '');
-  var safeOccupation = escapeHtml(char.basicInfo.occupation || '未知身份');
+  var safeOccupation = escapeHtml((char.dynamicState && char.dynamicState.currentOccupation) || char.basicInfo.occupation || '未知身份');
   var safePersonality = escapeHtml(char.basicInfo.personality || '点击下方输入框开始聊天');
   header.innerHTML = renderAvatarHtml(char, 'w-8 h-8 rounded-full flex-shrink-0', 'w-8 h-8 rounded-full bg-accent-soft flex items-center justify-center text-lg flex-shrink-0') + '<div><div class="chat-character-name font-medium text-sm" style="color: var(--text-color);">' + safeName + '</div><div class="text-xs text-muted-c truncate">' + safeOccupation + '</div></div>';
   var messages = char.memory.instant;
@@ -1966,7 +2025,8 @@ function renderChat(forceFollow) {
       (msg.role === 'user'
         ? '<button class="message-action" data-message-action="edit-resend" data-msg-id="' + safeMsgId + '" title="编辑并重发" aria-label="编辑并重发"><svg class="icon text-sm"><use href="#icon-edit"></use></svg></button>'
         : '<button class="message-action" data-message-action="regenerate" data-msg-id="' + safeMsgId + '" title="重新生成" aria-label="重新生成"><svg class="icon text-sm"><use href="#icon-refresh"></use></svg></button>'));
-    div.innerHTML = avatarHtml + '<div class="message-bubble ' + bubbleClass + '"><div class="message-content">' + formattedContent + '</div><div class="message-meta"><span class="text-xs ' + timeClass + '">' + time + '</span>' + actionHtml + '</div></div>';
+    var staticChangesHtml = (msg.role === 'assistant' && Array.isArray(msg.staticChanges) && msg.staticChanges.length > 0) ? '<div class="text-xs mt-1" style="color: var(--warning-color, #b45309);">⚡ ' + escapeHtml(msg.staticChanges.join(' · ')) + '已修改</div>' : '';
+    div.innerHTML = avatarHtml + '<div class="message-bubble ' + bubbleClass + '"><div class="message-content">' + formattedContent + '</div>' + staticChangesHtml + '<div class="message-meta"><span class="text-xs ' + timeClass + '">' + time + '</span>' + actionHtml + '</div></div>';
     container.appendChild(div);
     messageRowCache[msg.id || ''] = div;
     if (msg.role === 'assistant' && index === latestAssistantIndex && state.quickReplyCharacterId === char.id && state.quickReplyMessageId === msg.id) appendQuickReplyRow(container);
@@ -2032,17 +2092,14 @@ function renderCharacterModalContent(char) {
   } else {
   var basicFields = [
     { key: 'name', label: '名称' }, { key: 'avatar', label: '头像' }, { key: 'gender', label: '性别' },
-    { key: 'age', label: '年龄' }, { key: 'race', label: '种族' }, { key: 'occupation', label: '职业' },
-    { key: 'appearance', label: '外貌特征' }, { key: 'distinctiveFeatures', label: '标志性特征' },
+    { key: 'age', label: '年龄' }, { key: 'race', label: '种族' },
+    { key: 'appearance', label: '外貌特征' },
     { key: 'personality', label: '性格特征' }, { key: 'values', label: '价值观' },
-    { key: 'emotionalTendency', label: '情感倾向' }, { key: 'fears', label: '恐惧/弱点' },
-    { key: 'goals', label: '目标/动机' }, { key: 'background', label: '背景故事', type: 'textarea' },
+    { key: 'fears', label: '恐惧/弱点' }, { key: 'background', label: '背景故事', type: 'textarea' },
     { key: 'keyEvents', label: '关键过往' },
-    { key: 'relationshipWithUser', label: '与用户关系' }, { key: 'socialStyle', label: '社交风格' },
-    { key: 'importantOthers', label: '重要他人' }, { key: 'speakingStyle', label: '说话风格' },
-    { key: 'catchphrases', label: '口头禅' }, { key: 'nonVerbalHabits', label: '非语言习惯' },
-    { key: 'language', label: '语言/方言' }, { key: 'scene', label: '交互场景' },
-    { key: 'worldView', label: '时代/世界观' }, { key: 'sceneNotes', label: '场景补充' }
+    { key: 'speakingStyle', label: '说话风格' },
+    { key: 'language', label: '语言/方言' },
+    { key: 'worldView', label: '时代/世界观' }
   ];
   var basicHtml = '';
   basicFields.forEach(function(f) {
@@ -2055,6 +2112,7 @@ function renderCharacterModalContent(char) {
     }
   });
   basicContainer.innerHTML = basicHtml;
+  basicContainer.insertAdjacentHTML('beforeend', '<p class="text-xs text-muted-c mt-3 pt-3 border-t border-theme">以上为基础设定（谨慎修改）：仅当剧情出现极其明确的依据时，AI 才会在回复后自动调整这些字段，并会向你提示修改内容。可变状态（如当前目标、职业、关系等）在"动态状态"标签页维护。</p>');
   }
   if (state.editingGroupMemberIndex != null) {
     basicContainer.insertAdjacentHTML('afterbegin', '<div class="mb-4 pb-4 border-b border-theme"><label class="block text-xs text-muted-c mb-1">一句话补全空字段</label><div class="flex gap-2"><input id="memberFillInput" placeholder="例如：她是负责医疗支持的沉稳护士" class="flex-1 rounded-lg px-2 py-1.5 text-xs" style="background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text-color);"><button type="button" onclick="fillGroupMemberFields()" class="btn-secondary px-3 rounded-lg text-xs text-secondary-c">补全</button></div><p class="text-xs text-muted-c mt-1">只填充当前为空的字段，不覆盖已编辑内容。</p></div>');
@@ -2089,9 +2147,9 @@ function collectEditDraftFromDom() {
     state.editingCharacterDraft.basicInfo.name = group.name;
     state.editingCharacterDraft.basicInfo.avatar = group.avatar;
     state.editingCharacterDraft.basicInfo.personality = group.description;
-    state.editingCharacterDraft.basicInfo.scene = group.scene;
+    state.editingCharacterDraft.dynamicState.currentLocation = group.scene || state.editingCharacterDraft.dynamicState.currentLocation;
   } else {
-  var basicFields = ['name', 'avatar', 'gender', 'age', 'race', 'occupation', 'appearance', 'distinctiveFeatures', 'personality', 'values', 'emotionalTendency', 'fears', 'goals', 'background', 'keyEvents', 'relationshipWithUser', 'socialStyle', 'importantOthers', 'speakingStyle', 'catchphrases', 'nonVerbalHabits', 'language', 'scene', 'worldView', 'sceneNotes'];
+  var basicFields = ['name', 'avatar', 'gender', 'age', 'race', 'appearance', 'personality', 'values', 'fears', 'background', 'keyEvents', 'speakingStyle', 'language', 'worldView'];
   basicFields.forEach(function(field) {
     var input = document.getElementById('modal_basic_' + field);
     if (input) state.editingCharacterDraft.basicInfo[field] = input.value;
@@ -2131,7 +2189,7 @@ async function fillGroupMemberFields() {
   try {
     var response = await callAPI([
       { role: 'system', content: '你是角色卡补全助手。只返回JSON。只能根据群组设定、现有角色卡和用户的一句话补全空字段，不能覆盖或编造与已有字段冲突的信息。' },
-      { role: 'user', content: '群组信息:\n' + JSON.stringify(group.groupInfo || {}) + '\n群组其他成员:\n' + JSON.stringify((group.members || []).map(function(item) { return { name: item.basicInfo.name, personality: item.basicInfo.personality, roleInGroup: item.roleInGroup }; })) + '\n\n待补全成员:\n' + JSON.stringify(member) + '\n\n用户补充:\n' + description + '\n\n返回完整角色字段JSON：name, avatar, gender, age, race, occupation, appearance, distinctiveFeatures, personality, values, emotionalTendency, fears, goals, background, keyEvents, relationshipWithUser, socialStyle, importantOthers, speakingStyle, catchphrases, nonVerbalHabits, language, scene, worldView, sceneNotes, roleInGroup, dynamicState（包含currentSituation、currentLocation、currentMood、currentFocus、recentDevelopment）。只给出有把握的字段。' + PIXEL_AVATAR_PROMPT }
+      { role: 'user', content: '群组信息:\n' + JSON.stringify(group.groupInfo || {}) + '\n群组其他成员:\n' + JSON.stringify((group.members || []).map(function(item) { return { name: item.basicInfo.name, personality: item.basicInfo.personality, roleInGroup: item.roleInGroup }; })) + '\n\n待补全成员:\n' + JSON.stringify(member) + '\n\n用户补充:\n' + description + '\n\n返回完整角色字段JSON：name, avatar, gender, age, race, appearance, personality, values, fears, background, keyEvents, speakingStyle, language, worldView, roleInGroup, dynamicState（包含currentSituation、currentLocation、currentMood、currentFocus、recentDevelopment、currentOccupation、currentGoal、currentRelationship、currentSocialStyle、currentImportantOthers、currentEmotionalTendency）。只给出有把握的字段。' + PIXEL_AVATAR_PROMPT }
     ]);
     var data = parseJsonPayload(response.choices[0].message.content);
     if (!isPlainObject(data)) throw new Error('补全结果格式错误');
@@ -2215,7 +2273,7 @@ async function generateEmojiAvatarForDraft() {
 
 function buildAvatarDescription(obj, parent) {
   var bi = obj.basicInfo || {};
-  var parts = [bi.name, bi.appearance, bi.personality, bi.distinctiveFeatures];
+  var parts = [bi.name, bi.appearance, bi.personality];
   if (obj.roleInGroup) parts.push(obj.roleInGroup);
   return parts.map(function(v) { return toText(v); }).filter(Boolean).join('，') || '一个神秘角色';
 }
@@ -3457,6 +3515,30 @@ function applyDynamicStateUpdates(char, updates, assistantMessage, target, sourc
   return accepted;
 }
 
+// 谨慎修改字段：仅当模型给出极其明确的剧情依据时才更新 basicInfo 的静态设定字段。
+// 返回被修改字段的中文标签数组，供该轮回复气泡下提示用户。
+function applyStaticFieldUpdates(char, updates, assistantMessage, sources) {
+  if (!isPlainObject(updates)) return [];
+  if (!isPlainObject(char.basicInfo)) return [];
+  var changedLabels = [];
+  Object.keys(STATIC_PROFILE_FIELDS).forEach(function(key) {
+    var update = updates[key];
+    if (!isPlainObject(update)) return;
+    var value = trimText(toText(update.value), 700);
+    var sourcesResolved = resolveDynamicStateSources(char, update.sourceMessageIds, update.evidence, assistantMessage, sources);
+    if (!value || !sourcesResolved) return;
+    if (!('staticFieldMeta' in char)) char.staticFieldMeta = {};
+    char.staticFieldMeta[key] = {
+      sourceMessageIds: sourcesResolved.map(function(entry) { return entry.id; }),
+      evidence: trimText(update.evidence, 300),
+      updatedAt: new Date().toISOString()
+    };
+    char.basicInfo[key] = value;
+    changedLabels.push(STATIC_PROFILE_FIELDS[key].label);
+  });
+  return changedLabels;
+}
+
 function applyMemberDynamicStateUpdates(char, updates, assistantMessage, sources) {
   if (char.entityType !== 'group' || !Array.isArray(updates)) return 0;
   var accepted = 0;
@@ -3681,6 +3763,10 @@ function applyMemoryUpdate(memUpdate, char, assistantMessage) {
   memUpdate._accepted.memberDynamicState = applyMemberDynamicStateUpdates(char, memUpdate.memberDynamicState, assistantMessage, sources);
   memUpdate._accepted.promises = consumePromiseUpdates(char, memUpdate.promiseUpdates, sources);
   if (isPlainObject(memUpdate.recall)) handleRecall(memUpdate.recall, char);
+  var staticChangedLabels = applyStaticFieldUpdates(char, memUpdate.staticFields, assistantMessage, sources);
+  if (staticChangedLabels.length > 0 && isPlainObject(assistantMessage)) {
+    assistantMessage.staticChanges = staticChangedLabels;
+  }
   trimCharacterMemory(char);
   return memUpdate;
 }
@@ -3704,7 +3790,7 @@ function buildRoleContext(char) {
     var groupLines = [
       '群组名称: ' + trimText(group.name || char.basicInfo.name, 160),
       '群组描述: ' + trimText(group.description || char.basicInfo.personality, 700),
-      '场景: ' + trimText(group.scene || char.basicInfo.scene, 500),
+      '场景: ' + trimText(group.scene || (char.dynamicState && char.dynamicState.currentLocation), 500),
       '互动规则: ' + trimText(group.interactionRules, 700),
       '成员:'
     ];
@@ -3714,8 +3800,8 @@ function buildRoleContext(char) {
     });
     return groupLines.join('\n');
   }
-  var primaryFields = ['name', 'personality', 'values', 'goals', 'relationshipWithUser', 'speakingStyle', 'scene', 'worldView'];
-  var secondaryFields = ['gender', 'age', 'race', 'occupation', 'appearance', 'emotionalTendency', 'fears', 'background', 'sceneNotes'];
+  var primaryFields = ['name', 'personality', 'values', 'speakingStyle', 'worldView'];
+  var secondaryFields = ['gender', 'age', 'race', 'appearance', 'fears', 'background', 'language'];
   var lines = [];
   primaryFields.forEach(function(key) {
     var value = trimText(char.basicInfo[key], 700);
@@ -3816,12 +3902,18 @@ function getProminentPromise(char) {
   };
 }
 
-// 从角色背景与记忆中抽取候选话题素材，供角色自然引出新话题（避免冷场）
+// 从角色背景、动态状态与记忆中抽取候选话题素材，供角色自然引出新话题（避免冷场）。
+// 覆盖全部有效设定字段：静态基础设定 + 迁移后的动态可变字段 + 长期记忆。
 function buildTopicSuggestions(char) {
   var sources = [];
   var info = char.basicInfo || {};
-  ['personality', 'relationshipWithUser', 'goals', 'values', 'background', 'keyEvents', 'worldView', 'occupation', 'scene', 'importantOthers', 'fears', 'socialStyle'].forEach(function(key) {
+  ['gender', 'age', 'race', 'appearance', 'personality', 'values', 'fears', 'background', 'keyEvents', 'speakingStyle', 'language', 'worldView'].forEach(function(key) {
     var value = trimText(info[key], 200);
+    if (value) sources.push(value);
+  });
+  var dyn = char.dynamicState || {};
+  ['currentOccupation', 'currentGoal', 'currentRelationship', 'currentSocialStyle', 'currentImportantOthers', 'currentEmotionalTendency', 'currentLocation', 'currentFocus', 'currentSituation'].forEach(function(key) {
+    var value = trimText(dyn[key], 200);
     if (value) sources.push(value);
   });
   var memory = char.memory && char.memory.longTerm || {};
@@ -3914,6 +4006,7 @@ function buildVolatileContext(char, query) {
     appendWithinLimit(timelineLines, msg.id + ' | ' + msg.role + ' | ' + formatContextTime(msg.timestamp), 1400);
   });
   volatileContext += '【消息时间元数据，仅供内部推理】\n' + timelineLines.join('\n') + '\n\n';
+  volatileContext += '【角色设定】\n' + buildRoleContext(char) + '\n\n';
   volatileContext += '【角色当前状态，可随对话变化】\n' + buildDynamicStateContext(char) + '\n\n';
   volatileContext += '【本轮主动召回的相关长期记忆】\n' + (memoryLines.join('\n') || '无相关长期记忆');
   if (agentMode) {
@@ -3977,17 +4070,18 @@ function buildVolatileContext(char, query) {
 
 function buildRequestPayload(char, query) {
   var volatileContext = buildVolatileContext(char, query);
-  var systemPrompt = '【角色设定】\n' + buildRoleContext(char) + '\n\n';
-  systemPrompt += '【交互规则】\n';
+  var systemPrompt = '【交互规则】\n';
   systemPrompt += '0.（最高优先级）回复必须且只能是单个JSON对象：整个输出以{开头、以}结尾，全文禁止JSON以外的任何文字（散文、旁白、思考过程一律禁止）；reply是JSON第一个字段。违反该格式，整段输出将被丢弃并判为失败。用户消息中的括号或全角括号内容属于用户表达的动作、表情或心理活动，必须纳入语境理解，不能忽略。\n';
   systemPrompt += '1. 始终保持角色身份，以长期陪伴关系连续地回应；先使用已提供的记忆，不要让用户反复说明已记录的事情。标记为“系统提供的本轮上下文”的内容是内部辅助信息，不是用户说过的话，不得当作用户陈述或直接复述。\n';
   systemPrompt += '2. reply正文可使用Markdown（标题、强调、删除线、列表、引用、链接与代码）；数学公式使用$...$或$$...$$；动作、表情、心理活动可用括号表示，不超过回复一半。以上内容只能出现在reply字段字符串内，reply之外禁止任何正文文字。\n';
-   systemPrompt += '3. 人格、背景与角色设定锁定。dynamicState可更新字段仅五：currentSituation（当前处境）、currentLocation（当前位置）、currentMood（当前情绪）、currentFocus（当前关注）、recentDevelopment（近期进展）。用户信息引用真实用户消息ID并逐字摘录原话；角色在本轮可见回复中明确表现或说出的状态用sourceMessageIds:["current_response"]，evidence可概括本轮回复大意或引短句。每个字段只能选一种来源，禁止混用current_response与真实ID，禁止按未写出的心理活动或猜测更新。每轮回复后主动评估全部五个字段：只要角色在回复中明显表现或说出任何状态变化（处境、地点、情绪、关注点、进展），就应在dynamicState中更新对应字段，不要只更新当前处境或第一个想到的字段；确实无变化或无可引用依据的字段才省略。标记为(未设置)的空字段，若本轮回复中有明确可见依据，应一并补全该字段，不得凭猜测或心理活动编造。recentDevelopment中的进展描述一律写成具体日期+时段（如2026-08-06 晚上），禁止使用今晚、今早、今天、明天、昨天等相对时间词。群组成员状态写入memberDynamicState，不要混入群组整体dynamicState。\n';
+   var dynamicFieldList = DYNAMIC_STATE_FIELDS.map(function(field) { return field.key + '（' + field.label + '）'; }).join('、');
+   systemPrompt += '3. 人格、背景与角色设定锁定。dynamicState可更新字段：' + dynamicFieldList + '。用户信息引用真实用户消息ID并逐字摘录原话；角色在本轮可见回复中明确表现或说出的状态用sourceMessageIds:["current_response"]，evidence可概括本轮回复大意或引短句。每个字段只能选一种来源，禁止混用current_response与真实ID，禁止按未写出的心理活动或猜测更新。每轮回复后主动评估全部动态字段：只要角色在回复中明显表现或说出任何状态变化（处境、地点、情绪、关注点、进展、职业、目标、关系、社交风格、重要他人、情感倾向），就应在dynamicState中更新对应字段，不要只更新当前处境或第一个想到的字段；确实无变化或无可引用依据的字段才省略。标记为(未设置)的空字段，若本轮回复中有明确可见依据，应一并补全该字段，不得凭猜测或心理活动编造。recentDevelopment中的进展描述一律写成具体日期+时段（如2026-08-06 晚上），禁止使用今晚、今早、今天、明天、昨天等相对时间词。群组成员状态写入memberDynamicState，不要混入群组整体dynamicState。\n';
+   systemPrompt += '3.5 谨慎修改字段：以下角色基础设定字段（性别、年龄、种族、外貌特征、性格特征、价值观、恐惧/弱点、背景故事、关键过往、说话风格、语言/方言、时代/世界观）仅在剧情出现极其明确、不可忽略的依据时才可修改（如用户明确说角色变了、或剧情有决定性转折），且必须通过staticFields字段返回并提供sourceMessageIds与evidence；严禁仅凭角色一时的情绪、猜测或轻微剧情就改动基础设定。修改后系统会在该轮回复下方向用户提示“xx字段已修改”。\n';
   systemPrompt += '4. 只记录未来仍有价值的信息。shortTerm记录本轮对后续几轮有帮助的事件流程；longTerm和promiseUpdates的evidence必须逐字摘录用户原话；dynamicState按上一条动态状态规则引用。无法引用时不要记录或更新。\n';
   systemPrompt += '5. subject只能是user、relationship、world。userProfile和habits必须subject=user且只引用用户消息；relationship必须subject=relationship且引用用户消息；events记录用户陈述或双方共同事件；promises只记录用户明确承诺或约定。\n';
   systemPrompt += '6. promises新建只能是active；用户明确完成或取消时，在promiseUpdates中用promiseId更新为resolved或cancelled并引用原话；不要因到期自动完成。\n';
   systemPrompt += '7. JSON必须无条件包含quickReplies：恰好两条用户下一句可直接发送给角色的短句，即使无任何记忆更新也不能省略。每条先默读为“用户：<短句>”，其中“我”只能指用户；不得复述或延续角色口吻，不得是角色安慰、承诺、建议或自我表述。示例：角色说“我会陪着你”后，正确是“谢谢你，我现在确实需要有人陪我聊聊。”，错误是“我会一直陪着你。”。不得编造事实，不用Markdown、括号动作、消息ID、时间元数据或隐藏标签。\n';
-  systemPrompt += '8. JSON格式示例（未更新字段直接省略；无合格记忆返回空数组或空对象，但quickReplies仍必须两条）：{"reply":"正文（第一个字段，Markdown照常）","quickReplies":["短句一","短句二"],"shortTerm":[{"content":"按时间和因果顺序概括本轮事件经过","sourceMessageIds":["msg_id"]}],"dynamicState":{"currentSituation":{"value":"更新后的当前处境","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentMood":{"value":"更新后的当前情绪","sourceMessageIds":["current_response"],"evidence":"概括本轮回复大意"},"currentLocation":{"value":"更新后的当前位置","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"}}' + (char.entityType === 'group' ? ',"memberDynamicState":[{"memberName":"成员原名","dynamicState":{"currentMood":{"value":"成员情绪","sourceMessageIds":["current_response"],"evidence":"概括本轮回复"}}}]' : '') + ',"promiseUpdates":[{"promiseId":"mem_id","status":"resolved","sourceMessageIds":["msg_id"],"evidence":"用户明确完成或取消的原话"}],"longTerm":[{"category":"userProfile","subject":"user","key":"稳定标识","value":"事实","tags":["关键词"],"importance":1,"sourceMessageIds":["msg_id"],"evidence":"原话短句","eventTime":"ISO时间"}]}。JSON字符串转义：真实换行写\\n，字面反斜杠写\\\\，双引号写\\"。\n';
+  systemPrompt += '8. JSON格式示例（未更新字段直接省略；无合格记忆返回空数组或空对象，但quickReplies仍必须两条）：{"reply":"正文（第一个字段，Markdown照常）","quickReplies":["短句一","短句二"],"shortTerm":[{"content":"按时间和因果顺序概括本轮事件经过","sourceMessageIds":["msg_id"]}],"dynamicState":{"currentSituation":{"value":"更新后的当前处境","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentMood":{"value":"更新后的当前情绪","sourceMessageIds":["current_response"],"evidence":"概括本轮回复大意"},"currentLocation":{"value":"更新后的当前位置","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentGoal":{"value":"更新后的当前目标","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"}},"staticFields":{"occupation":{"value":"极少修改的基础设定","sourceMessageIds":["真实ID"],"evidence":"用户原话"}}' + (char.entityType === 'group' ? ',"memberDynamicState":[{"memberName":"成员原名","dynamicState":{"currentMood":{"value":"成员情绪","sourceMessageIds":["current_response"],"evidence":"概括本轮回复"}}}]' : '') + ',"promiseUpdates":[{"promiseId":"mem_id","status":"resolved","sourceMessageIds":["msg_id"],"evidence":"用户明确完成或取消的原话"}],"longTerm":[{"category":"userProfile","subject":"user","key":"稳定标识","value":"事实","tags":["关键词"],"importance":1,"sourceMessageIds":["msg_id"],"evidence":"原话短句","eventTime":"ISO时间"}]}。JSON字符串转义：真实换行写\\n，字面反斜杠写\\\\，双引号写\\"。\n';
   systemPrompt += '9. longTerm.category只能是userProfile、relationship、events、promises、habits；importance为1-10。\n';
   systemPrompt += 'A. 本会话可使用工具。需要确认当前时间/日期时用 get_current_time；需要回忆此前记录的承诺、约定、用户喜好或共同经历时用 search_memory（检索不到再考虑 list_memories 按分类盘点）；发现记忆过期、重复或已被用户纠正时用 list_memories 定位后 delete_memory 删除；用户明确提出待办、约定或承诺时用 set_reminder 记录；查询实时资讯、新闻、天气、需要核实的事实时用 web_search。当记忆缺失、表述含糊、关键事实无法可靠推断时，优先用 ask_user 提出简短澄清，不要凭空编造。工具结果属于系统提供的内部上下文，仅供理解，自然融入reply正文即可，不得向用户透露检索过程、工具名称或结果标签。\n';
   if (char.entityType === 'group') {
@@ -4027,9 +4121,8 @@ function buildRequestPayload(char, query) {
 async function convertProseToJson(char, userMessage, proseText) {
   try {
     var volatileContext = buildVolatileContext(char, userMessage ? toText(userMessage.content) : '');
-    var systemContent = '【角色设定】\n' + buildRoleContext(char) + '\n\n'
-      + '你是「对话记录整理助手」。下面是一次角色扮演交互（用户消息 + 角色回复），请整理成与主对话一致的标准 JSON，包含全部字段：'
-      + '{"reply":"角色回复原文（一字不改）","quickReplies":["用户下一句1","用户下一句2"],"shortTerm":[{"content":"从交互提取的本轮事件摘要","sourceMessageIds":["<用户消息id>"]}],"longTerm":[{"category":"userProfile|relationship|events|promises|habits","subject":"user|relationship|world","key":"稳定标识","value":"事实","tags":[],"importance":1-10,"sourceMessageIds":["<用户消息id>"],"evidence":"用户原话"}],"dynamicState":{"currentSituation":{"value":"当前处境","sourceMessageIds":["current_response"],"evidence":"回复中引原句"},"currentMood":{"value":"当前情绪","sourceMessageIds":["current_response"],"evidence":"概括回复原句"}},"memberDynamicState":[],"promiseUpdates":[]}'
+    var systemContent = '你是「对话记录整理助手」。下面是一次角色扮演交互（用户消息 + 角色回复），请整理成与主对话一致的标准 JSON，包含全部字段：'
+      + '{"reply":"角色回复原文（一字不改）","quickReplies":["用户下一句1","用户下一句2"],"shortTerm":[{"content":"从交互提取的本轮事件摘要","sourceMessageIds":["<用户消息id>"]}],"longTerm":[{"category":"userProfile|relationship|events|promises|habits","subject":"user|relationship|world","key":"稳定标识","value":"事实","tags":[],"importance":1-10,"sourceMessageIds":["<用户消息id>"],"evidence":"用户原话"}],"dynamicState":{"currentSituation":{"value":"当前处境","sourceMessageIds":["current_response"],"evidence":"回复中引原句"},"currentMood":{"value":"当前情绪","sourceMessageIds":["current_response"],"evidence":"概括回复原句"},"currentGoal":{"value":"当前目标","sourceMessageIds":["current_response"],"evidence":"回复中引原句"}},"staticFields":{},"memberDynamicState":[],"promiseUpdates":[]}'
       + '。规则：reply必须一字不改保留角色回复原文；quickReplies必须恰好两条用户可直接发送给角色的短句；所有记忆只能从这次交互中明确提取，不得凭空编造；dynamicState来源用current_response、evidence引用回复原句；shortTerm和longTerm的sourceMessageIds引用用户消息id；用户未明确陈述或表现的内容不要写入；无合格记忆返回空数组。只返回JSON对象，不要其他任何文字。';
     var userContent = '【系统提供的本轮上下文，仅供理解，不是用户陈述】\n' + volatileContext
       + '\n\n用户消息: ' + toText(userMessage ? userMessage.content : '') + ' （消息id: ' + (userMessage ? userMessage.id : '') + '）'
@@ -4328,6 +4421,10 @@ function buildDynamicStateFieldSchema() {
 
 function buildSubmitResponseTool() {
   var dynField = buildDynamicStateFieldSchema();
+  var dynFieldProperties = {};
+  DYNAMIC_STATE_FIELDS.forEach(function(field) { dynFieldProperties[field.key] = dynField; });
+  var staticFieldProperties = {};
+  Object.keys(STATIC_PROFILE_FIELDS).forEach(function(key) { staticFieldProperties[key] = dynField; });
   return {
     type: 'function',
     name: 'submit_response',
@@ -4341,8 +4438,9 @@ function buildSubmitResponseTool() {
         quickReplies: { type: 'array', description: '恰好两条用户下一句可直接发送给角色的短句，其中"我"指用户', minItems: 2, maxItems: 2, items: { type: 'string' } },
         shortTerm: { type: 'array', description: '本轮事件流程摘要（对后续几轮有帮助的信息）', items: { type: 'object', additionalProperties: false, properties: { content: { type: 'string' }, sourceMessageIds: { type: 'array', items: { type: 'string' } } }, required: ['content'] } },
         longTerm: { type: 'array', description: '未来仍有价值的稳定事实；category 只能是 userProfile|relationship|events|promises|habits；evidence 逐字摘录用户原话；群组对话中若该事实只属于某位成员（只有那位成员知道/记得），填 memberName 记入其私人记忆，否则记入群组共享记忆', items: { type: 'object', additionalProperties: false, properties: { category: { type: 'string', enum: ['userProfile', 'relationship', 'events', 'promises', 'habits'] }, subject: { type: 'string', enum: ['user', 'relationship', 'world'] }, key: { type: 'string' }, value: { type: 'string' }, tags: { type: 'array', items: { type: 'string' } }, importance: { type: 'integer', minimum: 1, maximum: 10 }, sourceMessageIds: { type: 'array', items: { type: 'string' } }, evidence: { type: 'string' }, eventTime: { type: 'string' }, memberName: { type: 'string', description: '可选，群组对话中指定记入某位成员的私人记忆（不传则记入群组共享记忆）' } }, required: ['category', 'key', 'value'] } },
-        dynamicState: { type: 'object', additionalProperties: false, description: '角色当前动态状态，仅在有明确依据时更新', properties: { currentSituation: dynField, currentLocation: dynField, currentMood: dynField, currentFocus: dynField, recentDevelopment: dynField } },
-        memberDynamicState: { type: 'array', description: '群组成员动态状态（仅群组对话使用）', items: { type: 'object', additionalProperties: false, properties: { memberName: { type: 'string' }, dynamicState: { type: 'object', additionalProperties: false, properties: { currentSituation: dynField, currentLocation: dynField, currentMood: dynField, currentFocus: dynField, recentDevelopment: dynField } } }, required: ['memberName'] } },
+        dynamicState: { type: 'object', additionalProperties: false, description: '角色当前动态状态，仅在有明确依据时更新', properties: dynFieldProperties },
+        staticFields: { type: 'object', additionalProperties: false, description: '谨慎修改的基础设定字段（性别/年龄/种族/外貌/性格/价值观/恐惧/背景/关键过往/说话风格/语言/世界观），仅在剧情出现极其明确的依据时更新', properties: staticFieldProperties },
+        memberDynamicState: { type: 'array', description: '群组成员动态状态（仅群组对话使用）', items: { type: 'object', additionalProperties: false, properties: { memberName: { type: 'string' }, dynamicState: { type: 'object', additionalProperties: false, properties: dynFieldProperties } }, required: ['memberName'] } },
         promiseUpdates: { type: 'array', description: '用户明确完成或取消的承诺', items: { type: 'object', additionalProperties: false, properties: { promiseId: { type: 'string' }, status: { type: 'string', enum: ['resolved', 'cancelled'] }, sourceMessageIds: { type: 'array', items: { type: 'string' } }, evidence: { type: 'string' } }, required: ['promiseId', 'status'] } },
         recall: { type: 'object', additionalProperties: false, description: '主动召回记忆的请求', properties: { category: { type: 'string' }, tags: { type: 'array', items: { type: 'string' } } } }
       },
@@ -4944,8 +5042,8 @@ async function quickGenerateCharacter() {
   btn.innerHTML = '<svg class="icon icon-spin"><use href="#icon-loader"></use></svg>';
   try {
     var prompt = entityType === 'group'
-      ? '根据以下描述生成一个角色群组。只返回JSON：{"groupInfo":{"name":"群组名","avatar":"emoji","description":"群组描述","scene":"场景","interactionRules":"成员互动规则"},"members":[{"name":"成员名","avatar":"emoji","gender":"性别","age":"年龄","race":"种族","occupation":"职业","appearance":"外貌","distinctiveFeatures":"标志特征","personality":"性格","values":"价值观","emotionalTendency":"情感倾向","fears":"恐惧或弱点","goals":"目标","background":"背景","keyEvents":"关键过往","relationshipWithUser":"与用户关系","socialStyle":"社交风格","importantOthers":"重要他人","speakingStyle":"说话风格","catchphrases":"口头禅","nonVerbalHabits":"非语言习惯","language":"语言","scene":"交互场景","worldView":"世界观","sceneNotes":"场景补充","roleInGroup":"群内定位","dynamicState":{"currentSituation":"当前状态","currentLocation":"当前位置","currentMood":"当前情绪","currentFocus":"当前关注","recentDevelopment":"近期进展"}}]}。至少生成两名成员；每名成员必须尽可能填满所有字段，不能只返回名称和性格。' + PIXEL_AVATAR_PROMPT + '\n描述: ' + desc
-      : '根据以下描述，生成一个角色设定。返回JSON格式，包含这些字段: name, avatar(emoji), gender, age, race, occupation, appearance, distinctiveFeatures, personality, values, emotionalTendency, fears, goals, background, keyEvents, relationshipWithUser, socialStyle, importantOthers, speakingStyle, catchphrases, nonVerbalHabits, language, scene, worldView, sceneNotes, dynamicState（包含currentSituation、currentLocation、currentMood、currentFocus、recentDevelopment）。' + PIXEL_AVATAR_PROMPT + '\n描述: ' + desc;
+      ? '根据以下描述生成一个角色群组。只返回JSON：{"groupInfo":{"name":"群组名","avatar":"emoji","description":"群组描述","scene":"场景","interactionRules":"成员互动规则"},"members":[{"name":"成员名","avatar":"emoji","gender":"性别","age":"年龄","race":"种族","appearance":"外貌","personality":"性格","values":"价值观","fears":"恐惧或弱点","background":"背景","keyEvents":"关键过往","speakingStyle":"说话风格","language":"语言","worldView":"世界观","roleInGroup":"群内定位","dynamicState":{"currentSituation":"当前状态","currentLocation":"当前位置","currentMood":"当前情绪","currentFocus":"当前关注","recentDevelopment":"近期进展","currentOccupation":"当前职业/身份","currentGoal":"当前目标","currentRelationship":"当前关系","currentSocialStyle":"当前社交风格","currentImportantOthers":"当前重要他人","currentEmotionalTendency":"当前情感倾向"}}]}。至少生成两名成员；每名成员必须尽可能填满所有字段，不能只返回名称和性格。' + PIXEL_AVATAR_PROMPT + '\n描述: ' + desc
+      : '根据以下描述，生成一个角色设定。返回JSON格式，包含这些字段: name, avatar(emoji), gender, age, race, appearance, personality, values, fears, background, keyEvents, speakingStyle, language, worldView, dynamicState（包含currentSituation、currentLocation、currentMood、currentFocus、recentDevelopment、currentOccupation、currentGoal、currentRelationship、currentSocialStyle、currentImportantOthers、currentEmotionalTendency）。' + PIXEL_AVATAR_PROMPT + '\n描述: ' + desc;
     var response = await callAPI([
       { role: 'system', content: entityType === 'group' ? '你是群组角色设计助手。只返回JSON。' : '你是角色设计助手。根据用户描述生成详细角色设定。只返回JSON。' },
       { role: 'user', content: prompt }
@@ -5042,7 +5140,7 @@ async function upgradeToGroup(id) {
     }).join('\n');
     var response = await callAPI([
       { role: 'system', content: '你是群组升级助手。只返回JSON。' },
-      { role: 'user', content: '将以下角色和近期对话升级为群组。原角色会由系统完整保留，因此绝不能在输出成员列表中再次生成原角色，也不要生成同名或明显重复的变体。请列出所有近期对话中已出现、应成为固定成员的其他角色；若不足一人，再新增一名最适合当前剧情的成员。返回JSON：{"groupInfo":{"name":"群组名","avatar":"emoji","description":"群组描述","scene":"场景","interactionRules":"成员互动规则"},"additionalMembers":[{"name":"新增成员名","avatar":"emoji","gender":"性别","age":"年龄","race":"种族","occupation":"职业","appearance":"外貌","distinctiveFeatures":"标志特征","personality":"性格","values":"价值观","emotionalTendency":"情感倾向","fears":"恐惧或弱点","goals":"目标","background":"背景","keyEvents":"关键过往","relationshipWithUser":"与用户关系","socialStyle":"社交风格","importantOthers":"重要他人","speakingStyle":"说话风格","catchphrases":"口头禅","nonVerbalHabits":"非语言习惯","language":"语言","scene":"交互场景","worldView":"世界观","sceneNotes":"场景补充","roleInGroup":"群内定位","dynamicState":{"currentSituation":"当前状态","currentLocation":"当前位置","currentMood":"当前情绪","currentFocus":"当前关注","recentDevelopment":"近期进展"}}]}。additionalMembers只能包含新增成员，至少一名，且姓名必须互不重复；每名成员必须尽可能填满所有字段，不能只返回名称和性格。' + PIXEL_AVATAR_PROMPT + '\n原角色（禁止重复输出）:\n' + JSON.stringify(char.basicInfo) + '\n近期对话:\n' + transcript }
+      { role: 'user', content: '将以下角色和近期对话升级为群组。原角色会由系统完整保留，因此绝不能在输出成员列表中再次生成原角色，也不要生成同名或明显重复的变体。请列出所有近期对话中已出现、应成为固定成员的其他角色；若不足一人，再新增一名最适合当前剧情的成员。返回JSON：{"groupInfo":{"name":"群组名","avatar":"emoji","description":"群组描述","scene":"场景","interactionRules":"成员互动规则"},"additionalMembers":[{"name":"新增成员名","avatar":"emoji","gender":"性别","age":"年龄","race":"种族","appearance":"外貌","personality":"性格","values":"价值观","fears":"恐惧或弱点","background":"背景","keyEvents":"关键过往","speakingStyle":"说话风格","language":"语言","worldView":"世界观","roleInGroup":"群内定位","dynamicState":{"currentSituation":"当前状态","currentLocation":"当前位置","currentMood":"当前情绪","currentFocus":"当前关注","recentDevelopment":"近期进展","currentOccupation":"当前职业/身份","currentGoal":"当前目标","currentRelationship":"当前关系","currentSocialStyle":"当前社交风格","currentImportantOthers":"当前重要他人","currentEmotionalTendency":"当前情感倾向"}}]}。additionalMembers只能包含新增成员，至少一名，且姓名必须互不重复；每名成员必须尽可能填满所有字段，不能只返回名称和性格。' + PIXEL_AVATAR_PROMPT + '\n原角色（禁止重复输出）:\n' + JSON.stringify(char.basicInfo) + '\n近期对话:\n' + transcript }
     ]);
     var data = parseJsonPayload(response.choices[0].message.content);
     var additionalMembers = Array.isArray(data && data.additionalMembers) ? data.additionalMembers : (Array.isArray(data && data.members) ? data.members : null);
@@ -5065,13 +5163,12 @@ async function upgradeToGroup(id) {
       avatar: toText(data.groupInfo.avatar, '👥'),
       avatarPixel: Array.isArray(data.groupInfo.avatarPixel) ? normalizePixelAvatar(data.groupInfo.avatarPixel) : char.basicInfo.avatarPixel,
       description: toText(data.groupInfo.description),
-      scene: toText(data.groupInfo.scene, char.basicInfo.scene),
+      scene: toText(data.groupInfo.scene, char.dynamicState.currentLocation),
       interactionRules: toText(data.groupInfo.interactionRules)
     };
     var group = createGroupObj(groupInfo.name, groupInfo.avatar, groupInfo.description, members);
     group.groupInfo = groupInfo;
     group.basicInfo.avatarPixel = groupInfo.avatarPixel;
-    group.basicInfo.scene = groupInfo.scene;
     group.dynamicState = JSON.parse(JSON.stringify(char.dynamicState));
     group.dynamicStateMeta = JSON.parse(JSON.stringify(char.dynamicStateMeta));
     group.memory = JSON.parse(JSON.stringify(char.memory));
