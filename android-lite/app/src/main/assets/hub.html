@@ -1229,6 +1229,45 @@ function sanitizeDynamicStateField(key, value) {
   return key === 'recentDevelopment' ? sanitizeRelativeTime(value) : value;
 }
 
+// 清洗模型返回的字段值：只保留内容本身，剥离括号注释、说明句式与字段名前缀。
+// 规则：剥离开头"字段名："前缀 → 剥离嵌套括号及其内容（中部括号只删括号不动正文）→
+// 剥离明确的说明句式（因为/由于/用户/决定/改为等）→ trim。
+function cleanFieldValue(key, value) {
+  var text = toText(value);
+  var fieldKeys = {};
+  var fieldLabels = [];
+  Object.keys(STATIC_PROFILE_FIELDS).forEach(function(k) { fieldKeys[k] = true; fieldLabels.push(STATIC_PROFILE_FIELDS[k].label); });
+  DYNAMIC_STATE_FIELDS.forEach(function(f) { fieldKeys[f.key] = true; fieldLabels.push(f.label); });
+  // 剥离开头字段名前缀：如"职业：教师"、"当前目标: xxx"、"性格特征：冷静"
+  var prefixMatch = text.match(/^\s*[^：:\n]{1,24}[：:]\s*/);
+  if (prefixMatch) {
+    var prefix = prefixMatch[0].replace(/[：:]/g, '').trim();
+    var prefixIsField = fieldKeys[prefix] || fieldLabels.some(function(label) {
+      return label === prefix || (label.length >= 3 && prefix.length >= 2 && (label.indexOf(prefix) !== -1 || prefix.indexOf(label) !== -1));
+    });
+    if (prefixIsField) {
+      text = text.slice(prefixMatch[0].length);
+    }
+  }
+  // 剥离嵌套括号及其内容：连续剥离全角/半角括号对（含内部再嵌套）。删除处补一个空格防止文字粘连。
+  var previous;
+  do {
+    previous = text;
+    text = text.replace(/（[^（）()]*）|\([^（）()]*\)/g, ' ');
+  } while (text !== previous);
+  // 剥离明确说明句式（出现在行首或内容末尾的"因为/由于/用户/决定/改为/其实/这是"等）
+  var patterns = [
+    /(^|[。；;，,])(因为|由于|用户|角色|决定|改为|变成|其实|这是因为|这是因为我|考虑到|依据|根据)([^。；;]{0,40})$/,
+    /^(因为|由于|考虑到|根据|依据)[^。；;]{0,40}[，,。]?/,
+    /[。；;]\s*(因为|由于|用户|决定|改为|其实)[^。；;]*$/,
+    /[，,]\s*(因为|由于|用户|角色|决定|改为|变成|其实)[^。；;]{0,40}$/
+  ];
+  patterns.forEach(function(pattern) { text = text.replace(pattern, function(m, p1) { return p1 || ''; }); });
+  // 清理残留的末尾逗号/句号
+  text = text.replace(/[，,。；;、\s]+$/, '');
+  return trimText(text.replace(/\s+/g, ' ').trim(), 700);
+}
+
 // 记忆衰减：按距上次召回的时长衰减有效重要性（未召回越久权重越低）
 function computeEffectiveImportance(item, now) {
   now = now || Date.now();
@@ -3501,7 +3540,7 @@ function applyDynamicStateUpdates(char, updates, assistantMessage, target, sourc
   DYNAMIC_STATE_FIELDS.forEach(function(field) {
     var update = updates[field.key];
     if (!isPlainObject(update)) return;
-    var value = trimText(sanitizeDynamicStateField(field.key, update.value), 700);
+    var value = trimText(cleanFieldValue(field.key, sanitizeDynamicStateField(field.key, update.value)), 700);
     var sourcesResolved = resolveDynamicStateSources(char, update.sourceMessageIds, update.evidence, assistantMessage, sources);
     if (!value || !sourcesResolved) return;
     target.dynamicState[field.key] = value;
@@ -3524,7 +3563,7 @@ function applyStaticFieldUpdates(char, updates, assistantMessage, sources) {
   Object.keys(STATIC_PROFILE_FIELDS).forEach(function(key) {
     var update = updates[key];
     if (!isPlainObject(update)) return;
-    var value = trimText(toText(update.value), 700);
+    var value = trimText(cleanFieldValue(key, toText(update.value)), 700);
     var sourcesResolved = resolveDynamicStateSources(char, update.sourceMessageIds, update.evidence, assistantMessage, sources);
     if (!value || !sourcesResolved) return;
     if (!('staticFieldMeta' in char)) char.staticFieldMeta = {};
@@ -4076,12 +4115,13 @@ function buildRequestPayload(char, query) {
   systemPrompt += '2. reply正文可使用Markdown（标题、强调、删除线、列表、引用、链接与代码）；数学公式使用$...$或$$...$$；动作、表情、心理活动可用括号表示，不超过回复一半。以上内容只能出现在reply字段字符串内，reply之外禁止任何正文文字。\n';
    var dynamicFieldList = DYNAMIC_STATE_FIELDS.map(function(field) { return field.key + '（' + field.label + '）'; }).join('、');
    systemPrompt += '3. 人格、背景与角色设定锁定。dynamicState可更新字段：' + dynamicFieldList + '。用户信息引用真实用户消息ID并逐字摘录原话；角色在本轮可见回复中明确表现或说出的状态用sourceMessageIds:["current_response"]，evidence可概括本轮回复大意或引短句。每个字段只能选一种来源，禁止混用current_response与真实ID，禁止按未写出的心理活动或猜测更新。每轮回复后主动评估全部动态字段：只要角色在回复中明显表现或说出任何状态变化（处境、地点、情绪、关注点、进展、职业、目标、关系、社交风格、重要他人、情感倾向），就应在dynamicState中更新对应字段，不要只更新当前处境或第一个想到的字段；确实无变化或无可引用依据的字段才省略。标记为(未设置)的空字段，若本轮回复中有明确可见依据，应一并补全该字段，不得凭猜测或心理活动编造。recentDevelopment中的进展描述一律写成具体日期+时段（如2026-08-06 晚上），禁止使用今晚、今早、今天、明天、昨天等相对时间词。群组成员状态写入memberDynamicState，不要混入群组整体dynamicState。\n';
-   systemPrompt += '3.5 谨慎修改字段：以下角色基础设定字段（性别、年龄、种族、外貌特征、性格特征、价值观、恐惧/弱点、背景故事、关键过往、说话风格、语言/方言、时代/世界观）仅在剧情出现极其明确、不可忽略的依据时才可修改（如用户明确说角色变了、或剧情有决定性转折），且必须通过staticFields字段返回并提供sourceMessageIds与evidence；严禁仅凭角色一时的情绪、猜测或轻微剧情就改动基础设定。修改后系统会在该轮回复下方向用户提示“xx字段已修改”。\n';
+   systemPrompt += '3.5 谨慎修改字段（基础设定）：以下字段（性别、年龄、种族、外貌特征、性格特征、价值观、恐惧/弱点、背景故事、关键过往、说话风格、语言/方言、时代/世界观）分两种情况处理。①用户直接要求修改时（如“把我职业改成教师”“我现在是学生了”）：必须通过staticFields更新用户明确指定的字段，内容严格按用户原话为准，不得忽略或改错字段，且只改用户提到的字段，用户未提及的字段不得连带改动。②无用户直接要求时：仅在剧情出现决定性、不可逆的转折（如角色死亡、身份彻底改变）且证据明确时才可修改，严禁仅凭情绪、猜测或轻微剧情改动。无论哪种情况，value必须只写该字段的内容本身（如职业写“教师”），禁止附带括号注释、理由、前后缀或任何解释性文字；同时必须提供sourceMessageIds与evidence。修改后系统会在该轮回复下方向用户提示“xx字段已修改”。\n';
+   systemPrompt += '3.6 所有记忆与状态字段（dynamicState、staticFields、shortTerm、longTerm等）的value/content一律只写内容本身，禁止携带任何括号注释、原因说明、理由或前后缀文字；解释性内容只能放在evidence字段。\n';
   systemPrompt += '4. 只记录未来仍有价值的信息。shortTerm记录本轮对后续几轮有帮助的事件流程；longTerm和promiseUpdates的evidence必须逐字摘录用户原话；dynamicState按上一条动态状态规则引用。无法引用时不要记录或更新。\n';
   systemPrompt += '5. subject只能是user、relationship、world。userProfile和habits必须subject=user且只引用用户消息；relationship必须subject=relationship且引用用户消息；events记录用户陈述或双方共同事件；promises只记录用户明确承诺或约定。\n';
   systemPrompt += '6. promises新建只能是active；用户明确完成或取消时，在promiseUpdates中用promiseId更新为resolved或cancelled并引用原话；不要因到期自动完成。\n';
   systemPrompt += '7. JSON必须无条件包含quickReplies：恰好两条用户下一句可直接发送给角色的短句，即使无任何记忆更新也不能省略。每条先默读为“用户：<短句>”，其中“我”只能指用户；不得复述或延续角色口吻，不得是角色安慰、承诺、建议或自我表述。示例：角色说“我会陪着你”后，正确是“谢谢你，我现在确实需要有人陪我聊聊。”，错误是“我会一直陪着你。”。不得编造事实，不用Markdown、括号动作、消息ID、时间元数据或隐藏标签。\n';
-  systemPrompt += '8. JSON格式示例（未更新字段直接省略；无合格记忆返回空数组或空对象，但quickReplies仍必须两条）：{"reply":"正文（第一个字段，Markdown照常）","quickReplies":["短句一","短句二"],"shortTerm":[{"content":"按时间和因果顺序概括本轮事件经过","sourceMessageIds":["msg_id"]}],"dynamicState":{"currentSituation":{"value":"更新后的当前处境","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentMood":{"value":"更新后的当前情绪","sourceMessageIds":["current_response"],"evidence":"概括本轮回复大意"},"currentLocation":{"value":"更新后的当前位置","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentGoal":{"value":"更新后的当前目标","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"}},"staticFields":{"occupation":{"value":"极少修改的基础设定","sourceMessageIds":["真实ID"],"evidence":"用户原话"}}' + (char.entityType === 'group' ? ',"memberDynamicState":[{"memberName":"成员原名","dynamicState":{"currentMood":{"value":"成员情绪","sourceMessageIds":["current_response"],"evidence":"概括本轮回复"}}}]' : '') + ',"promiseUpdates":[{"promiseId":"mem_id","status":"resolved","sourceMessageIds":["msg_id"],"evidence":"用户明确完成或取消的原话"}],"longTerm":[{"category":"userProfile","subject":"user","key":"稳定标识","value":"事实","tags":["关键词"],"importance":1,"sourceMessageIds":["msg_id"],"evidence":"原话短句","eventTime":"ISO时间"}]}。JSON字符串转义：真实换行写\\n，字面反斜杠写\\\\，双引号写\\"。\n';
+  systemPrompt += '8. JSON格式示例（未更新字段直接省略；无合格记忆返回空数组或空对象，但quickReplies仍必须两条）：{"reply":"正文（第一个字段，Markdown照常）","quickReplies":["短句一","短句二"],"shortTerm":[{"content":"按时间和因果顺序概括本轮事件经过","sourceMessageIds":["msg_id"]}],"dynamicState":{"currentSituation":{"value":"更新后的当前处境","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentMood":{"value":"更新后的当前情绪","sourceMessageIds":["current_response"],"evidence":"概括本轮回复大意"},"currentLocation":{"value":"更新后的当前位置","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentGoal":{"value":"更新后的当前目标","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"}},"staticFields":{"personality":{"value":"冷静克制","sourceMessageIds":["真实ID"],"evidence":"用户原话"}}' + (char.entityType === 'group' ? ',"memberDynamicState":[{"memberName":"成员原名","dynamicState":{"currentMood":{"value":"成员情绪","sourceMessageIds":["current_response"],"evidence":"概括本轮回复"}}}]' : '') + ',"promiseUpdates":[{"promiseId":"mem_id","status":"resolved","sourceMessageIds":["msg_id"],"evidence":"用户明确完成或取消的原话"}],"longTerm":[{"category":"userProfile","subject":"user","key":"稳定标识","value":"事实","tags":["关键词"],"importance":1,"sourceMessageIds":["msg_id"],"evidence":"原话短句","eventTime":"ISO时间"}]}。JSON字符串转义：真实换行写\\n，字面反斜杠写\\\\，双引号写\\"。\n';
   systemPrompt += '9. longTerm.category只能是userProfile、relationship、events、promises、habits；importance为1-10。\n';
   systemPrompt += 'A. 本会话可使用工具。需要确认当前时间/日期时用 get_current_time；需要回忆此前记录的承诺、约定、用户喜好或共同经历时用 search_memory（检索不到再考虑 list_memories 按分类盘点）；发现记忆过期、重复或已被用户纠正时用 list_memories 定位后 delete_memory 删除；用户明确提出待办、约定或承诺时用 set_reminder 记录；查询实时资讯、新闻、天气、需要核实的事实时用 web_search。当记忆缺失、表述含糊、关键事实无法可靠推断时，优先用 ask_user 提出简短澄清，不要凭空编造。工具结果属于系统提供的内部上下文，仅供理解，自然融入reply正文即可，不得向用户透露检索过程、工具名称或结果标签。\n';
   if (char.entityType === 'group') {
@@ -4411,7 +4451,7 @@ function buildDynamicStateFieldSchema() {
     type: 'object',
     additionalProperties: false,
     properties: {
-      value: { type: 'string' },
+      value: { type: 'string', description: '字段值：只写内容本身，禁止任何括号注释、理由或说明文字' },
       sourceMessageIds: { type: 'array', items: { type: 'string' } },
       evidence: { type: 'string' }
     },
@@ -4439,7 +4479,7 @@ function buildSubmitResponseTool() {
         shortTerm: { type: 'array', description: '本轮事件流程摘要（对后续几轮有帮助的信息）', items: { type: 'object', additionalProperties: false, properties: { content: { type: 'string' }, sourceMessageIds: { type: 'array', items: { type: 'string' } } }, required: ['content'] } },
         longTerm: { type: 'array', description: '未来仍有价值的稳定事实；category 只能是 userProfile|relationship|events|promises|habits；evidence 逐字摘录用户原话；群组对话中若该事实只属于某位成员（只有那位成员知道/记得），填 memberName 记入其私人记忆，否则记入群组共享记忆', items: { type: 'object', additionalProperties: false, properties: { category: { type: 'string', enum: ['userProfile', 'relationship', 'events', 'promises', 'habits'] }, subject: { type: 'string', enum: ['user', 'relationship', 'world'] }, key: { type: 'string' }, value: { type: 'string' }, tags: { type: 'array', items: { type: 'string' } }, importance: { type: 'integer', minimum: 1, maximum: 10 }, sourceMessageIds: { type: 'array', items: { type: 'string' } }, evidence: { type: 'string' }, eventTime: { type: 'string' }, memberName: { type: 'string', description: '可选，群组对话中指定记入某位成员的私人记忆（不传则记入群组共享记忆）' } }, required: ['category', 'key', 'value'] } },
         dynamicState: { type: 'object', additionalProperties: false, description: '角色当前动态状态，仅在有明确依据时更新', properties: dynFieldProperties },
-        staticFields: { type: 'object', additionalProperties: false, description: '谨慎修改的基础设定字段（性别/年龄/种族/外貌/性格/价值观/恐惧/背景/关键过往/说话风格/语言/世界观），仅在剧情出现极其明确的依据时更新', properties: staticFieldProperties },
+        staticFields: { type: 'object', additionalProperties: false, description: '谨慎修改的基础设定字段（性别/年龄/种族/外貌/性格/价值观/恐惧/背景/关键过往/说话风格/语言/世界观）。用户明确要求修改时必须更新；无用户要求时仅在有决定性剧情依据时更新。value只写内容本身，禁止括号/理由/说明', properties: staticFieldProperties },
         memberDynamicState: { type: 'array', description: '群组成员动态状态（仅群组对话使用）', items: { type: 'object', additionalProperties: false, properties: { memberName: { type: 'string' }, dynamicState: { type: 'object', additionalProperties: false, properties: dynFieldProperties } }, required: ['memberName'] } },
         promiseUpdates: { type: 'array', description: '用户明确完成或取消的承诺', items: { type: 'object', additionalProperties: false, properties: { promiseId: { type: 'string' }, status: { type: 'string', enum: ['resolved', 'cancelled'] }, sourceMessageIds: { type: 'array', items: { type: 'string' } }, evidence: { type: 'string' } }, required: ['promiseId', 'status'] } },
         recall: { type: 'object', additionalProperties: false, description: '主动召回记忆的请求', properties: { category: { type: 'string' }, tags: { type: 'array', items: { type: 'string' } } } }
