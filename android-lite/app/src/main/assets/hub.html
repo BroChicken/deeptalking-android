@@ -785,6 +785,7 @@ input:focus, textarea:focus, select:focus {
               </select>
             </div>
           </div>
+          <label class="flex items-center gap-2 text-xs text-muted-c"><input type="checkbox" id="proactiveToggle"> 角色主动开口（打开面板停留约 1 分钟未对话时，角色主动发起开场）</label>
            <div id="debugInfoWrap" class="hidden mt-3">
              <div class="flex items-center justify-between mb-1">
                <label class="block text-xs text-muted-c">调试信息（最近一次回应完整内容与活动时间线）</label>
@@ -962,6 +963,7 @@ const DEFAULT_CONFIG = {
   temperature: 0.8,
   stream: true,
   reasoningEffort: 'medium',
+  proactiveEnabled: true,
   platformSettings: {}
 };
 const APP_VERSION = '2.0';
@@ -998,7 +1000,7 @@ const MEMORY_LIMITS = {
 };
 const PROMPT_LIMITS = {
   roleChars: 3600,
-  memoryChars: 2400,
+  memoryChars: 3600,
   shortTermChars: 1400,
   recentChars: 5600
 };
@@ -1377,20 +1379,12 @@ function trimCharacterMemory(character) {
   if (character.memory.counters) {
     character.memory.counters.shortTermItemsSinceAnalyze = character.memory.shortTerm.filter(function(item) { return !item.analyzedAt; }).length;
   }
-  applyMemoryDecay(character);
   resolveMemoryConflicts(character);
-  Object.keys(character.memory.longTerm || {}).forEach(function(category) {
-    character.memory.longTerm[category] = pruneMemoryList(character.memory.longTerm[category], MEMORY_LIMITS.longTermPerCategory);
-  });
   character.memory.pendingRecall = Array.isArray(character.memory.pendingRecall) ? character.memory.pendingRecall.slice(0, MEMORY_LIMITS.pendingRecall) : [];
   if (character.entityType === 'group' && Array.isArray(character.members)) {
     character.members.forEach(function(member) {
       if (!member || !member.memory || !member.memory.longTerm) return;
-      applyMemoryDecay(character, member.memory);
       resolveMemoryConflicts(member);
-      Object.keys(member.memory.longTerm || {}).forEach(function(category) {
-        member.memory.longTerm[category] = pruneMemoryList(member.memory.longTerm[category], MEMORY_LIMITS.longTermPerCategory);
-      });
     });
   }
 }
@@ -1795,6 +1789,7 @@ function normalizeAppData(data, strict, skipLegacyRepair) {
        temperature: normalizeTemperature(rawConfig.temperature),
        stream: rawConfig.stream !== false,
        reasoningEffort: normalizeReasoningEffort(rawConfig.reasoningEffort),
+       proactiveEnabled: rawConfig.proactiveEnabled !== false,
        cacheStats: normalizeCacheStats(rawConfig.cacheStats),
        platformSettings: platformSettings
     },
@@ -1936,6 +1931,7 @@ function selectCharacter(id) {
   scheduleSave();
   renderCharacterList();
   renderChat();
+  scheduleProactiveCheck();
   if (window.innerWidth < 768) toggleSidebar(false);
 }
 
@@ -2040,6 +2036,7 @@ function renderChat(forceFollow) {
     if (msg.role === 'assistant' && !msg.isLoading) latestAssistantIndex = index;
   });
   messages.forEach(function(msg, index) {
+    if (msg.internalOnly) return;
     var div = document.createElement('div');
     div.className = 'flex items-start gap-2 fade-in ' + (msg.role === 'user' ? 'justify-end' : 'justify-start');
     div.dataset.msgId = msg.id || '';
@@ -2466,9 +2463,54 @@ function regenerateReply(messageId) {
   return sendMessage({ regenerateMessageId: messageId });
 }
 
+// ==================== 角色主动开口（面板停留空闲 1 分钟触发） ====================
+const PROACTIVE_IDLE_MS = 60000;
+const PROACTIVE_REPEAT_GAP_MS = 10 * 60 * 1000;
+var proactiveTimer = null;
+
+function clearProactiveCheck() {
+  if (proactiveTimer) { clearTimeout(proactiveTimer); proactiveTimer = null; }
+}
+
+function scheduleProactiveCheck() {
+  clearProactiveCheck();
+  if (!state.config || state.config.proactiveEnabled === false) return;
+  if (!state.activeCharacterId || !state.characters[state.activeCharacterId]) return;
+  proactiveTimer = setTimeout(function() { tryProactiveOpen(); }, PROACTIVE_IDLE_MS);
+}
+
+function canTriggerProactive(char) {
+  if (!char) return false;
+  if (!state.config || state.config.proactiveEnabled === false) return false;
+  if (!state.config.apiKey) return false;
+  if (state.isProcessing) return false;
+  if (state.activeCharacterId !== char.id) return false;
+  if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return false;
+  var visibleMessages = char.memory.instant.filter(function(message) { return !message.isLoading && !message.internalOnly; });
+  if (visibleMessages.length === 0) return true; // 新角色：直接开场
+  var lastVisible = visibleMessages[visibleMessages.length - 1];
+  if (lastVisible.role === 'user') return true; // 轮到角色开口
+  // 最后一条是角色回复：距离上次开口超过阈值才允许再次主动，避免连发
+  var lastTs = Date.parse(lastVisible.timestamp) || 0;
+  return lastTs > 0 && (Date.now() - lastTs) >= PROACTIVE_REPEAT_GAP_MS;
+}
+
+function tryProactiveOpen() {
+  proactiveTimer = null;
+  if (!state.activeCharacterId) return;
+  var char = state.characters[state.activeCharacterId];
+  if (!canTriggerProactive(char)) {
+    scheduleProactiveCheck();
+    return;
+  }
+  sendMessage({ proactive: true });
+}
+
 async function sendMessage(options) {
   if (state.isProcessing || !state.activeCharacterId) return;
   options = options || {};
+  var isProactive = options.proactive === true;
+  clearProactiveCheck();
   var input = document.getElementById('messageInput');
   var char = state.characters[state.activeCharacterId];
   if (!char) return;
@@ -2498,16 +2540,22 @@ async function sendMessage(options) {
     userMessage = { id: createMemoryId('msg'), role: 'user', content: text, timestamp: timestamp };
     char.memory.instant.push(userMessage);
   } else {
-    if (!text) return;
+    if (!text && !isProactive) return;
     var newTimestamp = new Date().toISOString();
-    userMessage = { id: createMemoryId('msg'), role: 'user', content: text, timestamp: newTimestamp };
+    if (isProactive) {
+      userMessage = { id: createMemoryId('msg'), role: 'user', content: '', internalOnly: true, timestamp: newTimestamp };
+    } else {
+      userMessage = { id: createMemoryId('msg'), role: 'user', content: text, timestamp: newTimestamp };
+    }
     char.memory.instant.push(userMessage);
   }
   char.memory.revision = (Number(char.memory.revision) || 0) + 1;
   invalidateQuickReplies();
 
-  input.value = '';
-  autoResize(input);
+  if (!isProactive) {
+    input.value = '';
+    autoResize(input);
+  }
   var loadingMsg = { id: createMemoryId('msg'), role: 'assistant', content: '', timestamp: new Date().toISOString(), isLoading: true };
   char.memory.instant.push(loadingMsg);
   trimCharacterMemory(char);
@@ -2515,7 +2563,7 @@ async function sendMessage(options) {
   scheduleSave();
 
   state.isProcessing = true;
-  state.activityLog = [{ at: new Date().toISOString(), text: '发送消息' }];
+  state.activityLog = [{ at: new Date().toISOString(), text: isProactive ? '角色主动开口' : '发送消息' }];
   state._receiveLogged = false;
   try {
     var messages = buildRequestPayload(char, text);
@@ -2571,9 +2619,9 @@ async function sendMessage(options) {
           (attempt.reasoningItems || []).forEach(function(item) { toolState.items.push(item); });
           var callId = primaryCall.call_id || primaryCall.id;
           toolState.items.push({ type: 'function_call', call_id: callId, name: primaryCall.name, arguments: primaryCall.arguments });
-          var output = executeToolCall(primaryCall, char);
+          var output = executeToolCall(primaryCall, char, toolState);
           toolState.items.push({ type: 'function_call_output', call_id: callId, output: output });
-          var toolHint = { get_current_time: '正在确认时间…', search_memory: '正在回忆…', list_memories: '正在整理记忆…', delete_memory: '正在清理记忆…', set_reminder: '已记下，正在回应…', web_search: '正在搜索…' }[primaryCall.name] || '正在处理…';
+          var toolHint = { get_current_time: '正在确认时间…', search_memory: '正在回忆…', list_memories: '正在整理记忆…', delete_memory: '正在清理记忆…', set_reminder: '已记下，正在回应…', update_character_field: '已按你的要求调整设定…', web_search: '正在搜索…' }[primaryCall.name] || '正在处理…';
           setActivity('工具结果已返回，正在继续推理…');
           updateMessageBubble(loadingMsg.id, getDisplayText(toolHint));
           continue;
@@ -2671,6 +2719,9 @@ async function sendMessage(options) {
       loadingMsg.content = displayText; // 先写入正文，供 current_response 证据校验匹配
       memUpdate = applyMemoryUpdate(structured.obj, char, loadingMsg);
       loadingMsg.apiContent = fullText;
+      if (toolState && Array.isArray(toolState.staticChanges) && toolState.staticChanges.length > 0) {
+        loadingMsg.staticChanges = Array.from(new Set((loadingMsg.staticChanges || []).concat(toolState.staticChanges)));
+      }
     } else if (salvagedReply != null) {
       displayText = unescapeLiteralNewlines(salvagedReply);
       loadingMsg.content = displayText;
@@ -2742,6 +2793,7 @@ async function sendMessage(options) {
     state.isProcessing = false;
     clearActivity();
     renderChat();
+    scheduleProactiveCheck();
   }
 }
 
@@ -3260,16 +3312,16 @@ function retrieveRelevantMemories(char, query, memoryStore) {
     });
   });
   candidates.sort(function(a, b) { return b.score - a.score; });
-  var selected = candidates.slice(0, 8);
+  var selected = candidates.slice(0, 12);
   var seen = new Set(selected.map(function(entry) { return entry.item.id || entry.category + ':' + entry.item.key; }));
   (memoryStore.pendingRecall || []).forEach(function(item) {
     var id = item.id || 'pending:' + item.key;
-    if (!seen.has(id) && selected.length < 10) {
+    if (!seen.has(id) && selected.length < 12) {
       selected.unshift({ item: item, category: 'recalled', score: 999 });
       seen.add(id);
     }
   });
-  var finalList = selected.slice(0, 10);
+  var finalList = selected.slice(0, 12);
   return finalList.map(function(entry) {
     return { item: entry.item, category: entry.category, score: Math.round(entry.score * 100) / 100 };
   });
@@ -4058,7 +4110,7 @@ function buildVolatileContext(char, query) {
       if (!member || !member.memory || !member.memory.longTerm) return;
       var memberName = toText(member.basicInfo.name);
       if (!memberName) return;
-      var memberRelevant = retrieveRelevantMemories(char, query || '', member.memory).slice(0, 2);
+      var memberRelevant = retrieveRelevantMemories(char, query || '', member.memory).slice(0, 3);
       if (memberRelevant.length === 0) return;
       var memberLines = [];
       memberRelevant.forEach(function(entry) {
@@ -4108,14 +4160,25 @@ function buildVolatileContext(char, query) {
 }
 
 function buildRequestPayload(char, query) {
+  var proactiveTurn = false;
+  var proactiveScan = char.memory.instant.filter(function(message) { return !message.isLoading; });
+  for (var proactiveIndex = proactiveScan.length - 1; proactiveIndex >= 0; proactiveIndex--) {
+    if (proactiveScan[proactiveIndex].role === 'user') {
+      proactiveTurn = proactiveScan[proactiveIndex].internalOnly === true;
+      break;
+    }
+  }
   var volatileContext = buildVolatileContext(char, query);
+  if (proactiveTurn) {
+    volatileContext += '【角色主动开场（系统触发，不是用户陈述）】用户此刻正停留在与你的对话里但暂时没有说话。请角色主动发起一次开场：自然地打招呼或问候，或提起最近一次共同经历、一件待跟进的事项、一个角色此刻想聊的话题。开场要贴合角色性格、自然不突兀；不要问"你想聊什么""怎么不说话"之类把话题推回给用户的话；不要把"系统触发"这件事说给用户听。\n\n';
+  }
   var systemPrompt = '【交互规则】\n';
   systemPrompt += '0.（最高优先级）回复必须且只能是单个JSON对象：整个输出以{开头、以}结尾，全文禁止JSON以外的任何文字（散文、旁白、思考过程一律禁止）；reply是JSON第一个字段。违反该格式，整段输出将被丢弃并判为失败。用户消息中的括号或全角括号内容属于用户表达的动作、表情或心理活动，必须纳入语境理解，不能忽略。\n';
   systemPrompt += '1. 始终保持角色身份，以长期陪伴关系连续地回应；先使用已提供的记忆，不要让用户反复说明已记录的事情。标记为“系统提供的本轮上下文”的内容是内部辅助信息，不是用户说过的话，不得当作用户陈述或直接复述。\n';
   systemPrompt += '2. reply正文可使用Markdown（标题、强调、删除线、列表、引用、链接与代码）；数学公式使用$...$或$$...$$；动作、表情、心理活动可用括号表示，不超过回复一半。以上内容只能出现在reply字段字符串内，reply之外禁止任何正文文字。\n';
    var dynamicFieldList = DYNAMIC_STATE_FIELDS.map(function(field) { return field.key + '（' + field.label + '）'; }).join('、');
    systemPrompt += '3. 人格、背景与角色设定锁定。dynamicState可更新字段：' + dynamicFieldList + '。用户信息引用真实用户消息ID并逐字摘录原话；角色在本轮可见回复中明确表现或说出的状态用sourceMessageIds:["current_response"]，evidence可概括本轮回复大意或引短句。每个字段只能选一种来源，禁止混用current_response与真实ID，禁止按未写出的心理活动或猜测更新。每轮回复后主动评估全部动态字段：只要角色在回复中明显表现或说出任何状态变化（处境、地点、情绪、关注点、进展、职业、目标、关系、社交风格、重要他人、情感倾向），就应在dynamicState中更新对应字段，不要只更新当前处境或第一个想到的字段；确实无变化或无可引用依据的字段才省略。标记为(未设置)的空字段，若本轮回复中有明确可见依据，应一并补全该字段，不得凭猜测或心理活动编造。recentDevelopment中的进展描述一律写成具体日期+时段（如2026-08-06 晚上），禁止使用今晚、今早、今天、明天、昨天等相对时间词。群组成员状态写入memberDynamicState，不要混入群组整体dynamicState。\n';
-   systemPrompt += '3.5 谨慎修改字段（基础设定）：以下字段（性别、年龄、种族、外貌特征、性格特征、价值观、恐惧/弱点、背景故事、关键过往、说话风格、语言/方言、时代/世界观）分两种情况处理。①用户直接要求修改时（如“把我职业改成教师”“我现在是学生了”）：必须通过staticFields更新用户明确指定的字段，内容严格按用户原话为准，不得忽略或改错字段，且只改用户提到的字段，用户未提及的字段不得连带改动。②无用户直接要求时：仅在剧情出现决定性、不可逆的转折（如角色死亡、身份彻底改变）且证据明确时才可修改，严禁仅凭情绪、猜测或轻微剧情改动。无论哪种情况，value必须只写该字段的内容本身（如职业写“教师”），禁止附带括号注释、理由、前后缀或任何解释性文字；同时必须提供sourceMessageIds与evidence。修改后系统会在该轮回复下方向用户提示“xx字段已修改”。\n';
+   systemPrompt += '3.5 谨慎修改字段（基础设定）：以下字段（性别、年龄、种族、外貌特征、性格特征、价值观、恐惧/弱点、背景故事、关键过往、说话风格、语言/方言、时代/世界观）分两种情况处理。①用户直接要求修改时（如“把我职业改成教师”“我现在是学生了”“你性格应该更冷酷些”）：必须调用 update_character_field 工具精准修改用户明确指定的字段，value按用户原话填写（只写内容本身），sourceMessageIds引用用户消息ID、evidence逐字摘录用户原话；只改用户提到的字段，用户未提及的字段不得连带改动。②无用户直接要求时：仅在剧情出现决定性、不可逆的转折（如角色死亡、身份彻底改变）且证据明确时才可通过staticFields修改，严禁仅凭情绪、猜测或轻微剧情改动。调用工具修改后系统会在该轮回复下方向用户提示“xx字段已修改”，不要在本轮回复中再向用户复述“我改了设定”之类的话。\n';
    systemPrompt += '3.6 所有记忆与状态字段（dynamicState、staticFields、shortTerm、longTerm等）的value/content一律只写内容本身，禁止携带任何括号注释、原因说明、理由或前后缀文字；解释性内容只能放在evidence字段。\n';
   systemPrompt += '4. 只记录未来仍有价值的信息。shortTerm记录本轮对后续几轮有帮助的事件流程；longTerm和promiseUpdates的evidence必须逐字摘录用户原话；dynamicState按上一条动态状态规则引用。无法引用时不要记录或更新。\n';
   systemPrompt += '5. subject只能是user、relationship、world。userProfile和habits必须subject=user且只引用用户消息；relationship必须subject=relationship且引用用户消息；events记录用户陈述或双方共同事件；promises只记录用户明确承诺或约定。\n';
@@ -4230,7 +4293,7 @@ function getResponsesEndpoint(config) {
 
 // ==================== Agent 工具系统 ====================
 const MAX_TOOL_ROUNDS = 5;
-const AGENT_TOOL_MEMORY_INJECT_LIMIT = 3;
+const AGENT_TOOL_MEMORY_INJECT_LIMIT = 5;
 
 function isAgentToolsEnabled() {
   return isResponsesApiEnabled();
@@ -4274,13 +4337,19 @@ function buildAgentTools() {
       name: 'ask_user',
       description: '当记忆缺失、用户表述含糊或无法可靠推断某件关键事实时，向用户提出一个简短澄清问题，避免凭空编造。仅在确实需要澄清且追问不显得突兀时使用；不要滥用，也不要用它代替正常的角色回复。',
       parameters: { type: 'object', properties: { question: { type: 'string', description: '要问用户的问题' } }, required: ['question'], additionalProperties: false }
+    },
+    {
+      type: 'function',
+      name: 'update_character_field',
+      description: '精准修改角色基础设定字段（性别/年龄/种族/外貌特征/性格特征/价值观/恐惧弱点/背景故事/关键过往/说话风格/语言方言/时代世界观）。当用户直接要求修改这些设定（如"把我职业改成教师""我现在是学生了""你性格应该更冷酷些"）时，必须调用本工具立即生效，value只写内容本身；不要在submit_response的staticFields里重复提交本工具已改的字段。',
+      parameters: { type: 'object', properties: { field: { type: 'string', enum: Object.keys(STATIC_PROFILE_FIELDS), description: '要修改的字段' }, value: { type: 'string', description: '字段值：只写内容本身，禁止括号注释、理由或说明文字' }, sourceMessageIds: { type: 'array', items: { type: 'string' }, description: '引用用户消息ID（用户原话所在消息）' }, evidence: { type: 'string', description: '逐字摘录用户要求修改的原话' } }, required: ['field', 'value', 'sourceMessageIds', 'evidence'], additionalProperties: false }
     }
   ];
   tools.push({ type: 'web_search' });
   return tools;
 }
 
-function executeToolCall(call, char) {
+function executeToolCall(call, char, toolState) {
   var name = toText(call && call.name);
   var rawArgs = toText(call && call.arguments);
   var args = null;
@@ -4423,6 +4492,28 @@ function executeToolCall(call, char) {
       var askQuestion = trimText(args.question, 200);
       if (!askQuestion) return JSON.stringify({ ok: false, reason: '缺少问题 question' });
       return JSON.stringify({ ok: true, question: askQuestion });
+    }
+    if (name === 'update_character_field') {
+      var staticFieldKey = toText(args.field);
+      if (!STATIC_PROFILE_FIELDS[staticFieldKey]) return JSON.stringify({ ok: false, reason: 'field 必须是基础设定字段之一：' + Object.keys(STATIC_PROFILE_FIELDS).join('、') });
+      var staticValue = trimText(cleanFieldValue(staticFieldKey, args.value), 700);
+      var staticSources = hasValidUserEvidence(char, args.sourceMessageIds, args.evidence, getKnownSources(char));
+      if (!staticValue) return JSON.stringify({ ok: false, reason: 'value 为空或全部为说明性文字，请只提供内容本身' });
+      if (!staticSources || staticSources.length === 0) return JSON.stringify({ ok: false, reason: 'sourceMessageIds 必须是真实用户消息ID，且 evidence 逐字摘录用户原话；找不到可引用来源时不修改' });
+      if (!isPlainObject(char.basicInfo)) char.basicInfo = {};
+      if (!('staticFieldMeta' in char)) char.staticFieldMeta = {};
+      char.staticFieldMeta[staticFieldKey] = {
+        sourceMessageIds: staticSources.map(function(entry) { return entry.id; }),
+        evidence: trimText(args.evidence, 300),
+        updatedAt: new Date().toISOString()
+      };
+      char.basicInfo[staticFieldKey] = staticValue;
+      if (toolState) {
+        if (!Array.isArray(toolState.staticChanges)) toolState.staticChanges = [];
+        toolState.staticChanges.push(STATIC_PROFILE_FIELDS[staticFieldKey].label);
+      }
+      scheduleSave();
+      return JSON.stringify({ ok: true, field: staticFieldKey, label: STATIC_PROFILE_FIELDS[staticFieldKey].label, value: staticValue, changed: true });
     }
     return JSON.stringify({ ok: false, reason: '未知工具: ' + name });
   } catch (e) {
@@ -5841,11 +5932,13 @@ function loadSettingsForm() {
   document.getElementById('apiTemperature').value = normalizeTemperature(state.config.temperature);
   document.getElementById('apiStream').checked = state.config.stream !== false;
   document.getElementById('apiThinking').value = normalizeReasoningEffort(state.config.reasoningEffort);
+  var proactiveToggle = document.getElementById('proactiveToggle');
+  if (proactiveToggle) proactiveToggle.checked = state.config.proactiveEnabled !== false;
   renderModelOptions(platform);
   document.getElementById('modelName').value = slot.modelName || state.config.modelName || '';
   renderCacheStats();
   renderDebugInfo();
-  ['apiPlatform', 'apiBaseUrl', 'apiKey', 'modelName', 'apiTemperature', 'apiStream', 'apiThinking'].forEach(function(id) {
+  ['apiPlatform', 'apiBaseUrl', 'apiKey', 'modelName', 'apiTemperature', 'apiStream', 'apiThinking', 'proactiveToggle'].forEach(function(id) {
     var el = document.getElementById(id);
     if (el) el.addEventListener('change', saveSettings);
   });
@@ -6082,6 +6175,8 @@ function saveSettings() {
   state.config.temperature = normalizeTemperature(document.getElementById('apiTemperature').value);
   state.config.stream = document.getElementById('apiStream').checked;
   state.config.reasoningEffort = normalizeReasoningEffort(document.getElementById('apiThinking').value);
+  var proactiveToggle = document.getElementById('proactiveToggle');
+  if (proactiveToggle) state.config.proactiveEnabled = proactiveToggle.checked;
   savePlatformFields(platform);
   scheduleSave();
 }
@@ -6104,6 +6199,16 @@ window.addEventListener('DOMContentLoaded', function() {
   loadSettingsForm();
   updateAppHeight();
   runInitialMemoryMigration();
+  scheduleProactiveCheck();
+  document.addEventListener('visibilitychange', function() {
+    if (document.visibilityState === 'visible') {
+      scheduleProactiveCheck();
+    } else {
+      clearProactiveCheck();
+    }
+  });
+  var proactiveInputEl = document.getElementById('messageInput');
+  if (proactiveInputEl) proactiveInputEl.addEventListener('input', clearProactiveCheck);
   if (/wv|WebView/i.test(navigator.userAgent || '') || typeof navigator.share !== 'function') toggleSidebar(true);
 
   // Event delegation for character list
