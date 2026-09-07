@@ -966,7 +966,7 @@ const DEFAULT_CONFIG = {
   proactiveEnabled: true,
   platformSettings: {}
 };
-const APP_VERSION = '2.0';
+const APP_VERSION = '1.0.7';
 const PLATFORM_CONFIGS = {
   deepseek: { baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-v4-flash', models: ['deepseek-v4-flash', 'deepseek-chat', 'deepseek-reasoner'] },
   opencode: { baseUrl: 'https://opencode.ai/zen/go/v1', model: 'deepseek-v4-flash', keepV1InResponses: true, models: ['deepseek-v4-flash'] },
@@ -2463,9 +2463,8 @@ function regenerateReply(messageId) {
   return sendMessage({ regenerateMessageId: messageId });
 }
 
-// ==================== 角色主动开口（面板停留空闲 1 分钟触发） ====================
+// ==================== 角色主动开口（对应面板停留空闲 1 分钟即开口，不分新老，无冷却） ====================
 const PROACTIVE_IDLE_MS = 60000;
-const PROACTIVE_REPEAT_GAP_MS = 10 * 60 * 1000;
 var proactiveTimer = null;
 
 function clearProactiveCheck() {
@@ -2486,13 +2485,7 @@ function canTriggerProactive(char) {
   if (state.isProcessing) return false;
   if (state.activeCharacterId !== char.id) return false;
   if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return false;
-  var visibleMessages = char.memory.instant.filter(function(message) { return !message.isLoading && !message.internalOnly; });
-  if (visibleMessages.length === 0) return true; // 新角色：直接开场
-  var lastVisible = visibleMessages[visibleMessages.length - 1];
-  if (lastVisible.role === 'user') return true; // 轮到角色开口
-  // 最后一条是角色回复：距离上次开口超过阈值才允许再次主动，避免连发
-  var lastTs = Date.parse(lastVisible.timestamp) || 0;
-  return lastTs > 0 && (Date.now() - lastTs) >= PROACTIVE_REPEAT_GAP_MS;
+  return true;
 }
 
 function tryProactiveOpen() {
