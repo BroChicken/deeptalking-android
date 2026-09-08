@@ -966,7 +966,7 @@ const DEFAULT_CONFIG = {
   proactiveEnabled: true,
   platformSettings: {}
 };
-const APP_VERSION = '1.0.7';
+const APP_VERSION = '1.0.8';
 const PLATFORM_CONFIGS = {
   deepseek: { baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-v4-flash', models: ['deepseek-v4-flash', 'deepseek-chat', 'deepseek-reasoner'] },
   opencode: { baseUrl: 'https://opencode.ai/zen/go/v1', model: 'deepseek-v4-flash', keepV1InResponses: true, models: ['deepseek-v4-flash'] },
@@ -1070,10 +1070,22 @@ function normalizeApiBaseUrl(value) {
   return toText(value).trim().replace(/\/+$/, '');
 }
 
-function buildApiHeaders(config) {
+function getSessionIdFor(char) {
+  return char && char.id ? 'deeptalking-' + char.id : 'deeptalking-general';
+}
+
+function getActiveSessionId() {
+  return getSessionIdFor(state.characters && state.characters[state.activeCharacterId]);
+}
+
+function buildApiHeaders(config, sessionId) {
   var headers = { 'Content-Type': 'application/json', Authorization: 'Bearer ' + config.apiKey };
   if (config.stream !== false) {
     headers.Accept = 'text/event-stream';
+  }
+  // opencode Go 网关强制要求每个会话发送稳定 x-opencode-session（缺失返回 400 MissingSessionID）
+  if (config.apiPlatform === 'opencode') {
+    headers['x-opencode-session'] = sessionId || getActiveSessionId();
   }
   return headers;
 }
@@ -2811,7 +2823,7 @@ async function performChatRequest(messages, text, loadingMsg, toolState, phase) 
   try {
     response = await fetch(getResponsesEndpoint(state.config), {
       method: 'POST',
-      headers: buildApiHeaders(state.config),
+headers: buildApiHeaders(state.config, getActiveSessionId()),
       body: JSON.stringify(buildResponsesRequestBody(messages, state.config.stream, toolState, phase)),
       signal: abortController ? abortController.signal : undefined
     });
@@ -4171,8 +4183,8 @@ function buildRequestPayload(char, query) {
   systemPrompt += '2. reply正文可使用Markdown（标题、强调、删除线、列表、引用、链接与代码）；数学公式使用$...$或$$...$$；动作、表情、心理活动可用括号表示，不超过回复一半。以上内容只能出现在reply字段字符串内，reply之外禁止任何正文文字。\n';
    var dynamicFieldList = DYNAMIC_STATE_FIELDS.map(function(field) { return field.key + '（' + field.label + '）'; }).join('、');
    systemPrompt += '3. 人格、背景与角色设定锁定。dynamicState可更新字段：' + dynamicFieldList + '。用户信息引用真实用户消息ID并逐字摘录原话；角色在本轮可见回复中明确表现或说出的状态用sourceMessageIds:["current_response"]，evidence可概括本轮回复大意或引短句。每个字段只能选一种来源，禁止混用current_response与真实ID，禁止按未写出的心理活动或猜测更新。每轮回复后主动评估全部动态字段：只要角色在回复中明显表现或说出任何状态变化（处境、地点、情绪、关注点、进展、职业、目标、关系、社交风格、重要他人、情感倾向），就应在dynamicState中更新对应字段，不要只更新当前处境或第一个想到的字段；确实无变化或无可引用依据的字段才省略。标记为(未设置)的空字段，若本轮回复中有明确可见依据，应一并补全该字段，不得凭猜测或心理活动编造。recentDevelopment中的进展描述一律写成具体日期+时段（如2026-08-06 晚上），禁止使用今晚、今早、今天、明天、昨天等相对时间词。群组成员状态写入memberDynamicState，不要混入群组整体dynamicState。\n';
-   systemPrompt += '3.5 谨慎修改字段（基础设定）：以下字段（性别、年龄、种族、外貌特征、性格特征、价值观、恐惧/弱点、背景故事、关键过往、说话风格、语言/方言、时代/世界观）分两种情况处理。①用户直接要求修改时（如“把我职业改成教师”“我现在是学生了”“你性格应该更冷酷些”）：必须调用 update_character_field 工具精准修改用户明确指定的字段，value按用户原话填写（只写内容本身），sourceMessageIds引用用户消息ID、evidence逐字摘录用户原话；只改用户提到的字段，用户未提及的字段不得连带改动。②无用户直接要求时：仅在剧情出现决定性、不可逆的转折（如角色死亡、身份彻底改变）且证据明确时才可通过staticFields修改，严禁仅凭情绪、猜测或轻微剧情改动。调用工具修改后系统会在该轮回复下方向用户提示“xx字段已修改”，不要在本轮回复中再向用户复述“我改了设定”之类的话。\n';
-   systemPrompt += '3.6 所有记忆与状态字段（dynamicState、staticFields、shortTerm、longTerm等）的value/content一律只写内容本身，禁止携带任何括号注释、原因说明、理由或前后缀文字；解释性内容只能放在evidence字段。\n';
+   systemPrompt += '3.5 谨慎修改字段（基础设定）：以下字段（性别、年龄、种族、外貌特征、性格特征、价值观、恐惧/弱点、背景故事、关键过往、说话风格、语言/方言、时代/世界观）分两种情况处理。①用户直接要求修改时（如“把我职业改成教师”“我现在是学生了”“你性格应该更冷酷些”）：必须调用 update_character_field 工具精准修改用户明确指定的字段，sourceMessageIds引用用户消息ID、evidence逐字摘录用户原话；只改用户提到的字段，用户未提及的字段不得连带改动。②无用户直接要求时：仅在剧情出现决定性、不可逆的转折（如角色死亡、身份彻底改变）且证据明确时才可通过staticFields修改，严禁仅凭情绪、猜测或轻微剧情改动。value必须采用与角色卡其余字段一致的精炼字段风格：用关键词或短语（通常2到12字），如性格写“冷静克制”、职业写“教师”、外貌写“银发”、年龄写“28岁”；把用户的完整表述提炼成该字段应有的简短形式，禁止写成整句、叙述、理由或场景描写（如禁止“性格变得开朗，比以前更愿意交朋友了”）。调用工具修改后系统会在该轮回复下方向用户提示“xx字段已修改”，不要在本轮回复中再向用户复述“我改了设定”之类的话。\n';
+   systemPrompt += '3.6 所有记忆与状态字段（dynamicState、staticFields、shortTerm、longTerm等）的value/content一律只写内容本身，且采用精炼字段风格：用关键词或短语，禁止携带括号注释、原因说明、理由、前后缀或任何解释性文字，也禁止写成整句叙述；解释性内容只能放在evidence字段。\n';
   systemPrompt += '4. 只记录未来仍有价值的信息。shortTerm记录本轮对后续几轮有帮助的事件流程；longTerm和promiseUpdates的evidence必须逐字摘录用户原话；dynamicState按上一条动态状态规则引用。无法引用时不要记录或更新。\n';
   systemPrompt += '5. subject只能是user、relationship、world。userProfile和habits必须subject=user且只引用用户消息；relationship必须subject=relationship且引用用户消息；events记录用户陈述或双方共同事件；promises只记录用户明确承诺或约定。\n';
   systemPrompt += '6. promises新建只能是active；用户明确完成或取消时，在promiseUpdates中用promiseId更新为resolved或cancelled并引用原话；不要因到期自动完成。\n';
@@ -4257,7 +4269,7 @@ async function callAPI(messages) {
   });
   var response = await fetch(getResponsesEndpoint(state.config), {
     method: 'POST',
-    headers: buildApiHeaders(state.config),
+    headers: buildApiHeaders(state.config, getActiveSessionId()),
     body: JSON.stringify(body)
   });
   if (!response.ok) {
@@ -4334,8 +4346,8 @@ function buildAgentTools() {
     {
       type: 'function',
       name: 'update_character_field',
-      description: '精准修改角色基础设定字段（性别/年龄/种族/外貌特征/性格特征/价值观/恐惧弱点/背景故事/关键过往/说话风格/语言方言/时代世界观）。当用户直接要求修改这些设定（如"把我职业改成教师""我现在是学生了""你性格应该更冷酷些"）时，必须调用本工具立即生效，value只写内容本身；不要在submit_response的staticFields里重复提交本工具已改的字段。',
-      parameters: { type: 'object', properties: { field: { type: 'string', enum: Object.keys(STATIC_PROFILE_FIELDS), description: '要修改的字段' }, value: { type: 'string', description: '字段值：只写内容本身，禁止括号注释、理由或说明文字' }, sourceMessageIds: { type: 'array', items: { type: 'string' }, description: '引用用户消息ID（用户原话所在消息）' }, evidence: { type: 'string', description: '逐字摘录用户要求修改的原话' } }, required: ['field', 'value', 'sourceMessageIds', 'evidence'], additionalProperties: false }
+      description: '精准修改角色基础设定字段（性别/年龄/种族/外貌特征/性格特征/价值观/恐惧弱点/背景故事/关键过往/说话风格/语言方言/时代世界观）。当用户直接要求修改这些设定（如"把我职业改成教师""我现在是学生了""你性格应该更冷酷些"）时，必须调用本工具立即生效；value必须用与角色卡其余字段一致的精炼字段风格（关键词或短语，通常2到12字，如性格"冷静克制"、职业"教师"、外貌"银发"），把用户表述提炼成简短字段值，禁止整句叙述或说明；不要在submit_response的staticFields里重复提交本工具已改的字段。',
+      parameters: { type: 'object', properties: { field: { type: 'string', enum: Object.keys(STATIC_PROFILE_FIELDS), description: '要修改的字段' }, value: { type: 'string', description: '字段值：精炼字段风格，关键词或短语（2到12字），如性格"冷静克制"、职业"教师"；禁止括号注释、理由、整句叙述或说明文字' }, sourceMessageIds: { type: 'array', items: { type: 'string' }, description: '引用用户消息ID（用户原话所在消息）' }, evidence: { type: 'string', description: '逐字摘录用户要求修改的原话' } }, required: ['field', 'value', 'sourceMessageIds', 'evidence'], additionalProperties: false }
     }
   ];
   tools.push({ type: 'web_search' });
@@ -4535,7 +4547,7 @@ function buildDynamicStateFieldSchema() {
     type: 'object',
     additionalProperties: false,
     properties: {
-      value: { type: 'string', description: '字段值：只写内容本身，禁止任何括号注释、理由或说明文字' },
+      value: { type: 'string', description: '字段值：精炼字段风格（关键词或短语，通常2到12字，如性格"冷静克制"、职业"教师"、外貌"银发"）；禁止括号注释、理由、整句叙述或说明文字' },
       sourceMessageIds: { type: 'array', items: { type: 'string' } },
       evidence: { type: 'string' }
     },
@@ -4563,7 +4575,7 @@ function buildSubmitResponseTool() {
         shortTerm: { type: 'array', description: '本轮事件流程摘要（对后续几轮有帮助的信息）', items: { type: 'object', additionalProperties: false, properties: { content: { type: 'string' }, sourceMessageIds: { type: 'array', items: { type: 'string' } } }, required: ['content'] } },
         longTerm: { type: 'array', description: '未来仍有价值的稳定事实；category 只能是 userProfile|relationship|events|promises|habits；evidence 逐字摘录用户原话；群组对话中若该事实只属于某位成员（只有那位成员知道/记得），填 memberName 记入其私人记忆，否则记入群组共享记忆', items: { type: 'object', additionalProperties: false, properties: { category: { type: 'string', enum: ['userProfile', 'relationship', 'events', 'promises', 'habits'] }, subject: { type: 'string', enum: ['user', 'relationship', 'world'] }, key: { type: 'string' }, value: { type: 'string' }, tags: { type: 'array', items: { type: 'string' } }, importance: { type: 'integer', minimum: 1, maximum: 10 }, sourceMessageIds: { type: 'array', items: { type: 'string' } }, evidence: { type: 'string' }, eventTime: { type: 'string' }, memberName: { type: 'string', description: '可选，群组对话中指定记入某位成员的私人记忆（不传则记入群组共享记忆）' } }, required: ['category', 'key', 'value'] } },
         dynamicState: { type: 'object', additionalProperties: false, description: '角色当前动态状态，仅在有明确依据时更新', properties: dynFieldProperties },
-        staticFields: { type: 'object', additionalProperties: false, description: '谨慎修改的基础设定字段（性别/年龄/种族/外貌/性格/价值观/恐惧/背景/关键过往/说话风格/语言/世界观）。用户明确要求修改时必须更新；无用户要求时仅在有决定性剧情依据时更新。value只写内容本身，禁止括号/理由/说明', properties: staticFieldProperties },
+        staticFields: { type: 'object', additionalProperties: false, description: '谨慎修改的基础设定字段（性别/年龄/种族/外貌/性格/价值观/恐惧/背景/关键过往/说话风格/语言/世界观）。用户明确要求修改时必须更新；无用户要求时仅在有决定性剧情依据时更新。value用精炼字段风格（关键词/短语），禁止括号、理由或整句叙述', properties: staticFieldProperties },
         memberDynamicState: { type: 'array', description: '群组成员动态状态（仅群组对话使用）', items: { type: 'object', additionalProperties: false, properties: { memberName: { type: 'string' }, dynamicState: { type: 'object', additionalProperties: false, properties: dynFieldProperties } }, required: ['memberName'] } },
         promiseUpdates: { type: 'array', description: '用户明确完成或取消的承诺', items: { type: 'object', additionalProperties: false, properties: { promiseId: { type: 'string' }, status: { type: 'string', enum: ['resolved', 'cancelled'] }, sourceMessageIds: { type: 'array', items: { type: 'string' } }, evidence: { type: 'string' } }, required: ['promiseId', 'status'] } },
         recall: { type: 'object', additionalProperties: false, description: '主动召回记忆的请求', properties: { category: { type: 'string' }, tags: { type: 'array', items: { type: 'string' } } } }
@@ -6115,7 +6127,7 @@ async function testApiConnection() {
     try {
       var res = await fetch(endpoint, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key },
+        headers: buildApiHeaders({ apiPlatform: platform, stream: false, apiKey: key }, 'deeptalking-general'),
         body: JSON.stringify({ model: model, input: [{ role: 'user', content: 'hi' }], max_output_tokens: 50, stream: false, reasoning: { effort: 'none' } })
       });
       var text = await res.text();
