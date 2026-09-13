@@ -1001,6 +1001,7 @@ function formatMessageContent(text) {
   function closeList() { if (listType) { html.push('</' + listType + '>'); listType = ''; } }
   function inline(value) {
     return value.replace(/`([^`\n]+)`/g, function(match, code) { return token('<code>' + code + '</code>'); })
+      .replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g, function(match, alt, url) { return token('<img class="message-image" src="' + url + '" alt="' + alt + '" loading="lazy" onerror="this.remove()" onclick="openImagePreview(this.src)">'); })
       .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
       .replace(/\(([^()\n]+)\)|（([^（）\n]+)）/g, function(match) { return '<span class="action-text">' + match + '</span>'; })
       .replace(/\*\*([^*\n]+)\*\*|__([^_\n]+)__/g, function(match, a, b) { return '<strong>' + (a || b) + '</strong>'; })
@@ -1032,7 +1033,7 @@ const DEFAULT_CONFIG = {
   proactiveEnabled: true,
   platformSettings: {}
 };
-const APP_VERSION = '1.0.10';
+const APP_VERSION = '1.0.11';
 const PLATFORM_CONFIGS = {
   deepseek: { baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-flash', models: ['deepseek-flash'] },
   opencode: { baseUrl: 'https://opencode.ai/zen/go/v1', model: 'deepseek-flash', keepV1InResponses: true, models: ['deepseek-flash'] },
@@ -2830,6 +2831,7 @@ async function sendMessage(options) {
         if (applied) memUpdate = applied;
       }
     }
+    displayText = dedupeRepeatedEnding(displayText, char);
     loadingMsg.content = displayText;
     loadingMsg.isLoading = false;
     loadingMsg.timestamp = new Date().toISOString();
@@ -4151,6 +4153,58 @@ function detectTopicSwitch(char, query) {
   return hits === 0;
 }
 
+function extractReplyEnding(text) {
+  var clean = toText(text).replace(/\s+$/, '');
+  if (!clean) return '';
+  var lines = clean.split('\n');
+  var line = '';
+  for (var li = lines.length - 1; li >= 0; li--) {
+    if (lines[li].trim()) { line = lines[li].trim(); break; }
+  }
+  if (!line) return '';
+  var end = line.length;
+  while (end > 0 && /[。！？!?…"'”’）)\]】]/.test(line.charAt(end - 1))) end--;
+  var prev = -1;
+  for (var k = end - 1; k >= 0; k--) {
+    if ('。！？!?…'.indexOf(line.charAt(k)) !== -1) { prev = k; break; }
+  }
+  return trimText(line.slice(prev + 1), 80);
+}
+
+function isMeaningfulEnding(ending) {
+  return toText(ending).replace(/[。！？!?…\s"'”’）)\]】]/g, '').length >= 4;
+}
+
+function getRecentReplyEndings(char, limit) {
+  var count = Number(limit) > 0 ? Number(limit) : 1;
+  var endings = [];
+  var messages = (char && char.memory && Array.isArray(char.memory.instant)) ? char.memory.instant : [];
+  for (var i = messages.length - 1; i >= 0 && endings.length < count; i--) {
+    var msg = messages[i];
+    if (!msg || msg.role !== 'assistant' || msg.isLoading || !toText(msg.content).trim()) continue;
+    var ending = extractReplyEnding(msg.content);
+    if (!ending || endings.indexOf(ending) !== -1) continue;
+    endings.push(ending);
+  }
+  return endings;
+}
+
+// 仅当本轮收尾与上一条回复的收尾逐字完全相同时，删掉本轮重复的那一份；不做任何改写
+function dedupeRepeatedEnding(text, char) {
+  var current = toText(text);
+  if (!current.trim()) return current;
+  var endings = getRecentReplyEndings(char, 1);
+  if (endings.length === 0) return current;
+  var previous = endings[0];
+  var currentEnding = extractReplyEnding(current);
+  if (!currentEnding || currentEnding !== previous) return current;
+  if (!isMeaningfulEnding(previous) || !isMeaningfulEnding(currentEnding)) return current;
+  var idx = current.lastIndexOf(currentEnding);
+  if (idx === -1) return current;
+  var trimmed = current.slice(0, idx).replace(/\s+$/, '');
+  return trimmed || current;
+}
+
 function buildVolatileContext(char, query) {
   var time = getTimeContext(new Date());
   var replyGap = getLastReplyGap(char);
@@ -4233,6 +4287,10 @@ function buildVolatileContext(char, query) {
     });
     volatileContext += '\n';
   }
+  var recentEndings = getRecentReplyEndings(char, 1);
+  if (recentEndings.length > 0) {
+    volatileContext += '【结尾多样性】你最近一次回复的结尾是：『' + recentEndings[0] + '』。本轮结尾不得与该结尾相同或高度相似，也不要每轮都用同一句或同一个动作收尾；请自然换一种收尾方式。\n\n';
+  }
   var userText = toText(query);
   if (isColdFieldRequest(userText)) {
     volatileContext += '【本轮：用户表达了不知聊什么或把话题选择权交给角色】\n必须主动开启一个新话题，直接自然开场，不要反问"你想聊什么"，也不要把话题选择推回给用户；优先从上方可选话题库或两人最近共同经历中挑选一个贴合角色身份与关系的话题。\n\n';
@@ -4266,7 +4324,7 @@ function buildRequestPayload(char, query) {
   var systemPrompt = '【交互规则】\n';
   systemPrompt += '0.（最高优先级）回复必须且只能是单个JSON对象：整个输出以{开头、以}结尾，全文禁止JSON以外的任何文字（散文、旁白、思考过程一律禁止）；reply是JSON第一个字段。违反该格式，整段输出将被丢弃并判为失败。用户消息中的括号或全角括号内容属于用户表达的动作、表情或心理活动，必须纳入语境理解，不能忽略。\n';
   systemPrompt += '1. 始终保持角色身份，以长期陪伴关系连续地回应；先使用已提供的记忆，不要让用户反复说明已记录的事情。标记为“系统提供的本轮上下文”的内容是内部辅助信息，不是用户说过的话，不得当作用户陈述或直接复述。\n';
-  systemPrompt += '2. reply正文可使用Markdown（标题、强调、删除线、列表、引用、链接与代码）；数学公式使用$...$或$$...$$；动作、表情、心理活动可用括号表示，不超过回复一半。以上内容只能出现在reply字段字符串内，reply之外禁止任何正文文字。\n';
+  systemPrompt += '2. reply正文可使用Markdown（标题、强调、删除线、列表、引用、链接与代码）；数学公式使用$...$或$$...$$；动作、表情、心理活动可用括号表示，不超过回复一半；如需展示图片，可用 Markdown 图片语法 ![说明](https://图片直链)（仅限真实存在的 http(s) 图片链接，不要编造）。每轮结尾须自然多样，禁止复用最近几轮或用户上一条的结尾句式、口头禅或固定动作，也不要在结尾复述或续写上一轮的收尾。以上内容只能出现在reply字段字符串内，reply之外禁止任何正文文字。\n';
    var dynamicFieldList = DYNAMIC_STATE_FIELDS.map(function(field) { return field.key + '（' + field.label + '）'; }).join('、');
    systemPrompt += '3. 人格、背景与角色设定锁定。dynamicState可更新字段：' + dynamicFieldList + '。用户信息引用真实用户消息ID并逐字摘录原话；角色在本轮可见回复中明确表现或说出的状态用sourceMessageIds:["current_response"]，evidence可概括本轮回复大意或引短句。每个字段只能选一种来源，禁止混用current_response与真实ID，禁止按未写出的心理活动或猜测更新。每轮回复后主动评估全部动态字段：只要角色在回复中明显表现或说出任何状态变化（处境、地点、情绪、关注点、进展、职业、目标、关系、社交风格、重要他人、情感倾向），就应在dynamicState中更新对应字段，不要只更新当前处境或第一个想到的字段；确实无变化或无可引用依据的字段才省略。标记为(未设置)的空字段，若本轮回复中有明确可见依据，应一并补全该字段，不得凭猜测或心理活动编造。recentDevelopment中的进展描述一律写成具体日期+时段（如2026-08-06 晚上），禁止使用今晚、今早、今天、明天、昨天等相对时间词。群组成员状态写入memberDynamicState，不要混入群组整体dynamicState。\n';
    systemPrompt += '3.5 谨慎修改字段（基础设定）：以下字段（性别、年龄、种族、外貌特征、性格特征、价值观、恐惧/弱点、背景故事、关键过往、说话风格、语言/方言、时代/世界观）分两种情况处理。①用户直接要求修改时（如“把我职业改成教师”“我现在是学生了”“你性格应该更冷酷些”）：必须调用 update_character_field 工具精准修改用户明确指定的字段，sourceMessageIds引用用户消息ID、evidence逐字摘录用户原话；只改用户提到的字段，用户未提及的字段不得连带改动。②无用户直接要求时：仅在剧情出现决定性、不可逆的转折（如角色死亡、身份彻底改变）且证据明确时才可通过staticFields修改，严禁仅凭情绪、猜测或轻微剧情改动。value一律以段落式的陈述句书写：用自然、完整的陈述句把内容写成简短段落（可多句），把用户表述整理成清楚的陈述（如性格写“性格冷静克制，遇事沉稳。”）；禁止括号注释、理由、前后缀或任何解释性文字，解释性内容只能放在evidence。调用工具修改后系统会在该轮回复下方向用户提示“xx字段已修改”，不要在本轮回复中再向用户复述“我改了设定”之类的话。\n';
@@ -4464,6 +4522,13 @@ function htmlToReadableText(html) {
     .trim();
 }
 
+function imageToolResult(url) {
+  return [
+    { type: 'input_text', text: '已获取图片。图片URL: ' + url + '（如需展示给用户，可在 reply 中用 ![说明](' + url + ') 直接贴出）' },
+    { type: 'input_image', image_url: url, detail: 'auto' }
+  ];
+}
+
 async function fetchWebContent(url) {
   var looksImage = /\.(png|jpe?g|gif|webp|bmp|svg)(\?|#|$)/i.test(url);
   try {
@@ -4471,22 +4536,22 @@ async function fetchWebContent(url) {
     var contentType = (res.headers.get('content-type') || '').toLowerCase();
     if (res.ok && contentType.indexOf('image/') === 0) {
       // 由服务端下载该图片并作为图片内容交给模型查看
-      return [{ type: 'input_image', image_url: url, detail: 'auto' }];
+      return imageToolResult(url);
     }
     if (res.ok) {
       var text = await res.text();
       var readable = htmlToReadableText(text);
       if (!readable) {
-        if (looksImage) return [{ type: 'input_image', image_url: url, detail: 'auto' }];
+        if (looksImage) return imageToolResult(url);
         return JSON.stringify({ ok: false, url: url, reason: '页面没有可读正文' });
       }
       return JSON.stringify({ ok: true, url: url, content: trimText(readable, 6000) });
     }
-    if (looksImage) return [{ type: 'input_image', image_url: url, detail: 'auto' }];
+    if (looksImage) return imageToolResult(url);
     return JSON.stringify({ ok: false, url: url, reason: 'HTTP ' + res.status });
   } catch (e) {
     // 跨域/网络失败：若是图片链接，交给服务端按图片下载；否则如实返回失败
-    if (looksImage) return [{ type: 'input_image', image_url: url, detail: 'auto' }];
+    if (looksImage) return imageToolResult(url);
     return JSON.stringify({ ok: false, url: url, reason: '抓取失败（可能是跨域限制或无网络）：' + (e && e.message ? e.message : String(e)) });
   }
 }
