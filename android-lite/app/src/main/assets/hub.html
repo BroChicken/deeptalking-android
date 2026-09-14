@@ -351,6 +351,76 @@ input:focus, textarea:focus, select:focus {
   max-height: 100%;
   border-radius: 8px;
 }
+.sticker-panel {
+  position: fixed;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: 96px;
+  z-index: 70;
+  width: min(92vw, 460px);
+  max-height: 44vh;
+  overflow-y: auto;
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
+  border-radius: 14px;
+  padding: 10px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+}
+.sticker-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(72px, 1fr));
+  gap: 8px;
+}
+.sticker-cell { position: relative; }
+.sticker-thumb {
+  width: 100%;
+  height: 72px;
+  object-fit: cover;
+  border-radius: 10px;
+  border: 1px solid var(--input-border);
+  cursor: pointer;
+  display: block;
+}
+.sticker-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+  margin-top: 3px;
+}
+.sticker-tag {
+  font-size: 10px;
+  color: var(--text-muted);
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+.sticker-del {
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  padding: 0 2px;
+}
+.sticker-tag-input {
+  width: 100%;
+  font-size: 11px;
+  border: 1px solid var(--input-border);
+  border-radius: 6px;
+  padding: 1px 3px;
+  background: var(--input-bg);
+  color: var(--text-color);
+}
+.sticker-empty {
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 12px;
+  text-align: center;
+}
 .message-action:hover, .message-action:focus-visible {
   color: var(--accent-color);
   background: var(--accent-bg);
@@ -719,6 +789,7 @@ input:focus, textarea:focus, select:focus {
   <symbol id="icon-upload" viewBox="0 0 24 24"><path d="M12 15V3M7 8l5-5 5 5M5 21h14"/></symbol>
   <symbol id="icon-bot" viewBox="0 0 24 24"><rect x="3" y="6" width="18" height="14" rx="3"/><path d="M12 2v4M8 11h.01M16 11h.01M8 16h8"/></symbol>
   <symbol id="icon-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></symbol>
+  <symbol id="icon-smile" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><path d="M9 9h.01M15 9h.01"/></symbol>
   <symbol id="icon-send" viewBox="0 0 24 24"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></symbol>
   <symbol id="icon-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
   <symbol id="icon-edit" viewBox="0 0 24 24"><path d="M12 20h9M16.5 3.5a2.12 2.12 0 0 1 3 3L8 18l-4 1 1-4Z"/></symbol>
@@ -872,6 +943,9 @@ input:focus, textarea:focus, select:focus {
     <div class="composer p-4 border-t border-theme bg-header-c">
       <div id="imagePreviewRow" class="max-w-4xl mx-auto mb-2" style="display:none;flex-wrap:wrap;gap:8px;"></div>
       <div class="max-w-4xl mx-auto flex items-end gap-2">
+        <button type="button" data-sticker-toggle onclick="toggleStickerPanel()" class="btn-secondary text-secondary-c p-3 w-12 h-12 flex items-center justify-center rounded-full flex-shrink-0" title="表情包" aria-label="表情包">
+          <svg class="icon"><use href="#icon-smile"></use></svg>
+        </button>
         <button type="button" onclick="triggerImagePick()" class="btn-secondary text-secondary-c p-3 w-12 h-12 flex items-center justify-center rounded-full flex-shrink-0" title="添加图片" aria-label="添加图片">
           <svg class="icon"><use href="#icon-image"></use></svg>
         </button>
@@ -884,6 +958,7 @@ input:focus, textarea:focus, select:focus {
         </button>
       </div>
     </div>
+    <div id="stickerPanel" class="sticker-panel" style="display:none;"><div id="stickerGrid" class="sticker-grid"></div></div>
     <div id="imageLightbox" class="image-lightbox" style="display:none;" onclick="closeImagePreview()"><img id="imageLightboxImg" src="" alt=""></div>
   </main>
 </div>
@@ -1033,7 +1108,7 @@ const DEFAULT_CONFIG = {
   proactiveEnabled: true,
   platformSettings: {}
 };
-const APP_VERSION = '1.0.11';
+const APP_VERSION = '1.0.12';
 const PLATFORM_CONFIGS = {
   deepseek: { baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-flash', models: ['deepseek-flash'] },
   opencode: { baseUrl: 'https://opencode.ai/zen/go/v1', model: 'deepseek-flash', keepV1InResponses: true, models: ['deepseek-flash'] },
@@ -1054,7 +1129,16 @@ let state = {
   quickReplyCharacterId: null,
   quickReplyMessageId: null,
   pendingImages: [],
+  stickers: [],
   activityLog: []
+};
+const STICKER_TAGS = ['开心', '大笑', '难过', '委屈', '生气', '无语', '惊讶', '疑惑', '害羞', '得意', '爱意', '亲亲', '抱抱', '加油', '点赞', '拒绝', '睡觉', '干杯'];
+const STICKER_LIMITS = {
+  maxCount: 40,
+  maxDimension: 384,
+  targetBytes: 120 * 1024,
+  maxTotalBytes: 3 * 1024 * 1024,
+  maxTagChars: 6
 };
 
 const MEMORY_LIMITS = {
@@ -1520,6 +1604,7 @@ function saveData() {
       characters: state.characters,
       activeCharacterId: state.activeCharacterId,
       activeTheme: state.activeTheme,
+      stickers: state.stickers,
       version: APP_VERSION
     };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(dataToSave));
@@ -1690,7 +1775,7 @@ function normalizeCharacter(rawCharacter, id, strict, skipLegacyRepair) {
        timestamp: toText(message.timestamp, new Date().toISOString()),
        extractedAt: message.extractedAt ? normalizeTimestamp(message.extractedAt, null) : null,
        apiContent: message.role === 'assistant' ? toText(message.apiContent, message.content) : '',
-       images: message.role === 'user' && Array.isArray(message.images) ? message.images.filter(function(uri) { return typeof uri === 'string' && uri; }).slice(0, 4) : undefined,
+       images: Array.isArray(message.images) ? message.images.filter(function(uri) { return typeof uri === 'string' && uri; }).slice(0, 4) : undefined,
        internalOnly: message.internalOnly === true ? true : undefined,
        staticChanges: Array.isArray(message.staticChanges) ? message.staticChanges.map(function(label) { return toText(label); }).filter(Boolean) : undefined
     };
@@ -1824,6 +1909,32 @@ function normalizeGroupMembers(items) {
   }).filter(function(member) { return member.basicInfo.name; }).slice(0, 8);
 }
 
+function normalizeStickers(raw) {
+  if (!Array.isArray(raw)) return [];
+  var result = [];
+  var seen = {};
+  var totalBytes = 0;
+  raw.forEach(function(item) {
+    if (!isPlainObject(item)) return;
+    var dataUrl = toText(item.dataUrl);
+    if (!/^data:image\//i.test(dataUrl)) return;
+    if (seen[dataUrl]) return;
+    var approxBytes = Math.round(dataUrl.length * 0.75);
+    if (totalBytes + approxBytes > STICKER_LIMITS.maxTotalBytes) return;
+    seen[dataUrl] = true;
+    totalBytes += approxBytes;
+    var tag = toText(item.tag).replace(/[\s\r\n]+/g, '').slice(0, STICKER_LIMITS.maxTagChars) || '未分类';
+    result.push({
+      id: toText(item.id) || createMemoryId('stk'),
+      dataUrl: dataUrl,
+      tag: tag,
+      createdAt: normalizeTimestamp(item.createdAt, new Date().toISOString()),
+      updatedAt: normalizeTimestamp(item.updatedAt, item.createdAt ? toText(item.createdAt) : new Date().toISOString())
+    });
+  });
+  return result.slice(0, STICKER_LIMITS.maxCount);
+}
+
 function normalizeAppData(data, strict, skipLegacyRepair) {
   if (!isPlainObject(data)) throw new Error('数据根节点格式错误');
   if (strict && !isPlainObject(data.characters)) throw new Error('characters 字段缺失或格式错误');
@@ -1877,7 +1988,8 @@ function normalizeAppData(data, strict, skipLegacyRepair) {
     },
     characters: characters,
     activeCharacterId: activeCharacterId,
-    activeTheme: activeTheme
+    activeTheme: activeTheme,
+    stickers: normalizeStickers(data.stickers)
   };
 }
 
@@ -1916,6 +2028,7 @@ function applyNormalizedData(data, isImport) {
   state.characters = data.characters;
   state.activeCharacterId = data.activeCharacterId;
   state.activeTheme = data.activeTheme;
+  state.stickers = Array.isArray(data.stickers) ? data.stickers : [];
   var repairs = window.__legacyMemoryRepairs || 0;
   if (repairs > 0) {
     window.__legacyMemoryRepairs = 0;
@@ -2705,7 +2818,7 @@ async function sendMessage(options) {
           toolState.items.push({ type: 'function_call', call_id: callId, name: primaryCall.name, arguments: primaryCall.arguments });
           var output = await executeToolCall(primaryCall, char, toolState);
           toolState.items.push({ type: 'function_call_output', call_id: callId, output: output });
-          var toolHint = { get_current_time: '正在确认时间…', search_memory: '正在回忆…', list_memories: '正在整理记忆…', delete_memory: '正在清理记忆…', set_reminder: '已记下，正在回应…', update_character_field: '已按你的要求调整设定…', web_search: '正在搜索…', web_fetch: '正在读取网页…' }[primaryCall.name] || '正在处理…';
+          var toolHint = { get_current_time: '正在确认时间…', search_memory: '正在回忆…', list_memories: '正在整理记忆…', delete_memory: '正在清理记忆…', set_reminder: '已记下，正在回应…', update_character_field: '已按你的要求调整设定…', web_search: '正在搜索…', web_fetch: '正在读取网页…', send_sticker: '正在挑表情…' }[primaryCall.name] || '正在处理…';
           setActivity('工具结果已返回，正在继续推理…');
           updateMessageBubble(loadingMsg.id, getDisplayText(toolHint));
           continue;
@@ -2832,6 +2945,9 @@ async function sendMessage(options) {
       }
     }
     displayText = dedupeRepeatedEnding(displayText, char);
+    if (toolState && toolState.stickerToSend && toolState.stickerToSend.dataUrl) {
+      loadingMsg.images = Array.from(new Set((loadingMsg.images || []).concat([toolState.stickerToSend.dataUrl])));
+    }
     loadingMsg.content = displayText;
     loadingMsg.isLoading = false;
     loadingMsg.timestamp = new Date().toISOString();
@@ -2866,6 +2982,10 @@ async function sendMessage(options) {
     await checkMemoryTriggers(char);
     scheduleSave();
     renderChat();
+    // 用户本轮发送的图片：自动入库为表情包并异步打短词标签（不阻塞回复）
+    (Array.isArray(userMessage.images) ? userMessage.images : []).forEach(function(imgUrl) {
+      addStickerFromImage(imgUrl).then(function(res) { if (res && res.created) tagStickerInBackground(res.sticker); });
+    });
   } catch (error) {
     console.error('API Error:', error);
     var loadingIndex = char.memory.instant.indexOf(loadingMsg);
@@ -4335,7 +4455,7 @@ function buildRequestPayload(char, query) {
   systemPrompt += '7. JSON必须无条件包含quickReplies：恰好两条用户下一句可直接发送给角色的短句，即使无任何记忆更新也不能省略。每条先默读为“用户：<短句>”，其中“我”只能指用户；不得复述或延续角色口吻，不得是角色安慰、承诺、建议或自我表述。示例：角色说“我会陪着你”后，正确是“谢谢你，我现在确实需要有人陪我聊聊。”，错误是“我会一直陪着你。”。不得编造事实，不用Markdown、括号动作、消息ID、时间元数据或隐藏标签。\n';
   systemPrompt += '8. JSON格式示例（未更新字段直接省略；无合格记忆返回空数组或空对象，但quickReplies仍必须两条）：{"reply":"正文（第一个字段，Markdown照常）","quickReplies":["短句一","短句二"],"shortTerm":[{"content":"按时间和因果顺序概括本轮事件经过","sourceMessageIds":["msg_id"]}],"dynamicState":{"currentSituation":{"value":"此刻正与导师在魔法塔顶对峙，气氛紧张。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentMood":{"value":"情绪紧绷，但仍强作镇定。","sourceMessageIds":["current_response"],"evidence":"概括本轮回复大意"},"currentLocation":{"value":"正位于魔法塔顶，寒风呼啸。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentGoal":{"value":"想从导师口中问出真相。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"}},"staticFields":{"personality":{"value":"性格冷静克制，遇事沉稳。","sourceMessageIds":["真实ID"],"evidence":"用户原话"}}' + (char.entityType === 'group' ? ',"memberDynamicState":[{"memberName":"成员原名","dynamicState":{"currentMood":{"value":"成员情绪","sourceMessageIds":["current_response"],"evidence":"概括本轮回复"}}}]' : '') + ',"promiseUpdates":[{"promiseId":"mem_id","status":"resolved","sourceMessageIds":["msg_id"],"evidence":"用户明确完成或取消的原话"}],"longTerm":[{"category":"userProfile","subject":"user","key":"稳定标识","value":"事实","tags":["关键词"],"importance":1,"sourceMessageIds":["msg_id"],"evidence":"原话短句","eventTime":"ISO时间"}]}。JSON字符串转义：真实换行写\\n，字面反斜杠写\\\\，双引号写\\"。\n';
   systemPrompt += '9. longTerm.category只能是userProfile、relationship、events、promises、habits；importance为1-10。\n';
-  systemPrompt += 'A. 本会话可使用工具。需要确认当前时间/日期时用 get_current_time；需要回忆此前记录的承诺、约定、用户喜好或共同经历时用 search_memory（检索不到再考虑 list_memories 按分类盘点）；发现记忆过期、重复或已被用户纠正时用 list_memories 定位后 delete_memory 删除；用户明确提出待办、约定或承诺时用 set_reminder 记录；查询实时资讯、新闻、天气、需要核实的事实时用 web_search；用户给出链接、或需要查看网页正文、或需要查看网上的图片时用 web_fetch。当记忆缺失、表述含糊、关键事实无法可靠推断时，优先用 ask_user 提出简短澄清，不要凭空编造。工具结果属于系统提供的内部上下文，仅供理解，自然融入reply正文即可，不得向用户透露检索过程、工具名称或结果标签。\n';
+  systemPrompt += 'A. 本会话可使用工具。需要确认当前时间/日期时用 get_current_time；需要回忆此前记录的承诺、约定、用户喜好或共同经历时用 search_memory（检索不到再考虑 list_memories 按分类盘点）；发现记忆过期、重复或已被用户纠正时用 list_memories 定位后 delete_memory 删除；用户明确提出待办、约定或承诺时用 set_reminder 记录；查询实时资讯、新闻、天气、需要核实的事实时用 web_search；用户给出链接、或需要查看网页正文、或需要查看网上的图片时用 web_fetch；当你想用表情包、贴图来表达情绪时用 send_sticker（tag 必须从工具描述里给出的可用标签中选择）。当记忆缺失、表述含糊、关键事实无法可靠推断时，优先用 ask_user 提出简短澄清，不要凭空编造。工具结果属于系统提供的内部上下文，仅供理解，自然融入reply正文即可，不得向用户透露检索过程、工具名称或结果标签；但工具返回的图片本身是内容，可以直接展示给用户。\n';
   if (char.entityType === 'group') {
     systemPrompt += '10. 当前是群组对话。只能由已列出的成员发言，可由一人或多人回应。reply字段中用户可见回复必须使用每人独立一行的“成员名：\"内容\"”格式，例如“张三：\"我明白。\"\n李四：\"我也这么想。\"”。不要写旁白、不要添加未列出的发言者；quickReplies同样必须保留两条，内容是用户可以发给全体或某位成员的话。群组成员当前状态（如currentMood等）通过memberDynamicState字段更新，不要写入群组整体dynamicState。\n';
     systemPrompt += '11. 记忆归属：每位成员有自己的私人记忆，互相不知道对方记得什么。只有当某件事实是全体都知道的（如用户公开告诉所有人的信息、群内公开讨论的事）才写入共享记忆（longTerm不填memberName）；若某事实只有某位成员知道、或属于某成员对用户的个人印象/私人约定，则在该条longTerm中填memberName记入其私人记忆。引用成员私人记忆时只能用该成员自己的记忆，不得张冠李戴。\n';
@@ -4501,6 +4621,17 @@ function buildAgentTools() {
       parameters: { type: 'object', properties: { url: { type: 'string', description: '要抓取的 http(s) 链接' } }, required: ['url'], additionalProperties: false }
     }
   ];
+  var stickers = Array.isArray(state.stickers) ? state.stickers : [];
+  if (stickers.length > 0) {
+    var stickerTags = [];
+    stickers.forEach(function(s) { if (stickerTags.indexOf(s.tag) === -1) stickerTags.push(s.tag); });
+    tools.push({
+      type: 'function',
+      name: 'send_sticker',
+      description: '给用户发一个表情包（贴图）。tag 必须从这些可用标签中选择其一：' + stickerTags.join('、') + '。当你想用表情包/贴图表达情绪时使用；发送后贴图会直接显示在你的消息里，不需要再用文字描述它。',
+      parameters: { type: 'object', properties: { tag: { type: 'string', enum: stickerTags, description: '表情包标签' } }, required: ['tag'], additionalProperties: false }
+    });
+  }
   tools.push({ type: 'web_search' });
   return tools;
 }
@@ -4726,6 +4857,18 @@ async function executeToolCall(call, char, toolState) {
       var fetchUrl = toText(args.url).trim();
       if (!/^https?:\/\//i.test(fetchUrl)) return JSON.stringify({ ok: false, reason: 'url 必须是 http(s) 链接' });
       return await fetchWebContent(fetchUrl);
+    }
+    if (name === 'send_sticker') {
+      var wantedTag = toText(args.tag).trim();
+      if (!wantedTag) return JSON.stringify({ ok: false, reason: '缺少 tag，请从可用标签中选择一个' });
+      var matches = getStickersByTag(wantedTag);
+      if (matches.length === 0) {
+        var allTags = (Array.isArray(state.stickers) ? state.stickers : []).map(function(s) { return s.tag; }).filter(function(v, i, a) { return a.indexOf(v) === i; });
+        return JSON.stringify({ ok: false, reason: '没有该标签的表情包；可用标签：' + allTags.join('、') });
+      }
+      var chosenSticker = matches[matches.length - 1];
+      if (toolState) toolState.stickerToSend = { tag: chosenSticker.tag, dataUrl: chosenSticker.dataUrl };
+      return JSON.stringify({ ok: true, tag: chosenSticker.tag, sent: true });
     }
     return JSON.stringify({ ok: false, reason: '未知工具: ' + name });
   } catch (e) {
@@ -5776,6 +5919,7 @@ function exportAllData() {
       characters: state.characters,
       activeCharacterId: state.activeCharacterId,
       activeTheme: state.activeTheme,
+      stickers: state.stickers,
       exportDate: new Date().toISOString(),
       version: APP_VERSION
     };
@@ -6200,6 +6344,169 @@ function closeImagePreview() {
   if (img) img.src = '';
 }
 
+// ==================== 表情包库（来源：用户发送的图片，短词标签） ====================
+function stickerStorageBytes() {
+  return (state.stickers || []).reduce(function(sum, s) { return sum + Math.round(toText(s.dataUrl).length * 0.75); }, 0);
+}
+
+function compressStickerDataUrl(dataUrl) {
+  return new Promise(function(resolve) {
+    var img = new Image();
+    img.onload = function() {
+      try {
+        var scale = Math.min(1, STICKER_LIMITS.maxDimension / Math.max(img.width, img.height));
+        var w = Math.max(1, Math.round(img.width * scale));
+        var h = Math.max(1, Math.round(img.height * scale));
+        var canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        var ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, w, h);
+        ctx.drawImage(img, 0, 0, w, h);
+        var quality = 0.82;
+        var out = canvas.toDataURL('image/jpeg', quality);
+        while (out.length * 0.75 > STICKER_LIMITS.targetBytes && quality > 0.4) {
+          quality -= 0.12;
+          out = canvas.toDataURL('image/jpeg', quality);
+        }
+        resolve(out);
+      } catch (e) {
+        resolve(null);
+      }
+    };
+    img.onerror = function() { resolve(null); };
+    img.src = dataUrl;
+  });
+}
+
+async function addStickerFromImage(dataUrl) {
+  if (!dataUrl || !/^data:image\//i.test(dataUrl)) return null;
+  state.stickers = Array.isArray(state.stickers) ? state.stickers : [];
+  var rawDup = state.stickers.find(function(s) { return s.dataUrl === dataUrl; });
+  if (rawDup) return { sticker: rawDup, created: false };
+  var stickerUrl = await compressStickerDataUrl(dataUrl);
+  if (!stickerUrl) return null;
+  var dup = state.stickers.find(function(s) { return s.dataUrl === stickerUrl; });
+  if (dup) return { sticker: dup, created: false };
+  if (state.stickers.length >= STICKER_LIMITS.maxCount) {
+    alert('表情包库已满（最多 ' + STICKER_LIMITS.maxCount + ' 张），请先删除一些再加。');
+    return null;
+  }
+  var approx = Math.round(stickerUrl.length * 0.75);
+  if (stickerStorageBytes() + approx > STICKER_LIMITS.maxTotalBytes) {
+    alert('表情包存储空间不足，请先删除一些再加。');
+    return null;
+  }
+  var now = new Date().toISOString();
+  var sticker = { id: createMemoryId('stk'), dataUrl: stickerUrl, tag: '未分类', createdAt: now, updatedAt: now };
+  state.stickers.push(sticker);
+  scheduleSave();
+  renderStickerPanel();
+  return { sticker: sticker, created: true };
+}
+
+async function tagStickerImage(dataUrl) {
+  try {
+    var response = await callAPI([
+      { role: 'system', content: '你是表情包分类助手。看这张表情包或图片，从下列标签中选一个最贴切的：' + STICKER_TAGS.join('、') + '。若都不贴切，就给出一个 1 到 ' + STICKER_LIMITS.maxTagChars + ' 字的中文短词。只输出这一个词，不要标点、解释或其它文字。' },
+      { role: 'user', content: [ { type: 'input_text', text: '给这张图打一个短词标签。' }, { type: 'input_image', image_url: dataUrl, detail: 'low' } ] }
+    ]);
+    var raw = toText(response.choices[0].message.content).replace(/[\s\r\n"'“”‘’。，,、！!？?：:；;（）()\[\]]/g, '');
+    return raw.slice(0, STICKER_LIMITS.maxTagChars);
+  } catch (e) {
+    return '';
+  }
+}
+
+async function tagStickerInBackground(sticker) {
+  if (!sticker || !state.config.apiKey) return;
+  var tag = await tagStickerImage(sticker.dataUrl);
+  if (!tag) return;
+  var living = (state.stickers || []).find(function(s) { return s.id === sticker.id; });
+  if (!living) return;
+  living.tag = tag;
+  living.updatedAt = new Date().toISOString();
+  scheduleSave();
+  renderStickerPanel();
+}
+
+function getStickersByTag(tag) {
+  var needle = toText(tag).trim();
+  if (!needle) return [];
+  var exact = (state.stickers || []).filter(function(s) { return s.tag === needle; });
+  if (exact.length) return exact;
+  return (state.stickers || []).filter(function(s) { return toText(s.tag).indexOf(needle) !== -1 || needle.indexOf(toText(s.tag)) !== -1; });
+}
+
+function toggleStickerPanel(force) {
+  var panel = document.getElementById('stickerPanel');
+  if (!panel) return;
+  var isHidden = !panel.style.display || panel.style.display === 'none';
+  var open = typeof force === 'boolean' ? force : isHidden;
+  panel.style.display = open ? 'block' : 'none';
+  if (open) renderStickerPanel();
+}
+
+function renderStickerPanel() {
+  var panel = document.getElementById('stickerPanel');
+  if (!panel) return;
+  var grid = document.getElementById('stickerGrid');
+  if (!grid) return;
+  var list = Array.isArray(state.stickers) ? state.stickers : [];
+  if (list.length === 0) {
+    grid.innerHTML = '<div class="sticker-empty">还没有表情包。发送或上传一张图片后会自动收藏并打标签。</div>';
+    return;
+  }
+  grid.innerHTML = list.map(function(s) {
+    var tagHtml = (state.editingStickerId === s.id)
+      ? '<input class="sticker-tag-input" value="' + escapeHtml(s.tag) + '" onkeydown="if(event.key===\'Enter\'){this.blur()}else if(event.key===\'Escape\'){state.editingStickerId=null;renderStickerPanel()}" onblur="saveStickerTag(\'' + escapeHtml(s.id) + '\', this.value)">'
+      : '<span class="sticker-tag" onclick="editStickerTag(\'' + escapeHtml(s.id) + '\')" title="点击改标签">' + escapeHtml(s.tag) + '</span>';
+    return '<div class="sticker-cell">' +
+      '<img src="' + escapeHtml(s.dataUrl) + '" class="sticker-thumb" alt="' + escapeHtml(s.tag) + '" onclick="sendStickerAsUser(\'' + escapeHtml(s.id) + '\')">' +
+      '<div class="sticker-bar">' + tagHtml +
+      '<button type="button" class="sticker-del" onclick="deleteSticker(\'' + escapeHtml(s.id) + '\')" aria-label="删除">×</button></div>' +
+      '</div>';
+  }).join('');
+  var input = grid.querySelector('.sticker-tag-input');
+  if (input) input.focus();
+}
+
+function sendStickerAsUser(id) {
+  var sticker = (state.stickers || []).find(function(s) { return s.id === id; });
+  if (!sticker || state.isProcessing) return;
+  state.pendingImages = [{ dataUrl: sticker.dataUrl }];
+  renderImagePreview();
+  toggleStickerPanel(false);
+  sendMessage();
+}
+
+function deleteSticker(id) {
+  if (!Array.isArray(state.stickers)) return;
+  state.stickers = state.stickers.filter(function(s) { return s.id !== id; });
+  scheduleSave();
+  renderStickerPanel();
+}
+
+function editStickerTag(id) {
+  state.editingStickerId = id;
+  renderStickerPanel();
+}
+
+function saveStickerTag(id, value) {
+  var sticker = (state.stickers || []).find(function(s) { return s.id === id; });
+  if (sticker) {
+    var tag = toText(value).replace(/[\s\r\n]+/g, '').slice(0, STICKER_LIMITS.maxTagChars);
+    if (tag) {
+      sticker.tag = tag;
+      sticker.updatedAt = new Date().toISOString();
+      scheduleSave();
+    }
+  }
+  state.editingStickerId = null;
+  renderStickerPanel();
+}
+
 function toggleSidebar(force) {
   var sidebar = document.getElementById('sidebar');
   var overlay = document.getElementById('sidebarOverlay');
@@ -6558,6 +6865,7 @@ window.addEventListener('DOMContentLoaded', function() {
 
   document.addEventListener('click', function(event) {
     if (!event.target.closest('.theme-menu-wrap')) toggleThemeMenu(false);
+    if (!event.target.closest('#stickerPanel') && !event.target.closest('[data-sticker-toggle]')) toggleStickerPanel(false);
   });
 });
 
