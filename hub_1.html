@@ -355,7 +355,7 @@ input:focus, textarea:focus, select:focus {
   position: fixed;
   left: 50%;
   transform: translateX(-50%);
-  bottom: 96px;
+  bottom: 88px;
   z-index: 70;
   width: min(92vw, 460px);
   max-height: 44vh;
@@ -365,6 +365,27 @@ input:focus, textarea:focus, select:focus {
   border-radius: 14px;
   padding: 10px;
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+}
+.sticker-panel-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.sticker-upload {
+  font-size: 12px;
+  line-height: 1;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--input-border);
+  background: transparent;
+  color: var(--text-color);
+  cursor: pointer;
+}
+.sticker-count {
+  font-size: 11px;
+  color: var(--text-muted);
 }
 .sticker-grid {
   display: grid;
@@ -943,10 +964,10 @@ input:focus, textarea:focus, select:focus {
     <div class="composer p-4 border-t border-theme bg-header-c">
       <div id="imagePreviewRow" class="max-w-4xl mx-auto mb-2" style="display:none;flex-wrap:wrap;gap:8px;"></div>
       <div class="max-w-4xl mx-auto flex items-end gap-2">
-        <button type="button" data-sticker-toggle onclick="toggleStickerPanel()" class="btn-secondary text-secondary-c p-3 w-12 h-12 flex items-center justify-center rounded-full flex-shrink-0" title="表情包" aria-label="表情包">
+        <button type="button" data-sticker-toggle onclick="toggleStickerPanel()" class="btn-secondary text-secondary-c p-2 w-8 h-8 text-sm flex items-center justify-center rounded-full flex-shrink-0" title="表情包" aria-label="表情包">
           <svg class="icon"><use href="#icon-smile"></use></svg>
         </button>
-        <button type="button" onclick="triggerImagePick()" class="btn-secondary text-secondary-c p-3 w-12 h-12 flex items-center justify-center rounded-full flex-shrink-0" title="添加图片" aria-label="添加图片">
+        <button type="button" onclick="triggerImagePick()" class="btn-secondary text-secondary-c p-2 w-8 h-8 text-sm flex items-center justify-center rounded-full flex-shrink-0" title="添加图片" aria-label="添加图片">
           <svg class="icon"><use href="#icon-image"></use></svg>
         </button>
         <input type="file" id="imageInput" accept="image/*" multiple class="hidden" onchange="handleImagePick(event)">
@@ -958,7 +979,14 @@ input:focus, textarea:focus, select:focus {
         </button>
       </div>
     </div>
-    <div id="stickerPanel" class="sticker-panel" style="display:none;"><div id="stickerGrid" class="sticker-grid"></div></div>
+    <div id="stickerPanel" class="sticker-panel" style="display:none;">
+      <div class="sticker-panel-bar">
+        <button type="button" class="sticker-upload" onclick="triggerStickerUpload()">+ 上传表情</button>
+        <span id="stickerCount" class="sticker-count"></span>
+      </div>
+      <div id="stickerGrid" class="sticker-grid"></div>
+    </div>
+    <input type="file" id="stickerInput" accept="image/*" multiple class="hidden" onchange="handleStickerPick(event)">
     <div id="imageLightbox" class="image-lightbox" style="display:none;" onclick="closeImagePreview()"><img id="imageLightboxImg" src="" alt=""></div>
   </main>
 </div>
@@ -1108,7 +1136,7 @@ const DEFAULT_CONFIG = {
   proactiveEnabled: true,
   platformSettings: {}
 };
-const APP_VERSION = '1.0.12';
+const APP_VERSION = '1.0.13';
 const PLATFORM_CONFIGS = {
   deepseek: { baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-flash', models: ['deepseek-flash'] },
   opencode: { baseUrl: 'https://opencode.ai/zen/go/v1', model: 'deepseek-flash', keepV1InResponses: true, models: ['deepseek-flash'] },
@@ -1129,15 +1157,13 @@ let state = {
   quickReplyCharacterId: null,
   quickReplyMessageId: null,
   pendingImages: [],
-  stickers: [],
+  editingStickerId: null,
   activityLog: []
 };
 const STICKER_TAGS = ['开心', '大笑', '难过', '委屈', '生气', '无语', '惊讶', '疑惑', '害羞', '得意', '爱意', '亲亲', '抱抱', '加油', '点赞', '拒绝', '睡觉', '干杯'];
 const STICKER_LIMITS = {
-  maxCount: 40,
   maxDimension: 384,
   targetBytes: 120 * 1024,
-  maxTotalBytes: 3 * 1024 * 1024,
   maxTagChars: 6
 };
 
@@ -1604,7 +1630,6 @@ function saveData() {
       characters: state.characters,
       activeCharacterId: state.activeCharacterId,
       activeTheme: state.activeTheme,
-      stickers: state.stickers,
       version: APP_VERSION
     };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(dataToSave));
@@ -1850,6 +1875,7 @@ function normalizeCharacter(rawCharacter, id, strict, skipLegacyRepair) {
     }
   }
   if (rawCharacter.avatarRepairPending) character.avatarRepairPending = true;
+  character.stickers = normalizeStickers(rawCharacter.stickers);
   return character;
 }
 
@@ -1913,16 +1939,12 @@ function normalizeStickers(raw) {
   if (!Array.isArray(raw)) return [];
   var result = [];
   var seen = {};
-  var totalBytes = 0;
   raw.forEach(function(item) {
     if (!isPlainObject(item)) return;
     var dataUrl = toText(item.dataUrl);
     if (!/^data:image\//i.test(dataUrl)) return;
     if (seen[dataUrl]) return;
-    var approxBytes = Math.round(dataUrl.length * 0.75);
-    if (totalBytes + approxBytes > STICKER_LIMITS.maxTotalBytes) return;
     seen[dataUrl] = true;
-    totalBytes += approxBytes;
     var tag = toText(item.tag).replace(/[\s\r\n]+/g, '').slice(0, STICKER_LIMITS.maxTagChars) || '未分类';
     result.push({
       id: toText(item.id) || createMemoryId('stk'),
@@ -1932,7 +1954,7 @@ function normalizeStickers(raw) {
       updatedAt: normalizeTimestamp(item.updatedAt, item.createdAt ? toText(item.createdAt) : new Date().toISOString())
     });
   });
-  return result.slice(0, STICKER_LIMITS.maxCount);
+  return result;
 }
 
 function normalizeAppData(data, strict, skipLegacyRepair) {
@@ -1973,6 +1995,12 @@ function normalizeAppData(data, strict, skipLegacyRepair) {
   if (!activeCharacterId || !characters[activeCharacterId]) activeCharacterId = Object.keys(characters)[0] || null;
   var activeTheme = ['theme-black', 'theme-blue', 'theme-yellow'].indexOf(data.activeTheme) !== -1 ? data.activeTheme : '';
 
+  // 旧版全局表情包迁移：并入当前激活角色/群组（一次性；新存档不再写全局字段）
+  var legacyStickers = normalizeStickers(data.stickers);
+  if (legacyStickers.length > 0 && activeCharacterId && characters[activeCharacterId] && characters[activeCharacterId].stickers.length === 0) {
+    characters[activeCharacterId].stickers = legacyStickers;
+  }
+
   return {
     config: {
       apiPlatform: platform,
@@ -1988,8 +2016,7 @@ function normalizeAppData(data, strict, skipLegacyRepair) {
     },
     characters: characters,
     activeCharacterId: activeCharacterId,
-    activeTheme: activeTheme,
-    stickers: normalizeStickers(data.stickers)
+    activeTheme: activeTheme
   };
 }
 
@@ -2028,7 +2055,6 @@ function applyNormalizedData(data, isImport) {
   state.characters = data.characters;
   state.activeCharacterId = data.activeCharacterId;
   state.activeTheme = data.activeTheme;
-  state.stickers = Array.isArray(data.stickers) ? data.stickers : [];
   var repairs = window.__legacyMemoryRepairs || 0;
   if (repairs > 0) {
     window.__legacyMemoryRepairs = 0;
@@ -2080,6 +2106,7 @@ function createCharacterObj(name, avatar, personality, background) {
     },
     dynamicState: { currentSituation: '', currentLocation: '', currentMood: '', currentFocus: '', recentDevelopment: '', currentOccupation: '', currentGoal: '', currentRelationship: '', currentSocialStyle: '', currentImportantOthers: '', currentEmotionalTendency: '' },
     dynamicStateMeta: {},
+    stickers: [],
     memory: {
       instant: [], shortTerm: [],
       longTerm: { userProfile: [], relationship: [], events: [], promises: [], habits: [] },
@@ -2126,6 +2153,8 @@ function selectCharacter(id) {
   if (!state.characters[id]) return;
   invalidateQuickReplies();
   state.activeCharacterId = id;
+  state.editingStickerId = null;
+  toggleStickerPanel(false);
   scheduleSave();
   renderCharacterList();
   renderChat();
@@ -2255,13 +2284,14 @@ function renderChat(forceFollow) {
     var timeClass = msg.role === 'user' ? 'opacity-70' : 'text-muted-c';
     var avatarHtml = msg.role === 'user' ? '' : '<div class="message-avatar">' + renderAvatarHtml(char, 'message-avatar-img', '') + '</div>';
     var safeMsgId = escapeHtml(msg.id || '');
-    var actionHtml = state.isProcessing ? '' : (
+    var actionHtml = (state.isProcessing || !formattedContent) ? '' : (
       '<button class="message-action" data-message-action="copy" data-msg-id="' + safeMsgId + '" title="复制消息" aria-label="复制消息"><svg class="icon text-sm"><use href="#icon-copy"></use></svg></button>' +
       (msg.role === 'user'
         ? '<button class="message-action" data-message-action="edit-resend" data-msg-id="' + safeMsgId + '" title="编辑并重发" aria-label="编辑并重发"><svg class="icon text-sm"><use href="#icon-edit"></use></svg></button>'
         : '<button class="message-action" data-message-action="regenerate" data-msg-id="' + safeMsgId + '" title="重新生成" aria-label="重新生成"><svg class="icon text-sm"><use href="#icon-refresh"></use></svg></button>'));
     var staticChangesHtml = (msg.role === 'assistant' && Array.isArray(msg.staticChanges) && msg.staticChanges.length > 0) ? '<div class="text-xs mt-1" style="color: var(--warning-color, #b45309);">⚡ ' + escapeHtml(msg.staticChanges.join(' · ')) + '已修改</div>' : '';
-    div.innerHTML = avatarHtml + '<div class="message-bubble ' + bubbleClass + '">' + imagesHtml + '<div class="message-content">' + formattedContent + '</div>' + staticChangesHtml + '<div class="message-meta"><span class="text-xs ' + timeClass + '">' + time + '</span>' + actionHtml + '</div></div>';
+    var contentHtml = formattedContent ? '<div class="message-content">' + formattedContent + '</div>' : '';
+    div.innerHTML = avatarHtml + '<div class="message-bubble ' + bubbleClass + '">' + imagesHtml + contentHtml + staticChangesHtml + '<div class="message-meta"><span class="text-xs ' + timeClass + '">' + time + '</span>' + actionHtml + '</div></div>';
     container.appendChild(div);
     messageRowCache[msg.id || ''] = div;
     if (msg.role === 'assistant' && index === latestAssistantIndex && state.quickReplyCharacterId === char.id && state.quickReplyMessageId === msg.id) appendQuickReplyRow(container);
@@ -2771,7 +2801,7 @@ async function sendMessage(options) {
     var attemptsLeft = 2;
     var didRetry = false;
     var requestStartTime = Date.now();
-    var toolState = { items: [], rounds: 0 };
+    var toolState = { items: [], rounds: 0, char: char };
     var phase = 'auto';
     var submitAttempted = false;
     var structuredFromSubmit = null;
@@ -2945,13 +2975,25 @@ async function sendMessage(options) {
       }
     }
     displayText = dedupeRepeatedEnding(displayText, char);
-    if (toolState && toolState.stickerToSend && toolState.stickerToSend.dataUrl) {
-      loadingMsg.images = Array.from(new Set((loadingMsg.images || []).concat([toolState.stickerToSend.dataUrl])));
-    }
     loadingMsg.content = displayText;
     loadingMsg.isLoading = false;
     loadingMsg.timestamp = new Date().toISOString();
     consumeInjectedRecalls(char);
+    var stickerMsg = null;
+    if (toolState && toolState.stickerToSend && toolState.stickerToSend.dataUrl) {
+      // 表情包作为紧跟其后的独立消息（不并入正文气泡，相当于两条消息）
+      stickerMsg = {
+        id: createMemoryId('msg'),
+        role: 'assistant',
+        content: '',
+        apiContent: '',
+        images: [toolState.stickerToSend.dataUrl],
+        timestamp: new Date().toISOString()
+      };
+      var replyIndexNow = char.memory.instant.indexOf(loadingMsg);
+      if (replyIndexNow >= 0) char.memory.instant.splice(replyIndexNow + 1, 0, stickerMsg);
+      else char.memory.instant.push(stickerMsg);
+    }
     var hasStructuredMemory = memUpdate && memUpdate._accepted && (memUpdate._accepted.shortTerm + memUpdate._accepted.longTerm > 0);
     if (!hasStructuredMemory && shouldCaptureUserTurn(text)) {
       addShortTermMemory(char, '本轮事件：用户表示“' + text + '”。尚未形成更完整的事件经过。', userMessage.timestamp, { sourceMessageIds: [userMessage.id], sourceRoles: ['user'] });
@@ -2962,7 +3004,7 @@ async function sendMessage(options) {
     if (quickReplies.length > 0) {
       state.quickReplies = quickReplies;
       state.quickReplyCharacterId = char.id;
-      state.quickReplyMessageId = loadingMsg.id;
+      state.quickReplyMessageId = stickerMsg ? stickerMsg.id : loadingMsg.id;
     }
     try {
       localStorage.setItem(DEBUG_REPLY_STORAGE_KEY, JSON.stringify({
@@ -2984,7 +3026,7 @@ async function sendMessage(options) {
     renderChat();
     // 用户本轮发送的图片：自动入库为表情包并异步打短词标签（不阻塞回复）
     (Array.isArray(userMessage.images) ? userMessage.images : []).forEach(function(imgUrl) {
-      addStickerFromImage(imgUrl).then(function(res) { if (res && res.created) tagStickerInBackground(res.sticker); });
+      addStickerFromImage(imgUrl, char).then(function(res) { if (res && res.created) tagStickerInBackground(res.sticker, char); });
     });
   } catch (error) {
     console.error('API Error:', error);
@@ -4485,7 +4527,9 @@ function buildRequestPayload(char, query) {
         recentMessages.push({ role: 'user', content: buildUserMessageContent(trimText(userContent, 800), messageImages) });
       }
     } else {
-      recentMessages.push({ role: 'assistant', content: trimText(toText(message.apiContent || message.content), 1200) });
+      var assistantHistoryText = trimText(toText(message.apiContent || message.content), 1200);
+      if (!assistantHistoryText) return; // 纯表情包消息不进请求（图片不发给模型）
+      recentMessages.push({ role: 'assistant', content: assistantHistoryText });
     }
   });
   return [{ role: 'system', content: systemPrompt }].concat(recentMessages);
@@ -4569,7 +4613,7 @@ function isAgentToolsEnabled() {
   return isResponsesApiEnabled();
 }
 
-function buildAgentTools() {
+function buildAgentTools(char) {
   if (!isAgentToolsEnabled()) return [];
   var tools = [
     {
@@ -4621,14 +4665,14 @@ function buildAgentTools() {
       parameters: { type: 'object', properties: { url: { type: 'string', description: '要抓取的 http(s) 链接' } }, required: ['url'], additionalProperties: false }
     }
   ];
-  var stickers = Array.isArray(state.stickers) ? state.stickers : [];
+  var stickers = (char && Array.isArray(char.stickers)) ? char.stickers : [];
   if (stickers.length > 0) {
     var stickerTags = [];
     stickers.forEach(function(s) { if (stickerTags.indexOf(s.tag) === -1) stickerTags.push(s.tag); });
     tools.push({
       type: 'function',
       name: 'send_sticker',
-      description: '给用户发一个表情包（贴图）。tag 必须从这些可用标签中选择其一：' + stickerTags.join('、') + '。当你想用表情包/贴图表达情绪时使用；发送后贴图会直接显示在你的消息里，不需要再用文字描述它。',
+      description: '给用户发一个表情包（贴图）。tag 必须从这些可用标签中选择其一：' + stickerTags.join('、') + '。当你想用表情包/贴图表达情绪时使用；贴图会作为你的下一条消息单独发出，不需要再用文字描述它。',
       parameters: { type: 'object', properties: { tag: { type: 'string', enum: stickerTags, description: '表情包标签' } }, required: ['tag'], additionalProperties: false }
     });
   }
@@ -4861,9 +4905,9 @@ async function executeToolCall(call, char, toolState) {
     if (name === 'send_sticker') {
       var wantedTag = toText(args.tag).trim();
       if (!wantedTag) return JSON.stringify({ ok: false, reason: '缺少 tag，请从可用标签中选择一个' });
-      var matches = getStickersByTag(wantedTag);
+      var matches = getStickersByTag(char, wantedTag);
       if (matches.length === 0) {
-        var allTags = (Array.isArray(state.stickers) ? state.stickers : []).map(function(s) { return s.tag; }).filter(function(v, i, a) { return a.indexOf(v) === i; });
+        var allTags = getHostStickers(char).map(function(s) { return s.tag; }).filter(function(v, i, a) { return a.indexOf(v) === i; });
         return JSON.stringify({ ok: false, reason: '没有该标签的表情包；可用标签：' + allTags.join('、') });
       }
       var chosenSticker = matches[matches.length - 1];
@@ -4977,7 +5021,7 @@ function buildResponsesRequestBody(messages, stream, toolState, phase) {
     body.tools = [buildSubmitResponseTool()];
     body.tool_choice = { type: 'function', name: 'submit_response' };
   } else {
-    body.tools = buildAgentTools();
+    body.tools = buildAgentTools(toolState && toolState.char);
     body.tool_choice = 'auto';
   }
   return body;
@@ -5919,7 +5963,6 @@ function exportAllData() {
       characters: state.characters,
       activeCharacterId: state.activeCharacterId,
       activeTheme: state.activeTheme,
-      stickers: state.stickers,
       exportDate: new Date().toISOString(),
       version: APP_VERSION
     };
@@ -6344,9 +6387,45 @@ function closeImagePreview() {
   if (img) img.src = '';
 }
 
-// ==================== 表情包库（来源：用户发送的图片，短词标签） ====================
-function stickerStorageBytes() {
-  return (state.stickers || []).reduce(function(sum, s) { return sum + Math.round(toText(s.dataUrl).length * 0.75); }, 0);
+// ==================== 表情包库（每个角色/群组独立；用户可上传，双方均可发送） ====================
+function getActiveStickerHost() {
+  return state.activeCharacterId ? (state.characters[state.activeCharacterId] || null) : null;
+}
+
+function getHostStickers(host) {
+  if (!host) return [];
+  if (!Array.isArray(host.stickers)) host.stickers = [];
+  return host.stickers;
+}
+
+function readFileAsDataUrl(file) {
+  return new Promise(function(resolve) {
+    var reader = new FileReader();
+    reader.onload = function() { resolve(reader.result); };
+    reader.onerror = function() { resolve(null); };
+    reader.readAsDataURL(file);
+  });
+}
+
+function triggerStickerUpload() {
+  var input = document.getElementById('stickerInput');
+  if (input) input.click();
+}
+
+function handleStickerPick(event) {
+  var host = getActiveStickerHost();
+  var files = Array.prototype.slice.call(event.target.files || []);
+  event.target.value = '';
+  if (!host) return;
+  files.forEach(function(file) {
+    if (!file || file.type.indexOf('image/') !== 0) return;
+    readFileAsDataUrl(file).then(function(dataUrl) {
+      if (!dataUrl) return;
+      return addStickerFromImage(dataUrl, host).then(function(res) {
+        if (res && res.created) tagStickerInBackground(res.sticker, host);
+      });
+    }).catch(function() { alert('图片处理失败，请换一张试试'); });
+  });
 }
 
 function compressStickerDataUrl(dataUrl) {
@@ -6380,29 +6459,22 @@ function compressStickerDataUrl(dataUrl) {
   });
 }
 
-async function addStickerFromImage(dataUrl) {
+async function addStickerFromImage(dataUrl, host) {
   if (!dataUrl || !/^data:image\//i.test(dataUrl)) return null;
-  state.stickers = Array.isArray(state.stickers) ? state.stickers : [];
-  var rawDup = state.stickers.find(function(s) { return s.dataUrl === dataUrl; });
+  host = host || getActiveStickerHost();
+  if (!host) return null;
+  var list = getHostStickers(host);
+  var rawDup = list.find(function(s) { return s.dataUrl === dataUrl; });
   if (rawDup) return { sticker: rawDup, created: false };
   var stickerUrl = await compressStickerDataUrl(dataUrl);
   if (!stickerUrl) return null;
-  var dup = state.stickers.find(function(s) { return s.dataUrl === stickerUrl; });
+  var dup = list.find(function(s) { return s.dataUrl === stickerUrl; });
   if (dup) return { sticker: dup, created: false };
-  if (state.stickers.length >= STICKER_LIMITS.maxCount) {
-    alert('表情包库已满（最多 ' + STICKER_LIMITS.maxCount + ' 张），请先删除一些再加。');
-    return null;
-  }
-  var approx = Math.round(stickerUrl.length * 0.75);
-  if (stickerStorageBytes() + approx > STICKER_LIMITS.maxTotalBytes) {
-    alert('表情包存储空间不足，请先删除一些再加。');
-    return null;
-  }
   var now = new Date().toISOString();
   var sticker = { id: createMemoryId('stk'), dataUrl: stickerUrl, tag: '未分类', createdAt: now, updatedAt: now };
-  state.stickers.push(sticker);
+  list.push(sticker);
   scheduleSave();
-  renderStickerPanel();
+  if (host === getActiveStickerHost()) renderStickerPanel();
   return { sticker: sticker, created: true };
 }
 
@@ -6419,24 +6491,27 @@ async function tagStickerImage(dataUrl) {
   }
 }
 
-async function tagStickerInBackground(sticker) {
+async function tagStickerInBackground(sticker, host) {
   if (!sticker || !state.config.apiKey) return;
+  host = host || getActiveStickerHost();
+  if (!host) return;
   var tag = await tagStickerImage(sticker.dataUrl);
   if (!tag) return;
-  var living = (state.stickers || []).find(function(s) { return s.id === sticker.id; });
+  var living = getHostStickers(host).find(function(s) { return s.id === sticker.id; });
   if (!living) return;
   living.tag = tag;
   living.updatedAt = new Date().toISOString();
   scheduleSave();
-  renderStickerPanel();
+  if (host === getActiveStickerHost()) renderStickerPanel();
 }
 
-function getStickersByTag(tag) {
+function getStickersByTag(host, tag) {
+  var list = getHostStickers(host);
   var needle = toText(tag).trim();
   if (!needle) return [];
-  var exact = (state.stickers || []).filter(function(s) { return s.tag === needle; });
+  var exact = list.filter(function(s) { return s.tag === needle; });
   if (exact.length) return exact;
-  return (state.stickers || []).filter(function(s) { return toText(s.tag).indexOf(needle) !== -1 || needle.indexOf(toText(s.tag)) !== -1; });
+  return list.filter(function(s) { return toText(s.tag).indexOf(needle) !== -1 || needle.indexOf(toText(s.tag)) !== -1; });
 }
 
 function toggleStickerPanel(force) {
@@ -6449,13 +6524,21 @@ function toggleStickerPanel(force) {
 }
 
 function renderStickerPanel() {
-  var panel = document.getElementById('stickerPanel');
-  if (!panel) return;
   var grid = document.getElementById('stickerGrid');
   if (!grid) return;
-  var list = Array.isArray(state.stickers) ? state.stickers : [];
+  var count = document.getElementById('stickerCount');
+  if (state.editingStickerId && !getHostStickers(getActiveStickerHost()).some(function(s) { return s.id === state.editingStickerId; })) {
+    state.editingStickerId = null;
+  }
+  var list = getHostStickers(getActiveStickerHost());
+  if (!getActiveStickerHost()) {
+    if (count) count.textContent = '';
+    grid.innerHTML = '<div class="sticker-empty">先选择一个角色，再管理它的表情包。</div>';
+    return;
+  }
+  if (count) count.textContent = list.length + ' 张';
   if (list.length === 0) {
-    grid.innerHTML = '<div class="sticker-empty">还没有表情包。发送或上传一张图片后会自动收藏并打标签。</div>';
+    grid.innerHTML = '<div class="sticker-empty">还没有表情包。点上方「上传表情」加入，或直接发送图片自动收藏。</div>';
     return;
   }
   grid.innerHTML = list.map(function(s) {
@@ -6472,18 +6555,26 @@ function renderStickerPanel() {
   if (input) input.focus();
 }
 
-function sendStickerAsUser(id) {
-  var sticker = (state.stickers || []).find(function(s) { return s.id === id; });
+async function sendStickerAsUser(id) {
+  var host = getActiveStickerHost();
+  var sticker = getHostStickers(host).find(function(s) { return s.id === id; });
   if (!sticker || state.isProcessing) return;
+  toggleStickerPanel(false);
+  var input = document.getElementById('messageInput');
+  // 输入框里若有文字，先作为一条普通消息发出，贴图紧随其后单独成一条，不共享气泡
+  if (input && input.value.trim()) {
+    await sendMessage();
+    if (state.isProcessing || !state.activeCharacterId) return;
+  }
   state.pendingImages = [{ dataUrl: sticker.dataUrl }];
   renderImagePreview();
-  toggleStickerPanel(false);
-  sendMessage();
+  await sendMessage();
 }
 
 function deleteSticker(id) {
-  if (!Array.isArray(state.stickers)) return;
-  state.stickers = state.stickers.filter(function(s) { return s.id !== id; });
+  var host = getActiveStickerHost();
+  if (!host || !Array.isArray(host.stickers)) return;
+  host.stickers = host.stickers.filter(function(s) { return s.id !== id; });
   scheduleSave();
   renderStickerPanel();
 }
@@ -6494,7 +6585,8 @@ function editStickerTag(id) {
 }
 
 function saveStickerTag(id, value) {
-  var sticker = (state.stickers || []).find(function(s) { return s.id === id; });
+  var host = getActiveStickerHost();
+  var sticker = getHostStickers(host).find(function(s) { return s.id === id; });
   if (sticker) {
     var tag = toText(value).replace(/[\s\r\n]+/g, '').slice(0, STICKER_LIMITS.maxTagChars);
     if (tag) {
