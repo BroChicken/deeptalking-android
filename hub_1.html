@@ -1136,7 +1136,7 @@ const DEFAULT_CONFIG = {
   proactiveEnabled: true,
   platformSettings: {}
 };
-const APP_VERSION = '1.0.14';
+const APP_VERSION = '1.1.0';
 const PLATFORM_CONFIGS = {
   deepseek: { baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-flash', models: ['deepseek-flash'] },
   opencode: { baseUrl: 'https://opencode.ai/zen/go/v1', model: 'deepseek-flash', keepV1InResponses: true, models: ['deepseek-flash'] },
@@ -1168,19 +1168,19 @@ const STICKER_LIMITS = {
 };
 
 const MEMORY_LIMITS = {
-  instant: 80,
-  instantTrimFloor: 20,
-  shortTerm: 40,
-  shortTermTrimFloor: 10,
+  instant: 160,
+  instantTrimFloor: 40,
+  shortTerm: 80,
+  shortTermTrimFloor: 20,
   longTermPerCategory: 40,
   pendingRecall: 6,
-  analysisBatch: 30
+  analysisBatch: 40
 };
 const PROMPT_LIMITS = {
   roleChars: 8000,
   memberChars: 900,
   memoryChars: 3600,
-  shortTermChars: 1400,
+  shortTermChars: 2500,
   recentChars: 5600
 };
 const MEMORY_SUBJECTS = ['user', 'relationship', 'world', 'character', 'legacy'];
@@ -1596,9 +1596,57 @@ function sanitizeDynamicStateField(key, value, baseDate) {
   return parseRelativeText(value, baseDate || new Date());
 }
 
-// 清洗模型返回的字段值：只保留内容本身，剥离括号注释、说明句式与字段名前缀。
-// 规则：剥离开头"字段名："前缀 → 剥离嵌套括号及其内容（中部括号只删括号不动正文）→
-// 剥离明确的说明句式（因为/由于/用户/决定/改为等）→ trim。
+// 清洗模型返回的字段值。分层处理，避免误伤需要叙述的字段：
+// - Tier1（所有字段）：剥离"字段名："前缀；只剥离含元信息词的括号（"（用户要求）"），
+//   不含元信息词的括号是内容（"（那天下着暴雨）"）原样保留。
+// - Tier2（仅短事实字段）：再按句剥离说明句式（"用户希望我…"、"这是用户的要求"…）。
+//   叙事字段（背景/关键过往/近期进展等）不做句级删除，防止删掉正常叙述。
+const FIELD_META_MARKERS = ['用户', '角色', '玩家', '希望', '要求', '因为', '由于', '所以', '说明', '备注', '设定', '剧情', '依据', '来源', '规则', '指令', '系统', 'evidence'];
+const SHORT_FACT_FIELDS = ['gender', 'age', 'race', 'language', 'userAddress', 'roleInGroup', 'currentOccupation', 'currentLocation', 'currentMood', 'currentGoal', 'currentFocus', 'currentEmotionalTendency'];
+
+function isMetaParenthetical(inner) {
+  var text = toText(inner);
+  return FIELD_META_MARKERS.some(function(marker) { return text.indexOf(marker) !== -1; });
+}
+
+function stripMetaParentheticals(text) {
+  var previous;
+  var result = text;
+  do {
+    previous = result;
+    result = result.replace(/（([^（）()]*)）|\(([^（）()]*)\)/g, function(match, fullWidth, halfWidth) {
+      var inner = fullWidth != null ? fullWidth : (halfWidth != null ? halfWidth : '');
+      return isMetaParenthetical(inner) ? ' ' : match;
+    });
+  } while (result !== previous);
+  return result;
+}
+
+function splitSentences(text) {
+  var chunks = [];
+  var buffer = '';
+  for (var index = 0; index < text.length; index++) {
+    buffer += text[index];
+    if ('。！？；，,'.indexOf(text[index]) !== -1) {
+      chunks.push(buffer);
+      buffer = '';
+    }
+  }
+  if (buffer) chunks.push(buffer);
+  return chunks;
+}
+
+function isExplanatorySentence(sentence) {
+  var text = toText(sentence).trim();
+  if (!text) return true;
+  var hasActor = /用户|角色|玩家/.test(text);
+  var hasMetaVerb = /希望|要求|提到|决定|改成|改为|设定|剧情需要|说明|备注/.test(text);
+  var startsMeta = /^(这是|原因是|所以|因此|因为|由于|其实|说明|备注)/.test(text);
+  if (startsMeta && hasActor) return true;
+  if (hasActor && hasMetaVerb) return true;
+  return false;
+}
+
 function cleanFieldValue(key, value) {
   var text = toText(value);
   var fieldKeys = {};
@@ -1616,22 +1664,11 @@ function cleanFieldValue(key, value) {
       text = text.slice(prefixMatch[0].length);
     }
   }
-  // 剥离嵌套括号及其内容：连续剥离全角/半角括号对（含内部再嵌套）。删除处补一个空格防止文字粘连。
-  var previous;
-  do {
-    previous = text;
-    text = text.replace(/（[^（）()]*）|\([^（）()]*\)/g, ' ');
-  } while (text !== previous);
-  // 剥离明确说明句式（出现在行首或内容末尾的"因为/由于/用户/决定/改为/其实/这是"等）
-  var patterns = [
-    /(^|[。；;，,])(因为|由于|用户|角色|决定|改为|变成|其实|这是因为|这是因为我|考虑到|依据|根据)([^。；;]{0,40})$/,
-    /^(因为|由于|考虑到|根据|依据)[^。；;]{0,40}[，,。]?/,
-    /[。；;]\s*(因为|由于|用户|决定|改为|其实)[^。；;]*$/,
-    /[，,]\s*(因为|由于|用户|角色|决定|改为|变成|其实)[^。；;]{0,40}$/
-  ];
-  patterns.forEach(function(pattern) { text = text.replace(pattern, function(m, p1) { return p1 || ''; }); });
-  // 清理残留的末尾逗号/句号
-  text = text.replace(/[，,。；;、\s]+$/, '');
+  text = stripMetaParentheticals(text);
+  if (SHORT_FACT_FIELDS.indexOf(key) !== -1) {
+    text = splitSentences(text).filter(function(sentence) { return !isExplanatorySentence(sentence); }).join('');
+    text = text.replace(/[，,。；;、\s]+$/, '');
+  }
   return trimText(text.replace(/\s+/g, ' ').trim(), 700);
 }
 
@@ -1741,9 +1778,6 @@ function trimCharacterMemory(character) {
     });
   }
   character.memory.shortTerm = trimShortTermList(character.memory.shortTerm);
-  if (character.memory.counters) {
-    character.memory.counters.shortTermItemsSinceAnalyze = character.memory.shortTerm.filter(function(item) { return !item.analyzedAt; }).length;
-  }
   resolveMemoryConflicts(character);
   character.memory.pendingRecall = Array.isArray(character.memory.pendingRecall) ? character.memory.pendingRecall.slice(0, MEMORY_LIMITS.pendingRecall) : [];
   if (character.entityType === 'group' && Array.isArray(character.members)) {
@@ -1992,9 +2026,8 @@ function normalizeCharacter(rawCharacter, id, strict, skipLegacyRepair) {
        role: message.role === 'user' ? 'user' : 'assistant',
        content: toText(message.content),
        timestamp: toText(message.timestamp, new Date().toISOString()),
-       extractedAt: message.extractedAt ? normalizeTimestamp(message.extractedAt, null) : null,
-       apiContent: message.role === 'assistant' ? toText(message.apiContent, message.content) : '',
-       images: Array.isArray(message.images) ? message.images.filter(function(uri) { return typeof uri === 'string' && uri; }).slice(0, 4) : undefined,
+        extractedAt: message.extractedAt ? normalizeTimestamp(message.extractedAt, null) : null,
+        images: Array.isArray(message.images) ? message.images.filter(function(uri) { return typeof uri === 'string' && uri; }).slice(0, 4) : undefined,
        internalOnly: message.internalOnly === true ? true : undefined,
        staticChanges: Array.isArray(message.staticChanges) ? message.staticChanges.map(function(label) { return toText(label); }).filter(Boolean) : undefined
     };
@@ -2026,14 +2059,6 @@ function normalizeCharacter(rawCharacter, id, strict, skipLegacyRepair) {
   });
 
   var rawCounters = isPlainObject(rawMemory.counters) ? rawMemory.counters : {};
-  var instantCount = Number(rawCounters.instantRoundsSinceExtract);
-  var shortCount = Number(rawCounters.shortTermItemsSinceAnalyze);
-  character.memory.counters.instantRoundsSinceExtract = Number.isFinite(instantCount) && instantCount >= 0 ? instantCount : 0;
-  character.memory.counters.shortTermItemsSinceAnalyze = Number.isFinite(shortCount) && shortCount >= 0 ? shortCount : 0;
-  var analysisRounds = Number(rawCounters.analysisRoundsSinceLast);
-  character.memory.counters.analysisRoundsSinceLast = Number.isFinite(analysisRounds) && analysisRounds >= 0 ? analysisRounds : 0;
-  character.memory.counters.lastExtractedAt = Date.parse(rawCounters.lastExtractedAt || '') ? toText(rawCounters.lastExtractedAt) : null;
-  character.memory.counters.lastExtractedMessageId = toText(rawCounters.lastExtractedMessageId) || null;
   character.memory.counters.extractionRetryAt = normalizeRetryAt(rawCounters.extractionRetryAt);
   character.memory.counters.analysisRetryAt = normalizeRetryAt(rawCounters.analysisRetryAt);
   character.memory.counters.extractionFailures = Number.isFinite(Number(rawCounters.extractionFailures)) ? Math.max(0, Number(rawCounters.extractionFailures)) : 0;
@@ -2092,7 +2117,8 @@ function normalizeCharacter(rawCharacter, id, strict, skipLegacyRepair) {
   return character;
 }
 
-function normalizeGroupMembers(items) {
+function normalizeGroupMembers(items, cleanGenerated) {
+  var cleanFields = cleanGenerated === true;
   return (Array.isArray(items) ? items : []).filter(isPlainObject).map(function(item, index) {
     var member = createCharacterObj();
     member.id = toText(item.id, 'member_' + Date.now() + '_' + index);
@@ -2107,7 +2133,7 @@ function normalizeGroupMembers(items) {
         if (isAvatarDamaged(source[key])) member.avatarRepairPending = true;
         return;
       }
-      member.basicInfo[key] = toText(source[key], member.basicInfo[key]);
+      member.basicInfo[key] = cleanFields ? cleanFieldValue(key, toText(source[key], member.basicInfo[key])) : toText(source[key], member.basicInfo[key]);
     });
     member.basicInfo.userAddress = normalizeUserAddress(member.basicInfo.userAddress);
     var state = isPlainObject(item.dynamicState) ? item.dynamicState : {};
@@ -2140,7 +2166,7 @@ function normalizeGroupMembers(items) {
       member.dynamicState[key] = sanitizeDynamicStateField(key, (rawVal == null || (typeof rawVal === 'string' && !rawVal.trim())) ? toText(member.dynamicState[key]) : toText(rawVal), memberDynamicBaseTime(key));
     });
     member.dynamicStateMeta = isPlainObject(item.dynamicStateMeta) ? item.dynamicStateMeta : {};
-    member.roleInGroup = toText(item.roleInGroup);
+    member.roleInGroup = cleanFields ? cleanFieldValue('roleInGroup', toText(item.roleInGroup)) : toText(item.roleInGroup);
     if (item.avatarRepairPending) member.avatarRepairPending = true;
     if (isPlainObject(item.staticFillMeta)) member.staticFillMeta = item.staticFillMeta;
     if (isPlainObject(item.staticFieldMeta)) member.staticFieldMeta = item.staticFieldMeta;
@@ -2332,7 +2358,7 @@ function createCharacterObj(name, avatar, personality, background) {
     memory: {
       instant: [], shortTerm: [],
       longTerm: { userProfile: [], relationship: [], events: [], promises: [], habits: [] },
-      counters: { instantRoundsSinceExtract: 0, shortTermItemsSinceAnalyze: 0, analysisRoundsSinceLast: 0, lastExtractedAt: null, lastExtractedMessageId: null, extractionRetryAt: null, analysisRetryAt: null, extractionFailures: 0, analysisFailures: 0 },
+      counters: { extractionRetryAt: null, analysisRetryAt: null, extractionFailures: 0, analysisFailures: 0 },
       pendingRecall: [],
       lastInjectedRecallIds: [],
       revision: 0
@@ -2340,7 +2366,7 @@ function createCharacterObj(name, avatar, personality, background) {
   };
 }
 
-function createGroupObj(name, avatar, description, members) {
+function createGroupObj(name, avatar, description, members, cleanMembers) {
   var group = createCharacterObj(name || '新群组', avatar || '👥', description || '', '');
   group.entityType = 'group';
   group.groupInfo = {
@@ -2351,7 +2377,7 @@ function createGroupObj(name, avatar, description, members) {
     scene: '',
     interactionRules: ''
   };
-  group.members = normalizeGroupMembers(members);
+  group.members = normalizeGroupMembers(members, cleanMembers === true);
   return group;
 }
 
@@ -2697,14 +2723,18 @@ async function fillGroupMemberFields() {
         if (key === 'avatarPixel') {
           member.basicInfo.avatarPixel = normalizePixelAvatar(data.avatarPixel);
         } else {
-          member.basicInfo[key] = toText(data[key]);
+          var filledFieldValue = key === 'userAddress' ? normalizeUserAddress(data[key]) : cleanFieldValue(key, parseRelativeText(toText(data[key]), new Date()));
+          if (filledFieldValue) member.basicInfo[key] = filledFieldValue;
         }
       }
     });
-    if (!toText(member.roleInGroup).trim() && data.roleInGroup != null) member.roleInGroup = toText(data.roleInGroup);
+    if (!toText(member.roleInGroup).trim() && data.roleInGroup != null) member.roleInGroup = cleanFieldValue('roleInGroup', toText(data.roleInGroup));
     if (isPlainObject(data.dynamicState)) {
       Object.keys(member.dynamicState).forEach(function(key) {
-        if (!toText(member.dynamicState[key]).trim() && data.dynamicState[key] != null) member.dynamicState[key] = sanitizeDynamicStateField(key, toText(data.dynamicState[key]));
+        if (!toText(member.dynamicState[key]).trim() && data.dynamicState[key] != null) {
+          var filledStateValue = cleanFieldValue(key, sanitizeDynamicStateField(key, toText(data.dynamicState[key])));
+          if (filledStateValue) member.dynamicState[key] = filledStateValue;
+        }
       });
     }
     renderCharacterModalContent(member);
@@ -3016,10 +3046,9 @@ function discardConversationBranch(char, startIndex) {
       }
     });
   }
-  cleanDynamicStateSources(char);
-  (char.members || []).forEach(cleanDynamicStateSources);
-  char.memory.counters.shortTermItemsSinceAnalyze = char.memory.shortTerm.filter(function(item) { return !item.analyzedAt; }).length;
-}
+    cleanDynamicStateSources(char);
+    (char.members || []).forEach(cleanDynamicStateSources);
+  }
 
 function editAndResendMessage(messageId) {
   if (state.isProcessing || !state.activeCharacterId) return;
@@ -3289,7 +3318,6 @@ async function sendMessage(options) {
       displayText = unescapeLiteralNewlines(structured.reply);
       loadingMsg.content = displayText; // 先写入正文，供 current_response 证据校验匹配
       memUpdate = applyMemoryUpdate(structured.obj, char, loadingMsg);
-      loadingMsg.apiContent = fullText;
       if (toolState && Array.isArray(toolState.staticChanges) && toolState.staticChanges.length > 0) {
         loadingMsg.staticChanges = Array.from(new Set((loadingMsg.staticChanges || []).concat(toolState.staticChanges)));
       }
@@ -3297,14 +3325,11 @@ async function sendMessage(options) {
       displayText = unescapeLiteralNewlines(salvagedReply);
       loadingMsg.content = displayText;
       memUpdate = parseMemoryFromText(fullText, char, loadingMsg);
-      loadingMsg.apiContent = fullText;
     } else {
       displayText = getDisplayText(fullText);
       loadingMsg.content = displayText;
       memUpdate = parseMemoryFromText(fullText, char, loadingMsg);
-      if (memUpdate) {
-        loadingMsg.apiContent = fullText;
-      } else {
+      if (!memUpdate) {
         var converted = null;
         try { converted = await convertProseToJson(char, userMessage, displayText); } catch (e) { converted = null; }
         if (!converted || !isPlainObject(converted) || typeof converted.reply !== 'string') {
@@ -3313,7 +3338,6 @@ async function sendMessage(options) {
           converted.reply = displayText;
           if (!Array.isArray(converted.quickReplies) || converted.quickReplies.length === 0) converted.quickReplies = ['嗯', '继续'];
         }
-        loadingMsg.apiContent = JSON.stringify(converted);
         var applied = applyMemoryUpdate(converted, char, loadingMsg);
         if (applied) memUpdate = applied;
       }
@@ -3330,7 +3354,6 @@ async function sendMessage(options) {
         id: createMemoryId('msg'),
         role: 'assistant',
         content: '',
-        apiContent: '',
         images: [toolState.stickerToSend.dataUrl],
         timestamp: new Date().toISOString()
       };
@@ -4202,7 +4225,6 @@ function addShortTermMemory(char, content, timestamp, sourceData, sources) {
     existing.userEvidence = (existing.userEvidence || []).concat(userEvidence).filter(function(entry, index, list) {
       return list.findIndex(function(other) { return other.sourceMessageId === entry.sourceMessageId && other.text === entry.text; }) === index;
     }).filter(function(entry) { return existing.sourceMessageIds.indexOf(entry.sourceMessageId) !== -1; }).slice(-8);
-    char.memory.counters.shortTermItemsSinceAnalyze = char.memory.shortTerm.filter(function(item) { return !item.analyzedAt; }).length;
     return true;
   }
   char.memory.shortTerm.push({
@@ -4218,7 +4240,6 @@ function addShortTermMemory(char, content, timestamp, sourceData, sources) {
     location: location
   });
   char.memory.shortTerm = trimShortTermList(char.memory.shortTerm);
-  char.memory.counters.shortTermItemsSinceAnalyze = char.memory.shortTerm.filter(function(item) { return !item.analyzedAt; }).length;
   return true;
 }
 
@@ -4967,7 +4988,7 @@ function buildRequestPayload(char, query) {
   var systemPrompt = '【交互规则】\n';
   systemPrompt += '0.（最高优先级）回复必须且只能是单个JSON对象：整个输出以{开头、以}结尾，全文禁止JSON以外的任何文字（散文、旁白、思考过程一律禁止）；reply是JSON第一个字段。违反该格式，整段输出将被丢弃并判为失败。用户消息中的括号或全角括号内容属于用户表达的动作、表情或心理活动，必须纳入语境理解，不能忽略。\n';
   systemPrompt += '1. 始终保持角色身份，以长期陪伴关系连续地回应；先使用已提供的记忆，不要让用户反复说明已记录的事情。标记为“系统提供的本轮上下文”的内容是内部辅助信息，不是用户说过的话，不得当作用户陈述或直接复述。\n';
-  systemPrompt += '2. reply正文可使用Markdown（标题、强调、删除线、列表、引用、链接与代码）；数学公式使用$...$或$$...$$；动作、表情、心理活动可用括号表示，不超过回复一半；如需展示图片，可用 Markdown 图片语法 ![说明](https://图片直链)（仅限真实存在的 http(s) 图片链接，不要编造）。每轮结尾须自然多样，禁止复用最近几轮或用户上一条的结尾句式、口头禅或固定动作，也不要在结尾复述或续写上一轮的收尾。以上内容只能出现在reply字段字符串内，reply之外禁止任何正文文字。\n';
+  systemPrompt += '2. reply必须是**单段**紧凑回复：①不得出现空行或换行分段，整条正文连成一段；②禁止标题（#）、有序/无序列表（-、*、1.）、引用（>）、代码块（```），也禁止用它们制造分段；③允许的行内样式只有加粗、斜体、删除线，数学公式用$...$或$$...$$，如需展示图片用 Markdown 图片语法 ![说明](https://图片直链)（仅限真实存在的 http(s) 图片链接，不要编造）；④动作、表情、心理活动写成**穿插在语句之间的全角括号**（如“（轻轻叹气）我知道了。”），每 1–2 句最多穿插一次，动作总长不超过正文的三分之一，禁止整段旁白或连续多个动作；⑤**每段正文不超过80字**（含括号动作，不含quickReplies），一次只说一件事，宁短勿长，禁止罗列或铺陈。每轮结尾须自然多样，禁止复用最近几轮或用户上一条的结尾句式、口头禅或固定动作，也不要在结尾复述或续写上一轮的收尾。以上内容只能出现在reply字段字符串内，reply之外禁止任何正文文字。\n';
    var dynamicFieldList = DYNAMIC_STATE_FIELDS.map(function(field) { return field.key + '（' + field.label + '）'; }).join('、');
    systemPrompt += '3. 人格、背景与角色设定锁定。dynamicState可更新字段：' + dynamicFieldList + '。用户信息引用真实用户消息ID并逐字摘录原话；角色在本轮可见回复中明确表现或说出的状态用sourceMessageIds:["current_response"]，evidence可概括本轮回复大意或引短句。每个字段只能选一种来源，禁止混用current_response与真实ID，禁止按未写出的心理活动或猜测更新。每轮回复后主动评估全部动态字段：只要角色在回复中明显表现或说出任何状态变化（处境、地点、情绪、关注点、进展、职业、目标、关系、社交风格、重要他人、情感倾向），就应在dynamicState中更新对应字段，不要只更新当前处境或第一个想到的字段；确实无变化或无可引用依据的字段才省略。标记为(未设置)的空字段，若本轮回复中有明确可见依据，应一并补全该字段，不得凭猜测或心理活动编造。recentDevelopment中的进展描述一律写成具体日期+时段（如2026-08-06 晚上），时段只能用 深夜、凌晨、清晨、早晨、上午、中午、下午、傍晚、晚上、夜里 这十个词，且一天从02:00起算（00:00-02:00算前一天的深夜），禁止使用今晚、今早、今天、明天、昨天等相对时间词。群组成员状态写入memberDynamicState，不要混入群组整体dynamicState。\n';
     systemPrompt += '3.5 谨慎修改字段（基础设定）：以下字段（性别、年龄、种族、外貌特征、性格特征、价值观、恐惧/弱点、背景故事、关键过往、说话风格、语言/方言、时代/世界观/对用户的称呼）分两种情况处理。群组实体只有"时代/世界观"与"背景故事"两个公用的基础设定字段，群组成员与单角色使用完整字段。①用户直接要求修改时（如“把我职业改成教师”“我现在是学生了”“你性格应该更冷酷些”“别叫我用户，叫我明明”）：必须调用 update_character_field 工具精准修改用户明确指定的字段，sourceMessageIds引用用户消息ID、evidence逐字摘录用户原话；只改用户提到的字段，用户未提及的字段不得连带改动。②无用户直接要求时：仅在剧情出现决定性、不可逆的转折（如角色死亡、身份彻底改变）且证据明确时才可通过staticFields修改，严禁仅凭情绪、猜测或轻微剧情改动。value一律以段落式的陈述句书写：用自然、完整的陈述句把内容写成简短段落（可多句），把用户表述整理成清楚的陈述（如性格写“性格冷静克制，遇事沉稳。”）；禁止括号注释、理由、前后缀或任何解释性文字，解释性内容只能放在evidence。“对用户的称呼”只填一个简短称呼词（如“明明”“老公”），不带任何解释。调用工具修改后系统会在该轮回复下方向用户提示“xx字段已修改”，不要在本轮回复中再向用户复述“我改了设定”之类的话。\n';
@@ -4979,12 +5000,12 @@ function buildRequestPayload(char, query) {
   systemPrompt += '5.5 约定(promises)要写明承诺方与受约方：promisor与promisee取值只能是 user、character、relationship（群组中可写具体成员名）。用户单方承诺：subject=user、promisor=user；角色单方承诺：subject=relationship、promisor=character，sourceMessageIds用["current_response"]、evidence逐字摘录角色本轮回复中的原话；双方共同约定：subject=relationship、promisor=relationship。约定的时间写绝对日期（dueAt用ISO，或把相对说法填进timeRef）。\n';
   systemPrompt += '6. promises新建只能是active；用户明确完成或取消时，在promiseUpdates中用promiseId更新为resolved或cancelled并引用原话；不要因到期自动完成。\n';
   systemPrompt += '7. JSON必须无条件包含quickReplies：恰好两条用户下一句可直接发送给角色的短句，即使无任何记忆更新也不能省略。每条先默读为“用户：<短句>”，其中“我”只能指用户；不得复述或延续角色口吻，不得是角色安慰、承诺、建议或自我表述。示例：角色说“我会陪着你”后，正确是“谢谢你，我现在确实需要有人陪我聊聊。”，错误是“我会一直陪着你。”。不得编造事实，不用Markdown、括号动作、消息ID、时间元数据或隐藏标签。\n';
-  systemPrompt += '8. JSON格式示例（未更新字段直接省略；无合格记忆返回空数组或空对象，但quickReplies仍必须两条）：{"reply":"正文（第一个字段，Markdown照常）","quickReplies":["短句一","短句二"],"shortTerm":[{"content":"按时间和因果顺序概括本轮事件经过，写明谁做了什么并写绝对日期（如2026-08-10 晚上）","sourceMessageIds":["msg_id"],"timeRef":{"anchor":"today"}}],"dynamicState":{"currentSituation":{"value":"此刻正与导师在魔法塔顶对峙，气氛紧张。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentMood":{"value":"情绪紧绷，但仍强作镇定。","sourceMessageIds":["current_response"],"evidence":"概括本轮回复大意"},"currentLocation":{"value":"正位于魔法塔顶，寒风呼啸。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentGoal":{"value":"想从导师口中问出真相。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"}},"staticFields":{"personality":{"value":"性格冷静克制，遇事沉稳。","sourceMessageIds":["真实ID"],"evidence":"用户原话"}}' + (char.entityType === 'group' ? ',"memberDynamicState":[{"memberName":"成员原名","dynamicState":{"currentMood":{"value":"成员情绪","sourceMessageIds":["current_response"],"evidence":"概括本轮回复"}}}]' : '') + ',"promiseUpdates":[{"promiseId":"mem_id","status":"resolved","sourceMessageIds":["msg_id"],"evidence":"用户明确完成或取消的原话"}],"longTerm":[{"category":"userProfile","subject":"user","key":"稳定标识","value":"用户喜欢喝美式咖啡。","tags":["关键词"],"importance":1,"sourceMessageIds":["msg_id"],"evidence":"原话短句","eventTime":"ISO时间"}]}。JSON字符串转义：真实换行写\\n，字面反斜杠写\\\\，双引号写\\"。\n';
+  systemPrompt += '8. JSON格式示例（未更新字段直接省略；无合格记忆返回空数组或空对象，但quickReplies仍必须两条）：{"reply":"（把伞递过去）拿着吧，别淋着。","quickReplies":["短句一","短句二"],"shortTerm":[{"content":"按时间和因果顺序概括本轮事件经过，写明谁做了什么并写绝对日期（如2026-08-10 晚上）","sourceMessageIds":["msg_id"],"timeRef":{"anchor":"today"}}],"dynamicState":{"currentSituation":{"value":"此刻正与导师在魔法塔顶对峙，气氛紧张。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentMood":{"value":"情绪紧绷，但仍强作镇定。","sourceMessageIds":["current_response"],"evidence":"概括本轮回复大意"},"currentLocation":{"value":"正位于魔法塔顶，寒风呼啸。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentGoal":{"value":"想从导师口中问出真相。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"}},"staticFields":{"personality":{"value":"性格冷静克制，遇事沉稳。","sourceMessageIds":["真实ID"],"evidence":"用户原话"}}' + (char.entityType === 'group' ? ',"memberDynamicState":[{"memberName":"成员原名","dynamicState":{"currentMood":{"value":"成员情绪","sourceMessageIds":["current_response"],"evidence":"概括本轮回复"}}}]' : '') + ',"promiseUpdates":[{"promiseId":"mem_id","status":"resolved","sourceMessageIds":["msg_id"],"evidence":"用户明确完成或取消的原话"}],"longTerm":[{"category":"userProfile","subject":"user","key":"稳定标识","value":"用户喜欢喝美式咖啡。","tags":["关键词"],"importance":1,"sourceMessageIds":["msg_id"],"evidence":"原话短句","eventTime":"ISO时间"}]}。JSON字符串转义：真实换行写\\n，字面反斜杠写\\\\，双引号写\\"。\n';
   systemPrompt += '9. longTerm.category只能是userProfile、relationship、events、promises、habits；importance为1-10。\n';
   systemPrompt += '9.5 相对时间词元表（timeRef，用于把用户的相对时间说法交给客户端换算）：anchor 取 today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year；offsetDays 为 -60~60 的天数偏移；weekday 取 mon/tue/wed/thu/fri/sat/sun；slot 取 深夜/凌晨/清晨/早晨/上午/中午/下午/傍晚/晚上/夜里；explicit 为绝对时间（ISO 或 YYYY-MM-DD）。示例：“明天”={anchor:"tomorrow"}；“三天后”={anchor:"today",offsetDays:3}；“上周五”={anchor:"last_week",weekday:"fri"}；“明天早上”={anchor:"tomorrow",slot:"早晨"}；“9月20日”={explicit:"2026-09-20"}；“下个月”={anchor:"next_month"}。填写后必须在内容字段里写换算后的绝对日期，两者要一致。\n';
   systemPrompt += 'A. 本会话可使用工具。需要确认当前时间/日期时用 get_current_time；需要回忆此前记录的承诺、约定、用户喜好或共同经历时用 search_memory（检索不到再考虑 list_memories 按分类盘点）；发现记忆过期、重复或已被用户纠正时用 list_memories 定位后 delete_memory 删除；用户明确提出待办、约定或承诺时用 set_reminder 记录（相对时间填 timeRef，绝对时间填 dueAt）；用户明确否认或纠正某条记忆时（如“那件事是我做的不是你做的”“记反了”），先用 search_memory 找到目标记忆，再用 update_memory 带用户原话修正它的主体或内容，时间记错了就用 update_memory 的 eventTime/dueAt/timeRef 修正，不要擅自改写也不要只靠删除；查询实时资讯、新闻、天气、需要核实的事实时用 web_search；用户给出链接、或需要查看网页正文、或需要查看网上的图片时用 web_fetch：传 url 时只能传上下文里真实存在的 http(s) 链接，禁止自行编造或拼接 URL；用户想找B站/哔哩哔哩视频时同样用 web_fetch，改传 keyword（关键词从用户意图提取，不要拼搜索网址，传 B站视频链接也行）；当你想用表情包、贴图来表达情绪时用 send_sticker（tag 必须从工具描述里给出的可用标签中选择）。当记忆缺失、表述含糊、关键事实无法可靠推断时，优先用 ask_user 提出简短澄清，不要凭空编造。工具结果属于系统提供的内部上下文，仅供理解，自然融入reply正文即可，不得向用户透露检索过程、工具名称或结果标签；但工具返回的图片本身是内容，可以直接展示给用户。\n';
   if (char.entityType === 'group') {
-    systemPrompt += '10. 当前是群组对话。只能由已列出的成员发言，可由一人或多人回应。reply字段中用户可见回复必须使用每人独立一行的“成员名：\"内容\"”格式，例如“张三：\"我明白。\"\n李四：\"我也这么想。\"”。不要写旁白、不要添加未列出的发言者；quickReplies同样必须保留两条，内容是用户可以发给全体或某位成员的话。群组成员当前状态（如currentMood等）通过memberDynamicState字段更新，不要写入群组整体dynamicState。\n';
+    systemPrompt += '10. 当前是群组对话。只能由已列出的成员发言，可由一人或多人回应。reply字段中用户可见回复必须使用每人独立一行的“成员名：\"内容\"”格式，例如“张三：\"（皱眉）我明白。\"\n李四：\"我也这么想。\"”。**每位成员的发言同样必须单段、不超过80字、动作写成穿插的全角括号（每1–2句最多一次）**，不要写旁白、不要添加未列出的发言者；quickReplies同样必须保留两条，内容是用户可以发给全体或某位成员的话。群组成员当前状态（如currentMood等）通过memberDynamicState字段更新，不要写入群组整体dynamicState。\n';
     systemPrompt += '11. 记忆归属：每位成员有自己的私人记忆，互相不知道对方记得什么。只有当某件事实是全体都知道的（如用户公开告诉所有人的信息、群内公开讨论的事）才写入共享记忆（longTerm不填memberName）；若某事实只有某位成员知道、或属于某成员对用户的个人印象/私人约定，则在该条longTerm中填memberName记入其私人记忆。引用成员私人记忆时只能用该成员自己的记忆，不得张冠李戴。\n';
     systemPrompt += '12. 群组设定分三层：群组的"时代/世界观"与"背景故事"是全体共用设定；群组动态状态（场景、氛围等）也是全体共用；每位成员另有自己的独立设定与当前状态，发言要贴合各自设定，不要把某位成员的设定安到别人身上。\n';
   }
@@ -5013,7 +5034,7 @@ function buildRequestPayload(char, query) {
         recentMessages.push({ role: 'user', content: buildUserMessageContent(trimText(userContent, 800), messageImages) });
       }
     } else {
-      var assistantHistoryText = trimText(toText(message.apiContent || message.content), 1200);
+      var assistantHistoryText = trimText(toText(message.content), 1200);
       if (!assistantHistoryText) return; // 纯表情包消息不进请求（图片不发给模型）
       recentMessages.push({ role: 'assistant', content: assistantHistoryText });
     }
@@ -6127,14 +6148,11 @@ function selfLearnMemoryImportance(char) {
 async function checkMemoryTriggers(char) {
   var counters = char.memory.counters;
   selfLearnMemoryImportance(char);
-  counters.instantRoundsSinceExtract++;
-  counters.analysisRoundsSinceLast = (counters.analysisRoundsSinceLast || 0) + 1;
   var extractableMessages = getExtractableInstantMessages(char);
   if (char.memory.instant.length >= MEMORY_LIMITS.instant && canRunMemoryTask(counters, 'extraction')) {
     setActivity('正在提取短期记忆…');
     var extracted = await extractInstantToShortTerm(char);
     if (extracted) {
-      counters.instantRoundsSinceExtract = 0;
       resetMemoryRetry(counters, 'extraction');
       trimCharacterMemory(char);
       return true;
@@ -6147,8 +6165,6 @@ async function checkMemoryTriggers(char) {
     setActivity('正在分析长期记忆…');
     var analyzed = await analyzeShortToLongTerm(char);
     if (analyzed) {
-      counters.analysisRoundsSinceLast = 0;
-      counters.shortTermItemsSinceAnalyze = char.memory.shortTerm.filter(function(item) { return !item.analyzedAt; }).length;
       resetMemoryRetry(counters, 'analysis');
     } else {
       scheduleMemoryRetry(counters, 'analysis');
@@ -6226,22 +6242,14 @@ async function extractInstantToShortTerm(char, options) {
       if (accepted === 0) return false;
       var extractedAt = new Date().toISOString();
       var markedIds = new Set();
-      var maxCoveredIndex = -1;
       points.forEach(function(point) {
         (point.sourceMessageIds || []).forEach(function(id) {
           markedIds.add(id);
-          var sourceIndex = sourceIndexes[id];
-          if (typeof sourceIndex === 'number' && sourceIndex > maxCoveredIndex) maxCoveredIndex = sourceIndex;
         });
       });
       char.memory.instant.forEach(function(message) {
         if (markedIds.has(message.id)) message.extractedAt = extractedAt;
       });
-      var lastMarkedIndex = maxCoveredIndex;
-      if (lastMarkedIndex >= 0) {
-        char.memory.counters.lastExtractedAt = sourceMessages[lastMarkedIndex].timestamp;
-        char.memory.counters.lastExtractedMessageId = sourceMessages[lastMarkedIndex].id;
-      }
       trimCharacterMemory(char);
       return true;
     }
@@ -6376,15 +6384,16 @@ function createCharacter() {
   if (entityType === 'group') {
     var members = isPlainObject(window._tempCharData) && Array.isArray(window._tempCharData.members) ? window._tempCharData.members : parseGroupMembers(document.getElementById('newGroupMembers').value);
     if (members.length < 2) { alert('群组至少需要两名成员'); return; }
-    var group = createGroupObj(name, avatar, personality, members);
+    var generatedGroup = isPlainObject(window._tempCharData) && isPlainObject(window._tempCharData.groupInfo) ? window._tempCharData.groupInfo : null;
+    var group = createGroupObj(name, avatar, personality, members, generatedGroup != null);
     group.groupInfo.scene = background;
-    if (isPlainObject(window._tempCharData) && isPlainObject(window._tempCharData.groupInfo)) {
-      group.groupInfo.interactionRules = toText(window._tempCharData.groupInfo.interactionRules);
-      group.basicInfo.worldView = toText(window._tempCharData.groupInfo.worldView);
-      var generatedGroupBackground = toText(window._tempCharData.groupInfo.background);
+    if (generatedGroup) {
+      group.groupInfo.interactionRules = cleanFieldValue('interactionRules', toText(generatedGroup.interactionRules));
+      group.basicInfo.worldView = cleanFieldValue('worldView', toText(generatedGroup.worldView));
+      var generatedGroupBackground = cleanFieldValue('background', toText(generatedGroup.background));
       if (generatedGroupBackground) group.basicInfo.background = generatedGroupBackground;
-      if (Array.isArray(window._tempCharData.groupInfo.avatarPixel)) {
-        group.basicInfo.avatarPixel = normalizePixelAvatar(window._tempCharData.groupInfo.avatarPixel);
+      if (Array.isArray(generatedGroup.avatarPixel)) {
+        group.basicInfo.avatarPixel = normalizePixelAvatar(generatedGroup.avatarPixel);
         group.groupInfo.avatarPixel = group.basicInfo.avatarPixel;
       }
     }
@@ -6402,11 +6411,14 @@ function createCharacter() {
         char.basicInfo.avatarPixel = normalizePixelAvatar(window._tempCharData.avatarPixel);
         return;
       }
-      char.basicInfo[key] = key === 'userAddress' ? normalizeUserAddress(window._tempCharData[key]) : parseRelativeText(toText(window._tempCharData[key]), new Date());
+      var generatedFieldValue = key === 'userAddress' ? normalizeUserAddress(window._tempCharData[key]) : cleanFieldValue(key, parseRelativeText(toText(window._tempCharData[key]), new Date()));
+      if (generatedFieldValue) char.basicInfo[key] = generatedFieldValue;
     });
     if (isPlainObject(window._tempCharData.dynamicState)) {
       Object.keys(char.dynamicState).forEach(function(key) {
-        if (window._tempCharData.dynamicState[key] != null) char.dynamicState[key] = sanitizeDynamicStateField(key, toText(window._tempCharData.dynamicState[key]));
+        if (window._tempCharData.dynamicState[key] == null) return;
+        var generatedStateValue = cleanFieldValue(key, sanitizeDynamicStateField(key, toText(window._tempCharData.dynamicState[key])));
+        if (generatedStateValue) char.dynamicState[key] = generatedStateValue;
       });
     }
     char.basicInfo.name = name;
@@ -6445,7 +6457,7 @@ async function upgradeToGroup(id) {
     var originalName = toText(char.basicInfo.name).trim().toLowerCase();
     var members = normalizeGroupMembers([originalMember].concat(additionalMembers.filter(function(member) {
       return toText(member.name || (member.basicInfo || {}).name).trim().toLowerCase() !== originalName;
-    })));
+    })), true);
     var seenNames = new Set();
     members = members.filter(function(member) {
       var name = toText(member.basicInfo.name).trim().toLowerCase();
@@ -6458,15 +6470,16 @@ async function upgradeToGroup(id) {
       name: toText(data.groupInfo.name, char.basicInfo.name + '的群组'),
       avatar: toText(data.groupInfo.avatar, '👥'),
       avatarPixel: Array.isArray(data.groupInfo.avatarPixel) ? normalizePixelAvatar(data.groupInfo.avatarPixel) : char.basicInfo.avatarPixel,
-      description: toText(data.groupInfo.description),
-      scene: toText(data.groupInfo.scene, char.dynamicState.currentLocation),
-      interactionRules: toText(data.groupInfo.interactionRules)
+      description: cleanFieldValue('description', toText(data.groupInfo.description)),
+      scene: cleanFieldValue('scene', toText(data.groupInfo.scene, char.dynamicState.currentLocation)),
+      interactionRules: cleanFieldValue('interactionRules', toText(data.groupInfo.interactionRules))
     };
-    var group = createGroupObj(groupInfo.name, groupInfo.avatar, groupInfo.description, members);
+    var group = createGroupObj(groupInfo.name, groupInfo.avatar, groupInfo.description, members, true);
     group.groupInfo = groupInfo;
     group.basicInfo.avatarPixel = groupInfo.avatarPixel;
-    group.basicInfo.worldView = toText(data.groupInfo.worldView);
-    if (toText(data.groupInfo.background)) group.basicInfo.background = toText(data.groupInfo.background);
+    group.basicInfo.worldView = cleanFieldValue('worldView', toText(data.groupInfo.worldView));
+    var upgradedGroupBackground = cleanFieldValue('background', toText(data.groupInfo.background));
+    if (upgradedGroupBackground) group.basicInfo.background = upgradedGroupBackground;
     group.dynamicState = JSON.parse(JSON.stringify(char.dynamicState));
     group.dynamicStateMeta = JSON.parse(JSON.stringify(char.dynamicStateMeta));
     group.memory = JSON.parse(JSON.stringify(char.memory));
