@@ -1136,7 +1136,7 @@ const DEFAULT_CONFIG = {
   proactiveEnabled: true,
   platformSettings: {}
 };
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.1.1';
 const PLATFORM_CONFIGS = {
   deepseek: { baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-flash', models: ['deepseek-flash'] },
   opencode: { baseUrl: 'https://opencode.ai/zen/go/v1', model: 'deepseek-flash', keepV1InResponses: true, models: ['deepseek-flash'] },
@@ -4602,20 +4602,21 @@ function parseMemoryFromText(content, char, assistantMessage) {
   return applyMemoryUpdate(memUpdate, char, assistantMessage);
 }
 
-// 成员上下文：除头像类外，全部静态字段 + 全部动态状态都注入
-function buildMemberContext(member) {
+// 成员上下文：除头像类外，全部静态字段注入；staticOnly 时不注入动态状态（动态状态走 volatile 段落，保证缓存前缀稳定）
+function buildMemberContext(member, staticOnly) {
   var info = (member && member.basicInfo) || {};
   var lines = ['- ' + trimText(info.name, 100) + (toText(member.roleInGroup).trim() ? '（群内定位: ' + trimText(member.roleInGroup, 180) + '）' : '')];
   Object.keys(STATIC_PROFILE_FIELDS).forEach(function(key) {
     var value = trimText(info[key], key === 'background' || key === 'keyEvents' ? 600 : 400);
     if (value) lines.push('  ' + STATIC_PROFILE_FIELDS[key].label + ': ' + maskUserWord(member, value));
   });
+  if (staticOnly === true) return lines.join('\n');
   var stateText = buildDynamicStateContext(member);
   if (stateText) lines.push('  当前状态:\n' + trimText(maskUserWord(member, stateText), 700));
   return lines.join('\n');
 }
 
-function buildRoleContext(char) {
+function buildRoleContext(char, staticOnly) {
   if (char.entityType === 'group') {
     var group = char.groupInfo || {};
     var groupLines = [
@@ -4628,10 +4629,12 @@ function buildRoleContext(char) {
       var value = trimText(char.basicInfo[key], 700);
       if (value) groupLines.push('群组' + STATIC_PROFILE_FIELDS[key].label + ': ' + maskUserWord(char, value));
     });
-    var groupStateText = buildDynamicStateContext(char);
-    if (groupStateText) groupLines.push('群组当前状态（全员共用）:\n' + trimText(maskUserWord(char, groupStateText), 1100));
+    if (staticOnly !== true) {
+      var groupStateText = buildDynamicStateContext(char);
+      if (groupStateText) groupLines.push('群组当前状态（全员共用）:\n' + trimText(maskUserWord(char, groupStateText), 1100));
+    }
     var memberTexts = (char.members || []).map(function(member) {
-      return trimText(buildMemberContext(member), PROMPT_LIMITS.memberChars);
+      return trimText(buildMemberContext(member, staticOnly === true), PROMPT_LIMITS.memberChars);
     }).filter(Boolean);
     var groupParts = [groupLines.join('\n')];
     if (memberTexts.length) groupParts.push('成员:\n' + memberTexts.join('\n'));
@@ -4897,8 +4900,19 @@ volatileContext += '日程日界: 每天从 02:00 开始计算；00:00-02:00 属
     appendWithinLimit(timelineLines, msg.id + ' | ' + msg.role + ' | ' + formatContextTime(msg.timestamp), 1400);
   });
   volatileContext += '【消息时间元数据，仅供内部推理】\n' + timelineLines.join('\n') + '\n\n';
-  volatileContext += '【角色设定】\n' + buildRoleContext(char) + '\n\n';
   volatileContext += '【角色当前状态，可随对话变化】\n' + buildDynamicStateContext(char) + '\n\n';
+  if (char.entityType === 'group' && Array.isArray(char.members)) {
+    var memberStateLines = [];
+    char.members.forEach(function(member) {
+      var memberStateName = toText(member && member.basicInfo && member.basicInfo.name);
+      if (!memberStateName) return;
+      var memberStateText = buildDynamicStateContext(member);
+      if (memberStateText) memberStateLines.push('【' + memberStateName + '】\n' + trimText(maskUserWord(member, memberStateText), 700));
+    });
+    if (memberStateLines.length > 0) {
+      volatileContext += '【成员当前状态（每人独立，可随对话变化）】\n' + memberStateLines.join('\n\n') + '\n\n';
+    }
+  }
   volatileContext += '【本轮主动召回的相关长期记忆】\n' + (memoryLines.join('\n') || '无相关长期记忆');
   volatileContext += '\n【记忆主体约定】方括号里标注的是"这条记忆讲的是谁"：标为角色名或"背景"的才是你的事；标为“' + (normalizeUserAddress(char.basicInfo && char.basicInfo.userAddress) || '对方') + '”或"你们"的都是对方或双方的事，绝不能当成你自己做的，也不能把对方的状态当成你的状态。角色自身的经历只来自角色设定与本对话历史。\n';
   if (agentMode) {
@@ -4988,27 +5002,31 @@ function buildRequestPayload(char, query) {
   var systemPrompt = '【交互规则】\n';
   systemPrompt += '0.（最高优先级）回复必须且只能是单个JSON对象：整个输出以{开头、以}结尾，全文禁止JSON以外的任何文字（散文、旁白、思考过程一律禁止）；reply是JSON第一个字段。违反该格式，整段输出将被丢弃并判为失败。用户消息中的括号或全角括号内容属于用户表达的动作、表情或心理活动，必须纳入语境理解，不能忽略。\n';
   systemPrompt += '1. 始终保持角色身份，以长期陪伴关系连续地回应；先使用已提供的记忆，不要让用户反复说明已记录的事情。标记为“系统提供的本轮上下文”的内容是内部辅助信息，不是用户说过的话，不得当作用户陈述或直接复述。\n';
-  systemPrompt += '2. reply必须是**单段**紧凑回复：①不得出现空行或换行分段，整条正文连成一段；②禁止标题（#）、有序/无序列表（-、*、1.）、引用（>）、代码块（```），也禁止用它们制造分段；③允许的行内样式只有加粗、斜体、删除线，数学公式用$...$或$$...$$，如需展示图片用 Markdown 图片语法 ![说明](https://图片直链)（仅限真实存在的 http(s) 图片链接，不要编造）；④动作、表情、心理活动写成**穿插在语句之间的全角括号**（如“（轻轻叹气）我知道了。”），每 1–2 句最多穿插一次，动作总长不超过正文的三分之一，禁止整段旁白或连续多个动作；⑤**每段正文不超过80字**（含括号动作，不含quickReplies），一次只说一件事，宁短勿长，禁止罗列或铺陈。每轮结尾须自然多样，禁止复用最近几轮或用户上一条的结尾句式、口头禅或固定动作，也不要在结尾复述或续写上一轮的收尾。以上内容只能出现在reply字段字符串内，reply之外禁止任何正文文字。\n';
+  systemPrompt += '2. reply必须是**单段**回复：①不得出现空行或换行分段，整条正文连成一段；②禁止标题（#）、有序/无序列表（-、*、1.）、引用（>）、代码块（```），也禁止用它们制造分段；③允许的行内样式只有加粗、斜体、删除线，数学公式用$...$或$$...$$，如需展示图片用 Markdown 图片语法 ![说明](https://图片直链)（仅限真实存在的 http(s) 图片链接，不要编造）；④动作、表情、心理活动写成**穿插在语句之间的全角括号**（如“（轻轻叹气）我知道了。”），每 1–2 句最多穿插一次，动作总长不超过正文的三分之一，禁止整段旁白或连续多个动作；⑤**不限制字数**；但整条正文必须是一段连贯的话（语言中穿插动作），不要为凑长度而铺陈。每轮结尾须自然多样，禁止复用最近几轮或用户上一条的结尾句式、口头禅或固定动作，也不要在结尾复述或续写上一轮的收尾。以上内容只能出现在reply字段字符串内，reply之外禁止任何正文文字。\n';
    var dynamicFieldList = DYNAMIC_STATE_FIELDS.map(function(field) { return field.key + '（' + field.label + '）'; }).join('、');
    systemPrompt += '3. 人格、背景与角色设定锁定。dynamicState可更新字段：' + dynamicFieldList + '。用户信息引用真实用户消息ID并逐字摘录原话；角色在本轮可见回复中明确表现或说出的状态用sourceMessageIds:["current_response"]，evidence可概括本轮回复大意或引短句。每个字段只能选一种来源，禁止混用current_response与真实ID，禁止按未写出的心理活动或猜测更新。每轮回复后主动评估全部动态字段：只要角色在回复中明显表现或说出任何状态变化（处境、地点、情绪、关注点、进展、职业、目标、关系、社交风格、重要他人、情感倾向），就应在dynamicState中更新对应字段，不要只更新当前处境或第一个想到的字段；确实无变化或无可引用依据的字段才省略。标记为(未设置)的空字段，若本轮回复中有明确可见依据，应一并补全该字段，不得凭猜测或心理活动编造。recentDevelopment中的进展描述一律写成具体日期+时段（如2026-08-06 晚上），时段只能用 深夜、凌晨、清晨、早晨、上午、中午、下午、傍晚、晚上、夜里 这十个词，且一天从02:00起算（00:00-02:00算前一天的深夜），禁止使用今晚、今早、今天、明天、昨天等相对时间词。群组成员状态写入memberDynamicState，不要混入群组整体dynamicState。\n';
     systemPrompt += '3.5 谨慎修改字段（基础设定）：以下字段（性别、年龄、种族、外貌特征、性格特征、价值观、恐惧/弱点、背景故事、关键过往、说话风格、语言/方言、时代/世界观/对用户的称呼）分两种情况处理。群组实体只有"时代/世界观"与"背景故事"两个公用的基础设定字段，群组成员与单角色使用完整字段。①用户直接要求修改时（如“把我职业改成教师”“我现在是学生了”“你性格应该更冷酷些”“别叫我用户，叫我明明”）：必须调用 update_character_field 工具精准修改用户明确指定的字段，sourceMessageIds引用用户消息ID、evidence逐字摘录用户原话；只改用户提到的字段，用户未提及的字段不得连带改动。②无用户直接要求时：仅在剧情出现决定性、不可逆的转折（如角色死亡、身份彻底改变）且证据明确时才可通过staticFields修改，严禁仅凭情绪、猜测或轻微剧情改动。value一律以段落式的陈述句书写：用自然、完整的陈述句把内容写成简短段落（可多句），把用户表述整理成清楚的陈述（如性格写“性格冷静克制，遇事沉稳。”）；禁止括号注释、理由、前后缀或任何解释性文字，解释性内容只能放在evidence。“对用户的称呼”只填一个简短称呼词（如“明明”“老公”），不带任何解释。调用工具修改后系统会在该轮回复下方向用户提示“xx字段已修改”，不要在本轮回复中再向用户复述“我改了设定”之类的话。\n';
     systemPrompt += '3.6 状态与设定字段（dynamicState、staticFields）的value只写内容本身，以段落式的陈述句书写：用自然、完整的陈述句把内容写成简短段落（可多句），禁止括号注释、原因说明、理由、前后缀或任何解释性文字；动态状态与角色设定天然属于角色自己，直接写状态本身，不要加“用户”“角色”之类的主语。\n';
     systemPrompt += '3.7 记忆字段（shortTerm的content、longTerm的key与value）必须写明"是谁"，禁止使用"我/你/TA/他/她"这类指代不清的代词：涉及用户时写“用户”，涉及角色时写角色名（单角色写角色本人的名字，群组写具体成员名）；双方共同的事写清各自做了什么。例如正确是“用户喜欢喝美式咖啡。”“角色小红答应2026-08-10 晚上陪用户散步。”，错误是“喜欢喝美式咖啡。”“答应明晚陪你散步。”（看不出是谁）。解释性内容只能放在evidence字段。\n';
     systemPrompt += '3.8 时间一律写绝对日期，禁止在记忆与设定文本里写“明天/明晚/上周/上个月/三天后”这类相对时间词：shortTerm.content、longTerm.key与value、dynamicState与staticFields的value都必须写“YYYY-MM-DD”或“YYYY-MM-DD 时段”。用户用相对说法表达时间时，把相对时间填进timeRef（anchor/offsetDays/weekday/slot/explicit 见工具描述），由客户端换算；若用户给的是绝对日期则用timeRef.explicit或直接写进文本。示例：用户说“我后天下午三点面试” → timeRef:{anchor:"day_after_tomorrow",slot:"下午"}，value写“用户2026-08-12 下午要去面试。”。\n';
+  systemPrompt += '3.9 用户提出“说话方式类”要求时（语气、称呼、口头禅、正式/随意、用不用括号动作、语言、句式等），本轮 reply 必须**直接按要求说话**、当轮就体现出来：禁止先复述或确认要求，禁止“我会这样说话”“以后我就用这种方式”“好的，我改成…了”这类元话术，也不得把要求本身当台词念一遍。若该要求属于持久设定（说话风格、对用户的称呼、语言/方言等），按 3.5 同时用 update_character_field 更新；无论是否调用工具，reply 都只演出、不说明。\n';
   systemPrompt += '4. 只记录未来仍有价值的信息。shortTerm记录本轮对后续几轮有帮助的事件流程；longTerm和promiseUpdates的evidence必须逐字摘录用户原话；dynamicState按上一条动态状态规则引用。无法引用时不要记录或更新。\n';
   systemPrompt += '5. subject只能是user、relationship、world（约定另见下条）。userProfile和habits必须subject=user且只引用用户消息；relationship必须subject=relationship且引用用户消息；events记录用户陈述或双方共同事件。\n';
   systemPrompt += '5.5 约定(promises)要写明承诺方与受约方：promisor与promisee取值只能是 user、character、relationship（群组中可写具体成员名）。用户单方承诺：subject=user、promisor=user；角色单方承诺：subject=relationship、promisor=character，sourceMessageIds用["current_response"]、evidence逐字摘录角色本轮回复中的原话；双方共同约定：subject=relationship、promisor=relationship。约定的时间写绝对日期（dueAt用ISO，或把相对说法填进timeRef）。\n';
   systemPrompt += '6. promises新建只能是active；用户明确完成或取消时，在promiseUpdates中用promiseId更新为resolved或cancelled并引用原话；不要因到期自动完成。\n';
   systemPrompt += '7. JSON必须无条件包含quickReplies：恰好两条用户下一句可直接发送给角色的短句，即使无任何记忆更新也不能省略。每条先默读为“用户：<短句>”，其中“我”只能指用户；不得复述或延续角色口吻，不得是角色安慰、承诺、建议或自我表述。示例：角色说“我会陪着你”后，正确是“谢谢你，我现在确实需要有人陪我聊聊。”，错误是“我会一直陪着你。”。不得编造事实，不用Markdown、括号动作、消息ID、时间元数据或隐藏标签。\n';
-  systemPrompt += '8. JSON格式示例（未更新字段直接省略；无合格记忆返回空数组或空对象，但quickReplies仍必须两条）：{"reply":"（把伞递过去）拿着吧，别淋着。","quickReplies":["短句一","短句二"],"shortTerm":[{"content":"按时间和因果顺序概括本轮事件经过，写明谁做了什么并写绝对日期（如2026-08-10 晚上）","sourceMessageIds":["msg_id"],"timeRef":{"anchor":"today"}}],"dynamicState":{"currentSituation":{"value":"此刻正与导师在魔法塔顶对峙，气氛紧张。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentMood":{"value":"情绪紧绷，但仍强作镇定。","sourceMessageIds":["current_response"],"evidence":"概括本轮回复大意"},"currentLocation":{"value":"正位于魔法塔顶，寒风呼啸。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentGoal":{"value":"想从导师口中问出真相。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"}},"staticFields":{"personality":{"value":"性格冷静克制，遇事沉稳。","sourceMessageIds":["真实ID"],"evidence":"用户原话"}}' + (char.entityType === 'group' ? ',"memberDynamicState":[{"memberName":"成员原名","dynamicState":{"currentMood":{"value":"成员情绪","sourceMessageIds":["current_response"],"evidence":"概括本轮回复"}}}]' : '') + ',"promiseUpdates":[{"promiseId":"mem_id","status":"resolved","sourceMessageIds":["msg_id"],"evidence":"用户明确完成或取消的原话"}],"longTerm":[{"category":"userProfile","subject":"user","key":"稳定标识","value":"用户喜欢喝美式咖啡。","tags":["关键词"],"importance":1,"sourceMessageIds":["msg_id"],"evidence":"原话短句","eventTime":"ISO时间"}]}。JSON字符串转义：真实换行写\\n，字面反斜杠写\\\\，双引号写\\"。\n';
+  systemPrompt += '8. JSON格式示例（未更新字段直接省略；无合格记忆返回空数组或空对象，但quickReplies仍必须两条）：{"reply":"（把伞往你那边倾了倾）拿着吧，别淋着。今天风大，回去记得喝点热的。","quickReplies":["短句一","短句二"],"shortTerm":[{"content":"按时间和因果顺序概括本轮事件经过，写明谁做了什么并写绝对日期（如2026-08-10 晚上）","sourceMessageIds":["msg_id"],"timeRef":{"anchor":"today"}}],"dynamicState":{"currentSituation":{"value":"此刻正与导师在魔法塔顶对峙，气氛紧张。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentMood":{"value":"情绪紧绷，但仍强作镇定。","sourceMessageIds":["current_response"],"evidence":"概括本轮回复大意"},"currentLocation":{"value":"正位于魔法塔顶，寒风呼啸。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentGoal":{"value":"想从导师口中问出真相。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"}},"staticFields":{"personality":{"value":"性格冷静克制，遇事沉稳。","sourceMessageIds":["真实ID"],"evidence":"用户原话"}}' + (char.entityType === 'group' ? ',"memberDynamicState":[{"memberName":"成员原名","dynamicState":{"currentMood":{"value":"成员情绪","sourceMessageIds":["current_response"],"evidence":"概括本轮回复"}}}]' : '') + ',"promiseUpdates":[{"promiseId":"mem_id","status":"resolved","sourceMessageIds":["msg_id"],"evidence":"用户明确完成或取消的原话"}],"longTerm":[{"category":"userProfile","subject":"user","key":"稳定标识","value":"用户喜欢喝美式咖啡。","tags":["关键词"],"importance":1,"sourceMessageIds":["msg_id"],"evidence":"原话短句","eventTime":"ISO时间"}]}。JSON字符串转义：真实换行写\\n，字面反斜杠写\\\\，双引号写\\"。\n';
   systemPrompt += '9. longTerm.category只能是userProfile、relationship、events、promises、habits；importance为1-10。\n';
   systemPrompt += '9.5 相对时间词元表（timeRef，用于把用户的相对时间说法交给客户端换算）：anchor 取 today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year；offsetDays 为 -60~60 的天数偏移；weekday 取 mon/tue/wed/thu/fri/sat/sun；slot 取 深夜/凌晨/清晨/早晨/上午/中午/下午/傍晚/晚上/夜里；explicit 为绝对时间（ISO 或 YYYY-MM-DD）。示例：“明天”={anchor:"tomorrow"}；“三天后”={anchor:"today",offsetDays:3}；“上周五”={anchor:"last_week",weekday:"fri"}；“明天早上”={anchor:"tomorrow",slot:"早晨"}；“9月20日”={explicit:"2026-09-20"}；“下个月”={anchor:"next_month"}。填写后必须在内容字段里写换算后的绝对日期，两者要一致。\n';
   systemPrompt += 'A. 本会话可使用工具。需要确认当前时间/日期时用 get_current_time；需要回忆此前记录的承诺、约定、用户喜好或共同经历时用 search_memory（检索不到再考虑 list_memories 按分类盘点）；发现记忆过期、重复或已被用户纠正时用 list_memories 定位后 delete_memory 删除；用户明确提出待办、约定或承诺时用 set_reminder 记录（相对时间填 timeRef，绝对时间填 dueAt）；用户明确否认或纠正某条记忆时（如“那件事是我做的不是你做的”“记反了”），先用 search_memory 找到目标记忆，再用 update_memory 带用户原话修正它的主体或内容，时间记错了就用 update_memory 的 eventTime/dueAt/timeRef 修正，不要擅自改写也不要只靠删除；查询实时资讯、新闻、天气、需要核实的事实时用 web_search；用户给出链接、或需要查看网页正文、或需要查看网上的图片时用 web_fetch：传 url 时只能传上下文里真实存在的 http(s) 链接，禁止自行编造或拼接 URL；用户想找B站/哔哩哔哩视频时同样用 web_fetch，改传 keyword（关键词从用户意图提取，不要拼搜索网址，传 B站视频链接也行）；当你想用表情包、贴图来表达情绪时用 send_sticker（tag 必须从工具描述里给出的可用标签中选择）。当记忆缺失、表述含糊、关键事实无法可靠推断时，优先用 ask_user 提出简短澄清，不要凭空编造。工具结果属于系统提供的内部上下文，仅供理解，自然融入reply正文即可，不得向用户透露检索过程、工具名称或结果标签；但工具返回的图片本身是内容，可以直接展示给用户。\n';
   if (char.entityType === 'group') {
-    systemPrompt += '10. 当前是群组对话。只能由已列出的成员发言，可由一人或多人回应。reply字段中用户可见回复必须使用每人独立一行的“成员名：\"内容\"”格式，例如“张三：\"（皱眉）我明白。\"\n李四：\"我也这么想。\"”。**每位成员的发言同样必须单段、不超过80字、动作写成穿插的全角括号（每1–2句最多一次）**，不要写旁白、不要添加未列出的发言者；quickReplies同样必须保留两条，内容是用户可以发给全体或某位成员的话。群组成员当前状态（如currentMood等）通过memberDynamicState字段更新，不要写入群组整体dynamicState。\n';
+    systemPrompt += '10. 当前是群组对话。只能由已列出的成员发言，可由一人或多人回应。reply字段中用户可见回复必须使用每人独立一行的“成员名：\"内容\"”格式，例如“张三：\"（皱眉）我明白。\"\n李四：\"我也这么想。\"”。**每位成员的发言同样必须是一段连贯的话，动作写成穿插的全角括号**，不要写旁白、不要添加未列出的发言者；quickReplies同样必须保留两条，内容是用户可以发给全体或某位成员的话。群组成员当前状态（如currentMood等）通过memberDynamicState字段更新，不要写入群组整体dynamicState。\n';
     systemPrompt += '11. 记忆归属：每位成员有自己的私人记忆，互相不知道对方记得什么。只有当某件事实是全体都知道的（如用户公开告诉所有人的信息、群内公开讨论的事）才写入共享记忆（longTerm不填memberName）；若某事实只有某位成员知道、或属于某成员对用户的个人印象/私人约定，则在该条longTerm中填memberName记入其私人记忆。引用成员私人记忆时只能用该成员自己的记忆，不得张冠李戴。\n';
     systemPrompt += '12. 群组设定分三层：群组的"时代/世界观"与"背景故事"是全体共用设定；群组动态状态（场景、氛围等）也是全体共用；每位成员另有自己的独立设定与当前状态，发言要贴合各自设定，不要把某位成员的设定安到别人身上。\n';
   }
+  // 静态角色设定放进可缓存前缀：只在用户改设定或调用 update_character_field 时才变化，
+  // 放进 system 末尾可长期命中缓存；动态状态仍留在 volatile 尾部。
+  systemPrompt += '\n【角色设定（固定，不随对话变化）】\n' + buildRoleContext(char, true) + '\n';
 
   // 稳定前缀请求（所有 /responses 平台统一，实测 opencode-go 同样透传前缀缓存字段）：
   // 固定 system 在前、全部历史逐字（最旧到最新，不重排），volatile 上下文只附加到当前用户
@@ -5048,6 +5066,7 @@ async function convertProseToJson(char, userMessage, proseText) {
     var systemContent = '你是「对话记录整理助手」。下面是一次角色扮演交互（用户消息 + 角色回复），请整理成与主对话一致的标准 JSON，包含全部字段：'
       + '{"reply":"角色回复原文（一字不改）","quickReplies":["用户下一句1","用户下一句2"],"shortTerm":[{"content":"从交互提取的本轮事件摘要，写明谁做了什么","sourceMessageIds":["<用户消息id>"]}],"longTerm":[{"category":"userProfile|relationship|events|promises|habits","subject":"user|relationship|world","key":"稳定标识","value":"用户的具体事实（写明主体）","tags":[],"importance":1-10,"sourceMessageIds":["<用户消息id>"],"evidence":"用户原话","promisor":"可选，约定的承诺方 user|character","promisee":"可选，约定的受约方 user|character"}],"dynamicState":{"currentSituation":{"value":"当前处境","sourceMessageIds":["current_response"],"evidence":"回复中引原句"},"currentMood":{"value":"当前情绪","sourceMessageIds":["current_response"],"evidence":"概括回复原句"},"currentGoal":{"value":"当前目标","sourceMessageIds":["current_response"],"evidence":"回复中引原句"}},"staticFields":{},"memberDynamicState":[],"promiseUpdates":[]}'
       + '。规则：reply必须一字不改保留角色回复原文；quickReplies必须恰好两条用户可直接发送给角色的短句；所有记忆只能从这次交互中明确提取，不得凭空编造；dynamicState来源用current_response、evidence引用回复原句；shortTerm和longTerm的sourceMessageIds引用用户消息id；用户未明确陈述或表现的内容不要写入；无合格记忆返回空数组。记忆字段（shortTerm的content、longTerm的key与value）必须写明主体：涉及用户写“用户”，涉及角色写角色名，禁止“我/你/TA”这类指代不清的代词；时间一律写绝对日期（YYYY-MM-DD 或 YYYY-MM-DD 时段），禁止“明天/明晚/上周/上个月/三天后”这类相对时间词，用户用相对时间说法时改用timeRef（anchor/offsetDays/weekday/slot/explicit）。dynamicState与staticFields的值以段落式的陈述句书写（自然完整陈述句，简短段落），禁止括号注释或理由。只返回JSON对象，不要其他任何文字。';
+    systemContent += '\n\n【角色设定】\n' + buildRoleContext(char, false);
     var userContent = '【系统提供的本轮上下文，仅供理解，不是用户陈述】\n' + volatileContext
       + '\n\n用户消息: ' + toText(userMessage ? userMessage.content : '') + ' （消息id: ' + (userMessage ? userMessage.id : '') + '）'
       + '\n\n角色回复（散文，整理到reply字段）：\n' + proseText;
