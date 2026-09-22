@@ -7,6 +7,9 @@ on:
     paths:
       - 'android-lite/**'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -17,6 +20,14 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: gradle/actions/setup-gradle@v4
+      - name: Read versionName from build.gradle.kts
+        id: version
+        working-directory: android-lite
+        run: |
+          VERSION=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts | head -1)
+          if [ -z "$VERSION" ]; then echo "versionName not found" >&2; exit 1; fi
+          echo "name=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Detected versionName=$VERSION"
       - name: Restore signing keystore
         shell: bash
         env:
@@ -30,7 +41,30 @@ jobs:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: gradle :app:assembleRelease --stacktrace
+      - name: Rename APK to versioned file
+        shell: bash
+        run: |
+          SRC=android-lite/app/build/outputs/apk/release/app-release.apk
+          DEST=apk/DeepTalking-lite-v${{ steps.version.outputs.name }}.apk
+          mkdir -p apk
+          cp "$SRC" "$DEST"
+          echo "Prepared $DEST"
+          ls -l "$DEST"
       - uses: actions/upload-artifact@v4
         with:
           name: deeptalking-lite-release-apk
-          path: android-lite/app/build/outputs/apk/release/app-release.apk
+          path: apk/DeepTalking-lite-v${{ steps.version.outputs.name }}.apk
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ steps.version.outputs.name }}"
+          APK="apk/DeepTalking-lite-v${{ steps.version.outputs.name }}.apk"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$APK" --clobber
+          else
+            gh release create "$TAG" "$APK" \
+              --title "$TAG" \
+              --notes "Automated release for $TAG (DeepTalking Lite)." \
+              --latest
+          fi
