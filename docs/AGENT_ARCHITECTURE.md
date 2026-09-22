@@ -1,6 +1,6 @@
-# Agent 架构文档（DeepTalking / hub_1.html）
+# Agent 架构文档（DeepTalking / hub.html）
 
-> 本文档记录 `hub_1.html` 中 agent 功能的定义与构造，所有代码锚点均指向当前文件行号，重构时请同步更新。
+> 本文档记录 `hub.html` 中 agent 功能的定义与构造，所有代码锚点均指向当前文件行号，重构时请同步更新。
 
 ## 一、Agent 是什么
 
@@ -19,7 +19,7 @@
 用户输入
    │
    ▼
-buildRequestPayload(hub_1.html:3452)
+buildRequestPayload(hub.html:3452)
    ├─ 人格注入 buildRoleContext(:3280)
    ├─ 相关记忆注入 buildVolatileContext(:3398) / retrieveRelevantMemories(:2825)
    └─ 消息历史（DeepSeek 前缀缓存友好截断 :3473）
@@ -44,14 +44,14 @@ applyMemoryUpdate(:3242) 落盘 shortTerm / longTerm / dynamicState / promiseUpd
 
 ### 1. API 载体（Responses API）
 
-- `buildResponsesRequestBody()` — hub_1.html:3838
+- `buildResponsesRequestBody()` — hub.html:3838
 - 请求体字段：`model`、`input`（首条 system 提升为 `instructions`）、`stream`、`temperature`、`max_output_tokens=8192`、`tools`、`tool_choice`、`reasoning.effort`。
-- 端点：`getResponsesEndpoint()` — hub_1.html:3573（把 base URL 归一化为 `/responses`）。
+- 端点：`getResponsesEndpoint()` — hub.html:3573（把 base URL 归一化为 `/responses`）。
 - 阶段二（submit）时强制 `tool_choice = { type: 'function', name: 'submit_response' }`，且 `reasoning = { effort: 'none' }`（DeepSeek 仅支持 effort=none 时锁定工具）。
 
 ### 2. 工具清单（agent 的能力）
 
-`buildAgentTools()` — hub_1.html:3587，通过 `isAgentToolsEnabled()`（:3583）控制开关（当前即启用）。
+`buildAgentTools()` — hub.html:3587，通过 `isAgentToolsEnabled()`（:3583）控制开关（当前即启用）。
 
 | 工具 | 作用 | 关键实现 |
 |---|---|---|
@@ -67,13 +67,13 @@ applyMemoryUpdate(:3242) 落盘 shortTerm / longTerm / dynamicState / promiseUpd
 
 ### 3. 工具实现（agent 的手）
 
-`executeToolCall(call, char)` — hub_1.html:3631
+`executeToolCall(call, char)` — hub.html:3631
 - 模型只"说"要调用，真正干活的是这段代码：读写 `char.memory.longTerm`、返回时间、记约定等。
 - 统一返回 JSON 字符串，异常安全（`try/catch` 兜底，失败返回 `{ ok: false, reason }`）。
 
 ### 4. Agent 循环（大脑）
 
-`sendMessage` 内的 `while(true)` — hub_1.html:2159-2247：
+`sendMessage` 内的 `while(true)` — hub.html:2159-2247：
 
 - **工具调用**：模型返回 `function_call` 事件时，逐个执行。关键限制：DeepSeek thinking 模式不支持并行 function_call 回传（会 400），所以**每轮仅回传一个调用**，其余丢弃，模型基于结果下一轮再决定（:2192-2195）。
 - **上限**：`MAX_TOOL_ROUNDS = 5`（:3580），超出直接进入收尾阶段。
@@ -83,7 +83,7 @@ applyMemoryUpdate(:3242) 落盘 shortTerm / longTerm / dynamicState / promiseUpd
 
 ### 5. 结构化收尾协议（agent 的手续）
 
-`buildSubmitResponseTool()` — hub_1.html:3796；`extractSubmitResponse()` — :3821。
+`buildSubmitResponseTool()` — hub.html:3796；`extractSubmitResponse()` — :3821。
 
 每轮必须且只能调用一次 `submit_response`，用 JSON Schema（`strict: true`）强制校验，一次性输出：
 
@@ -104,7 +104,7 @@ applyMemoryUpdate(:3242) 落盘 shortTerm / longTerm / dynamicState / promiseUpd
 
 ### 三层结构
 
-`MEMORY_LIMITS` — hub_1.html:979
+`MEMORY_LIMITS` — hub.html:979
 
 | 层 | 内容 | 上限 |
 |---|---|---|
@@ -121,7 +121,7 @@ applyMemoryUpdate(:3242) 落盘 shortTerm / longTerm / dynamicState / promiseUpd
 
 ### 相关度检索
 
-`retrieveRelevantMemories(char, query)` — hub_1.html:2825
+`retrieveRelevantMemories(char, query)` — hub.html:2825
 - 评分 = 有效重要度×0.45 + 关键词命中加分 + 时效加分（90 天内递增）。
 - 取 top 8，配合 `pendingRecall`（待召回记忆，强制置顶）。
 
@@ -132,7 +132,7 @@ applyMemoryUpdate(:3242) 落盘 shortTerm / longTerm / dynamicState / promiseUpd
 
 ### 动态状态（动态字段）
 
-`DYNAMIC_STATE_FIELDS` — hub_1.html:996：`currentSituation`（处境）/ `currentLocation`（位置）/ `currentMood`（情绪）/ `currentFocus`（关注）/ `recentDevelopment`（进展）。每个字段的 value 必须带 `sourceMessageIds` + `evidence` 溯源。
+`DYNAMIC_STATE_FIELDS` — hub.html:996：`currentSituation`（处境）/ `currentLocation`（位置）/ `currentMood`（情绪）/ `currentFocus`（关注）/ `recentDevelopment`（进展）。每个字段的 value 必须带 `sourceMessageIds` + `evidence` 溯源。
 
 ## 五、进阶记忆子系统（2026-08 新增）
 
@@ -176,7 +176,7 @@ applyMemoryUpdate(:3242) 落盘 shortTerm / longTerm / dynamicState / promiseUpd
 
 ## 七、人格与 Prompt
 
-- `buildRoleContext(char)` — hub_1.html:3280：从 `char.basicInfo` 拼人格（主字段 + 次字段），群组则拼成员清单。
+- `buildRoleContext(char)` — hub.html:3280：从 `char.basicInfo` 拼人格（主字段 + 次字段），群组则拼成员清单。
 - `buildRequestPayload(char, query)` — :3452：system prompt = 角色设定 + 交互规则（JSON 格式铁律、dynamicState 溯源规则、记忆写入规则、工具使用说明、群组格式）。
 - DeepSeek 前缀缓存优化 — :3473：固定 system 在前，历史消息原样按序（最旧→最新）拼接，volatile context 只追加到当前用户消息，保证缓存前缀每轮不变。
 
@@ -192,4 +192,4 @@ applyMemoryUpdate(:3242) 落盘 shortTerm / longTerm / dynamicState / promiseUpd
 | `DYNAMIC_STATE_FIELDS` | 5 个动态字段 | :996 |
 | `max_output_tokens` | 8192 | :3845 |
 
-> 注：文中行号随 `hub_1.html` 演进会偏移，仅作参考；以函数名检索为准。
+> 注：文中行号随 `hub.html` 演进会偏移，仅作参考；以函数名检索为准。

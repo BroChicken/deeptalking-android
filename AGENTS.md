@@ -7,9 +7,11 @@
 | **像素头像**（16×16 网格） | `archive/experimental_failures/pixel_test/` | 试验失败品：模型输出网格常缺行/缺色/尺寸错误；**不再渲染**，头像统一走 emoji，代码中仅保留 `normalizePixelAvatar` 做历史数据兼容 |
 
 ## 2. 每次开发只改两个文件，且内容必须一致
-- 开发主文件：`hub_1.html`（Web 版/开发版）
+- 开发主文件：`hub.html`（仓库根目录，Web 版/开发版）
 - APK 内文件：`android-lite/app/src/main/assets/hub.html`
-- **任何对 hub_1.html 的改动，必须同步复制到 hub.html，两份文件字节级一致，否则禁止提交。**
+- **任何对根目录 `hub.html` 的改动，必须同步复制到 `android-lite/app/src/main/assets/hub.html`，两份文件字节级一致，否则禁止提交。**
+  提交前跑一次校验：`powershell -File tools/check-sync.ps1`（SHA256 不一致会退出码 1）。
+- `stable_version/` 已废弃、不再保留；需要回退旧版本用 git 历史与标签（`git checkout <tag> -- hub.html`）。
 
 ## 3. 版本号规则
 - `android-lite/app/build.gradle.kts` 中 `versionName` 为 `X.Y.Z`，`versionCode` 单调递增。

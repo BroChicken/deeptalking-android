@@ -1136,7 +1136,7 @@ const DEFAULT_CONFIG = {
   proactiveEnabled: true,
   platformSettings: {}
 };
-const APP_VERSION = '1.1.1';
+const APP_VERSION = '1.1.2';
 const PLATFORM_CONFIGS = {
   deepseek: { baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-flash', models: ['deepseek-flash'] },
   opencode: { baseUrl: 'https://opencode.ai/zen/go/v1', model: 'deepseek-flash', keepV1InResponses: true, models: ['deepseek-flash'] },
@@ -3792,6 +3792,36 @@ function updateMessageBubble(messageId, text) {
   if (shouldFollow) container.scrollTop = container.scrollHeight;
 }
 
+// 模型经常把 reply 等自由文本字段里的引号与换行原样写进 JSON 字符串（群组回复尤其常见：
+// 成员名后的 "台词" 带半角引号，成员之间还有真实换行），导致 JSON.parse 直接失败。
+// 这里对已知自由文本字段做定向修复：取 "key":" 之后到最近一个 "下一个键名": 或 "} 之前的
+// 原文，先解码已有转义再交给 JSON.stringify 重新转义拼回，使整段 JSON 可解析——解析成功后
+// quickReplies/shortTerm/longTerm/dynamicState 等记忆字段也一并保住，不必再触发"整理回复"。
+const JSON_FREETEXT_KEYS = ['reply', 'content', 'value', 'key', 'evidence', 'question', 'summary', 'description', 'note', 'reason'];
+
+function decodeJsonEscapes(raw) {
+  return String(raw).replace(/\\(u[0-9a-fA-F]{4}|.)/g, function(match, code) {
+    if (code.charAt(0) === 'u') return String.fromCharCode(parseInt(code.slice(1), 16));
+    if (code === 'n') return '\n';
+    if (code === 'r') return '\r';
+    if (code === 't') return '\t';
+    if (code === 'b') return '\b';
+    if (code === 'f') return '\f';
+    if (code === '"' || code === '\\' || code === '/') return code;
+    return match;
+  });
+}
+
+function repairFreetextFields(raw) {
+  var source = toText(raw);
+  if (!source) return source;
+  var pattern = new RegExp('("(?:' + JSON_FREETEXT_KEYS.join('|') + ')"\\s*:\\s*")([\\s\\S]*?)("(?:\\s*,\\s*"[A-Za-z_][A-Za-z0-9_]*"\\s*:|\\s*[}\\]]))', 'g');
+  return source.replace(pattern, function(match, head, body, tail) {
+    // head 已含开引号、tail 已含闭引号，这里只取 JSON.stringify 的转义内容
+    return head + JSON.stringify(decodeJsonEscapes(body)).slice(1, -1) + tail;
+  });
+}
+
 function parseJsonPayload(text) {
   var cleaned = toText(text).trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
   if (!cleaned) throw new Error('JSON内容为空');
@@ -3824,6 +3854,24 @@ function parseJsonPayload(text) {
     try {
       return JSON.parse(cleaned.replace(/,\s*([}\]])/g, '$1')); // 尾随逗号清理
     } catch (trailingCommaError) { /* 继续尝试其他兜底 */ }
+    var repairedAttempts = [];
+    try { repairedAttempts.push(repairFreetextFields(cleaned)); } catch (repairError) { /* 忽略 */ }
+    var shapeStart = cleaned.indexOf('{');
+    var shapeEnd = cleaned.lastIndexOf('}');
+    if (shapeStart !== -1 && shapeEnd > shapeStart) {
+      try { repairedAttempts.push(repairFreetextFields(cleaned.slice(shapeStart, shapeEnd + 1))); } catch (shapeError) { /* 忽略 */ }
+    }
+    for (var repairedIndex = 0; repairedIndex < repairedAttempts.length; repairedIndex++) {
+      var repairedText = repairedAttempts[repairedIndex];
+      if (!repairedText) continue;
+      try {
+        return JSON.parse(repairedText);
+      } catch (strictRepairedError) {
+        try {
+          return JSON.parse(repairedText.replace(/,\s*([}\]])/g, '$1'));
+        } catch (looseRepairedError) { /* 继续尝试其他兜底 */ }
+      }
+    }
     var pairs = [['{', '}'], ['[', ']']];
     for (var i = 0; i < pairs.length; i++) {
       var start = cleaned.indexOf(pairs[i][0]);
@@ -5027,6 +5075,7 @@ function buildRequestPayload(char, query) {
   // 静态角色设定放进可缓存前缀：只在用户改设定或调用 update_character_field 时才变化，
   // 放进 system 末尾可长期命中缓存；动态状态仍留在 volatile 尾部。
   systemPrompt += '\n【角色设定（固定，不随对话变化）】\n' + buildRoleContext(char, true) + '\n';
+  systemPrompt += '【输出格式（再次强调）】你的输出必须且只能是单个JSON对象：以{开头、以}结尾，reply为JSON第一个字段，全文不得出现JSON以外的任何文字；reply字符串里的每个引号写成 \\"，每个换行写成 \\n（群组回复里每位成员的台词引号同样要转义，成员之间换行写 \\n）。\n';
 
   // 稳定前缀请求（所有 /responses 平台统一，实测 opencode-go 同样透传前缀缓存字段）：
   // 固定 system 在前、全部历史逐字（最旧到最新，不重排），volatile 上下文只附加到当前用户
@@ -5054,7 +5103,9 @@ function buildRequestPayload(char, query) {
     } else {
       var assistantHistoryText = trimText(toText(message.content), 1200);
       if (!assistantHistoryText) return; // 纯表情包消息不进请求（图片不发给模型）
-      recentMessages.push({ role: 'assistant', content: assistantHistoryText });
+      // 历史里的 assistant 轮次按最小 JSON 注入（reply 用 JSON.stringify 正确转义）：
+      // 既保持"每轮输出都是一个 JSON 对象"的格式示范，也让模型持续看到引号/换行该怎么转义。
+      recentMessages.push({ role: 'assistant', content: '{"reply":' + JSON.stringify(assistantHistoryText) + '}' });
     }
   });
   return [{ role: 'system', content: systemPrompt }].concat(recentMessages);
@@ -5821,7 +5872,9 @@ function buildResponsesRequestBody(messages, stream, toolState, phase) {
   // 阶段二（提交回复）：必须强制锁定 submit_response，且 DeepSeek 仅支持 effort=none 时锁定
   body.reasoning = { effort: submitPhase ? 'none' : state.config.reasoningEffort };
   if (submitPhase) {
-    body.tools = [buildSubmitResponseTool()];
+    // 阶段二沿用与自动阶段完全相同的工具数组，只把 tool_choice 锁到 submit_response：
+    // 前缀与自动阶段一致，这次请求仍能命中缓存（实测网关接受"全量 tools + 锁定 tool_choice"）。
+    body.tools = buildAgentTools(toolState && toolState.char).concat([buildSubmitResponseTool()]);
     body.tool_choice = { type: 'function', name: 'submit_response' };
   } else {
     body.tools = buildAgentTools(toolState && toolState.char);
@@ -5926,6 +5979,11 @@ function extractReplyFromJson(raw) {
         try {
           return JSON.parse(raw.slice(i, j + 1));
         } catch (e) {
+          // 引号/换行未转义时用同一套定向修复再取一次 reply
+          try {
+            var repairedReplyMatch = repairFreetextFields(raw).match(/"reply"\s*:\s*("(?:[^"\\]|\\.)*")/);
+            if (repairedReplyMatch) return JSON.parse(repairedReplyMatch[1]);
+          } catch (repairError) { /* 忽略 */ }
           return null;
         }
       }

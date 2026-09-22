@@ -1,6 +1,6 @@
 # Agent 后续方向（Roadmap）
 
-> 记录已评估的优化方向，标注实施状态。已实施内容见 `hub_1.html` 与 `docs/AGENT_ARCHITECTURE.md`。
+> 记录已评估的优化方向，标注实施状态。已实施内容见 `hub.html` 与 `docs/AGENT_ARCHITECTURE.md`。
 > 本文件是根目录旧 `AGENT_OPTIMIZATIONS.md` 的迁移版，按"架构层 / 体验层 / 记忆 / 性能安全"重组，并补充了原理对照。
 
 ## 已弃用功能（试验失败品，请勿再使用/扩展）
@@ -81,4 +81,4 @@
 ## 附录：与现有实现的关系
 
 - 所有优化都在现有五大部件（API 载体 / 工具清单 / 工具实现 / 运行循环 / 结构化收尾）内扩展，不改整体架构。
-- 涉及记忆写入的项需同步约束 `isValidAutomaticMemory`（hub_1.html）与 `applyMemoryUpdate` 的校验逻辑，防止"记录了什么"与"校验规则"脱节。
+- 涉及记忆写入的项需同步约束 `isValidAutomaticMemory`（hub.html）与 `applyMemoryUpdate` 的校验逻辑，防止"记录了什么"与"校验规则"脱节。

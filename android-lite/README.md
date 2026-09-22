@@ -1,6 +1,6 @@
 # DeepTalking Lite (android-lite)
 
-DeepTalking 的轻量 Android 封装：单个 WebView 直接加载 `assets/hub.html`（最新稳定版，由 `hub_1.html` 同步而来）。
+DeepTalking 的轻量 Android 封装：单个 WebView 直接加载 `assets/hub.html`（由仓库根目录 `hub.html` 同步而来）。
 
 - 包名：`com.deeptalking.lite`
 - 显示名：DeepTalking
@@ -22,10 +22,12 @@ CI：推送 `android-lite/**` 到 `main`/`cloud-main` 自动构建，产物上�
 
 ## 更新资产（每次出包前）
 
-把最新的开发版 `hub_1.html` 同步为 APK 内稳定版：
+把仓库根目录的最新开发版 `hub.html` 同步为 APK 内副本：
 
 ```bash
-Copy-Item hub_1.html android-lite/app/src/main/assets/hub.html
+Copy-Item hub.html android-lite/app/src/main/assets/hub.html
+# 同步后校验两份文件一致（SHA256）
+powershell -File tools/check-sync.ps1
 # katex/ 同步（引用了 katex/katex.min.css）
 Copy-Item katex android-lite/app/src/main/assets/katex -Recurse
 ```
