@@ -1136,7 +1136,7 @@ const DEFAULT_CONFIG = {
   proactiveEnabled: true,
   platformSettings: {}
 };
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.2.1';
 const PLATFORM_CONFIGS = {
   deepseek: { baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-flash', models: ['deepseek-flash'] },
   opencode: { baseUrl: 'https://opencode.ai/zen/go/v1', model: 'deepseek-flash', keepV1InResponses: true, models: ['deepseek-flash'] },
@@ -4061,7 +4061,10 @@ function decodeJsonEscapes(raw) {
   });
 }
 
-function repairFreetextFields(raw) {
+// 旧策略（保留作为兜底）：非贪婪正则 + 下一个键名/闭合符作为字段终点。
+// 缺点是无法区分"字段内部未转义引号"与"字段真正的结束引号"，嵌套对象里出现
+// value/evidence 含引号时会把字段提前截断（见 docs/PARSE_GRAPH.md F1）。
+function repairFreetextFieldsLegacy(raw) {
   var source = toText(raw);
   if (!source) return source;
   var pattern = new RegExp('("(?:' + JSON_FREETEXT_KEYS.join('|') + ')"\\s*:\\s*")([\\s\\S]*?)("(?:\\s*,\\s*"[A-Za-z_][A-Za-z0-9_]*"\\s*:|\\s*[}\\]]))', 'g');
@@ -4069,6 +4072,196 @@ function repairFreetextFields(raw) {
     // head 已含开引号、tail 已含闭引号，这里只取 JSON.stringify 的转义内容
     return head + JSON.stringify(decodeJsonEscapes(body)).slice(1, -1) + tail;
   });
+}
+
+// 判断从某个下标起、跳过空白后是否是一个合法的 JSON 结构后继（, "key": / } / ]）。
+function looksLikeJsonContinuation(text, index) {
+  var i = index;
+  while (i < text.length && /\s/.test(text[i])) i++;
+  if (i >= text.length) return false;
+  var ch = text[i];
+  if (ch === '}' || ch === ']') return true;
+  if (ch !== ',') return false;
+  i++;
+  while (i < text.length && /\s/.test(text[i])) i++;
+  if (text[i] === '"') {
+    // ,"key" 的形式
+    var j = i + 1;
+    while (j < text.length && text[j] !== '"') {
+      if (text[j] === '\\') j++;
+      j++;
+    }
+    j++;
+    while (j < text.length && /\s/.test(text[j])) j++;
+    return text[j] === ':';
+  }
+  // ,{ 或 ,[ （数组元素为对象）
+  return text[i] === '{' || text[i] === '[';
+}
+
+// 新策略（引号配对感知）：对每个自由文本字段，从其开引号起逐字符扫描；遇到未转义的
+// 引号时，只有"其后是合法 JSON 后继"才认定为真正的结束引号，否则视为值内部的散引号，
+// 一并转义。为避免 "…"x" } tail" 里值内部的引号因后跟 } 被误判为结束，附加消歧：
+// 若该引号是 }/] 型后继，且其后仍存在别的候选结束引号，则跳过后面的更优候选（真正的
+// 结束引号通常是本字段内最靠后的、结构自洽的那个）。
+function repairFreetextFieldsByScan(raw) {
+  var source = toText(raw);
+  if (!source) return source;
+  var keyPattern = new RegExp('"(' + JSON_FREETEXT_KEYS.join('|') + ')"\\s*:', 'g');
+  var out = '';
+  var cursor = 0;
+  var match;
+  var guard = 0;
+  while ((match = keyPattern.exec(source)) !== null && guard++ < 200) {
+    var keyEnd = match.index + match[0].length;
+    var i = keyEnd;
+    while (i < source.length && /\s/.test(source[i])) i++;
+    if (source[i] !== '"') continue;
+    var openQuote = i;
+    var body = '';
+    var escaped = false;
+    var j = openQuote + 1;
+    var closed = false;
+    while (j < source.length) {
+      var ch = source[j];
+      if (escaped) { body += ch; escaped = false; j++; continue; }
+      if (ch === '\\') { body += ch; escaped = true; j++; continue; }
+      if (ch === '"' && looksLikeJsonContinuation(source, j + 1)) {
+        // 消歧：若是 }/] 型后继且后面还有候选，则跳过后面的候选
+        var isCloseType = false;
+        var peek = j + 1;
+        while (peek < source.length && /\s/.test(source[peek])) peek++;
+        if (source[peek] === '}' || source[peek] === ']') isCloseType = true;
+        if (isCloseType && hasLaterCandidate(source, j + 1)) {
+          body += ch; j++; continue;
+        }
+        closed = true;
+        break;
+      }
+      body += ch;
+      j++;
+    }
+    if (!closed) continue;
+    out += source.slice(cursor, openQuote + 1);
+    out += JSON.stringify(decodeJsonEscapes(body)).slice(1, -1);
+    out += '"';
+    cursor = j + 1;
+    keyPattern.lastIndex = cursor;
+  }
+  out += source.slice(cursor);
+  return out;
+}
+
+// 在 fromIndex 之后是否还存在"疑似结束引号"（其后为合法 JSON 后继）的候选。
+function hasLaterCandidate(source, fromIndex) {
+  var escaped = false;
+  for (var j = fromIndex; j < source.length; j++) {
+    var ch = source[j];
+    if (escaped) { escaped = false; continue; }
+    if (ch === '\\') { escaped = true; continue; }
+    if (ch === '"' && looksLikeJsonContinuation(source, j + 1)) return true;
+  }
+  return false;
+}
+
+// 数组型字段（如 quickReplies）的单条字符串修复：对 "field": [ "..",".." ] 里的每个
+// 字符串项用同样的"引号配对感知"重转义，处理数组项自身含未转义引号的情况。
+const JSON_STRING_ARRAY_KEYS = ['quickReplies'];
+function repairStringArrayField(raw, key) {
+  var source = toText(raw);
+  var keyMatch = source.match(new RegExp('"' + key + '"\\s*:\\s*\\['));
+  if (!keyMatch) return source;
+  var start = source.indexOf('[', keyMatch.index + keyMatch[0].length - 1);
+  // 找到与之配对的 ']'（跳过字符串内部）
+  var i = start + 1;
+  var depth = 1;
+  var inStr = false;
+  var escaped = false;
+  var end = -1;
+  while (i < source.length) {
+    var ch = source[i];
+    if (inStr) {
+      if (escaped) { escaped = false; }
+      else if (ch === '\\') { escaped = true; }
+      else if (ch === '"') { inStr = false; }
+    } else {
+      if (ch === '"') inStr = true;
+      else if (ch === '[') depth++;
+      else if (ch === ']') { depth--; if (depth === 0) { end = i; break; } }
+    }
+    i++;
+  }
+  if (end === -1) return source;
+  var inner = source.slice(start + 1, end);
+  // 按顶层逗号切分数组项，逐个把含散引号的裸串修正
+  var parts = [];
+  var buf = '';
+  var inS = false, esc = false, dep = 0;
+  for (var k = 0; k < inner.length; k++) {
+    var c = inner[k];
+    buf += c;
+    if (inS) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inS = false;
+      continue;
+    }
+    if (c === '"') { inS = true; continue; }
+    if (c === '[' || c === '{') dep++;
+    else if (c === ']' || c === '}') dep--;
+    else if (c === ',' && dep === 0) { parts.push(buf.slice(0, -1)); buf = ''; }
+  }
+  if (buf.trim()) parts.push(buf);
+  var fixedParts = parts.map(function(part) {
+    var t = part.trim();
+    if (t.charAt(0) !== '"') return part;
+    // 提取裸串体：去掉首引号，逐字符找真正的结束（其后为 , 或 ] 或空）
+    var body = '';
+    var es = false;
+    var idx = 1;
+    var closed = false;
+    while (idx < t.length) {
+      var cc = t[idx];
+      if (es) { body += cc; es = false; idx++; continue; }
+      if (cc === '\\') { body += cc; es = true; idx++; continue; }
+      if (cc === '"') {
+        var rest = t.slice(idx + 1).trim();
+        if (rest === '' || rest.charAt(0) === ',') { closed = true; break; }
+        body += cc; idx++; continue;
+      }
+      body += cc; idx++;
+    }
+    if (!closed) return part;
+    return '"' + JSON.stringify(decodeJsonEscapes(body)).slice(1, -1) + '"';
+  });
+  return source.slice(0, start + 1) + fixedParts.join(',') + source.slice(end);
+}
+
+// 定向修复：先试用更安全的扫描式修复；能整段解析就用它，否则退回旧策略（保持既有能力为下限）。
+function repairFreetextFields(raw) {
+  var source = toText(raw);
+  if (!source) return source;
+  var scans = [];
+  JSON_STRING_ARRAY_KEYS.forEach(function(key) {
+    try { scans.push(repairStringArrayField(source, key)); } catch (e) { /* 忽略 */ }
+  });
+  try { scans.push(repairFreetextFieldsByScan(source)); } catch (scanError) { /* 忽略 */ }
+  var attempts = scans.slice();
+  try { attempts.push(repairFreetextFieldsLegacy(source)); } catch (legacyError) { /* 忽略 */ }
+  // 组合：先对数组项修复，再做字段扫描
+  try {
+    var combined = source;
+    JSON_STRING_ARRAY_KEYS.forEach(function(key) { combined = repairStringArrayField(combined, key); });
+    attempts.push(repairFreetextFieldsByScan(combined));
+  } catch (comboError) { /* 忽略 */ }
+  for (var i = 0; i < attempts.length; i++) {
+    var candidate = attempts[i];
+    if (!candidate) continue;
+    try { JSON.parse(candidate); return candidate; } catch (strictError) { /* 试去尾逗号 */ }
+    try { JSON.parse(candidate.replace(/,\s*([}\]])/g, '$1')); return candidate; } catch (looseError) { /* 下一个 */ }
+  }
+  // 都无法整段解析时，返回扫描式结果（通常仍能修复，交由 parseJsonPayload 的多级兜底）
+  return attempts[0] || source;
 }
 
 function parseJsonPayload(text) {
