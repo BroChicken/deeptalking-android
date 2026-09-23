@@ -1136,7 +1136,7 @@ const DEFAULT_CONFIG = {
   proactiveEnabled: true,
   platformSettings: {}
 };
-const APP_VERSION = '1.2.1';
+const APP_VERSION = '1.2.2';
 const PLATFORM_CONFIGS = {
   deepseek: { baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-flash', models: ['deepseek-flash'] },
   opencode: { baseUrl: 'https://opencode.ai/zen/go/v1', model: 'deepseek-flash', keepV1InResponses: true, models: ['deepseek-flash'] },
@@ -3426,6 +3426,7 @@ async function sendMessage(options) {
     var toolState = { items: [], rounds: 0, char: char };
     var phase = 'auto';
     var submitAttempted = false;
+    var quickRepliesRetried = false;
     var structuredFromSubmit = null;
     while (true) {
       var attempt = await performChatRequestWithRetry(messages, text, loadingMsg, toolState, phase);
@@ -3437,6 +3438,21 @@ async function sendMessage(options) {
         if (submitResult && submitResult.ok) {
           fullText = submitResult.rawArgs;
           structuredFromSubmit = submitResult;
+          break;
+        }
+        // 协议层守卫：submit_response 有 reply 但缺/非法 quickReplies。重试一次逼模型补全；
+        // 若已重试过仍缺，则接受 reply 并放行（后面会走 quickReplies 兜底），避免死循环。
+        if (submitResult && submitResult.reason === 'missing_quick_replies') {
+          salvagedReply = submitResult.reply;
+          if (phase === 'submit' && !quickRepliesRetried && attemptsLeft > 0) {
+            quickRepliesRetried = true;
+            attemptsLeft--;
+            setActivity('正在补齐快速回应…');
+            updateMessageBubble(loadingMsg.id, getDisplayText('正在补齐快速回应…'));
+            continue;
+          }
+          structuredFromSubmit = { ok: true, obj: { reply: submitResult.reply }, reply: submitResult.reply, rawArgs: submitResult.rawArgs };
+          fullText = submitResult.rawArgs;
           break;
         }
         var infoCalls = (attempt.functionCalls || []).filter(function(call) { return call.name !== 'submit_response'; });
@@ -3641,10 +3657,6 @@ async function sendMessage(options) {
     scheduleSave();
     renderChat();
     autoFillStaticFields();
-    // 用户本轮发送的图片：自动入库为表情包并异步打短词标签（不阻塞回复）
-    (Array.isArray(userMessage.images) ? userMessage.images : []).forEach(function(imgUrl) {
-      addStickerFromImage(imgUrl, char).then(function(res) { if (res && res.created) tagStickerInBackground(res.sticker, char); });
-    });
   } catch (error) {
     console.error('API Error:', error);
     var loadingIndex = char.memory.instant.indexOf(loadingMsg);
@@ -6284,7 +6296,14 @@ function extractSubmitResponse(fullResponse) {
       var args = null;
       try { args = parseJsonPayload(argsText); } catch (e) { args = null; }
       if (isPlainObject(args) && typeof args.reply === 'string' && args.reply) {
-        return { ok: true, obj: args, reply: args.reply, rawArgs: argsText };
+        // 协议层守卫：quickReplies 必须恰好两条非空短句。缺失/非法时判为未通过，
+        // 交由调用方重试一次（避免 v1.1.2 起模型省略该字段后静默退化为兜底）。
+        // 同时带上 reply，保证重试前正文不会丢。
+        var normalizedQuickReplies = parseQuickReplyList(args.quickReplies);
+        if (normalizedQuickReplies.length >= 2) {
+          return { ok: true, obj: args, reply: args.reply, rawArgs: argsText, quickReplies: normalizedQuickReplies };
+        }
+        return { ok: false, rawArgs: argsText, reply: args.reply, reason: 'missing_quick_replies' };
       }
       return { ok: false, rawArgs: argsText };
     }
@@ -6314,9 +6333,11 @@ function buildResponsesRequestBody(messages, stream, toolState, phase) {
   // 阶段二（提交回复）：必须强制锁定 submit_response，且 DeepSeek 仅支持 effort=none 时锁定
   body.reasoning = { effort: submitPhase ? 'none' : state.config.reasoningEffort };
   if (submitPhase) {
-    // 阶段二沿用与自动阶段完全相同的工具数组，只把 tool_choice 锁到 submit_response：
-    // 前缀与自动阶段一致，这次请求仍能命中缓存（实测网关接受"全量 tools + 锁定 tool_choice"）。
-    body.tools = buildAgentTools(toolState && toolState.char).concat([buildSubmitResponseTool()]);
+    // 阶段二只发 submit_response 一个工具：让模型别无选择，必须产出完整字段（含 quickReplies）。
+    // 历史教训（见 docs/PARSE_GRAPH.md）：v1.1.2 曾为命中前缀缓存而改成"全量工具 + 锁定 tool_choice"，
+    // 结果海量工具描述弱化了 schema strict 约束，模型倾向只输出 {reply}、省略 quickReplies，
+    // 快速回应因此长期退化为兜底「嗯/继续」。工具能力在阶段一（auto）已提供，阶段二是收尾，不需要再调工具。
+    body.tools = [buildSubmitResponseTool()];
     body.tool_choice = { type: 'function', name: 'submit_response' };
   } else {
     body.tools = buildAgentTools(toolState && toolState.char);
