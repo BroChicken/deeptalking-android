@@ -1136,7 +1136,7 @@ const DEFAULT_CONFIG = {
   proactiveEnabled: true,
   platformSettings: {}
 };
-const APP_VERSION = '1.2.2';
+const APP_VERSION = '1.2.3';
 const PLATFORM_CONFIGS = {
   deepseek: { baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-flash', models: ['deepseek-flash'] },
   opencode: { baseUrl: 'https://opencode.ai/zen/go/v1', model: 'deepseek-flash', keepV1InResponses: true, models: ['deepseek-flash'] },
@@ -3492,14 +3492,16 @@ async function sendMessage(options) {
           continue;
         }
         if (phase === 'auto') {
-          // 阶段一结束：若模型已直接给出可解析的合法JSON正文，直接用（省一次请求）；
-          // 否则切换阶段二强制 submit_response 收尾，保证结构合规
-          if (parseStructuredResponse(fullText).ok) break;
+          // 阶段一结束：若模型已直接给出含 quickReplies 的合法 JSON 正文，直接用（省一次请求）；
+          // 否则切换阶段二强制 submit_response 收尾，保证结构合规（含快速回应）。
+          var autoStructured = parseStructuredResponse(fullText);
+          if (autoStructured.ok && autoStructured.hasQuickReplies) break;
           // 切阶段二前把阶段一的 reasoning 与正文回传，保持 thinking 上下文连续
           (attempt.reasoningItems || []).forEach(function(item) { toolState.items.push(item); });
           if (fullText && fullText.trim()) {
             toolState.items.push({ role: 'assistant', content: trimText(fullText, 1200) });
           }
+          if (autoStructured.ok && autoStructured.reply) salvagedReply = autoStructured.reply;
           phase = 'submit';
           submitAttempted = false;
           setActivity('正在整理回复…');
@@ -5520,7 +5522,7 @@ function buildRequestPayload(char, query) {
   systemPrompt += '8. JSON格式示例（未更新字段直接省略；无合格记忆返回空数组或空对象，但quickReplies仍必须两条）：{"reply":"（看了一眼时间）我把刚才那句又说了一遍，你听清了没有。要是还有不清楚的地方，我可以再讲一次，说不准换个说法你就明白了。（把桌面上的纸推过去）你可以先看这个，有疑问随时说。","quickReplies":["短句一","短句二"],"shortTerm":[{"content":"按时间和因果顺序概括本轮事件经过，写明谁做了什么并写绝对日期（如2026-08-10 晚上）","sourceMessageIds":["msg_id"],"timeRef":{"anchor":"today"}}],"dynamicState":{"currentSituation":{"value":"当前正在与对方核对一件待确认的事项，需要把话说清楚。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentMood":{"value":"较为专注，态度平和。","sourceMessageIds":["current_response"],"evidence":"概括本轮回复大意"},"currentLocation":{"value":"当前所处的位置。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentGoal":{"value":"想把这件事说明白，让对方理解。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"}},"staticFields":{"personality":{"value":"性格沉稳，遇事不急。","sourceMessageIds":["真实ID"],"evidence":"用户原话"}}' + (char.entityType === 'group' ? ',"memberDynamicState":[{"memberName":"成员原名","dynamicState":{"currentMood":{"value":"成员情绪","sourceMessageIds":["current_response"],"evidence":"概括本轮回复"}}}]' : '') + ',"promiseUpdates":[{"promiseId":"mem_id","status":"resolved","sourceMessageIds":["msg_id"],"evidence":"用户明确完成或取消的原话"}],"longTerm":[{"category":"userProfile","subject":"user","key":"稳定标识","value":"用户喜欢喝美式咖啡。","tags":["关键词"],"importance":1,"sourceMessageIds":["msg_id"],"evidence":"原话短句","eventTime":"ISO时间"}]}。示例仅示范结构与动作穿插方式，**不得模仿其口吻或措辞**（口吻一律以角色设定的“说话风格”为准）。JSON字符串转义：真实换行写\\n，字面反斜杠写\\\\，双引号写\\"。\n';
   systemPrompt += '9. longTerm.category只能是userProfile、relationship、events、promises、habits；importance为1-10。\n';
   systemPrompt += '9.5 相对时间词元表（timeRef，用于把用户的相对时间说法交给客户端换算）：anchor 取 today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year；offsetDays 为 -60~60 的天数偏移；weekday 取 mon/tue/wed/thu/fri/sat/sun；slot 取 深夜/凌晨/清晨/早晨/上午/中午/下午/傍晚/晚上/夜里；explicit 为绝对时间（ISO 或 YYYY-MM-DD）。示例：“明天”={anchor:"tomorrow"}；“三天后”={anchor:"today",offsetDays:3}；“上周五”={anchor:"last_week",weekday:"fri"}；“明天早上”={anchor:"tomorrow",slot:"早晨"}；“9月20日”={explicit:"2026-09-20"}；“下个月”={anchor:"next_month"}。填写后必须在内容字段里写换算后的绝对日期，两者要一致。\n';
-  systemPrompt += 'A. 本会话可使用工具。需要确认当前时间/日期时用 get_current_time；需要回忆此前记录的承诺、约定、用户喜好或共同经历时用 search_memory（检索不到再考虑 list_memories 按分类盘点）；发现记忆过期、重复或已被用户纠正时用 list_memories 定位后 delete_memory 删除；用户明确提出待办、约定或承诺时用 set_reminder 记录（相对时间填 timeRef，绝对时间填 dueAt）；用户明确否认或纠正某条记忆时（如“那件事是我做的不是你做的”“记反了”），先用 search_memory 找到目标记忆，再用 update_memory 带用户原话修正它的主体或内容，时间记错了就用 update_memory 的 eventTime/dueAt/timeRef 修正，不要擅自改写也不要只靠删除；查询实时资讯、新闻、天气、需要核实的事实时用 web_search；用户给出链接、或需要查看网页正文、或需要查看网上的图片时用 web_fetch：传 url 时只能传上下文里真实存在的 http(s) 链接，禁止自行编造或拼接 URL；用户想找B站/哔哩哔哩视频时同样用 web_fetch，改传 keyword（关键词从用户意图提取，不要拼搜索网址，传 B站视频链接也行）；当你想用表情包、贴图来表达情绪时用 send_sticker（tag 必须从工具描述里给出的可用标签中选择）。当记忆缺失、表述含糊、关键事实无法可靠推断时，优先用 ask_user 提出简短澄清，不要凭空编造。工具结果属于系统提供的内部上下文，仅供理解，自然融入reply正文即可，不得向用户透露检索过程、工具名称或结果标签；但工具返回的图片本身是内容，可以直接展示给用户。\n';
+  systemPrompt += 'A. 本会话可使用工具。需要确认当前时间/日期时用 get_current_time；需要回忆此前记录的承诺、约定、用户喜好或共同经历时用 search_memory（检索不到再考虑 list_memories 按分类盘点）；发现记忆过期、重复或已被用户纠正时用 list_memories 定位后 delete_memory 删除；待办（约定/承诺）一律指“需要用户参与”的事：只有**用户自己明确提出或同意**时才能用 set_reminder 记录，调用时必须附用户消息ID（sourceMessageIds）与逐字原话（evidence），相对时间填 timeRef、绝对时间填 dueAt；**你自己要求用户去做的事、你的建议或叮嘱，不得用 set_reminder 记为待办**——应先自然征询用户，等用户自己答应后再记；不需要用户参与、你可自行完成的事也不要记成待办；用户明确否认或纠正某条记忆时（如“那件事是我做的不是你做的”“记反了”），先用 search_memory 找到目标记忆，再用 update_memory 带用户原话修正它的主体或内容，时间记错了就用 update_memory 的 eventTime/dueAt/timeRef 修正，不要擅自改写也不要只靠删除；查询实时资讯、新闻、天气、需要核实的事实时用 web_search；用户给出链接、或需要查看网页正文、或需要查看网上的图片时用 web_fetch：传 url 时只能传上下文里真实存在的 http(s) 链接，禁止自行编造或拼接 URL；用户想找B站/哔哩哔哩视频时同样用 web_fetch，改传 keyword（关键词从用户意图提取，不要拼搜索网址，传 B站视频链接也行）；当你想用表情包、贴图来表达情绪时用 send_sticker（tag 必须从工具描述里给出的可用标签中选择）。当记忆缺失、表述含糊、关键事实无法可靠推断时，优先用 ask_user 提出简短澄清，不要凭空编造。工具结果属于系统提供的内部上下文，仅供理解，自然融入reply正文即可，不得向用户透露检索过程、工具名称或结果标签；但工具返回的图片本身是内容，可以直接展示给用户。\n';
   if (char.entityType === 'group') {
     systemPrompt += '10. 当前是群组对话。只能由已列出的成员发言，可由一人或多人回应。reply字段中用户可见回复必须使用每人独立一行的“成员名：\"内容\"”格式，例如“张三：\"（看了一眼纸）这件事我先说说我的看法。\"\n李四：\"我补充一点，跟前面的意思不冲突。\"”。**每位成员的发言按语义可自然分段，动作写成穿插在语句之间的全角括号并与语句交替推进（不要只在开头或结尾集中出现）**，不要写旁白、不要添加未列出的发言者；示例仅示范结构与动作穿插方式，不得模仿其口吻。quickReplies同样必须保留两条，内容是用户可以发给全体或某位成员的话。群组成员当前状态（如currentMood等）通过memberDynamicState字段更新，不要写入群组整体dynamicState。\n';
     systemPrompt += '11. 记忆归属：每位成员有自己的私人记忆，互相不知道对方记得什么。只有当某件事实是全体都知道的（如用户公开告诉所有人的信息、群内公开讨论的事）才写入共享记忆（longTerm不填memberName）；若某事实只有某位成员知道、或属于某成员对用户的个人印象/私人约定，则在该条longTerm中填memberName记入其私人记忆。引用成员私人记忆时只能用该成员自己的记忆，不得张冠李戴。\n';
@@ -5674,8 +5676,8 @@ function buildAgentTools(char) {
     {
       type: 'function',
       name: 'set_reminder',
-      description: '记住用户明确提出的待办、约定或承诺（如"我明天要交报告""记得提醒我买药"）。用于创建或更新一条约定记忆，到时间可在对话中温和提起。群组对话中若要记入某位成员的私人记忆可传 memberName。',
-      parameters: { type: 'object', properties: { key: { type: 'string', description: '约定/待办的简短标题' }, value: { type: 'string', description: '约定详情，写绝对日期，不要写“明天”这类相对词' }, dueAt: { type: 'string', description: '可选，约定的截止时间（ISO格式），如 2026-08-10T09:00:00' }, timeRef: buildTimeRefSchema(), memberName: { type: 'string', description: '可选，群组对话中指定记入某位成员的私人记忆（不传则记入共享记忆）' } }, required: ['key', 'value'], additionalProperties: false }
+      description: '记录“需要用户参与”的待办/约定，且**必须由用户自己明确提出或同意**（如用户说“我明天要交报告”“记得提醒我买药”）。调用时必须附用户原话：sourceMessageIds 填用户消息ID、evidence 逐字摘录用户原话。角色要求用户去做的事、角色的建议或叮嘱，一律不得用本工具记录——应先自然征询用户，等用户自己答应后再记。到时间可在对话中温和提起。群组对话中若要记入某位成员的私人记忆可传 memberName。',
+      parameters: { type: 'object', properties: { key: { type: 'string', description: '约定/待办的简短标题' }, value: { type: 'string', description: '约定详情，写绝对日期，不要写“明天”这类相对词' }, dueAt: { type: 'string', description: '可选，约定的截止时间（ISO格式），如 2026-08-10T09:00:00' }, timeRef: buildTimeRefSchema(), sourceMessageIds: { type: 'array', items: { type: 'string' }, description: '用户明确提出该待办的消息ID（必须是真实用户消息）' }, evidence: { type: 'string', description: '逐字摘录用户提出该待办的原话' }, memberName: { type: 'string', description: '可选，群组对话中指定记入某位成员的私人记忆（不传则记入共享记忆）' } }, required: ['key', 'value', 'sourceMessageIds', 'evidence'], additionalProperties: false }
     },
     {
       type: 'function',
@@ -6101,6 +6103,12 @@ async function executeToolCall(call, char, toolState) {
       var reminderKey = trimText(args.key, 100);
       var reminderValue = trimText(args.value, 900);
       if (!reminderKey || !reminderValue) return JSON.stringify({ ok: false, reason: '缺少 key 或 value' });
+      // 待办=需要用户参与的事：只有用户自己明确提出/同意才能记录（复用用户提起路径）。
+      // 角色要求用户做X、角色的建议叮嘱没有用户原话 → 拒绝建待办，引导模型先征询用户。
+      var reminderSources = hasValidUserEvidence(char, args.sourceMessageIds, args.evidence, getKnownSources(char));
+      if (!reminderSources || reminderSources.length === 0) {
+        return JSON.stringify({ ok: false, reason: '只能记录用户自己明确提出或同意的待办：请附用户原话 sourceMessageIds 与 evidence；若是你要求用户去做的事，请先在回复中征询用户，等用户答应后再记录' });
+      }
       var reminderNow = new Date().toISOString();
       var reminderResolved = resolveTimeRef(args.timeRef, reminderNow);
       var reminderBase = (reminderResolved && reminderResolved.iso) || reminderNow;
@@ -6111,9 +6119,9 @@ async function executeToolCall(call, char, toolState) {
         value: parseRelativeText(reminderValue, reminderBase),
         tags: [],
         importance: 6,
-        sourceMessageIds: [],
-        sourceRoles: ['user'],
-        evidence: '',
+        sourceMessageIds: reminderSources.map(function(entry) { return entry.id; }),
+        sourceRoles: reminderSources.map(function(entry) { return entry.source.role; }),
+        evidence: trimText(args.evidence, 300),
         eventTime: reminderNow,
         participants: [],
         location: '',
@@ -6468,9 +6476,11 @@ function parseStructuredResponse(outputText) {
     parsed = null;
   }
   if (isPlainObject(parsed) && typeof parsed.reply === 'string') {
-    return { ok: true, obj: parsed, reply: parsed.reply };
+    // hasQuickReplies：供主循环判断是否可直接采用（缺 quickReplies 时不应 break，需转阶段二补齐）
+    var hasQuickReplies = parseQuickReplyList(parsed.quickReplies).length >= 2;
+    return { ok: true, obj: parsed, reply: parsed.reply, hasQuickReplies: hasQuickReplies };
   }
-  return { ok: false };
+  return { ok: false, hasQuickReplies: false };
 }
 
 function extractStreamText(event) {

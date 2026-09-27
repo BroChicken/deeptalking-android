@@ -91,6 +91,44 @@ STATIC_PROFILE_FIELDS ─┬─► submit_response schema (staticFieldProperties
 - 165/165 组用例 `parseJsonPayload` 均返回**对象**且 `quickReplies` 完整（含 `reply`/`value`/`evidence` 内出现 `"`、`}`、`]`、`,`、真实换行、中文引号、数组项含引号）。
 - 真实群组回复格式（`成员名："台词"` + 真实换行、未转义引号）解析为对象且 reply 文本字节一致。
 
+## 4.5 请求体布局与阶段一/二路径（v1.2.3 关键认知）
+
+### 请求体（Responses API，`buildResponsesRequestBody`）
+```
+{
+  model, instructions(=system提示词，单独提顶层), input(=对话+工具回传),
+  stream, temperature, max_output_tokens, reasoning,
+  tools: [...],        // ★工具定义在顶层，与 input/instructions 平级
+  tool_choice: 'auto' | {type:'function', name:'submit_response'}
+}
+```
+- **阶段一 `auto`**：`tools = buildAgentTools()`（10 个），`tool_choice:'auto'`。工具调用只发生在这里。
+- **阶段二 `submit`**：`tools = [submit_response]`（**只有 1 个**），`tool_choice` 锁定。
+
+### 两条产出路径（都需 quickReplies 守卫，v1.2.3 起）
+```
+主路径：阶段一模型直接返回纯文本 JSON {reply}
+        └─ parseStructuredResponse → ok && hasQuickReplies ? break : 转阶段二
+次路径：阶段二 submit_response 工具
+        └─ extractSubmitResponse → quickReplies>=2 ? ok : 重试一次 → 仍缺则接受reply走兜底
+```
+- `parseStructuredResponse` 现返回 `hasQuickReplies`；`extractSubmitResponse` 缺 quickReplies 返回 `ok:false, reason:'missing_quick_replies'`。
+- 兜底 `['嗯','继续']` 仅当两条路径都拿不到时触发。
+
+### 历史回归（务必牢记）
+| 版本 | 阶段二 tools | 结果 |
+|---|---|---|
+| ≤v1.1.1 | `[submit_response]` | quickReplies 正常 |
+| v1.1.2 (bd3dc24) | 全量工具 + 锁定（为命中缓存） | **strict 被稀释，模型只吐 {reply}，quickReplies 长期退化** |
+| v1.2.2+ | 回退为 `[submit_response]` | 恢复；并加协议守卫覆盖主/次两条路径 |
+
+## 4.6 待办（promises）准入原则（v1.2.3）
+
+- **定义**：待办 = 需要用户参与的事。
+- **准入**：只有**用户自己明确提出/同意**才可入库（`set_reminder` 必须带 `sourceMessageIds`+`evidence`，经 `hasValidUserEvidence` 校验）。
+- **禁止**：角色要求用户去做的事、角色的建议/叮嘱，不得记为待办（缺用户原话 → `set_reminder` 返回 `ok:false`，引导模型先征询用户）。
+- **既有保护**：`longTerm` 的 promises 走 `isValidAutomaticMemory`，要求来源全为用户消息。
+
 ## 5. 改动检查清单（每次改前必读）
 
 - [ ] 是否碰到 `parseJsonPayload` / `repairFreetextFields`？→ 跑"自测样例"（含未转义引号、真实换行、嵌套对象）。
@@ -99,6 +137,8 @@ STATIC_PROFILE_FIELDS ─┬─► submit_response schema (staticFieldProperties
 - [ ] 是否改 `hub.html`？→ 同步 APK 副本 + `check-sync.ps1`。
 - [ ] 是否改 `versionName`？→ 同步 `APP_VERSION` + `versionCode`，跑 workflow。
 - [ ] 是否新增 `parseJsonPayload` 调用？→ 检查返回类型守卫。
+- [ ] 是否改请求体阶段（`buildResponsesRequestBody`）？→ 核对阶段二 tools/tool_choice（INV-6）。
+- [ ] 是否改待办（promises）准入？→ 必须保留"用户原话证据"约束（INV-7）。
 
 ## 6. GRAPH（YAML 镜像）
 
@@ -109,6 +149,8 @@ invariants:
   INV-3: {rule: field-set-change-requires-downstream-audit, keys: [DYNAMIC_STATE_FIELDS, STATIC_PROFILE_FIELDS]}
   INV-4: {rule: two-hub-files-identical, check: tools/check-sync.ps1}
   INV-5: {rule: prefix-cache-stability}
+  INV-6: {rule: submit-phase-tools-only-submit_response, why: 'full tools dilute strict schema -> quickReplies dropped (v1.1.2 regression)'}
+  INV-7: {rule: promises-require-user-evidence, why: 'to-do = needs-user; character instructions must not become to-dos'}
 
 nodes:
   parseJsonPayload:        {kind: function, role: hub, risk: high}
