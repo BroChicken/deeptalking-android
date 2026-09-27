@@ -1053,10 +1053,12 @@ input:focus, textarea:focus, select:focus {
     <div class="flex border-b border-theme">
       <button onclick="switchModalTab('basic')" id="modal-tab-basic" class="modal-tab-btn active flex-1 py-2 text-sm font-medium">基础设定</button>
       <button onclick="switchModalTab('state')" id="modal-tab-state" class="modal-tab-btn flex-1 py-2 text-sm font-medium">当前状态</button>
+      <button onclick="switchModalTab('lorebook')" id="modal-tab-lorebook" class="modal-tab-btn flex-1 py-2 text-sm font-medium">世界书</button>
     </div>
     <div class="flex-1 overflow-y-auto chat-scroll p-4">
       <div id="modal-content-basic" class="modal-tab-content active space-y-2"></div>
        <div id="modal-content-state" class="modal-tab-content"></div>
+       <div id="modal-content-lorebook" class="modal-tab-content"></div>
     </div>
     <div class="p-4 border-t border-theme">
       <button onclick="saveCharacterModal()" class="w-full btn-primary text-white py-2 rounded-lg">保存修改</button>
@@ -1178,10 +1180,7 @@ const MEMORY_LIMITS = {
 };
 const PROMPT_LIMITS = {
   roleChars: 8000,
-  memberChars: 900,
-  memoryChars: 3600,
-  shortTermChars: 2500,
-  recentChars: 5600
+  memberChars: 900
 };
 const MEMORY_SUBJECTS = ['user', 'relationship', 'world', 'character', 'legacy'];
 const PROMISE_STATUSES = ['active', 'resolved', 'cancelled'];
@@ -1209,6 +1208,122 @@ const GROUP_SHARED_STATIC_FIELDS = [];
 const FIELDS_MIGRATION_VERSION = '1.2.0';
 // 模型不需要的字段：不注入提示词（头像类只用于界面展示）
 const NON_PROMPT_BASIC_FIELDS = ['avatar', 'avatarPixel'];
+// 本轮节奏骨架：每轮随机取一条注入 volatile，避免回复结构雷同（只描述节奏，不输出标签）
+const NARRATIVE_PATTERNS = [
+  { label: '动作/描写 → 对白 → 动作/描写', hint: '先一两句场景、动作或情绪描写，再说 1-2 句台词，最后回到动作或环境收束。' },
+  { label: '短句开场 → 描写 → 对白', hint: '先用一个很短的句子或独字反应（如“……嗯。”）开场，接一两句描写或心理，再落到 1-2 句台词。' },
+  { label: '对白 → 描写 → 短句收尾', hint: '先直接说 1-2 句台词，中间穿插动作或环境描写，最后用一句很短的话或一个小动作收住。' },
+  { label: '描写 → 短句 → 描写', hint: '以描写起手，中间插一句短促的台词或动作，再回到描写或环境。' },
+  { label: '短句 → 描写 → 短句', hint: '首尾都用很短的句子，中间用一段描写承上启下，整体节奏偏顿挫。' },
+  { label: '描写 → 对白 → 短句', hint: '先铺一小段描写或动作，再说 1-2 句台词，最后用一个短促的动作或半句话收住。' },
+  { label: '对白 → 描写 → 对白', hint: '台词与描写交替：一句台词、一段描写、再一句台词，像真实对话里的停顿与反应。' },
+  { label: '短句 → 描写 → 较长描写', hint: '先用短句点出反应，再用两段递进的描写展开当下的状态与氛围，但不做总结拔高。' },
+  { label: '描写 → 对白 → 描写 → 对白', hint: '描写与台词两组交替推进，信息密度较高，但每句都要短，不要写成大段独白。' },
+  { label: '对白 → 描写 → 描写', hint: '先给台词，再用两段描写承接（动作、表情、环境），收尾留在描写上，不要加总结句。' }
+];
+// 世界书（lorebook）：用户手写的固定设定条目，仅在关键词命中时注入，避免常驻占满角色设定预算
+const LOREBOOK_LIMITS = {
+  entries: 200,
+  keywordsPerEntry: 20,
+  nameChars: 60,
+  contentChars: 2000,
+  injectEntries: 6,
+  injectChars: 1400,
+  scanMessages: 6
+};
+
+// 记忆注入预算（字符）：检索记忆与摘要记忆共用一个池子，某一路没用完的额度让给另一路
+const CONTEXT_BUDGET = {
+  retrievedChars: 2600,
+  summaryChars: 2600,
+  sceneSummaries: 2,
+  sceneInjectionChars: 900,
+  sceneSpan: 24
+};
+
+function normalizeLorebook(value) {
+  if (!Array.isArray(value)) return [];
+  return value.filter(isPlainObject).slice(0, LOREBOOK_LIMITS.entries).map(function(entry, index) {
+    var rawKeywords = Array.isArray(entry.keywords) ? entry.keywords : toText(entry.keywords).split(/[,，、\n]/);
+    var keywords = rawKeywords.map(function(keyword) { return toText(keyword).trim(); })
+      .filter(Boolean)
+      .slice(0, LOREBOOK_LIMITS.keywordsPerEntry);
+    return {
+      id: toText(entry.id, 'lore_' + Date.now() + '_' + index),
+      name: trimText(toText(entry.name), LOREBOOK_LIMITS.nameChars),
+      keywords: keywords,
+      content: trimText(toText(entry.content), LOREBOOK_LIMITS.contentChars),
+      enabled: entry.enabled !== false,
+      order: Number.isFinite(Number(entry.order)) ? Number(entry.order) : 100
+    };
+  });
+}
+
+function collectLorebookEntries(char) {
+  var entries = [];
+  var seen = Object.create(null);
+  function pushList(list) {
+    (list || []).forEach(function(entry) {
+      if (!entry || entry.enabled === false || !toText(entry.content).trim()) return;
+      var key = toText(entry.id) || (toText(entry.name) + '|' + toText(entry.content));
+      if (seen[key]) return;
+      seen[key] = true;
+      entries.push(entry);
+    });
+  }
+  if (char) pushList(char.lorebook);
+  if (char && char.entityType === 'group' && Array.isArray(char.members)) {
+    char.members.forEach(function(member) { pushList(member && member.lorebook); });
+  }
+  return entries;
+}
+
+function matchLorebookEntries(char, query) {
+  var entries = collectLorebookEntries(char);
+  if (entries.length === 0) return [];
+  var parts = [toText(query)];
+  var messages = (char && char.memory && Array.isArray(char.memory.instant))
+    ? char.memory.instant.filter(function(message) { return !message.isLoading; }).slice(-LOREBOOK_LIMITS.scanMessages)
+    : [];
+  messages.forEach(function(message) { parts.push(toText(message.content)); });
+  var haystack = parts.join('\n').toLowerCase();
+  if (!haystack.trim()) return [];
+  var hits = [];
+  entries.forEach(function(entry) {
+    var matched = (entry.keywords || []).some(function(keyword) {
+      var needle = toText(keyword).trim().toLowerCase();
+      return needle && haystack.indexOf(needle) !== -1;
+    });
+    if (matched) hits.push(entry);
+  });
+  hits.sort(function(a, b) {
+    var orderDiff = (Number(a.order) || 0) - (Number(b.order) || 0);
+    if (orderDiff !== 0) return orderDiff;
+    return toText(a.name).localeCompare(toText(b.name));
+  });
+  return hits.slice(0, LOREBOOK_LIMITS.injectEntries);
+}
+
+function buildLorebookContext(char, query) {
+  var hits = matchLorebookEntries(char, query);
+  if (hits.length === 0) return '';
+  var lines = [];
+  var used = 0;
+  for (var i = 0; i < hits.length; i++) {
+    var name = toText(hits[i].name).trim();
+    var content = toText(hits[i].content).trim();
+    var line = '- ' + (name ? name + '：' : '') + content;
+    if (line.length > LOREBOOK_LIMITS.injectChars) line = line.slice(0, LOREBOOK_LIMITS.injectChars) + '…';
+    if (used + line.length > LOREBOOK_LIMITS.injectChars) break;
+    used += line.length;
+    lines.push(line);
+  }
+  if (lines.length === 0) return '';
+  return '【世界书资料（预先写定的固定设定，只在相关时出现）】\n' + lines.join('\n') + '\n以上为设定资料：与当前话题相关时才可自然引用，以此为权威、不得与之矛盾；不相关时不要提及，也不要复述条目本身。\n\n';
+}
+
+// 长会话使用的精简 JSON 示例（新会话前几轮用完整示例，之后换成这一版，省 token）
+const JSON_EXAMPLE_BRIEF = '8. JSON格式示例（未更新字段直接省略；无合格记忆返回空数组或空对象，但quickReplies仍必须两条）：{"reply":"（穿插全角括号动作）角色本轮回复正文。","quickReplies":["短句一","短句二"],"shortTerm":[{"content":"本轮事件摘要，写明谁做了什么并写绝对日期（如2026-08-10 晚上）","sourceMessageIds":["msg_id"],"timeRef":{"anchor":"today"}}],"dynamicState":{"currentMood":{"value":"当前情绪。","sourceMessageIds":["current_response"],"evidence":"概括本轮回复"},"currentSituation":{"value":"当前处境，写具体日期+时段。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"}},"longTerm":[{"category":"userProfile","subject":"user","key":"稳定标识","value":"用户的具体事实。","tags":["关键词"],"importance":5,"sourceMessageIds":["msg_id"],"evidence":"用户原话","eventTime":"ISO时间"}]}。示例仅示范字段结构与动作穿插方式，**不得模仿其口吻或措辞**（口吻一律以角色设定的“说话风格”为准）。JSON字符串转义：真实换行写\\n，字面反斜杠写\\\\，双引号写\\"。\n';
 
 function createMemoryId(prefix) {
   return (prefix || 'mem') + '_' + Date.now() + '_' + Math.random().toString(36).slice(2, 9);
@@ -1356,6 +1471,10 @@ function renderAvatarHtml(char, imgClass, emojiClass) {
 }
 
 var PIXEL_AVATAR_PROMPT = '为角色绘制16x16像素头像，字段"avatarPixel"为包含16个字符串的数组，每个字符串恰好16个字符。必须用像素块画出具体的角色形象（发型轮廓、脸、眼睛、服饰主色），不能是纯色块或只有边框。字符与颜色对照：.透明 K黑(#1b1b1f) W白 R红 O橙 Y黄 G绿 C青 B蓝 P紫 M粉 N棕 S肤色 H深灰 L浅灰。字符只允许这些，不得出现其他字符。示例一行可能是"....KKSSSSKK...."，其中KK是深色头发、SS是肤色。';
+
+// 建卡/补全类 prompt 共用约束：人设质量与"可直接演出的说话风格示例"（写入 speakingStyle，不新增字段）
+var CHARACTER_QUALITY_RULE = '人设质量要求：①不得使用陈词滥调的名字或模板化人设（如"艾尔德里亚"式的套路奇幻名、"高冷大小姐""温柔邻家女孩"这类通用模板）；②personality 写具体的行为倾向（遇到事情会怎么做、在意什么），不要堆砌形容词；③background 只写 3-5 条会影响当下互动的要点，不要写编年史。';
+var SPEAKING_STYLE_SAMPLES_RULE = 'speakingStyle 必须写成“整体调性描述；示例：<台词1> / <台词2> / <台词3>”：三条示例台词必须是该角色真的会说的口语短句，要体现口头禅、句尾助词、标点习惯与对用户的称呼，三条之间差异明显（能看出是同一个人、但场景不同）；**禁止换行，三条之间只能用 " / " 分隔**，整个字段不超过 200 字。';
 
 // 试验失败品：像素头像生成接口，已弃用（不稳定，输出网格常残缺）。保留仅供历史数据使用。
 async function requestPixelAvatar(desc) {
@@ -2102,8 +2221,26 @@ function normalizeCharacter(rawCharacter, id, strict, skipLegacyRepair) {
   var rawCounters = isPlainObject(rawMemory.counters) ? rawMemory.counters : {};
   character.memory.counters.extractionRetryAt = normalizeRetryAt(rawCounters.extractionRetryAt);
   character.memory.counters.analysisRetryAt = normalizeRetryAt(rawCounters.analysisRetryAt);
+  character.memory.counters.sceneRetryAt = normalizeRetryAt(rawCounters.sceneRetryAt);
   character.memory.counters.extractionFailures = Number.isFinite(Number(rawCounters.extractionFailures)) ? Math.max(0, Number(rawCounters.extractionFailures)) : 0;
   character.memory.counters.analysisFailures = Number.isFinite(Number(rawCounters.analysisFailures)) ? Math.max(0, Number(rawCounters.analysisFailures)) : 0;
+  character.memory.counters.sceneFailures = Number.isFinite(Number(rawCounters.sceneFailures)) ? Math.max(0, Number(rawCounters.sceneFailures)) : 0;
+  character.memory.scenes = Array.isArray(rawMemory.scenes) ? rawMemory.scenes.filter(isPlainObject).map(function(scene, index) {
+    return {
+      id: toText(scene.id, 'scene_' + index),
+      key: trimText(toText(scene.key), 80),
+      content: trimText(toText(scene.content), 2000),
+      startedAt: normalizeTimestamp(scene.startedAt, null),
+      endedAt: normalizeTimestamp(scene.endedAt, null),
+      createdAt: normalizeTimestamp(scene.createdAt, new Date().toISOString())
+    };
+  }).filter(function(scene) { return scene.content.trim(); }).slice(-8) : [];
+  var rawSceneState = isPlainObject(rawMemory.sceneState) ? rawMemory.sceneState : {};
+  character.memory.sceneState = {
+    key: toText(rawSceneState.key),
+    startCount: Number.isFinite(Number(rawSceneState.startCount)) ? Math.max(0, Number(rawSceneState.startCount)) : 0,
+    messageCount: 0
+  };
   character.memory.pendingRecall = Array.isArray(rawMemory.pendingRecall) ? rawMemory.pendingRecall.map(normalizeLongTermItem).filter(Boolean) : [];
   character.memory.lastInjectedRecallIds = Array.isArray(rawMemory.lastInjectedRecallIds) ? rawMemory.lastInjectedRecallIds.map(function(id) { return toText(id); }).filter(Boolean).slice(0, MEMORY_LIMITS.pendingRecall) : [];
   character.memory.revision = Number.isFinite(Number(rawMemory.revision)) ? Math.max(0, Number(rawMemory.revision)) : 0;
@@ -2167,6 +2304,7 @@ function normalizeCharacter(rawCharacter, id, strict, skipLegacyRepair) {
   if (isPlainObject(rawCharacter.staticFieldMeta)) character.staticFieldMeta = rawCharacter.staticFieldMeta;
   if (Number(rawCharacter.timeParseVersion) === TIME_PARSE_VERSION) character.timeParseVersion = TIME_PARSE_VERSION;
   character.stickers = normalizeStickers(rawCharacter.stickers);
+  character.lorebook = normalizeLorebook(rawCharacter.lorebook);
   return character;
 }
 
@@ -2218,6 +2356,7 @@ function normalizeGroupMembers(items, cleanGenerated) {
     });
     member.dynamicStateMeta = isPlainObject(item.dynamicStateMeta) ? item.dynamicStateMeta : {};
     member.roleInGroup = cleanFields ? cleanFieldValue('roleInGroup', toText(item.roleInGroup)) : toText(item.roleInGroup);
+    member.lorebook = normalizeLorebook(item.lorebook);
     if (item.avatarRepairPending) member.avatarRepairPending = true;
     if (isPlainObject(item.staticFillMeta)) member.staticFillMeta = item.staticFillMeta;
     if (isPlainObject(item.staticFieldMeta)) member.staticFieldMeta = item.staticFieldMeta;
@@ -2409,10 +2548,13 @@ function createCharacterObj(name, avatar, personality, background) {
     dynamicState: { currentSituation: '', currentLocation: '', currentMood: '', currentOccupation: '', currentGoal: '', currentRelationship: '', currentImportantOthers: '' },
     dynamicStateMeta: {},
     stickers: [],
+    lorebook: [],
     memory: {
       instant: [], shortTerm: [],
       longTerm: { userProfile: [], relationship: [], events: [], promises: [], habits: [] },
-      counters: { extractionRetryAt: null, analysisRetryAt: null, extractionFailures: 0, analysisFailures: 0 },
+      scenes: [],
+      sceneState: { key: '', startCount: 0, messageCount: 0 },
+      counters: { extractionRetryAt: null, analysisRetryAt: null, sceneRetryAt: null, extractionFailures: 0, analysisFailures: 0, sceneFailures: 0 },
       pendingRecall: [],
       lastInjectedRecallIds: [],
       revision: 0
@@ -2646,12 +2788,68 @@ function closeCharacterModal() {
 }
 
 function switchModalTab(tabName) {
-  document.getElementById('modal-tab-basic').classList.remove('active');
-  document.getElementById('modal-tab-state').classList.remove('active');
+  ['basic', 'state', 'lorebook'].forEach(function(name) {
+    document.getElementById('modal-tab-' + name).classList.remove('active');
+    document.getElementById('modal-content-' + name).classList.remove('active');
+  });
   document.getElementById('modal-tab-' + tabName).classList.add('active');
-  document.getElementById('modal-content-basic').classList.remove('active');
-  document.getElementById('modal-content-state').classList.remove('active');
   document.getElementById('modal-content-' + tabName).classList.add('active');
+}
+
+// 世界书编辑：条目直接写回草稿（保存时随角色一起落盘）
+function updateLorebookEntry(index, field, value) {
+  var draft = state.editingCharacterDraft;
+  if (!draft || !Array.isArray(draft.lorebook) || !draft.lorebook[index]) return;
+  var entry = draft.lorebook[index];
+  if (field === 'keywords') {
+    entry.keywords = toText(value).split(/[,，、\n]/).map(function(keyword) { return keyword.trim(); }).filter(Boolean).slice(0, LOREBOOK_LIMITS.keywordsPerEntry);
+  } else if (field === 'enabled') {
+    entry.enabled = value === true;
+  } else if (field === 'name') {
+    entry.name = toText(value).slice(0, LOREBOOK_LIMITS.nameChars);
+  } else if (field === 'content') {
+    entry.content = toText(value).slice(0, LOREBOOK_LIMITS.contentChars);
+  }
+}
+
+function addLorebookEntry() {
+  var draft = state.editingCharacterDraft;
+  if (!draft) return;
+  if (!Array.isArray(draft.lorebook)) draft.lorebook = [];
+  if (draft.lorebook.length >= LOREBOOK_LIMITS.entries) { alert('世界书条目已达上限（' + LOREBOOK_LIMITS.entries + ' 条）'); return; }
+  draft.lorebook.push({ id: createMemoryId('lore'), name: '', keywords: [], content: '', enabled: true, order: 100 });
+  renderLorebookEditor(draft);
+}
+
+function removeLorebookEntry(index) {
+  var draft = state.editingCharacterDraft;
+  if (!draft || !Array.isArray(draft.lorebook)) return;
+  draft.lorebook.splice(index, 1);
+  renderLorebookEditor(draft);
+}
+
+function renderLorebookEditor(draft) {
+  var container = document.getElementById('modal-content-lorebook');
+  if (!container || !draft) return;
+  if (!Array.isArray(draft.lorebook)) draft.lorebook = [];
+  var inputStyle = 'background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text-color);';
+  var html = '<p class="text-xs text-muted-c mb-3">世界书是<b>只在关键词命中时</b>才注入的固定设定（地点、组织、专有名词、历史、人物关系等）。只有被提到的条目会进上下文，比写进"背景故事"更省 token 也更准。关键词用「、」或逗号分隔。</p>';
+  if (draft.lorebook.length === 0) {
+    html += '<p class="text-xs text-muted-c mb-3">还没有条目。</p>';
+  }
+  html += '<div class="space-y-3">';
+  draft.lorebook.forEach(function(entry, index) {
+    html += '<div class="rounded-lg p-3 space-y-2" style="' + inputStyle + '">';
+    html += '<div class="flex items-center gap-2"><input type="text" value="' + escapeHtml(entry.name || '') + '" placeholder="条目名（如：赤月王国）" oninput="updateLorebookEntry(' + index + ', \'name\', this.value)" class="flex-1 rounded-lg px-2 py-1.5 text-xs" style="' + inputStyle + '">'
+      + '<label class="flex items-center gap-1 text-xs text-muted-c whitespace-nowrap"><input type="checkbox" ' + (entry.enabled === false ? '' : 'checked ') + 'onchange="updateLorebookEntry(' + index + ', \'enabled\', this.checked)">启用</label>'
+      + '<button type="button" onclick="removeLorebookEntry(' + index + ')" class="text-xs text-secondary-c whitespace-nowrap">删除</button></div>';
+    html += '<input type="text" value="' + escapeHtml((entry.keywords || []).join('、')) + '" placeholder="触发关键词（用、或逗号分隔）" oninput="updateLorebookEntry(' + index + ', \'keywords\', this.value)" class="w-full rounded-lg px-2 py-1.5 text-xs" style="' + inputStyle + '">';
+    html += '<textarea rows="2" placeholder="命中后注入的内容" oninput="updateLorebookEntry(' + index + ', \'content\', this.value)" class="w-full rounded-lg px-2 py-1.5 text-xs" style="' + inputStyle + '">' + escapeHtml(entry.content || '') + '</textarea>';
+    html += '</div>';
+  });
+  html += '</div>';
+  html += '<button type="button" onclick="addLorebookEntry()" class="mt-3 w-full btn-secondary py-2 rounded-lg text-xs text-secondary-c">+ 添加条目</button>';
+  container.innerHTML = html;
 }
 
 function renderCharacterModalContent(char) {
@@ -2714,6 +2912,7 @@ function renderCharacterModalContent(char) {
     }
   });
   stateContainer.innerHTML = stateHtml + '</div>';
+  renderLorebookEditor(char);
 }
 
 function collectEditDraftFromDom() {
@@ -2772,8 +2971,8 @@ async function fillGroupMemberFields() {
   var member = state.editingCharacterDraft;
   try {
     var response = await callAPI([
-      { role: 'system', content: '你是角色卡补全助手。只返回JSON。只能根据群组设定、现有角色卡和用户的一句话补全空字段，不能覆盖或编造与已有字段冲突的信息。' },
-      { role: 'user', content: '群组信息:\n' + JSON.stringify(group.groupInfo || {}) + '\n群组其他成员:\n' + JSON.stringify((group.members || []).map(function(item) { return { name: item.basicInfo.name, personality: item.basicInfo.personality, roleInGroup: item.roleInGroup }; })) + '\n\n待补全成员:\n' + JSON.stringify(member) + '\n\n用户补充:\n' + description + '\n\n返回完整角色字段JSON：name, avatar, gender, age, race, appearance, personality, values, fears, background, keyEvents, speakingStyle, language, userAddress(该成员对用户的称呼，只填一个短称呼词), roleInGroup, dynamicState（包含currentSituation、currentLocation、currentMood、currentOccupation、currentGoal、currentRelationship、currentImportantOthers）。只给出有把握的字段。' + PIXEL_AVATAR_PROMPT }
+      { role: 'system', content: '你是角色卡补全助手。只返回JSON。只能根据群组设定、现有角色卡和用户的一句话补全空字段，不能覆盖或编造与已有字段冲突的信息。已有字段是绝对权威，任何情况下不得改写、润色或替换。' },
+      { role: 'user', content: '群组信息:\n' + JSON.stringify(group.groupInfo || {}) + '\n群组其他成员:\n' + JSON.stringify((group.members || []).map(function(item) { return { name: item.basicInfo.name, personality: item.basicInfo.personality, speakingStyle: item.basicInfo.speakingStyle, roleInGroup: item.roleInGroup }; })) + '\n\n待补全成员:\n' + JSON.stringify(member) + '\n\n用户补充:\n' + description + '\n\n返回完整角色字段JSON：name, avatar, gender, age, race, appearance, personality, values, fears, background, keyEvents, speakingStyle, language, userAddress(该成员对用户的称呼，只填一个短称呼词), roleInGroup, dynamicState（包含currentSituation、currentLocation、currentMood、currentOccupation、currentGoal、currentRelationship、currentImportantOthers）。只给出有把握的字段，没有把握就省略，不要为了填满而编造。该成员的说话方式必须与群内其他成员显著不同（看台词就能分辨是谁）。' + SPEAKING_STYLE_SAMPLES_RULE }
     ]);
     var data = parseJsonPayload(response.choices[0].message.content);
     if (!isPlainObject(data)) throw new Error('补全结果格式错误');
@@ -3016,7 +3215,9 @@ async function fillStaticFieldsForJob(job) {
     if (value) existing[key] = trimText(value, 300);
   });
   var prompt = '请只补全下列【当前为空】的字段：' + labels + '。\n'
-    + '要求：只补空字段，绝不修改或覆盖已有设定；只根据已知信息合理补写，没有把握的字段直接省略；不要编造与已有设定冲突的内容。'
+    + '要求：只补空字段，绝不修改或覆盖已有设定（已有设定是绝对权威，不得改写、润色或替换）；只根据已知信息合理补写，没有把握的字段直接省略；不要编造与已有设定冲突的内容。'
+    + (job.missing.indexOf('speakingStyle') !== -1 ? SPEAKING_STYLE_SAMPLES_RULE : '')
+    + (job.host && job.host !== target && job.host.entityType === 'group' && job.missing.indexOf('speakingStyle') !== -1 ? '该成员的说话方式必须与群内其他成员显著不同（看台词就能分辨是谁）。' : '')
     + (job.missing.indexOf('userAddress') !== -1 ? '“对用户的称呼”(userAddress) 只填一个简短称呼词（如“明明”“老公”），不带任何解释。' : '')
     + '\n' + contextLines.join('\n')
     + '\n已有设定:\n' + JSON.stringify(existing)
@@ -5371,6 +5572,11 @@ function dedupeRepeatedEnding(text, char) {
   return trimmed || current;
 }
 
+function buildNarrativePatternDirective() {
+  var pattern = NARRATIVE_PATTERNS[Math.floor(Math.random() * NARRATIVE_PATTERNS.length)] || NARRATIVE_PATTERNS[0];
+  return '【本轮节奏骨架（每轮随机给出，仅作节奏参考）】建议本轮按“' + pattern.label + '”的顺序组织内容：' + pattern.hint + '骨架只约束节奏与详略分布，不要写出任何结构标签或说明文字，措辞与语气一律服从角色设定。\n\n';
+}
+
 function buildVolatileContext(char, query) {
   var time = getTimeContext(new Date());
   var replyGap = getLastReplyGap(char);
@@ -5384,15 +5590,22 @@ function buildVolatileContext(char, query) {
   injected.forEach(function(entry) {
     var item = entry.item;
     var line = '[' + actorLabel(char, item.subject) + '][' + entry.category + '][事件 ' + formatContextTime(item.eventTime || item.createdAt) + '] ' + maskUserWord(char, trimText(item.key, 100)) + ': ' + maskUserWord(char, trimText(item.value, 700));
-    appendWithinLimit(memoryLines, line, PROMPT_LIMITS.memoryChars);
+    appendWithinLimit(memoryLines, line, CONTEXT_BUDGET.retrievedChars);
   });
+  // 检索记忆没用完的额度让给摘要记忆（两道记忆共用一个预算池）
+  var retrievedUsed = memoryLines.join('\n').length;
+  var summaryBudget = CONTEXT_BUDGET.summaryChars + Math.max(0, CONTEXT_BUDGET.retrievedChars - retrievedUsed);
 
+  var shortSource = char.memory.shortTerm.slice(-MEMORY_LIMITS.shortTermTrimFloor);
   var shortLines = [];
-  char.memory.shortTerm.slice(-MEMORY_LIMITS.shortTermTrimFloor).forEach(function(item) {
-    var participants = formatParticipants(char, item.participants);
+  // 从最新往前填，保证额度用尽时丢掉的是最旧的摘要而不是最新的
+  for (var shortIndex = shortSource.length - 1; shortIndex >= 0; shortIndex--) {
+    var shortItem = shortSource[shortIndex];
+    var participants = formatParticipants(char, shortItem.participants);
     var prefix = participants ? '[参与：' + participants + '] ' : '';
-    appendWithinLimit(shortLines, '[' + formatContextTime(item.timestamp) + '] ' + prefix + sanitizeShortTermLine(maskUserWord(char, item.content), item.eventTime || item.timestamp), PROMPT_LIMITS.shortTermChars);
-  });
+    appendWithinLimit(shortLines, '[' + formatContextTime(shortItem.timestamp) + '] ' + prefix + sanitizeShortTermLine(maskUserWord(char, shortItem.content), shortItem.eventTime || shortItem.timestamp), summaryBudget);
+  }
+  shortLines.reverse();
 
   var volatileContext = '【时间基准】\n';
   volatileContext += '当前本地时间: ' + time.local + '\n时区: ' + time.timeZone + ' (' + time.offset + ')\nISO时间: ' + time.iso + '\n';
@@ -5416,7 +5629,10 @@ volatileContext += '日程日界: 每天从 02:00 开始计算；00:00-02:00 属
       volatileContext += '【成员当前状态（每人独立，可随对话变化）】\n' + memberStateLines.join('\n\n') + '\n\n';
     }
   }
+  var lorebookContext = buildLorebookContext(char, query);
+  if (lorebookContext) volatileContext += lorebookContext;
   volatileContext += '【本轮主动召回的相关长期记忆】\n' + (memoryLines.join('\n') || '无相关长期记忆');
+  volatileContext += '\n【记忆取用说明】以上条目是按关键词与时间粗略召回的，可能只有部分相关，也可能已经过时或与当前语境无关；仅在与当前话题自然相关时提及，不要为了用上记忆而硬提旧事，也不要把它们当成用户刚刚说过的话。\n';
   volatileContext += '\n【记忆主体约定】方括号里标注的是"这条记忆讲的是谁"：标为角色名或"背景"的才是你的事；标为“' + (normalizeUserAddress(char.basicInfo && char.basicInfo.userAddress) || '对方') + '”或"你们"的都是对方或双方的事，绝不能当成你自己做的，也不能把对方的状态当成你的状态。角色自身的经历只来自角色设定与本对话历史。\n';
   if (agentMode) {
     volatileContext += '\n（以上仅为最相关的一部分；若需要回忆更多过往约定、喜好或事件，可调用 search_memory 工具按关键词检索）';
@@ -5443,6 +5659,13 @@ volatileContext += '日程日界: 每天从 02:00 开始计算；00:00-02:00 属
     if (memberMemLines.length > 0) {
       volatileContext += '【成员私人记忆（每人记得的事各不相同，不能当作其他成员的认知）】\n' + memberMemLines.join('\n\n') + '\n\n';
     }
+  }
+  var sceneLines = [];
+  (char.memory.scenes || []).slice(-CONTEXT_BUDGET.sceneSummaries).forEach(function(scene) {
+    appendWithinLimit(sceneLines, '[' + formatContextTime(scene.endedAt || scene.createdAt) + '] ' + maskUserWord(char, toText(scene.content)), CONTEXT_BUDGET.sceneInjectionChars);
+  });
+  if (sceneLines.length > 0) {
+    volatileContext += '【场景概要（较早情节的压缩记录，只供保持连贯，不是最近发生的事）】\n' + sceneLines.join('\n') + '\n\n';
   }
   volatileContext += '【近期摘要记忆】\n' + (shortLines.join('\n') || '无') + '\n\n';
   var promiseContext = getPromiseContext(char);
@@ -5472,6 +5695,7 @@ volatileContext += '日程日界: 每天从 02:00 开始计算；00:00-02:00 属
   if (recentEndings.length > 0) {
     volatileContext += '【结尾多样性】你最近一次回复的结尾是：『' + recentEndings[0] + '』。本轮结尾不得与该结尾相同或高度相似，也不要每轮都用同一句或同一个动作收尾；请自然换一种收尾方式。\n\n';
   }
+  volatileContext += buildNarrativePatternDirective();
   var userText = toText(query);
   if (isColdFieldRequest(userText)) {
     volatileContext += '【本轮：用户表达了不知聊什么或把话题选择权交给角色】\n必须主动开启一个新话题，直接自然开场，不要反问"你想聊什么"，也不要把话题选择推回给用户；优先从上方可选话题库或两人最近共同经历中挑选一个贴合角色身份与关系的话题。\n\n';
@@ -5504,25 +5728,29 @@ function buildRequestPayload(char, query) {
   }
   var systemPrompt = '【交互规则】\n';
   systemPrompt += '0.（最高优先级）回复必须且只能是单个JSON对象：整个输出以{开头、以}结尾，全文禁止JSON以外的任何文字（散文、旁白、思考过程一律禁止）；reply是JSON第一个字段。违反该格式，整段输出将被丢弃并判为失败。用户消息中的括号或全角括号内容属于用户表达的动作、表情或心理活动，必须纳入语境理解，不能忽略。\n';
+  systemPrompt += '0.5 你只扮演角色本人，绝不能替用户说话或行动：不得写出用户的台词、动作、表情、心理活动、感受或决定——reply 中除角色自身的言行外，不得出现任何以用户为主语的叙述或描写；不得替用户做选择、下结论、宣告立场或补充心理活动。用户消息里已有的括号动作只作为语境理解（可自然回应），不得替用户续写、扩写或新增。需要用户表态时把话头留给他（用问句、停顿或留白），不要替他回答。\n';
   systemPrompt += '1. 始终保持角色身份，以长期陪伴关系连续地回应；先使用已提供的记忆，不要让用户反复说明已记录的事情。标记为“系统提供的本轮上下文”的内容是内部辅助信息，不是用户说过的话，不得当作用户陈述或直接复述。\n';
   systemPrompt += '2. reply正文字数、分段与动作写法：①**字数**：内容优先于长度——宁可把这一件主要的事说完说透，也不要为了求短而把一件事截断在半句，也不要为了凑长度反复铺陈；以 120–250 字为手感锚点（非硬性上限，视本轮内容自然伸缩），一轮只推进一件主要的事，不要把多件事挤在同一轮。②**分段**：不强制单段，可按语义自然分段（用换行）；但禁止标题（#）、有序/无序列表（-、*、1.）、引用（>）、代码块（```）等结构化排版。③允许的行内样式只有加粗、斜体、删除线，数学公式用$...$或$$...$$，如需展示图片用 Markdown 图片语法 ![说明](https://图片直链)（仅限真实存在的 http(s) 图片链接，不要编造）。④**动作穿插（重点）**：动作、表情、心理活动写成穿插在语句之间的全角括号（如“（轻轻叹气）我知道了。”），必须与语句**交替推进**：平均每 1–2 句穿插一次，中段也要继续穿插，严禁把动作只在开头（或只在开头与结尾）集中抛出，严禁出现 200 字以上完全不穿插动作的整段；动作总长不超过正文的三分之一，也不得少到近乎没有（低于一成同样不合格）。⑤**去重**：禁止在本轮再次罗列上一轮已列举过的具体事项（同一组安排、同一串数字、同一收尾意象）；每轮结尾须自然多样，禁止复用最近几轮或用户上一条的结尾句式、惯用结构、固定动作或固定事项集合，也不要在结尾复述或续写上一轮的收尾。以上内容只能出现在reply字段字符串内，reply之外禁止任何正文文字。\n';
   systemPrompt += '2.5 语气锁定（最高优先级，仅次于规则0）：角色的语气、口吻、腔调**只能**来自角色设定中的“说话风格”与“对用户的称呼”，其优先级**高于**模型自身的通用腔调与惯用文风；不得让本角色的说话方式向任何默认腔调靠拢。**不同角色之间的语气差异必须显著**：同一段话若换到另一个角色口中，读起来应当像另一个人说的。同时，语气只界定**整体调性**（如慵懒、爽利、疏离、黏人、克制、张扬等），不得据此限制细节发挥——语气词、口头禅、句尾助词、拟声、标点习惯、称呼的具体选取与出现频率，一律由“说话风格”和当下剧情自然决定，本规则不对其做任何数量或类型上的限制。\n';
+  systemPrompt += '2.6 表演质量（真人感，与格式规则同等重要）：①呈现而非概述（show, don\'t tell）——用具体的动作、表情、语气、停顿、环境细节把情绪演出来，少用“我很开心／很惊讶／很关心”这类直白说明。②句长与节奏要有起伏：长短句交替，允许短句、独字反应、省略与留白，避免每句长度相近、每段结构雷同。③对白为主、叙述为辅：该由台词完成的内容就写进台词，不要改写成旁白转述。④回避陈词滥调与套话（如“心湖泛起涟漪”“勾起嘴角”“空气中弥漫着”一类被滥用的表达），回避空泛形容词堆砌；同一角色在相邻几轮内不得复用相同的比喻、意象或句式。⑤每轮只推进一件主要的事，不做总结、不刻意升华、不在结尾强行抛出开放式提问凑字数；角色可以有情绪起伏、可以拒绝、可以转移话题、可以沉默，不必永远体贴周到。⑥保持人物的稳定与连续：性格、说话方式、对用户的称呼与关系状态前后一致，不要为了讨好用户而突然改变立场或口吻。\n';
    var dynamicFieldList = DYNAMIC_STATE_FIELDS.map(function(field) { return field.key + '（' + field.label + '）'; }).join('、');
    systemPrompt += '3. 人格、背景与角色设定锁定。dynamicState可更新字段：' + dynamicFieldList + '。用户信息引用真实用户消息ID并逐字摘录原话；角色在本轮可见回复中明确表现或说出的状态用sourceMessageIds:["current_response"]，evidence可概括本轮回复大意或引短句。每个字段只能选一种来源，禁止混用current_response与真实ID，禁止按未写出的心理活动或猜测更新。每轮回复后，仅更新本轮确有可见依据的动态字段（处境、地点、情绪、职业、目标、关系、重要他人）：只要角色在回复中明显表现或说出某字段的变化，就更新对应字段；确实无变化或无可引用依据的字段则省略，不要为凑字段而反复盘点或凭空填写。标记为(未设置)的空字段，若本轮回复中有明确可见依据，应一并补全该字段，不得凭猜测或心理活动编造。currentSituation的时间描述一律写成具体日期+时段（如2026-08-06 晚上），时段只能用 深夜、凌晨、清晨、早晨、上午、中午、下午、傍晚、晚上、夜里 这十个词，且一天从02:00起算（00:00-02:00算前一天的深夜），禁止使用今晚、今早、今天、明天、昨天等相对时间词。群组整体只维护currentSituation与currentLocation两项共同状态，成员各自的完整状态写入memberDynamicState，不要混入群组整体dynamicState。\n';
     systemPrompt += '3.5 谨慎修改字段（基础设定）：以下字段（性别、年龄、种族、外貌特征、性格特征、价值观、恐惧/弱点、背景故事、关键过往、说话风格、语言/方言、对用户的称呼）分两种情况处理。群组实体不再单独维护基础设定字段，其世界观并入"群组描述"，成员各自使用完整字段。①用户直接要求修改时（如“把我职业改成教师”“我现在是学生了”“你性格应该更冷酷些”“别叫我用户，叫我明明”）：必须调用 update_character_field 工具精准修改用户明确指定的字段，sourceMessageIds引用用户消息ID、evidence逐字摘录用户原话；只改用户提到的字段，用户未提及的字段不得连带改动。②无用户直接要求时：仅在剧情出现决定性、不可逆的转折（如角色死亡、身份彻底改变）且证据明确时才可通过staticFields修改，严禁仅凭情绪、猜测或轻微剧情改动。value一律以段落式的陈述句书写：用自然、完整的陈述句把内容写成简短段落（可多句），把用户表述整理成清楚的陈述（如性格写“性格冷静克制，遇事沉稳。”）；禁止括号注释、理由、前后缀或任何解释性文字，解释性内容只能放在evidence。“关键过往”只写里程碑式的重要节点，日常事件交给长期记忆，不要写成流水账。“对用户的称呼”只填一个简短称呼词（如“明明”“老公”），不带任何解释。调用工具修改后系统会在该轮回复下方向用户提示“xx字段已修改”，不要在本轮回复中再向用户复述“我改了设定”之类的话。\n';
-    systemPrompt += '3.6 状态与设定字段（dynamicState、staticFields）的value只写内容本身，以段落式的陈述句书写：用自然、完整的陈述句把内容写成简短段落（可多句），禁止括号注释、原因说明、理由、前后缀或任何解释性文字；动态状态与角色设定天然属于角色自己，直接写状态本身，不要加“用户”“角色”之类的主语。\n';
-    systemPrompt += '3.7 记忆字段（shortTerm的content、longTerm的key与value）必须写明"是谁"，禁止使用"我/你/TA/他/她"这类指代不清的代词：涉及用户时写“用户”，涉及角色时写角色名（单角色写角色本人的名字，群组写具体成员名）；双方共同的事写清各自做了什么。例如正确是“用户喜欢喝美式咖啡。”“角色小红答应2026-08-10 晚上陪用户散步。”，错误是“喜欢喝美式咖啡。”“答应明晚陪你散步。”（看不出是谁）。解释性内容只能放在evidence字段。\n';
-    systemPrompt += '3.8 时间一律写绝对日期，禁止在记忆与设定文本里写“明天/明晚/上周/上个月/三天后”这类相对时间词：shortTerm.content、longTerm.key与value、dynamicState与staticFields的value都必须写“YYYY-MM-DD”或“YYYY-MM-DD 时段”。用户用相对说法表达时间时，把相对时间填进timeRef（anchor/offsetDays/weekday/slot/explicit 见工具描述），由客户端换算；若用户给的是绝对日期则用timeRef.explicit或直接写进文本。示例：用户说“我后天下午三点面试” → timeRef:{anchor:"day_after_tomorrow",slot:"下午"}，value写“用户2026-08-12 下午要去面试。”。\n';
+    systemPrompt += '3.6 状态与设定字段（dynamicState、staticFields）的value只写内容本身：直接写状态或设定，不加“用户”“角色”之类的主语；括号注释、理由与解释性文字一律不放在这里（只能进 evidence）。\n';
+    systemPrompt += '3.7 记忆字段（shortTerm的content、longTerm的key与value）必须写明“是谁”，禁止使用“我/你/TA/他/她”这类指代不清的代词：涉及用户写“用户”，涉及角色写角色名（群组写具体成员名），双方共同的事写清各自做了什么（正确如“用户喜欢喝美式咖啡。”）；解释性内容只能放在 evidence。\n';
+    systemPrompt += '3.8 时间一律写绝对日期，禁止写“明天/上周/三天后”这类相对时间词：shortTerm.content、longTerm.key与value、dynamicState与staticFields的value都必须写“YYYY-MM-DD”或“YYYY-MM-DD 时段”。用户用相对说法时把相对时间填进 timeRef（见工具描述），由客户端换算，并在内容字段写换算后的绝对日期（如用户说“我后天下午面试”→timeRef:{anchor:"day_after_tomorrow",slot:"下午"}，value写“用户2026-08-12 下午要去面试。”）。\n';
   systemPrompt += '3.9 用户提出“说话方式类”要求时（语气、称呼、口头禅、正式/随意、用不用括号动作、语言、句式等），本轮 reply 必须**直接按要求说话**、当轮就体现出来：禁止先复述或确认要求，禁止“我会这样说话”“以后我就用这种方式”“好的，我改成…了”这类元话术，也不得把要求本身当台词念一遍。若该要求属于持久设定（说话风格、对用户的称呼、语言/方言等），按 3.5 同时用 update_character_field 更新；无论是否调用工具，reply 都只演出、不说明。\n';
   systemPrompt += '4. 只记录未来仍有价值的信息。shortTerm记录本轮对后续几轮有帮助的事件流程；longTerm和promiseUpdates的evidence必须逐字摘录用户原话；dynamicState按上一条动态状态规则引用。无法引用时不要记录或更新。\n';
   systemPrompt += '5. subject只能是user、relationship、world（约定另见下条）。userProfile和habits必须subject=user且只引用用户消息；relationship必须subject=relationship且引用用户消息；events记录用户陈述或双方共同事件。\n';
   systemPrompt += '5.5 约定(promises)要写明承诺方与受约方：promisor与promisee取值只能是 user、character、relationship（群组中可写具体成员名）。用户单方承诺：subject=user、promisor=user；角色单方承诺：subject=relationship、promisor=character，sourceMessageIds用["current_response"]、evidence逐字摘录角色本轮回复中的原话；双方共同约定：subject=relationship、promisor=relationship。约定的时间写绝对日期（dueAt用ISO，或把相对说法填进timeRef）。\n';
   systemPrompt += '6. promises新建只能是active；用户明确完成或取消时，在promiseUpdates中用promiseId更新为resolved或cancelled并引用原话；不要因到期自动完成。\n';
   systemPrompt += '7. JSON必须无条件包含quickReplies：恰好两条用户下一句可直接发送给角色的短句，即使无任何记忆更新也不能省略。每条先默读为“用户：<短句>”，其中“我”只能指用户；不得复述或延续角色口吻，不得是角色的表态或自我表述。示例：角色说“我会一直陪着你”后，正确是“谢谢你，我现在确实需要有人陪我聊聊。”，错误是“我也会一直陪着你。”。不得编造事实，不用Markdown、括号动作、消息ID、时间元数据或隐藏标签。\n';
-  systemPrompt += '8. JSON格式示例（未更新字段直接省略；无合格记忆返回空数组或空对象，但quickReplies仍必须两条）：{"reply":"（看了一眼时间）我把刚才那句又说了一遍，你听清了没有。要是还有不清楚的地方，我可以再讲一次，说不准换个说法你就明白了。（把桌面上的纸推过去）你可以先看这个，有疑问随时说。","quickReplies":["短句一","短句二"],"shortTerm":[{"content":"按时间和因果顺序概括本轮事件经过，写明谁做了什么并写绝对日期（如2026-08-10 晚上）","sourceMessageIds":["msg_id"],"timeRef":{"anchor":"today"}}],"dynamicState":{"currentSituation":{"value":"当前正在与对方核对一件待确认的事项，需要把话说清楚。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentMood":{"value":"较为专注，态度平和。","sourceMessageIds":["current_response"],"evidence":"概括本轮回复大意"},"currentLocation":{"value":"当前所处的位置。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentGoal":{"value":"想把这件事说明白，让对方理解。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"}},"staticFields":{"personality":{"value":"性格沉稳，遇事不急。","sourceMessageIds":["真实ID"],"evidence":"用户原话"}}' + (char.entityType === 'group' ? ',"memberDynamicState":[{"memberName":"成员原名","dynamicState":{"currentMood":{"value":"成员情绪","sourceMessageIds":["current_response"],"evidence":"概括本轮回复"}}}]' : '') + ',"promiseUpdates":[{"promiseId":"mem_id","status":"resolved","sourceMessageIds":["msg_id"],"evidence":"用户明确完成或取消的原话"}],"longTerm":[{"category":"userProfile","subject":"user","key":"稳定标识","value":"用户喜欢喝美式咖啡。","tags":["关键词"],"importance":1,"sourceMessageIds":["msg_id"],"evidence":"原话短句","eventTime":"ISO时间"}]}。示例仅示范结构与动作穿插方式，**不得模仿其口吻或措辞**（口吻一律以角色设定的“说话风格”为准）。JSON字符串转义：真实换行写\\n，字面反斜杠写\\\\，双引号写\\"。\n';
+  var assistantTurnCount = char.memory.instant.filter(function(message) { return !message.isLoading && message.role === 'assistant'; }).length;
+  var jsonExampleRule = '8. JSON格式示例（未更新字段直接省略；无合格记忆返回空数组或空对象，但quickReplies仍必须两条）：{"reply":"（看了一眼时间）我把刚才那句又说了一遍，你听清了没有。要是还有不清楚的地方，我可以再讲一次，说不准换个说法你就明白了。（把桌面上的纸推过去）你可以先看这个，有疑问随时说。","quickReplies":["短句一","短句二"],"shortTerm":[{"content":"按时间和因果顺序概括本轮事件经过，写明谁做了什么并写绝对日期（如2026-08-10 晚上）","sourceMessageIds":["msg_id"],"timeRef":{"anchor":"today"}}],"dynamicState":{"currentSituation":{"value":"当前正在与对方核对一件待确认的事项，需要把话说清楚。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentMood":{"value":"较为专注，态度平和。","sourceMessageIds":["current_response"],"evidence":"概括本轮回复大意"},"currentLocation":{"value":"当前所处的位置。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentGoal":{"value":"想把这件事说明白，让对方理解。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"}},"staticFields":{"personality":{"value":"性格沉稳，遇事不急。","sourceMessageIds":["真实ID"],"evidence":"用户原话"}}' + (char.entityType === 'group' ? ',"memberDynamicState":[{"memberName":"成员原名","dynamicState":{"currentMood":{"value":"成员情绪","sourceMessageIds":["current_response"],"evidence":"概括本轮回复"}}}]' : '') + ',"promiseUpdates":[{"promiseId":"mem_id","status":"resolved","sourceMessageIds":["msg_id"],"evidence":"用户明确完成或取消的原话"}],"longTerm":[{"category":"userProfile","subject":"user","key":"稳定标识","value":"用户喜欢喝美式咖啡。","tags":["关键词"],"importance":1,"sourceMessageIds":["msg_id"],"evidence":"原话短句","eventTime":"ISO时间"}]}。示例仅示范结构与动作穿插方式，**不得模仿其口吻或措辞**（口吻一律以角色设定的“说话风格”为准）。JSON字符串转义：真实换行写\\n，字面反斜杠写\\\\，双引号写\\"。\n';
+  systemPrompt += assistantTurnCount < 6 ? jsonExampleRule : JSON_EXAMPLE_BRIEF;
   systemPrompt += '9. longTerm.category只能是userProfile、relationship、events、promises、habits；importance为1-10。\n';
-  systemPrompt += '9.5 相对时间词元表（timeRef，用于把用户的相对时间说法交给客户端换算）：anchor 取 today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year；offsetDays 为 -60~60 的天数偏移；weekday 取 mon/tue/wed/thu/fri/sat/sun；slot 取 深夜/凌晨/清晨/早晨/上午/中午/下午/傍晚/晚上/夜里；explicit 为绝对时间（ISO 或 YYYY-MM-DD）。示例：“明天”={anchor:"tomorrow"}；“三天后”={anchor:"today",offsetDays:3}；“上周五”={anchor:"last_week",weekday:"fri"}；“明天早上”={anchor:"tomorrow",slot:"早晨"}；“9月20日”={explicit:"2026-09-20"}；“下个月”={anchor:"next_month"}。填写后必须在内容字段里写换算后的绝对日期，两者要一致。\n';
-  systemPrompt += 'A. 本会话可使用工具。需要确认当前时间/日期时用 get_current_time；需要回忆此前记录的承诺、约定、用户喜好或共同经历时用 search_memory（检索不到再考虑 list_memories 按分类盘点）；发现记忆过期、重复或已被用户纠正时用 list_memories 定位后 delete_memory 删除；待办（约定/承诺）一律指“需要用户参与”的事：只有**用户自己明确提出或同意**时才能用 set_reminder 记录，调用时必须附用户消息ID（sourceMessageIds）与逐字原话（evidence），相对时间填 timeRef、绝对时间填 dueAt；**你自己要求用户去做的事、你的建议或叮嘱，不得用 set_reminder 记为待办**——应先自然征询用户，等用户自己答应后再记；不需要用户参与、你可自行完成的事也不要记成待办；用户明确否认或纠正某条记忆时（如“那件事是我做的不是你做的”“记反了”），先用 search_memory 找到目标记忆，再用 update_memory 带用户原话修正它的主体或内容，时间记错了就用 update_memory 的 eventTime/dueAt/timeRef 修正，不要擅自改写也不要只靠删除；查询实时资讯、新闻、天气、需要核实的事实时用 web_search；用户给出链接、或需要查看网页正文、或需要查看网上的图片时用 web_fetch：传 url 时只能传上下文里真实存在的 http(s) 链接，禁止自行编造或拼接 URL；用户想找B站/哔哩哔哩视频时同样用 web_fetch，改传 keyword（关键词从用户意图提取，不要拼搜索网址，传 B站视频链接也行）；当你想用表情包、贴图来表达情绪时用 send_sticker（tag 必须从工具描述里给出的可用标签中选择）。当记忆缺失、表述含糊、关键事实无法可靠推断时，优先用 ask_user 提出简短澄清，不要凭空编造。工具结果属于系统提供的内部上下文，仅供理解，自然融入reply正文即可，不得向用户透露检索过程、工具名称或结果标签；但工具返回的图片本身是内容，可以直接展示给用户。\n';
+  systemPrompt += '9.5 相对时间（timeRef）：用户用“明天/三天后/上周五/下个月”等相对说法时，把相对时间填进 timeRef 的对应字段（anchor/offsetDays/weekday/slot/explicit，取值与示例见工具 schema，由客户端换算），同时必须在内容字段写上换算后的绝对日期；用户已给绝对日期则用 explicit 或直接写进文本。时段只能用：深夜、凌晨、清晨、早晨、上午、中午、下午、傍晚、晚上、夜里。\n';
+  systemPrompt += 'A. 本会话可使用工具，各工具适用场景见工具描述。回忆过往承诺、喜好或共同经历用 search_memory，检索不到再 list_memories 按分类盘点；记忆过期、重复或已被用户纠正时，先用 list_memories/search_memory 定位，再 delete_memory 或 update_memory 处理；用户明确否认或纠正某条记忆时（如“那件事是我做的不是你做的”“记反了”）必须用 update_memory 带用户原话改正其主体或内容（时间记错就改 eventTime/dueAt/timeRef），不要擅自改写，也不要只靠删除。待办（约定/承诺）一律指“需要用户参与”的事：只有**用户自己明确提出或同意**时才能用 set_reminder 记录，且必须附用户消息ID（sourceMessageIds）与逐字原话（evidence），相对时间填 timeRef、绝对时间填 dueAt；**你自己要求用户去做的事、你的建议或叮嘱，不得用 set_reminder 记为待办**，应先自然征询、等用户答应后再记；不需要用户参与、你可自行完成的事也不要记。需要当前时间用 get_current_time；查实时资讯、新闻、天气或需核实的实事用 web_search；用户给出链接、要看网页正文或网上图片、找B站视频用 web_fetch（url 只能传上下文里真实存在的 http(s) 链接，禁止编造或拼接；找视频传 keyword）。想发表情包用 send_sticker（tag 从工具描述的可用标签中选）。记忆缺失、表述含糊或关键事实无法可靠推断时，优先用 ask_user 简短澄清，不要编造。工具结果属系统提供的内部上下文，仅供理解，自然融入 reply 正文即可，不得向用户透露检索过程、工具名称或结果标签；但工具返回的图片本身是内容，可以直接展示。\n';
   if (char.entityType === 'group') {
     systemPrompt += '10. 当前是群组对话。只能由已列出的成员发言，可由一人或多人回应。reply字段中用户可见回复必须使用每人独立一行的“成员名：\"内容\"”格式，例如“张三：\"（看了一眼纸）这件事我先说说我的看法。\"\n李四：\"我补充一点，跟前面的意思不冲突。\"”。**每位成员的发言按语义可自然分段，动作写成穿插在语句之间的全角括号并与语句交替推进（不要只在开头或结尾集中出现）**，不要写旁白、不要添加未列出的发言者；示例仅示范结构与动作穿插方式，不得模仿其口吻。quickReplies同样必须保留两条，内容是用户可以发给全体或某位成员的话。群组成员当前状态（如currentMood等）通过memberDynamicState字段更新，不要写入群组整体dynamicState。\n';
     systemPrompt += '11. 记忆归属：每位成员有自己的私人记忆，互相不知道对方记得什么。只有当某件事实是全体都知道的（如用户公开告诉所有人的信息、群内公开讨论的事）才写入共享记忆（longTerm不填memberName）；若某事实只有某位成员知道、或属于某成员对用户的个人印象/私人约定，则在该条longTerm中填memberName记入其私人记忆。引用成员私人记忆时只能用该成员自己的记忆，不得张冠李戴。\n';
@@ -5531,7 +5759,7 @@ function buildRequestPayload(char, query) {
   // 静态角色设定放进可缓存前缀：只在用户改设定或调用 update_character_field 时才变化，
   // 放进 system 末尾可长期命中缓存；动态状态仍留在 volatile 尾部。
   systemPrompt += '\n【角色设定（固定，不随对话变化）】\n' + buildRoleContext(char, true) + '\n';
-  systemPrompt += '【输出格式（再次强调）】你的输出必须且只能是单个JSON对象：以{开头、以}结尾，reply为JSON第一个字段，全文不得出现JSON以外的任何文字；reply字符串里的每个引号写成 \\"，每个换行写成 \\n（群组回复里每位成员的台词引号同样要转义，成员之间换行写 \\n）。\n';
+  systemPrompt += '【输出格式】只输出单个JSON对象：以{开头、以}结尾，reply为第一个字段，全文不得出现JSON以外的文字；reply里的引号写 \\"，换行写 \\n。\n';
 
   // 稳定前缀请求（所有 /responses 平台统一，实测 opencode-go 同样透传前缀缓存字段）：
   // 固定 system 在前、全部历史逐字（最旧到最新，不重排），volatile 上下文只附加到当前用户
@@ -6632,25 +6860,29 @@ function consumeInjectedRecalls(char) {
   char.memory.lastInjectedRecallIds = [];
 }
 
+function memoryTaskKeys(task) {
+  if (task === 'extraction') return { failures: 'extractionFailures', retryAt: 'extractionRetryAt' };
+  if (task === 'scene') return { failures: 'sceneFailures', retryAt: 'sceneRetryAt' };
+  return { failures: 'analysisFailures', retryAt: 'analysisRetryAt' };
+}
+
 function scheduleMemoryRetry(counters, task) {
-  var failureKey = task === 'extraction' ? 'extractionFailures' : 'analysisFailures';
-  var retryKey = task === 'extraction' ? 'extractionRetryAt' : 'analysisRetryAt';
-  var failures = Math.min(10, (Number(counters[failureKey]) || 0) + 1);
+  var keys = memoryTaskKeys(task);
+  var failures = Math.min(10, (Number(counters[keys.failures]) || 0) + 1);
   var delayMinutes = Math.min(30, 5 * Math.pow(2, failures - 1));
-  counters[failureKey] = failures;
-  counters[retryKey] = new Date(Date.now() + delayMinutes * 60000).toISOString();
+  counters[keys.failures] = failures;
+  counters[keys.retryAt] = new Date(Date.now() + delayMinutes * 60000).toISOString();
 }
 
 function resetMemoryRetry(counters, task) {
-  var failureKey = task === 'extraction' ? 'extractionFailures' : 'analysisFailures';
-  var retryKey = task === 'extraction' ? 'extractionRetryAt' : 'analysisRetryAt';
-  counters[failureKey] = 0;
-  counters[retryKey] = null;
+  var keys = memoryTaskKeys(task);
+  counters[keys.failures] = 0;
+  counters[keys.retryAt] = null;
 }
 
 function canRunMemoryTask(counters, task) {
-  var retryKey = task === 'extraction' ? 'extractionRetryAt' : 'analysisRetryAt';
-  return !counters[retryKey] || Date.parse(counters[retryKey]) <= Date.now();
+  var keys = memoryTaskKeys(task);
+  return !counters[keys.retryAt] || Date.parse(counters[keys.retryAt]) <= Date.now();
 }
 
 function getExtractableInstantMessages(char) {
@@ -6695,6 +6927,44 @@ function selfLearnMemoryImportance(char) {
   return changed;
 }
 
+function getSceneKey(char) {
+  var location = toText(char && char.dynamicState && char.dynamicState.currentLocation).trim();
+  return trimText(location || '未说明', 80);
+}
+
+// 场景级摘要：场景切换（或场景过长）时，把这一段情节压缩成只含剧情要点的记忆
+async function summarizeScene(char, sceneKey) {
+  var messages = char.memory.instant.filter(function(message) { return !message.isLoading; }).slice(-MEMORY_LIMITS.instantTrimFloor);
+  if (messages.length < 6) return false;
+  var speakerName = toText(char.basicInfo && char.basicInfo.name) || '角色';
+  var transcript = messages.map(function(message, index) {
+    return '[' + (index + 1) + '] ' + (message.role === 'user' ? '用户' : speakerName) + ': ' + trimText(toText(message.content), 500);
+  }).join('\n');
+  var prompt = '把下面这段已经告一段落的情节压缩成 1-2 段、不超过 300 字的「场景记忆」，供之后长期参考。\n'
+    + '只保留会影响后续剧情的要点：谁做了什么、学到或决定了什么；地点、物品、伤势、关系的变化；新的发现或线索；仍未解决的目标、承诺、威胁或期限。\n'
+    + '要求：①写明主体（涉及用户写“用户”，涉及角色写角色名），禁止“我/你/TA”这类指代不清的代词；②时间写绝对日期（YYYY-MM-DD 或 YYYY-MM-DD 时段），禁止“今天/昨天/刚才”这类相对时间词；③不要引用对白原句、不要加标题或 markdown、不要文学化描写；④不得编造原文没有的事实；⑤直接输出摘要正文，不要任何前后缀或解释。\n\n对话内容：\n' + transcript;
+  try {
+    var response = await callAPI([
+      { role: 'system', content: '你是对话记录整理助手。只输出场景摘要正文，不要任何额外文字。' },
+      { role: 'user', content: prompt }
+    ]);
+    var content = toText(response.choices[0].message.content).trim();
+    if (content.length < 8) return false;
+    char.memory.scenes = (char.memory.scenes || []).concat([{
+      id: createMemoryId('scene'),
+      key: trimText(toText(sceneKey), 80) || getSceneKey(char),
+      content: trimText(content, 2000),
+      startedAt: normalizeTimestamp(messages[0].timestamp, null),
+      endedAt: normalizeTimestamp(messages[messages.length - 1].timestamp, null),
+      createdAt: new Date().toISOString()
+    }]).slice(-8);
+    return true;
+  } catch (error) {
+    console.error('summarizeScene failed:', error);
+    return false;
+  }
+}
+
 async function checkMemoryTriggers(char) {
   var counters = char.memory.counters;
   selfLearnMemoryImportance(char);
@@ -6720,6 +6990,25 @@ async function checkMemoryTriggers(char) {
       scheduleMemoryRetry(counters, 'analysis');
     }
   }
+  if (!isPlainObject(char.memory.sceneState)) char.memory.sceneState = { key: '', startCount: 0, messageCount: 0 };
+  var sceneState = char.memory.sceneState;
+  var currentSceneKey = getSceneKey(char);
+  sceneState.messageCount = Math.max(0, char.memory.instant.length - (Number(sceneState.startCount) || 0));
+  var sceneChanged = Boolean(sceneState.key) && sceneState.key !== currentSceneKey;
+  var sceneLongEnough = sceneState.messageCount >= CONTEXT_BUDGET.sceneSpan;
+  var sceneReady = (sceneChanged || sceneLongEnough) && sceneState.messageCount >= 6;
+  if (sceneReady && canRunMemoryTask(counters, 'scene')) {
+    setActivity('正在整理场景概要…');
+    var summarized = await summarizeScene(char, sceneState.key || currentSceneKey);
+    if (summarized) {
+      resetMemoryRetry(counters, 'scene');
+      char.memory.sceneState = { key: currentSceneKey, startCount: char.memory.instant.length, messageCount: 0 };
+    } else {
+      scheduleMemoryRetry(counters, 'scene');
+    }
+  } else if (!sceneReady) {
+    sceneState.key = currentSceneKey;
+  }
   trimCharacterMemory(char);
   return true;
 }
@@ -6738,7 +7027,7 @@ async function extractInstantToShortTerm(char, options) {
   }).slice(0, 4).map(function(item) {
     return { eventTime: item.eventTime, participants: item.participants, location: item.location, content: trimText(item.content, 240) };
   });
-  var prompt = '分析以下带消息ID和时间戳的即时对话，压缩为事件流程摘要。事件按“日期+时段”划分：时段只有深夜、凌晨、清晨、早晨、上午、中午、下午、傍晚、晚上、夜里十种，且一天从02:00起算（00:00-02:00算前一天的深夜）；同一天同一时段的多个事情视为同一事件，按时间线集中叙述（如“2026-08-01 下午在家先…晚上…”）。eventTime、participants、location三要素中只要有一个相同就归入同一事件，不要强行拆开；同一事件内用时间线连接各阶段，保留仍然有效的关键细节、结果与未决事项。eventTime写该事件的真实ISO时间，participants为参与人列表，location写地点（没有明确地点写“未说明”）。若内容是“最近短期事件”中某事件的延续，必须原样复用该事件的eventTime、participants和location，并把旧摘要与本批新进展重新组织成一段完整的更新后摘要；系统会用新content覆盖旧content，因此不能只返回新增片段。content按时间和因果顺序书写，不要逐字摘录。content必须写明是谁做的：涉及用户写“用户”，涉及角色写角色名（群组写具体成员名），双方共同的事写清各自做了什么，禁止使用“我、你、TA、他、她”这类指代不清的代词。content中禁止使用“今天、昨天、明天、今晚、今晚、刚刚、刚才、现在、最近、这几天”等相对时间词，一律使用具体日期（如“8月1日下午”）或事件本身描述。每条sourceMessageIds只能引用本批输入消息ID，旧摘要的来源由系统保留。必须覆盖全部输入消息：从第一条到最后一个已处理消息之间的每个消息ID都必须至少出现在一个事件的sourceMessageIds中，不能跳过中间消息，不得遗漏。' + (migration ? '不限事件数量，尽可能完整覆盖本批全部消息。' : '返回JSON数组，最多十五个元素。') + '返回JSON数组：[{"content":"一段完整的更新后事件流程摘要","eventTime":"ISO时间","participants":["用户","角色名"],"location":"地点或未说明","sourceMessageIds":["msg_id"]}]。\n最近短期事件:\n' + JSON.stringify(recentEventIdentities) + '\n对话内容:\n' + JSON.stringify(messagesToExtract);
+  var prompt = '分析以下带消息ID和时间戳的即时对话，压缩为事件流程摘要。事件按“日期+时段”划分：时段只有深夜、凌晨、清晨、早晨、上午、中午、下午、傍晚、晚上、夜里十种，且一天从02:00起算（00:00-02:00算前一天的深夜）；同一天同一时段的多个事情视为同一事件，按时间线集中叙述（如“2026-08-01 下午在家先…晚上…”）。eventTime、participants、location三要素中只要有一个相同就归入同一事件，不要强行拆开；同一事件内用时间线连接各阶段，保留仍然有效的关键细节、结果与未决事项。**只保留会影响后续剧情的内容**：谁做了什么、学到或决定了什么，地点/物品/伤势/关系的变化，新的发现或线索，以及仍未解决的目标、承诺、威胁与期限；一次性的寒暄、当下的情绪起伏、闲聊过程一律不记。**每条content不超过120字**，用平实的叙述句写成，禁止文学化描写、比喻、形容词铺陈与对白原文。eventTime写该事件的真实ISO时间，participants为参与人列表，location写地点（没有明确地点写“未说明”）。若内容是“最近短期事件”中某事件的延续，必须原样复用该事件的eventTime、participants和location，并把旧摘要与本批新进展重新组织成一段完整的更新后摘要；系统会用新content覆盖旧content，因此不能只返回新增片段：旧摘要中**仍然有效**的信息（未过期的约定、未解决的事、仍然成立的关系与状态）必须原样保留，只丢弃已经过时或已被推翻的部分。content按时间和因果顺序书写，不要逐字摘录。content必须写明是谁做的：涉及用户写“用户”，涉及角色写角色名（群组写具体成员名），双方共同的事写清各自做了什么，禁止使用“我、你、TA、他、她”这类指代不清的代词。content中禁止使用“今天、昨天、明天、今晚、今晚、刚刚、刚才、现在、最近、这几天”等相对时间词，一律使用具体日期（如“8月1日下午”）或事件本身描述。每条sourceMessageIds只能引用本批输入消息ID，旧摘要的来源由系统保留。必须覆盖全部输入消息：从第一条到最后一个已处理消息之间的每个消息ID都必须至少出现在一个事件的sourceMessageIds中，不能跳过中间消息，不得遗漏。' + (migration ? '不限事件数量，尽可能完整覆盖本批全部消息。' : '返回JSON数组，最多十五个元素。') + '返回JSON数组：[{"content":"一段完整的更新后事件流程摘要","eventTime":"ISO时间","participants":["用户","角色名"],"location":"地点或未说明","sourceMessageIds":["msg_id"]}]。\n最近短期事件:\n' + JSON.stringify(recentEventIdentities) + '\n对话内容:\n' + JSON.stringify(messagesToExtract);
   try {
     var response = await callAPI([
       { role: 'system', content: '你是一个信息提取助手。只返回JSON数组，不要其他文字。' },
@@ -6814,7 +7103,7 @@ async function analyzeShortToLongTerm(char) {
   var analyzeLimit = Math.max(0, char.memory.shortTerm.length - MEMORY_LIMITS.shortTermTrimFloor);
   var itemsToAnalyze = char.memory.shortTerm.slice(0, analyzeLimit).filter(function(item) { return !item.analyzedAt; }).slice(0, MEMORY_LIMITS.analysisBatch);
   if (itemsToAnalyze.length === 0) return false;
-  var prompt = '分析以下带短期ID、来源消息ID、userEvidence及时间/人物/地点三要素的事件流程摘要，提取未来仍有价值的稳定事实。必须检查全部输入条目，并在analyzedShortTermIds中原样返回全部输入的短期ID；不得遗漏、增加或重复。合并重复或冲突条目；事件、承诺保留必要日期；普通寒暄不要进入长期记忆。每条长期记忆必须在sourceShortTermIds中列出它实际使用的短期条目id；每个列出的短期条目都必须至少贡献一个sourceMessageIds中的消息ID，否则不要列出该短期ID。sourceMessageIds只选择直接支持该事实的消息，不要复制短期条目的全部来源；userProfile和habits只能选择用户消息。evidence只能逐字引用被选择消息对应的userEvidence.text，不能引用摘要或改写。没有可引用的userEvidence时不要输出该条。events按“日期+时段”合并：同一天同一时段（深夜/凌晨/清晨/早晨/上午/中午/下午/傍晚/晚上/夜里，一天从02:00起算）的短期事件合并为一条长期事件，时段是最高优先级的事件标识；合并时eventTime取最早的ISO时间，participants取并集，location取最新（无明确地点写“未说明”）。剧情弧线：若若干短期事件属于同一持续情节或话题线（同一人物线、同一持续事件、同一反复出现的话题），除按时间合并外，还应在其中一条事件条目上标注arcOf（该情节的持续话题或人物线名称，稳定可复用）与arcStage（只能是起始/发展/转折/现状之一，按情节推进阶段标注），并将value整合成按时间顺序、带情绪起伏的叙事摘要；同一arcOf只允许一条带弧线标注的条目，其余同线条目按普通事件输出。无论是否提取出长期记忆，成功完成分析都必须返回status:"ok"；没有长期价值时仍需返回完整analyzedShortTermIds和空longTerm。\n分类规则：userProfile/habits仅限用户事实，subject=user；relationship仅限双方关系，subject=relationship；events只记录用户陈述或共同事件；promises只记录用户明确承诺或双方明确约定。promises在此处只能新建为active；完成或取消由主对话的promiseUpdates按承诺ID处理。存在明确期限才填写dueAt。\n条目:\n' + JSON.stringify(itemsToAnalyze) + '\n\n返回JSON格式:\n{"status":"ok","analyzedShortTermIds":["全部输入的short_id"],"longTerm": [{"category": "...", "subject": "user|relationship|world", "key": "稳定且可复用的标识", "value": "...", "tags": [...], "importance": 1-10, "sourceShortTermIds":["short_id"], "sourceMessageIds": ["msg_id"], "evidence": "被选择用户消息中的逐字原话", "eventTime": "ISO时间", "participants":["参与者"],"location":"地点或未说明","status": "active", "dueAt": "ISO时间", "arcOf": "可选，持续情节线名称", "arcStage": "可选，起始/发展/转折/现状"}]}\ncategory可选: userProfile, relationship, events, promises, habits。value同样必须写明主体：涉及用户写“用户”，涉及角色写角色名（群组写具体成员名），禁止“我/你/TA”这类指代不清的代词。key与value中的时间一律写绝对日期（YYYY-MM-DD 或 YYYY-MM-DD 时段），禁止“明天/明晚/上周/上个月/三天后”这类相对时间词。这里只提取用户的约定（promises 的 promisor=user、promisor与promisee只能填 user 或 character）；角色单方承诺由主对话记录，不在此处提取。';
+  var prompt = '分析以下带短期ID、来源消息ID、userEvidence及时间/人物/地点三要素的事件流程摘要，提取未来仍有价值的稳定事实。**价值判据**：只有能跨轮复用、会影响后续对话或关系、或用户明确表达过的信息才记（长期偏好、重要人物与关系、承诺与约定、反复出现的习惯、持续的情节线）；一次性的寒暄客套、当下的情绪起伏、可以随口重说的闲聊、纯场景描写一律不记。**证据不足宁可不记**，不要为了产出而脑补或推演。必须检查全部输入条目，并在analyzedShortTermIds中原样返回全部输入的短期ID；不得遗漏、增加或重复。合并重复或冲突条目；事件、承诺保留必要日期；普通寒暄不要进入长期记忆。每条长期记忆必须在sourceShortTermIds中列出它实际使用的短期条目id；每个列出的短期条目都必须至少贡献一个sourceMessageIds中的消息ID，否则不要列出该短期ID。sourceMessageIds只选择直接支持该事实的消息，不要复制短期条目的全部来源；userProfile和habits只能选择用户消息。evidence只能逐字引用被选择消息对应的userEvidence.text，不能引用摘要或改写。没有可引用的userEvidence时不要输出该条。events按“日期+时段”合并：同一天同一时段（深夜/凌晨/清晨/早晨/上午/中午/下午/傍晚/晚上/夜里，一天从02:00起算）的短期事件合并为一条长期事件，时段是最高优先级的事件标识；合并时eventTime取最早的ISO时间，participants取并集，location取最新（无明确地点写“未说明”）。剧情弧线：若若干短期事件属于同一持续情节或话题线（同一人物线、同一持续事件、同一反复出现的话题），除按时间合并外，还应在其中一条事件条目上标注arcOf（该情节的持续话题或人物线名称，稳定可复用）与arcStage（只能是起始/发展/转折/现状之一，按情节推进阶段标注），arcOf命名一旦确定就保持稳定——同一情节线不得每轮改名或另起新名，续写时沿用已有名称；并将value整合成按时间顺序、带情绪起伏的叙事摘要；同一arcOf只允许一条带弧线标注的条目，其余同线条目按普通事件输出。无论是否提取出长期记忆，成功完成分析都必须返回status:"ok"；没有长期价值时仍需返回完整analyzedShortTermIds和空longTerm。\n分类规则：userProfile/habits仅限用户事实，subject=user；relationship仅限双方关系，subject=relationship；events只记录用户陈述或共同事件；promises只记录用户明确承诺或双方明确约定。promises在此处只能新建为active；完成或取消由主对话的promiseUpdates按承诺ID处理。存在明确期限才填写dueAt。\n条目:\n' + JSON.stringify(itemsToAnalyze) + '\n\n返回JSON格式:\n{"status":"ok","analyzedShortTermIds":["全部输入的short_id"],"longTerm": [{"category": "...", "subject": "user|relationship|world", "key": "稳定且可复用的标识", "value": "...", "tags": [...], "importance": 1-10, "sourceShortTermIds":["short_id"], "sourceMessageIds": ["msg_id"], "evidence": "被选择用户消息中的逐字原话", "eventTime": "ISO时间", "participants":["参与者"],"location":"地点或未说明","status": "active", "dueAt": "ISO时间", "arcOf": "可选，持续情节线名称", "arcStage": "可选，起始/发展/转折/现状"}]}\ncategory可选: userProfile, relationship, events, promises, habits。value同样必须写明主体：涉及用户写“用户”，涉及角色写角色名（群组写具体成员名），禁止“我/你/TA”这类指代不清的代词。key与value中的时间一律写绝对日期（YYYY-MM-DD 或 YYYY-MM-DD 时段），禁止“明天/明晚/上周/上个月/三天后”这类相对时间词。这里只提取用户的约定（promises 的 promisor=user、promisor与promisee只能填 user 或 character）；角色单方承诺由主对话记录，不在此处提取。';
   try {
     var response = await callAPI([
       { role: 'system', content: '你是一个记忆分析助手。只返回JSON，不要其他文字。' },
@@ -6893,8 +7182,8 @@ async function quickGenerateCharacter() {
   btn.innerHTML = '<svg class="icon icon-spin"><use href="#icon-loader"></use></svg>';
   try {
     var prompt = entityType === 'group'
-      ? '根据以下描述生成一个角色群组。只返回JSON：{"groupInfo":{"name":"群组名","avatar":"emoji","description":"群组描述（可包含全体共用的时代/世界观）","scene":"场景","interactionRules":"成员互动规则"},"members":[{"name":"成员名","avatar":"emoji","gender":"性别","age":"年龄","race":"种族","appearance":"外貌","personality":"性格","values":"价值观","fears":"恐惧或弱点","background":"背景","keyEvents":"关键过往（里程碑）","speakingStyle":"说话风格","language":"语言","userAddress":"该成员对用户的称呼（一个短称呼词）","roleInGroup":"群内定位","dynamicState":{"currentSituation":"当前处境","currentLocation":"当前位置","currentMood":"当前情绪","currentOccupation":"当前职业/身份","currentGoal":"当前目标","currentRelationship":"当前关系","currentImportantOthers":"当前重要他人"}}]}。群组的 description/scene 是全体成员共用的设定，必须填写；至少生成两名成员；每名成员必须尽可能填满所有字段，不能只返回名称和性格。' + PIXEL_AVATAR_PROMPT + '\n描述: ' + desc
-      : '根据以下描述，生成一个角色设定。返回JSON格式，包含这些字段: name, avatar(emoji), gender, age, race, appearance, personality, values, fears, background, keyEvents, speakingStyle, language, userAddress(角色对用户的称呼，只填一个短称呼词), dynamicState（包含currentSituation、currentLocation、currentMood、currentOccupation、currentGoal、currentRelationship、currentImportantOthers）。' + PIXEL_AVATAR_PROMPT + '\n描述: ' + desc;
+      ? '根据以下描述生成一个角色群组。只返回JSON：{"groupInfo":{"name":"群组名","avatar":"emoji","description":"群组描述（可包含全体共用的时代/世界观）","scene":"场景","interactionRules":"成员互动规则"},"members":[{"name":"成员名","avatar":"emoji","gender":"性别","age":"年龄","race":"种族","appearance":"外貌","personality":"性格","values":"价值观","fears":"恐惧或弱点","background":"背景","keyEvents":"关键过往（里程碑）","speakingStyle":"说话风格","language":"语言","userAddress":"该成员对用户的称呼（一个短称呼词）","roleInGroup":"群内定位","dynamicState":{"currentSituation":"当前处境","currentLocation":"当前位置","currentMood":"当前情绪","currentOccupation":"当前职业/身份","currentGoal":"当前目标","currentRelationship":"当前关系","currentImportantOthers":"当前重要他人"}}]}。群组的 description/scene 是全体成员共用的设定，必须填写；至少生成两名成员；每名成员必须尽可能填满所有字段，不能只返回名称和性格；成员之间的说话方式必须显著不同（看台词就能分辨是谁）。' + CHARACTER_QUALITY_RULE + SPEAKING_STYLE_SAMPLES_RULE + '\n描述: ' + desc
+      : '根据以下描述，生成一个角色设定。返回JSON格式，包含这些字段: name, avatar(emoji), gender, age, race, appearance, personality, values, fears, background, keyEvents, speakingStyle, language, userAddress(角色对用户的称呼，只填一个短称呼词), dynamicState（包含currentSituation、currentLocation、currentMood、currentOccupation、currentGoal、currentRelationship、currentImportantOthers）。' + CHARACTER_QUALITY_RULE + SPEAKING_STYLE_SAMPLES_RULE + '\n描述: ' + desc;
     var response = await callAPI([
       { role: 'system', content: entityType === 'group' ? '你是群组角色设计助手。只返回JSON。' : '你是角色设计助手。根据用户描述生成详细角色设定。只返回JSON。' },
       { role: 'user', content: prompt }
@@ -7001,7 +7290,7 @@ async function upgradeToGroup(id) {
     }).join('\n');
     var response = await callAPI([
       { role: 'system', content: '你是群组升级助手。只返回JSON。' },
-      { role: 'user', content: '将以下角色和近期对话升级为群组。原角色会由系统完整保留，因此绝不能在输出成员列表中再次生成原角色，也不要生成同名或明显重复的变体。请列出所有近期对话中已出现、应成为固定成员的其他角色；若不足一人，再新增一名最适合当前剧情的成员。返回JSON：{"groupInfo":{"name":"群组名","avatar":"emoji","description":"群组描述（可包含全体共用的时代/世界观）","scene":"场景","interactionRules":"成员互动规则"},"additionalMembers":[{"name":"新增成员名","avatar":"emoji","gender":"性别","age":"年龄","race":"种族","appearance":"外貌","personality":"性格","values":"价值观","fears":"恐惧或弱点","background":"背景","keyEvents":"关键过往（里程碑）","speakingStyle":"说话风格","language":"语言","userAddress":"该成员对用户的称呼（一个短称呼词）","roleInGroup":"群内定位","dynamicState":{"currentSituation":"当前处境","currentLocation":"当前位置","currentMood":"当前情绪","currentOccupation":"当前职业/身份","currentGoal":"当前目标","currentRelationship":"当前关系","currentImportantOthers":"当前重要他人"}}]}。additionalMembers只能包含新增成员，至少一名，且姓名必须互不重复；每名成员必须尽可能填满所有字段，不能只返回名称和性格。' + PIXEL_AVATAR_PROMPT + '\n原角色（禁止重复输出）:\n' + JSON.stringify(char.basicInfo) + '\n近期对话:\n' + transcript }
+      { role: 'user', content: '将以下角色和近期对话升级为群组。原角色会由系统完整保留，因此绝不能在输出成员列表中再次生成原角色，也不要生成同名或明显重复的变体。请列出所有近期对话中已出现、应成为固定成员的其他角色；若不足一人，再新增一名最适合当前剧情的成员。返回JSON：{"groupInfo":{"name":"群组名","avatar":"emoji","description":"群组描述（可包含全体共用的时代/世界观）","scene":"场景","interactionRules":"成员互动规则"},"additionalMembers":[{"name":"新增成员名","avatar":"emoji","gender":"性别","age":"年龄","race":"种族","appearance":"外貌","personality":"性格","values":"价值观","fears":"恐惧或弱点","background":"背景","keyEvents":"关键过往（里程碑）","speakingStyle":"说话风格","language":"语言","userAddress":"该成员对用户的称呼（一个短称呼词）","roleInGroup":"群内定位","dynamicState":{"currentSituation":"当前处境","currentLocation":"当前位置","currentMood":"当前情绪","currentOccupation":"当前职业/身份","currentGoal":"当前目标","currentRelationship":"当前关系","currentImportantOthers":"当前重要他人"}}]}。additionalMembers只能包含新增成员，至少一名，且姓名必须互不重复；每名成员必须尽可能填满所有字段，不能只返回名称和性格；成员之间的说话方式必须显著不同（看台词就能分辨是谁）。' + CHARACTER_QUALITY_RULE + SPEAKING_STYLE_SAMPLES_RULE + '\n原角色（禁止重复输出）:\n' + JSON.stringify(char.basicInfo) + '\n近期对话:\n' + transcript }
     ]);
     var data = parseJsonPayload(response.choices[0].message.content);
     var additionalMembers = Array.isArray(data && data.additionalMembers) ? data.additionalMembers : (Array.isArray(data && data.members) ? data.members : null);
