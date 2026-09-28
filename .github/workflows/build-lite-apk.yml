@@ -28,6 +28,12 @@ jobs:
           if [ -z "$VERSION" ]; then echo "versionName not found" >&2; exit 1; fi
           echo "name=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Detected versionName=$VERSION"
+      - name: Sync APP_VERSION into both hub.html copies
+        run: node tools/sync-version.mjs
+      - name: Assert both hub.html copies are byte-identical
+        run: |
+          sha256sum hub.html android-lite/app/src/main/assets/hub.html
+          cmp hub.html android-lite/app/src/main/assets/hub.html
       - name: Restore signing keystore
         shell: bash
         env:

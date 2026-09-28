@@ -62,8 +62,10 @@ try {
     + '\n' + extractBraced(script, 'function trimText(')
     + '\n' + extractBraced(script, 'function getSceneKey(')
     + '\n' + extractBraced(script, 'function memoryTaskKeys(')
+    + '\n' + extractBraced(script, 'function toolActivityHint(')
+    + '\n' + extractBraced(script, 'function chatStageDecision(')
     + '\n' + script.match(/const LOREBOOK_LIMITS = \{[\s\S]*?\n\};/)[0]
-    + '\nreturn { NARRATIVE_PATTERNS: NARRATIVE_PATTERNS, buildNarrativePatternDirective: buildNarrativePatternDirective, normalizeLorebook: normalizeLorebook, collectLorebookEntries: collectLorebookEntries, matchLorebookEntries: matchLorebookEntries, buildLorebookContext: buildLorebookContext, LOREBOOK_LIMITS: LOREBOOK_LIMITS, getSceneKey: getSceneKey, memoryTaskKeys: memoryTaskKeys };';
+    + '\nreturn { NARRATIVE_PATTERNS: NARRATIVE_PATTERNS, buildNarrativePatternDirective: buildNarrativePatternDirective, normalizeLorebook: normalizeLorebook, collectLorebookEntries: collectLorebookEntries, matchLorebookEntries: matchLorebookEntries, buildLorebookContext: buildLorebookContext, LOREBOOK_LIMITS: LOREBOOK_LIMITS, getSceneKey: getSceneKey, memoryTaskKeys: memoryTaskKeys, toolActivityHint: toolActivityHint, chatStageDecision: chatStageDecision };';
   unit = new Function(src)();
 } catch (error) {
   ok('可提取并求值目标函数', false, error.message);
@@ -143,6 +145,50 @@ if (unit) {
   ok('memoryTaskKeys: 默认 analysis', memoryTaskKeys('analysis').retryAt === 'analysisRetryAt');
 }
 
+console.log('\n[2b] 右上角状态显示（主对话阶段决策）全分支覆盖');
+if (unit) {
+  const { toolActivityHint, chatStageDecision } = unit;
+  const toolNames = ['get_current_time', 'search_memory', 'list_memories', 'delete_memory', 'set_reminder', 'update_character_field', 'web_search', 'web_fetch', 'send_sticker'];
+  ok('每个工具都有专属进度提示', toolNames.every((n) => toolActivityHint(n) !== '正在处理…' && toolActivityHint(n).length >= 5), toolNames.map((n) => n + '=' + toolActivityHint(n)).join(' '));
+  ok('提示文案互不重复', new Set(toolNames.map((n) => toolActivityHint(n))).size === toolNames.length);
+  ok('未知工具回退到“正在处理…”', toolActivityHint('nope') === '正在处理…' && toolActivityHint() === '正在处理…');
+
+  const happy = chatStageDecision('auto-final', { structuredOk: true, hasQuickReplies: true });
+  ok('正常路径不触发整理回复', happy.action === 'accept-text' && !happy.activity && !happy.bubble, JSON.stringify(happy));
+
+  const noQuick = chatStageDecision('auto-final', { structuredOk: true, hasQuickReplies: false });
+  ok('阶段一 JSON 缺 quickReplies 才转整理回复', noQuick.action === 'force-submit' && noQuick.activity === '正在整理回复…' && noQuick.bubble === '正在整理回复…', JSON.stringify(noQuick));
+
+  const noJson = chatStageDecision('auto-final', {});
+  ok('阶段一无 JSON 正文转整理回复', noJson.action === 'force-submit' && noJson.activity === '正在整理回复…');
+
+  const toolRun = chatStageDecision('auto-tool', { toolName: 'search_memory' });
+  ok('工具轮：显示工具提示 + 继续推理', toolRun.action === 'run-tool' && toolRun.activity === '工具结果已返回，正在继续推理…' && toolRun.bubble === '正在回忆…', JSON.stringify(toolRun));
+  ok('工具轮提示与工具一一对应', chatStageDecision('auto-tool', { toolName: 'web_fetch' }).bubble === '正在读取网页…');
+
+  const limit = chatStageDecision('auto-tool-limit', {});
+  ok('工具次数上限：提示上限并收尾', limit.action === 'force-submit' && limit.activity === '工具调用次数达到上限，直接收尾…' && limit.bubble === '正在整理回复…', JSON.stringify(limit));
+
+  const qrRetry = chatStageDecision('quick-replies-missing', { phase: 'submit', quickRepliesRetried: false, attemptsLeft: 1 });
+  ok('提交缺 quickReplies：先补齐一次', qrRetry.action === 'retry-quick-replies' && qrRetry.activity === '正在补齐快速回应…', JSON.stringify(qrRetry));
+  ok('已补齐过则接受正文（不死循环）', chatStageDecision('quick-replies-missing', { phase: 'submit', quickRepliesRetried: true, attemptsLeft: 1 }).action === 'accept-reply');
+  ok('无重试额度则接受正文', chatStageDecision('quick-replies-missing', { phase: 'submit', quickRepliesRetried: false, attemptsLeft: 0 }).action === 'accept-reply');
+  ok('阶段一缺 quickReplies 不走补齐分支', chatStageDecision('quick-replies-missing', { phase: 'auto', quickRepliesRetried: false, attemptsLeft: 2 }).action === 'accept-reply');
+
+  const submitRetry = chatStageDecision('submit-retry', {});
+  ok('阶段二重试：重新整理回复', submitRetry.action === 'retry-submit' && submitRetry.activity === '正在重新整理回复…' && submitRetry.bubble === '正在重新整理回复…');
+
+  const regen = chatStageDecision('empty', { attemptsLeft: 1 });
+  ok('空回复：重新生成', regen.action === 'regenerate' && regen.activity === '正在重新生成（第2次）…' && regen.bubble === '正在重新生成…');
+  ok('额度用尽：失败收口', chatStageDecision('empty', { attemptsLeft: 0 }).action === 'fail');
+  ok('未知阶段不抛错', chatStageDecision('???', {}).action === 'unknown');
+
+  const mainLoop = script.slice(script.indexOf('while (true)'), script.indexOf('var structured = null;'));
+  const rawStatus = mainLoop.match(/setActivity\('[^']*'\)/g) || [];
+  ok('主循环状态文案全部走 chatStageDecision', rawStatus.length === 0, rawStatus.join(','));
+  ok('主循环不再硬编码“正在整理回复…”', !mainLoop.includes("setActivity('正在整理回复…')") && !mainLoop.includes("getDisplayText('正在整理回复…')"));
+}
+
 console.log('\n[3] 提示词静态断言');
 const mustHave = [
   ['禁止替用户说话/行动', '0.5 你只扮演角色本人，绝不能替用户说话或行动'],
@@ -155,6 +201,8 @@ const mustHave = [
   ['JSON 收口规则仍在', '回复必须且只能是单个JSON对象'],
   ['quickReplies 强制两条仍在', 'JSON必须无条件包含quickReplies'],
   ['输出格式强调仍在', '【输出格式】'],
+  ['输出格式：用过工具也要以 JSON 收尾', '即使本轮调用过工具，最终也必须用这一个 JSON 对象收尾'],
+  ['输出格式：禁用代码块包裹', '不得用 Markdown 代码块包裹'],
   ['长会话精简示例常量', 'const JSON_EXAMPLE_BRIEF'],
   ['示例按轮次切换', 'assistantTurnCount < 6 ? jsonExampleRule : JSON_EXAMPLE_BRIEF'],
   ['timeRef 元表已精简', '9.5 相对时间（timeRef）'],
@@ -238,6 +286,25 @@ console.log('\n[5] 角色卡弹窗 tab 结构一致性');
   ok('tab 按钮与内容区一一对应', JSON.stringify(tabIds) === JSON.stringify(contentIds));
   ok('switchModalTab 覆盖全部 tab', JSON.stringify(declared) === JSON.stringify(tabIds));
   ok('所有切换目标都有对应 tab', clickTargets.every((t) => tabIds.includes(t)));
+}
+
+console.log('\n[6] 版本号同步（APP_VERSION 与 versionName）');
+{
+  const rootDir = path.resolve(here, '..');
+  const gradle = fs.readFileSync(path.join(rootDir, 'android-lite', 'app', 'build.gradle.kts'), 'utf8');
+  const vName = (gradle.match(/versionName\s*=\s*"([^"]+)"/) || [])[1];
+  const vCode = Number((gradle.match(/versionCode\s*=\s*(\d+)/) || [])[1]);
+  const appVersion = (script.match(/const APP_VERSION = '([^']*)'/) || [])[1];
+  const assetHtml = fs.readFileSync(path.join(rootDir, 'android-lite', 'app', 'src', 'main', 'assets', 'hub.html'), 'utf8');
+  const assetVersion = (assetHtml.match(/const APP_VERSION = '([^']*)'/) || [])[1];
+  console.log('  versionName=' + vName + ' | versionCode=' + vCode + ' | hub.html=' + appVersion + ' | assets=' + assetVersion);
+  ok('hub.html 的 APP_VERSION 与 versionName 一致', !!vName && appVersion === vName, 'APP_VERSION=' + appVersion + ' vs ' + vName);
+  ok('APK 内 hub.html 的 APP_VERSION 与版本一致', assetVersion === appVersion && assetVersion === vName, 'assets=' + assetVersion);
+  ok('versionCode 为数字且已递增（>= 26）', vCode >= 26, 'versionCode=' + vCode);
+  ok('sync-version 脚本存在', fs.existsSync(path.join(here, 'sync-version.mjs')));
+  const workflow = fs.readFileSync(path.join(rootDir, '.github', 'workflows', 'build-lite-apk.yml'), 'utf8');
+  ok('工作流在打包前写入 APP_VERSION', workflow.includes('node tools/sync-version.mjs'));
+  ok('工作流校验两份 hub.html 字节一致', workflow.includes('cmp hub.html android-lite/app/src/main/assets/hub.html'));
 }
 
 console.log('\n结果: ' + pass + ' 通过, ' + failures.length + ' 失败');

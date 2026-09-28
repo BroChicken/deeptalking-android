@@ -20,12 +20,14 @@
 - 每次 APK 更新：**版本号最后一位 Z 必须 +1**（如 1.0.0 → 1.0.1）。
 - 前两位 X.Y 由用户决定是否升级；**若我认为需要升 X 或 Y，必须先询问用户**，不得擅自修改。
 - `versionCode` 必须同步 +1。
+- 右上角显示的版本号来自 `hub.html` 里的 `const APP_VERSION`，**唯一来源是 `versionName`，不要手改**：改完 `versionName` 后跑 `node tools/sync-version.mjs`（会把两份 `hub.html` 同步成同一版本）；CI 在打包前也会自动跑一次，保证 APK 显示与 `versionName` 一致。
 
 ## 4. 每次更新后要支持直接安装包覆盖升级
 - 签名必须稳定一致，否则用户手机会报"签名冲突/与现有应用签名不一致"无法覆盖安装。
-- 当前构建在 GitHub Actions 上跑 `assembleDebug`，使用 CI 环境临时生成的 debug keystore，签名每次不同 → 必须改为固定的签名配置（详见 android-lite/README 或 workflow）。
+- 构建在 GitHub Actions 上跑 `assembleRelease`，签名用固定 keystore（`android-lite/keystore/deeptalking-release.jks`，由 CI secret `ANDROID_KEYSTORE_BASE64` 还原），不得改回临时 debug 签名。
 
-## 5. 改完必跑的自检（两条都过才算完成）
+## 5. 改完必跑的自检（全部通过才算完成）
 1. `powershell -File tools/check-sync.ps1` —— 两份 `hub.html` 字节级一致。
-2. `node tools/verify-hub.mjs` —— 脚本块语法检查 + 纯函数单测 + 提示词静态断言（改提示词/记忆/世界书/弹窗 tab 后尤其必跑；新增功能应同步补断言）。
-3. `docs/AGENT_ARCHITECTURE.md` 已同步更新（见第 2 条）。
+2. `node tools/sync-version.mjs --check` —— `APP_VERSION` 与 `versionName` 一致。
+3. `node tools/verify-hub.mjs` —— 脚本块语法检查 + 纯函数单测（含右上角状态显示全分支）+ 提示词静态断言 + tab/版本一致性（改提示词/记忆/世界书/弹窗 tab/状态文案后尤其必跑；新增功能应同步补断言）。
+4. `docs/AGENT_ARCHITECTURE.md` 已同步更新（见第 2 条）。

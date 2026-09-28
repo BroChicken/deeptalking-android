@@ -83,17 +83,18 @@ checkMemoryTriggers(:6962) 异步整理短期记忆 / 长期记忆 / 场景概�
 
 ### 4. Agent 循环（大脑）
 
-`sendMessage(options)` 内的 `while(true)` — hub.html:3626：
+`sendMessage(options)` 内的 `while(true)` — hub.html:3632：
 
 - **工具调用**：模型返回 `function_call` 事件时，逐个执行。关键限制：DeepSeek thinking 模式不支持并行 function_call 回传（会 400），所以**每轮仅回传一个调用**，其余丢弃。
-- **上限**：`MAX_TOOL_ROUNDS = 5`（:5864），超出直接进入收尾阶段。
+- **上限**：`MAX_TOOL_ROUNDS = 5`（:5875），超出直接进入收尾阶段。
 - **reasoning 回传**：thinking 模式的 `reasoning_text` 必须先回传，否则上下文断裂。
 - **ask_user 特判**：本轮只调 `ask_user` 时，直接把问题包装成结构化回复输出，不进入工具循环。
-- **两阶段**：阶段一 `phase='auto'`（工具自由）；拿不到合法 JSON 时切阶段二 `phase='submit'`（强制 `submit_response`），必要时重试一次。
+- **两阶段**：阶段一 `phase='auto'`（工具自由）；阶段二 `phase='submit'`（只给 `submit_response`，强制结构合规）。阶段一若直接产出含 `quickReplies` 的合法 JSON 正文，则跳过阶段二（省一次请求），否则本轮的收尾必然要再走一次请求（右上角显示「正在整理回复…」）。
+- **状态显示**：循环内所有右上角文案都来自纯函数 `chatStageDecision(stage, ctx)`（:8333），工具提示来自 `toolActivityHint(name)`（:8316），`setActivity()` 只负责写入 DOM。
 
 ### 5. 结构化收尾协议（agent 的手续）
 
-`buildSubmitResponseTool()` — hub.html:6490；`extractSubmitResponse()` — :6520。
+`buildSubmitResponseTool()` — hub.html:6501；`extractSubmitResponse()` — :6531。
 
 每轮必须且只能调用一次 `submit_response`，用 JSON Schema（`strict: true`）强制校验，一次性输出：
 
@@ -109,6 +110,23 @@ checkMemoryTriggers(:6962) 异步整理短期记忆 / 长期记忆 / 场景概�
 | `recall` | 主动召回记忆的请求 |
 
 这是"回复 + 写记忆"合一的契约，保证每轮回复结构合法。
+
+### 6. 右上角状态显示（全分支）
+
+`chatStageDecision` 是状态文案的唯一来源（verify-hub 第 2b 节断言主循环内不再出现裸 `setActivity('…')`）：
+
+| stage | 触发条件 | action | 右上角文案 |
+|---|---|---|---|
+| `auto-tool` | 阶段一模型发起工具调用 | run-tool | `工具结果已返回，正在继续推理…` + 对应工具提示 |
+| `auto-tool-limit` | 工具轮次达 `MAX_TOOL_ROUNDS` | force-submit | `工具调用次数达到上限，直接收尾…` |
+| `auto-final` | 阶段一未调用工具、拿到正文 | accept-text / force-submit | 合法 JSON 且含 `quickReplies` → 直接采用（无提示）；否则 `正在整理回复…` |
+| `quick-replies-missing` | `submit_response` 有 `reply` 但缺/非法 `quickReplies` | retry-quick-replies / accept-reply | 阶段二且未重试过 → `正在补齐快速回应…`；否则接受正文（防死循环） |
+| `submit-retry` | 阶段二仍未拿到合法 `submit_response` | retry-submit | `正在重新整理回复…` |
+| `empty` | 无可用正文 | regenerate / fail | 有额度 → `正在重新生成（第2次）…`；否则抛错收口 |
+
+工具提示（`toolActivityHint`）：`get_current_time`→`正在确认时间…`、`search_memory`→`正在回忆…`、`list_memories`→`正在整理记忆…`、`delete_memory`→`正在清理记忆…`、`set_reminder`→`已记下，正在回应…`、`update_character_field`→`已按你的要求调整设定…`、`web_search`→`正在搜索…`、`web_fetch`→`正在读取网页…`、`send_sticker`→`正在挑表情…`，未知工具回退 `正在处理…`。
+
+> 主提示词的 3.8/7/8 与【输出格式】都要求"无条件以单个 JSON 对象收尾、`quickReplies` 恒为两条"；【输出格式】额外强调"即使本轮调用过工具也必须用它收尾、不得用 Markdown 代码块包裹"，用于压低「整理回复」这一额外收尾轮的出现频率。
 
 ## 四、记忆系统
 
@@ -291,18 +309,19 @@ checkMemoryTriggers(:6962) 异步整理短期记忆 / 长期记忆 / 场景概�
 
 ## 八、健壮性
 
-- **API 请求级重试**：`performChatRequestWithRetry`（:4194）对瞬时失败（网络错误 / 超时 Abort / HTTP 429 / 5xx）自动重试最多 `MAX_API_RETRIES = 3` 次（1s/2s/4s 指数退避）。
+- **API 请求级重试**：`performChatRequestWithRetry`（:4205）对瞬时失败（网络错误 / 超时 Abort / HTTP 429 / 5xx）自动重试最多 `MAX_API_RETRIES = 3` 次（1s/2s/4s 指数退避）。
 - **工具失败可恢复**：`executeToolCall` 失败时回传可修正的提示（如 `delete_memory` 找不到 ID 时提示先 `list_memories`）。
-- **记忆任务重试**：`memoryTaskKeys(task)` — :6857 统一映射 `extraction` / `analysis` / `scene` 三组计数器（`*Failures` / `*RetryAt`），`scheduleMemoryRetry` 指数退避（5→30 分钟封顶）。
-- **导入/导出归一化**：`normalizeAppData` → `normalizeCharacter`（:2117）逐字段校验，包含世界书、场景概要、场景状态与新增计数器。
+- **记忆任务重试**：`memoryTaskKeys(task)` — :6868 统一映射 `extraction` / `analysis` / `scene` 三组计数器（`*Failures` / `*RetryAt`），`scheduleMemoryRetry` 指数退避（5→30 分钟封顶）。
+- **导入/导出归一化**：`normalizeAppData` → `normalizeCharacter`（:2121）逐字段校验，包含世界书、场景概要、场景状态与新增计数器。
+- **版本号单一来源**：右上角 `APP_VERSION`（:1141）由 `versionName` 派生，`tools/sync-version.mjs` 负责写入两份 `hub.html`；CI 在 `assembleRelease` 前执行该脚本并 `cmp` 校验两份文件一致，本地用 `node tools/sync-version.mjs --check` 复核。
 
 ## 九、关键常量速查
 
 | 常量 | 值 | 位置 |
 |---|---|---|
-| `MAX_TOOL_ROUNDS` | 5 | :5864 |
-| `AGENT_TOOL_MEMORY_INJECT_LIMIT` | 5 | :5865 |
-| `MAX_API_RETRIES` | 3（退避 1s/2s/4s） | :4182 |
+| `MAX_TOOL_ROUNDS` | 5 | :5875 |
+| `AGENT_TOOL_MEMORY_INJECT_LIMIT` | 5 | :5876 |
+| `MAX_API_RETRIES` | 3（退避 1s/2s/4s） | :4193 |
 | `MEMORY_LIMITS` | instant 160(保底 40) / shortTerm 80(保底 20) / longTermPerCategory 40 / pendingRecall 6 / analysisBatch 40 | :1172 |
 | `PROMPT_LIMITS` | roleChars 8000 / memberChars 900 | :1181 |
 | `CONTEXT_BUDGET` | retrievedChars 2600 / summaryChars 2600 / sceneSummaries 2 / sceneInjectionChars 900 / sceneSpan 24 | :1236 |
@@ -310,5 +329,7 @@ checkMemoryTriggers(:6962) 异步整理短期记忆 / 长期记忆 / 场景概�
 | `NARRATIVE_PATTERNS` | 10 条节奏骨架 | :1212 |
 | `DYNAMIC_STATE_FIELDS` | 7 个动态字段 | :1187 |
 | `STATIC_PROFILE_FIELDS` | 12 个基础设定字段 | :1198 |
-| 长示例切换阈值 | `assistantTurnCount < 6` 用完整 JSON 示例，否则用 `JSON_EXAMPLE_BRIEF` | :5742 |
-| `max_output_tokens` | 8192 | :6544 附近 |
+| `CHARACTER_QUALITY_RULE` / `SPEAKING_STYLE_SAMPLES_RULE` | 建卡与补全共用的质量/示例台词约束 | :1476 / :1477 |
+| `APP_VERSION` | 由 `versionName` 写入（`tools/sync-version.mjs`） | :1141 |
+| 长示例切换阈值 | `assistantTurnCount < 6` 用完整 JSON 示例，否则用 `JSON_EXAMPLE_BRIEF` | :5755 |
+| `max_output_tokens` | 8192 | :6562 |
