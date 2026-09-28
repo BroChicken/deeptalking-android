@@ -938,6 +938,7 @@ input:focus, textarea:focus, select:focus {
             </div>
           </div>
           <label class="flex items-center gap-2 text-xs text-muted-c"><input type="checkbox" id="proactiveToggle"> 角色主动开口（打开面板停留约 1 分钟未对话时，角色主动发起开场）</label>
+          <label class="flex items-center gap-2 text-xs text-muted-c"><input type="checkbox" id="styleCritiqueToggle"> 文风自动校对（回复命中语气/风格问题时，追加一次只改文风的修订请求）</label>
            <div id="debugInfoWrap" class="hidden mt-3">
              <div class="flex items-center justify-between mb-1">
                <label class="block text-xs text-muted-c">调试信息（最近一次回应完整内容与活动时间线）</label>
@@ -1136,9 +1137,10 @@ const DEFAULT_CONFIG = {
   stream: true,
   reasoningEffort: 'medium',
   proactiveEnabled: true,
+  styleCritique: true,
   platformSettings: {}
 };
-const APP_VERSION = '1.3.1';
+const APP_VERSION = '1.3.3';
 const PLATFORM_CONFIGS = {
   deepseek: { baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-flash', models: ['deepseek-flash'] },
   opencode: { baseUrl: 'https://opencode.ai/zen/go/v1', model: 'deepseek-flash', keepV1InResponses: true, models: ['deepseek-flash'] },
@@ -1198,7 +1200,7 @@ const GROUP_SHARED_DYNAMIC_FIELDS = ['currentSituation', 'currentLocation'];
 const STATIC_PROFILE_FIELDS = {
   gender: { label: '性别' }, age: { label: '年龄' }, race: { label: '种族' },
   appearance: { label: '外貌特征' }, personality: { label: '性格特征' }, values: { label: '价值观' },
-  fears: { label: '恐惧/弱点' }, background: { label: '背景故事' }, keyEvents: { label: '关键过往（里程碑）' },
+  fears: { label: '恐惧/弱点' }, background: { label: '个人背景' }, keyEvents: { label: '关键过往（里程碑）' },
   speakingStyle: { label: '说话风格' }, language: { label: '语言/方言' },
   userAddress: { label: '对用户的称呼' }
 };
@@ -1221,7 +1223,9 @@ const NARRATIVE_PATTERNS = [
   { label: '描写 → 对白 → 描写 → 对白', hint: '描写与台词两组交替推进，信息密度较高，但每句都要短，不要写成大段独白。' },
   { label: '对白 → 描写 → 描写', hint: '先给台词，再用两段描写承接（动作、表情、环境），收尾留在描写上，不要加总结句。' }
 ];
-// 世界书（lorebook）：用户手写的固定设定条目，仅在关键词命中时注入，避免常驻占满角色设定预算
+// 世界书（lorebook）：世界层设定的唯一去处。条目分两种模式——alwaysActive（常驻，每轮都注入）
+// 与关键词命中（只在相关时注入）。AI 会在剧情推进中自动维护条目；用户可随时手改。
+// 来源 origin 决定保护级别：user 条目永不被模型覆盖、也不参与自动淘汰。
 const LOREBOOK_LIMITS = {
   entries: 200,
   keywordsPerEntry: 20,
@@ -1229,7 +1233,10 @@ const LOREBOOK_LIMITS = {
   contentChars: 2000,
   injectEntries: 6,
   injectChars: 1400,
-  scanMessages: 6
+  scanMessages: 6,
+  autoEntriesPerPass: 3,
+  evictionMisses: 3,
+  consolidateSpan: 8
 };
 
 // 记忆注入预算（字符）：检索记忆与摘要记忆共用一个池子，某一路没用完的额度让给另一路
@@ -1241,6 +1248,31 @@ const CONTEXT_BUDGET = {
   sceneSpan: 24
 };
 
+// 语气/风格遵从度（attention）：把最容易违反的约束放到生成点最近处，并做客户端违规检测
+const STYLE_GUARD = {
+  reviewEveryTurns: 3,       // 每 N 轮追加一次「语气回顾」
+  lookbackReplies: 2,        // 违规检测回看的近期回复条数
+  anchorStyleChars: 300,     // 语气锚里说话风格的截断长度
+  anchorSamples: 2,          // 语气锚里回灌的示例台词条数
+  reusePhraseChars: 8,       // 视为"复用近期意象"的最短共享片段长度
+  critiqueMaxChars: 1600,    // 修订稿长度上限，超过则回退原文
+  critiqueMinRatio: 0.5,     // 修订稿短于原文该比例时视为异常，回退原文
+  critiqueMaxRatio: 2.0      // 修订稿长于原文该比例时视为异常，回退原文
+};
+
+// 陈词滥调表（与规则 2.6 的示例一致，用于客户端违规检测）
+const STYLE_CLICHES = ['心湖泛起涟漪', '勾起嘴角', '嘴角勾起', '空气中弥漫着', '不易察觉', '意味深长', '微微一愣', '眼神暗了暗', '不能自已', '宠溺地', '邪魅一笑'];
+
+// 违规标签 → 给模型的纠正说明（内部提醒用，不展示给用户）
+const STYLE_VIOLATION_LABELS = {
+  metaTalk: '出现元话术（如"好的我改成/我会这样说话/收到，我调整"）——应直接演出，不要说明自己在调整',
+  speaksForUser: '替用户写了台词或行动——用户的话只能由用户自己说',
+  cliche: '出现陈词滥调（如"心湖泛起涟漪""勾起嘴角""空气中弥漫着"）',
+  reusedImagery: '复用了近期用过的比喻、意象或收尾方式',
+  toneDrift: '没有体现设定的说话风格（口癖/句尾/称呼），或句长过于整齐缺少起伏',
+  recitedLore: '复述了世界书或设定条目本身，应当只在需要时自然引用'
+};
+
 function normalizeLorebook(value) {
   if (!Array.isArray(value)) return [];
   return value.filter(isPlainObject).slice(0, LOREBOOK_LIMITS.entries).map(function(entry, index) {
@@ -1248,14 +1280,31 @@ function normalizeLorebook(value) {
     var keywords = rawKeywords.map(function(keyword) { return toText(keyword).trim(); })
       .filter(Boolean)
       .slice(0, LOREBOOK_LIMITS.keywordsPerEntry);
+    var misses = Number(entry.misses);
+    var mentions = Number(entry.mentions);
     return {
       id: toText(entry.id, 'lore_' + Date.now() + '_' + index),
       name: trimText(toText(entry.name), LOREBOOK_LIMITS.nameChars),
       keywords: keywords,
       content: trimText(toText(entry.content), LOREBOOK_LIMITS.contentChars),
       enabled: entry.enabled !== false,
-      order: Number.isFinite(Number(entry.order)) ? Number(entry.order) : 100
+      order: Number.isFinite(Number(entry.order)) ? Number(entry.order) : 100,
+      alwaysActive: entry.alwaysActive === true,
+      origin: entry.origin === 'ai' ? 'ai' : 'user',
+      mentions: Number.isFinite(mentions) && mentions > 0 ? Math.floor(mentions) : 0,
+      lastMentionedAt: toText(entry.lastMentionedAt).trim() || null,
+      misses: Number.isFinite(misses) && misses > 0 ? Math.floor(misses) : 0
     };
+  });
+}
+
+// AI 生成/更新的条目统一标记来源（保护用户手写条目；自动淘汰只针对 ai 条目）
+function normalizeGeneratedLorebook(value) {
+  return normalizeLorebook(value).map(function(entry) {
+    entry.origin = 'ai';
+    // 没有关键词又不常驻的条目永远不会被注入，直接按常驻处理
+    if (entry.keywords.length === 0) entry.alwaysActive = true;
+    return entry;
   });
 }
 
@@ -1278,6 +1327,130 @@ function collectLorebookEntries(char) {
   return entries;
 }
 
+// 条目所属的世界书列表：共享世界书，或群组中某位成员的私人世界书
+function resolveLorebookList(char, memberName) {
+  var wanted = toText(memberName).trim().toLowerCase();
+  if (char && char.entityType === 'group' && wanted && Array.isArray(char.members)) {
+    var member = char.members.find(function(item) {
+      return item && toText(item.basicInfo && item.basicInfo.name).trim().toLowerCase() === wanted;
+    });
+    if (!member) return null;
+    if (!Array.isArray(member.lorebook)) member.lorebook = [];
+    return member.lorebook;
+  }
+  if (!char) return null;
+  if (!Array.isArray(char.lorebook)) char.lorebook = [];
+  return char.lorebook;
+}
+
+function findLorebookEntry(list, entryId, name) {
+  var id = toText(entryId).trim();
+  var wantedName = toText(name).trim().toLowerCase();
+  if (id) {
+    var byId = list.find(function(entry) { return toText(entry.id) === id; });
+    if (byId) return byId;
+  }
+  if (!wantedName) return null;
+  return list.find(function(entry) { return toText(entry.name).trim().toLowerCase() === wantedName; }) || null;
+}
+
+// 宽松一档：允许归纳式短句，但必须与原文有 2 字以上的实词重叠
+// （不像 evidenceMatchesSummary 那样只凭长度就采信，防止世界书被凭空写满）
+function lorebookEvidenceOverlaps(source, evidence) {
+  if (evidenceMatchesSource(source, evidence)) return true;
+  var ev = toText(evidence).trim();
+  var src = toText(source).toLowerCase();
+  if (ev.length < 4 || src.length < 4) return false;
+  for (var i = 0; i + 2 <= ev.length; i++) {
+    var pair = ev.substr(i, 2).toLowerCase();
+    if (/^[\u4e00-\u9fff\w]/.test(pair.charAt(0)) && /[\u4e00-\u9fff\w]/.test(pair.charAt(1)) && src.indexOf(pair) !== -1) return true;
+  }
+  return false;
+}
+
+// 世界书来源校验：设定必须来自上下文里真实存在的消息（用户或角色消息），
+// 允许"紧扣原文的短句"式证据——世界层设定常是归纳，很难逐字摘录
+function resolveLorebookSources(char, sourceMessageIds, evidence, sources) {
+  var sourceIds = Array.isArray(sourceMessageIds) ? sourceMessageIds.map(function(id) { return toText(id); }).filter(Boolean).slice(0, 8) : [];
+  var excerpt = trimText(evidence, 300);
+  if (sourceIds.length === 0 || excerpt.length < 2) return null;
+  sources = sources || getKnownSources(char);
+  var resolved = sourceIds.map(function(id) { return { id: id, source: sources[id] }; });
+  if (resolved.some(function(entry) { return !entry.source; })) return null;
+  var matched = resolved.some(function(entry) {
+    return (entry.source.role === 'user' || entry.source.role === 'assistant')
+      && lorebookEvidenceOverlaps(entry.source.text, excerpt);
+  });
+  return matched ? resolved : null;
+}
+
+// 写入/更新世界书条目（工具与整理任务共用）：命中已有条目则更新，否则新建
+function upsertLorebookEntry(char, payload, meta) {
+  var list = resolveLorebookList(char, payload.memberName);
+  if (!list) return { ok: false, reason: '找不到成员「' + toText(payload.memberName) + '」，无法写入其世界书' };
+  var name = trimText(toText(payload.name), LOREBOOK_LIMITS.nameChars);
+  if (!name) return { ok: false, reason: '缺少条目名 name' };
+  var content = trimText(toText(payload.content), LOREBOOK_LIMITS.contentChars);
+  if (!content) return { ok: false, reason: '缺少内容 content' };
+  var rawKeywords = Array.isArray(payload.keywords) ? payload.keywords : toText(payload.keywords).split(/[,，、\n]/);
+  var keywords = rawKeywords.map(function(keyword) { return toText(keyword).trim(); })
+    .filter(Boolean).slice(0, LOREBOOK_LIMITS.keywordsPerEntry);
+  // 没有关键词的条目只能靠常驻生效，否则永远不会被注入
+  var alwaysActive = payload.alwaysActive === true || keywords.length === 0;
+  var existing = findLorebookEntry(list, payload.entryId, name);
+  if (existing && existing.origin !== 'ai') {
+    return { ok: false, reason: '「' + toText(existing.name) + '」是用户手写条目，不能覆盖或改写；请换一个条目名新增' };
+  }
+  if (existing) {
+    existing.name = existing.name || name;
+    existing.content = content;
+    if (keywords.length > 0) existing.keywords = keywords;
+    existing.alwaysActive = alwaysActive;
+    existing.enabled = true;
+    existing.misses = 0;
+    existing.origin = 'ai';
+    if (meta && Array.isArray(meta.sourceMessageIds)) existing.sourceMessageIds = meta.sourceMessageIds.slice(0, 8);
+    if (meta && meta.evidence) existing.evidence = trimText(meta.evidence, 300);
+    return { ok: true, entry: existing, created: false };
+  }
+  if (list.length >= LOREBOOK_LIMITS.entries) {
+    return { ok: false, reason: '世界书条目已达上限 ' + LOREBOOK_LIMITS.entries + ' 条' };
+  }
+  var entry = {
+    id: createMemoryId('lore'),
+    name: name,
+    keywords: keywords,
+    content: content,
+    enabled: true,
+    order: 100,
+    alwaysActive: alwaysActive,
+    origin: 'ai',
+    mentions: 0,
+    lastMentionedAt: null,
+    misses: 0
+  };
+  if (meta && Array.isArray(meta.sourceMessageIds)) entry.sourceMessageIds = meta.sourceMessageIds.slice(0, 8);
+  if (meta && meta.evidence) entry.evidence = trimText(meta.evidence, 300);
+  list.push(entry);
+  return { ok: true, entry: entry, created: true };
+}
+
+// 自动淘汰：AI 条目连续 misses 次整理都没被提及就退役；常驻条目与用户手写条目永不淘汰
+function evictStaleLorebookEntries(entries) {
+  var removed = [];
+  if (!Array.isArray(entries)) return removed;
+  for (var i = entries.length - 1; i >= 0; i--) {
+    var entry = entries[i];
+    if (!entry || entry.origin !== 'ai' || entry.alwaysActive === true) continue;
+    entry.misses = (Number(entry.misses) || 0) + 1;
+    if (entry.misses >= LOREBOOK_LIMITS.evictionMisses) {
+      removed.push(entry);
+      entries.splice(i, 1);
+    }
+  }
+  return removed;
+}
+
 function matchLorebookEntries(char, query) {
   var entries = collectLorebookEntries(char);
   if (entries.length === 0) return [];
@@ -1287,9 +1460,11 @@ function matchLorebookEntries(char, query) {
     : [];
   messages.forEach(function(message) { parts.push(toText(message.content)); });
   var haystack = parts.join('\n').toLowerCase();
-  if (!haystack.trim()) return [];
   var hits = [];
+  // 常驻条目无条件入围（世界前提），关键词条目只在命中时才进
   entries.forEach(function(entry) {
+    if (entry.alwaysActive === true) { hits.push(entry); return; }
+    if (!haystack.trim()) return;
     var matched = (entry.keywords || []).some(function(keyword) {
       var needle = toText(keyword).trim().toLowerCase();
       return needle && haystack.indexOf(needle) !== -1;
@@ -1297,6 +1472,8 @@ function matchLorebookEntries(char, query) {
     if (matched) hits.push(entry);
   });
   hits.sort(function(a, b) {
+    var alwaysDiff = (b.alwaysActive === true ? 1 : 0) - (a.alwaysActive === true ? 1 : 0);
+    if (alwaysDiff !== 0) return alwaysDiff;
     var orderDiff = (Number(a.order) || 0) - (Number(b.order) || 0);
     if (orderDiff !== 0) return orderDiff;
     return toText(a.name).localeCompare(toText(b.name));
@@ -1304,23 +1481,53 @@ function matchLorebookEntries(char, query) {
   return hits.slice(0, LOREBOOK_LIMITS.injectEntries);
 }
 
-function buildLorebookContext(char, query) {
-  var hits = matchLorebookEntries(char, query);
-  if (hits.length === 0) return '';
+// 把命中的条目按注入预算裁成行；返回真正注入的条目（供 mentions 计数与注入文本共用同一判定）
+function buildLorebookLines(hits) {
   var lines = [];
-  var used = 0;
+  var used = [];
+  var chars = 0;
   for (var i = 0; i < hits.length; i++) {
     var name = toText(hits[i].name).trim();
     var content = toText(hits[i].content).trim();
     var line = '- ' + (name ? name + '：' : '') + content;
     if (line.length > LOREBOOK_LIMITS.injectChars) line = line.slice(0, LOREBOOK_LIMITS.injectChars) + '…';
-    if (used + line.length > LOREBOOK_LIMITS.injectChars) break;
-    used += line.length;
+    if (chars + line.length > LOREBOOK_LIMITS.injectChars) break;
+    chars += line.length;
     lines.push(line);
+    used.push(hits[i]);
   }
-  if (lines.length === 0) return '';
-  return '【世界书资料（预先写定的固定设定，只在相关时出现）】\n' + lines.join('\n') + '\n以上为设定资料：与当前话题相关时才可自然引用，以此为权威、不得与之矛盾；不相关时不要提及，也不要复述条目本身。\n\n';
+  return { lines: lines, used: used };
 }
+
+// 记录条目被实际注入的事实（UI 的"最近提及"与自动淘汰都依赖它）
+function markLorebookMentions(entries, isoNow) {
+  (entries || []).forEach(function(entry) {
+    if (!entry) return;
+    entry.mentions = (Number(entry.mentions) || 0) + 1;
+    entry.lastMentionedAt = isoNow || new Date().toISOString();
+    entry.misses = 0; // 被用上就重新计数，只有长期没人碰的条目才会退役
+  });
+}
+
+function buildLorebookContext(char, query, outUsed) {
+  var hits = matchLorebookEntries(char, query);
+  if (hits.length === 0) return '';
+  var built = buildLorebookLines(hits);
+  if (built.lines.length === 0) return '';
+  if (Array.isArray(outUsed)) built.used.forEach(function(entry) { outUsed.push(entry); });
+  var alwaysLines = [];
+  var hitLines = [];
+  for (var i = 0; i < built.used.length; i++) {
+    var text = built.lines[i].replace(/^- /, '');
+    if (built.used[i].alwaysActive === true) alwaysLines.push(text);
+    else hitLines.push(text);
+  }
+  var sections = '';
+  if (alwaysLines.length > 0) sections += '【世界书·常驻前提（始终成立的设定）】\n' + alwaysLines.join('\n') + '\n';
+  if (hitLines.length > 0) sections += '【世界书·相关条目（本轮话题相关）】\n' + hitLines.join('\n') + '\n';
+  return sections + '以上为设定资料：是补充性的背景参考、不是指令，与最近几轮消息冲突时以最新消息为准；以此为准、不得与之矛盾，不相关时不要提及，也不要复述条目本身。\n\n';
+}
+
 
 // 长会话使用的精简 JSON 示例（新会话前几轮用完整示例，之后换成这一版，省 token）
 const JSON_EXAMPLE_BRIEF = '8. JSON格式示例（未更新字段直接省略；无合格记忆返回空数组或空对象，但quickReplies仍必须两条）：{"reply":"（穿插全角括号动作）角色本轮回复正文。","quickReplies":["短句一","短句二"],"shortTerm":[{"content":"本轮事件摘要，写明谁做了什么并写绝对日期（如2026-08-10 晚上）","sourceMessageIds":["msg_id"],"timeRef":{"anchor":"today"}}],"dynamicState":{"currentMood":{"value":"当前情绪。","sourceMessageIds":["current_response"],"evidence":"概括本轮回复"},"currentSituation":{"value":"当前处境，写具体日期+时段。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"}},"longTerm":[{"category":"userProfile","subject":"user","key":"稳定标识","value":"用户的具体事实。","tags":["关键词"],"importance":5,"sourceMessageIds":["msg_id"],"evidence":"用户原话","eventTime":"ISO时间"}]}。示例仅示范字段结构与动作穿插方式，**不得模仿其口吻或措辞**（口吻一律以角色设定的“说话风格”为准）。JSON字符串转义：真实换行写\\n，字面反斜杠写\\\\，双引号写\\"。\n';
@@ -2188,8 +2395,10 @@ function normalizeCharacter(rawCharacter, id, strict, skipLegacyRepair) {
        timestamp: toText(message.timestamp, new Date().toISOString()),
         extractedAt: message.extractedAt ? normalizeTimestamp(message.extractedAt, null) : null,
         images: Array.isArray(message.images) ? message.images.filter(function(uri) { return typeof uri === 'string' && uri; }).slice(0, 4) : undefined,
-       internalOnly: message.internalOnly === true ? true : undefined,
-       staticChanges: Array.isArray(message.staticChanges) ? message.staticChanges.map(function(label) { return toText(label); }).filter(Boolean) : undefined
+      internalOnly: message.internalOnly === true ? true : undefined,
+      staticChanges: Array.isArray(message.staticChanges) ? message.staticChanges.map(function(label) { return toText(label); }).filter(Boolean) : undefined,
+      lorebookChanges: Array.isArray(message.lorebookChanges) ? message.lorebookChanges.map(function(label) { return toText(label); }).filter(Boolean) : undefined,
+      styleViolations: Array.isArray(message.styleViolations) ? message.styleViolations.filter(function(key) { return STYLE_VIOLATION_LABELS[key]; }) : undefined
     };
   }) : [];
   character.memory.shortTerm = Array.isArray(rawMemory.shortTerm) ? rawMemory.shortTerm.filter(isPlainObject).map(function(item) {
@@ -2202,6 +2411,7 @@ function normalizeCharacter(rawCharacter, id, strict, skipLegacyRepair) {
       content: toText(item.content),
       timestamp: toText(item.timestamp, new Date().toISOString()),
       analyzedAt: Date.parse(item.analyzedAt || '') ? toText(item.analyzedAt) : null,
+      lorebookScannedAt: Date.parse(item.lorebookScannedAt || '') ? toText(item.lorebookScannedAt) : null,
       sourceMessageIds: sourceMessageIds,
       sourceRoles: Array.isArray(item.sourceRoles) ? item.sourceRoles.filter(function(role) { return role === 'user' || role === 'assistant'; }).slice(0, 8) : [],
       userEvidence: userEvidence,
@@ -2222,9 +2432,12 @@ function normalizeCharacter(rawCharacter, id, strict, skipLegacyRepair) {
   character.memory.counters.extractionRetryAt = normalizeRetryAt(rawCounters.extractionRetryAt);
   character.memory.counters.analysisRetryAt = normalizeRetryAt(rawCounters.analysisRetryAt);
   character.memory.counters.sceneRetryAt = normalizeRetryAt(rawCounters.sceneRetryAt);
+  character.memory.counters.lorebookRetryAt = normalizeRetryAt(rawCounters.lorebookRetryAt);
   character.memory.counters.extractionFailures = Number.isFinite(Number(rawCounters.extractionFailures)) ? Math.max(0, Number(rawCounters.extractionFailures)) : 0;
   character.memory.counters.analysisFailures = Number.isFinite(Number(rawCounters.analysisFailures)) ? Math.max(0, Number(rawCounters.analysisFailures)) : 0;
   character.memory.counters.sceneFailures = Number.isFinite(Number(rawCounters.sceneFailures)) ? Math.max(0, Number(rawCounters.sceneFailures)) : 0;
+  character.memory.counters.lorebookFailures = Number.isFinite(Number(rawCounters.lorebookFailures)) ? Math.max(0, Number(rawCounters.lorebookFailures)) : 0;
+  character.memory.counters.lorebookScannedCount = Number.isFinite(Number(rawCounters.lorebookScannedCount)) ? Math.max(0, Number(rawCounters.lorebookScannedCount)) : 0;
   character.memory.scenes = Array.isArray(rawMemory.scenes) ? rawMemory.scenes.filter(isPlainObject).map(function(scene, index) {
     return {
       id: toText(scene.id, 'scene_' + index),
@@ -2305,6 +2518,7 @@ function normalizeCharacter(rawCharacter, id, strict, skipLegacyRepair) {
   if (Number(rawCharacter.timeParseVersion) === TIME_PARSE_VERSION) character.timeParseVersion = TIME_PARSE_VERSION;
   character.stickers = normalizeStickers(rawCharacter.stickers);
   character.lorebook = normalizeLorebook(rawCharacter.lorebook);
+  character.lorebookMigratedAt = normalizeTimestamp(rawCharacter.lorebookMigratedAt, null);
   return character;
 }
 
@@ -2452,6 +2666,7 @@ function normalizeAppData(data, strict, skipLegacyRepair) {
        stream: rawConfig.stream !== false,
        reasoningEffort: normalizeReasoningEffort(rawConfig.reasoningEffort),
        proactiveEnabled: rawConfig.proactiveEnabled !== false,
+       styleCritique: rawConfig.styleCritique !== false,
        cacheStats: normalizeCacheStats(rawConfig.cacheStats),
        platformSettings: platformSettings
     },
@@ -2554,7 +2769,7 @@ function createCharacterObj(name, avatar, personality, background) {
       longTerm: { userProfile: [], relationship: [], events: [], promises: [], habits: [] },
       scenes: [],
       sceneState: { key: '', startCount: 0, messageCount: 0 },
-      counters: { extractionRetryAt: null, analysisRetryAt: null, sceneRetryAt: null, extractionFailures: 0, analysisFailures: 0, sceneFailures: 0 },
+      counters: { extractionRetryAt: null, analysisRetryAt: null, sceneRetryAt: null, lorebookRetryAt: null, extractionFailures: 0, analysisFailures: 0, sceneFailures: 0, lorebookFailures: 0, lorebookScannedCount: 0 },
       pendingRecall: [],
       lastInjectedRecallIds: [],
       revision: 0
@@ -2742,8 +2957,9 @@ function renderChat(forceFollow) {
         ? '<button class="message-action" data-message-action="edit-resend" data-msg-id="' + safeMsgId + '" title="编辑并重发" aria-label="编辑并重发"><svg class="icon text-sm"><use href="#icon-edit"></use></svg></button>'
         : '<button class="message-action" data-message-action="regenerate" data-msg-id="' + safeMsgId + '" title="重新生成" aria-label="重新生成"><svg class="icon text-sm"><use href="#icon-refresh"></use></svg></button>'));
     var staticChangesHtml = (msg.role === 'assistant' && Array.isArray(msg.staticChanges) && msg.staticChanges.length > 0) ? '<div class="text-xs mt-1" style="color: var(--warning-color, #b45309);">⚡ ' + escapeHtml(msg.staticChanges.join(' · ')) + '已修改</div>' : '';
+    var lorebookChangesHtml = (msg.role === 'assistant' && Array.isArray(msg.lorebookChanges) && msg.lorebookChanges.length > 0) ? '<div class="text-xs mt-1" style="color: var(--warning-color, #b45309);">📖 ' + escapeHtml(msg.lorebookChanges.join(' · ')) + '</div>' : '';
     var contentHtml = formattedContent ? '<div class="message-content">' + formattedContent + '</div>' : '';
-    div.innerHTML = avatarHtml + '<div class="message-bubble ' + bubbleClass + '">' + imagesHtml + contentHtml + staticChangesHtml + '<div class="message-meta"><span class="text-xs ' + timeClass + '">' + time + '</span>' + actionHtml + '</div></div>';
+    div.innerHTML = avatarHtml + '<div class="message-bubble ' + bubbleClass + '">' + imagesHtml + contentHtml + staticChangesHtml + lorebookChangesHtml + '<div class="message-meta"><span class="text-xs ' + timeClass + '">' + time + '</span>' + actionHtml + '</div></div>';
     container.appendChild(div);
     messageRowCache[msg.id || ''] = div;
     if (msg.role === 'assistant' && index === latestAssistantIndex && state.quickReplyCharacterId === char.id && state.quickReplyMessageId === msg.id) appendQuickReplyRow(container);
@@ -2797,19 +3013,27 @@ function switchModalTab(tabName) {
 }
 
 // 世界书编辑：条目直接写回草稿（保存时随角色一起落盘）
+// 用户一旦手改内容，条目就转为 origin='user'：从此 AI 不得覆盖，也不会被自动淘汰
 function updateLorebookEntry(index, field, value) {
   var draft = state.editingCharacterDraft;
   if (!draft || !Array.isArray(draft.lorebook) || !draft.lorebook[index]) return;
   var entry = draft.lorebook[index];
   if (field === 'keywords') {
     entry.keywords = toText(value).split(/[,，、\n]/).map(function(keyword) { return keyword.trim(); }).filter(Boolean).slice(0, LOREBOOK_LIMITS.keywordsPerEntry);
+    if (!(entry.alwaysActive === true) && entry.keywords.length === 0) entry.alwaysActive = true;
+    entry.origin = 'user';
   } else if (field === 'enabled') {
     entry.enabled = value === true;
+  } else if (field === 'alwaysActive') {
+    entry.alwaysActive = value === true;
   } else if (field === 'name') {
     entry.name = toText(value).slice(0, LOREBOOK_LIMITS.nameChars);
+    entry.origin = 'user';
   } else if (field === 'content') {
     entry.content = toText(value).slice(0, LOREBOOK_LIMITS.contentChars);
+    entry.origin = 'user';
   }
+  return entry;
 }
 
 function addLorebookEntry() {
@@ -2817,8 +3041,18 @@ function addLorebookEntry() {
   if (!draft) return;
   if (!Array.isArray(draft.lorebook)) draft.lorebook = [];
   if (draft.lorebook.length >= LOREBOOK_LIMITS.entries) { alert('世界书条目已达上限（' + LOREBOOK_LIMITS.entries + ' 条）'); return; }
-  draft.lorebook.push({ id: createMemoryId('lore'), name: '', keywords: [], content: '', enabled: true, order: 100 });
+  draft.lorebook.push({ id: createMemoryId('lore'), name: '', keywords: [], content: '', enabled: true, order: 100, alwaysActive: true, origin: 'user', mentions: 0, lastMentionedAt: null, misses: 0 });
   renderLorebookEditor(draft);
+}
+
+// "最近提及"显示：没被命中过就标未命中，不展示精确时间
+function formatLorebookMention(entry) {
+  if (!entry || !Number(entry.mentions)) return '未命中过';
+  var when = Date.parse(entry.lastMentionedAt || '');
+  if (!when) return '命中 ' + entry.mentions + ' 次';
+  var minutes = Math.max(0, Math.round((Date.now() - when) / 60000));
+  var relative = minutes < 1 ? '刚刚' : (minutes < 60 ? minutes + ' 分钟前' : (minutes < 1440 ? Math.round(minutes / 60) + ' 小时前' : Math.round(minutes / 1440) + ' 天前'));
+  return '命中 ' + entry.mentions + ' 次 · ' + relative;
 }
 
 function removeLorebookEntry(index) {
@@ -2833,18 +3067,24 @@ function renderLorebookEditor(draft) {
   if (!container || !draft) return;
   if (!Array.isArray(draft.lorebook)) draft.lorebook = [];
   var inputStyle = 'background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text-color);';
-  var html = '<p class="text-xs text-muted-c mb-3">世界书是<b>只在关键词命中时</b>才注入的固定设定（地点、组织、专有名词、历史、人物关系等）。只有被提到的条目会进上下文，比写进"背景故事"更省 token 也更准。关键词用「、」或逗号分隔。</p>';
+  var html = '<p class="text-xs text-muted-c mb-3">世界书是<b>世界层设定的唯一去处</b>（时代与世界观、地点、组织、专有名词、历史、规则）。每条可选<b>常驻</b>（每轮都注入）或<b>关键词命中</b>（被提到才注入，更省 token）。条目由 AI 在剧情推进中<b>自动维护</b>，你可以随时修改、禁用或删除；你手改过的条目会被锁定，AI 不会再覆盖它。</p>';
   if (draft.lorebook.length === 0) {
-    html += '<p class="text-xs text-muted-c mb-3">还没有条目。</p>';
+    html += '<p class="text-xs text-muted-c mb-3">还没有条目。可以让 AI 在建卡时生成，或在对话中自动补充。</p>';
   }
   html += '<div class="space-y-3">';
   draft.lorebook.forEach(function(entry, index) {
+    var originLabel = entry.origin === 'ai' ? 'AI 写入' : '手写';
+    var originColor = entry.origin === 'ai' ? 'var(--text-muted, #8a8a8a)' : 'var(--warning-color, #b45309)';
     html += '<div class="rounded-lg p-3 space-y-2" style="' + inputStyle + '">';
     html += '<div class="flex items-center gap-2"><input type="text" value="' + escapeHtml(entry.name || '') + '" placeholder="条目名（如：赤月王国）" oninput="updateLorebookEntry(' + index + ', \'name\', this.value)" class="flex-1 rounded-lg px-2 py-1.5 text-xs" style="' + inputStyle + '">'
-      + '<label class="flex items-center gap-1 text-xs text-muted-c whitespace-nowrap"><input type="checkbox" ' + (entry.enabled === false ? '' : 'checked ') + 'onchange="updateLorebookEntry(' + index + ', \'enabled\', this.checked)">启用</label>'
+      + '<span class="text-xs whitespace-nowrap" style="color:' + originColor + ';">' + originLabel + '</span>'
       + '<button type="button" onclick="removeLorebookEntry(' + index + ')" class="text-xs text-secondary-c whitespace-nowrap">删除</button></div>';
-    html += '<input type="text" value="' + escapeHtml((entry.keywords || []).join('、')) + '" placeholder="触发关键词（用、或逗号分隔）" oninput="updateLorebookEntry(' + index + ', \'keywords\', this.value)" class="w-full rounded-lg px-2 py-1.5 text-xs" style="' + inputStyle + '">';
-    html += '<textarea rows="2" placeholder="命中后注入的内容" oninput="updateLorebookEntry(' + index + ', \'content\', this.value)" class="w-full rounded-lg px-2 py-1.5 text-xs" style="' + inputStyle + '">' + escapeHtml(entry.content || '') + '</textarea>';
+    html += '<div class="flex items-center gap-3 text-xs text-muted-c">'
+      + '<label class="flex items-center gap-1 whitespace-nowrap"><input type="checkbox" ' + (entry.enabled === false ? '' : 'checked ') + 'onchange="updateLorebookEntry(' + index + ', \'enabled\', this.checked)">启用</label>'
+      + '<label class="flex items-center gap-1 whitespace-nowrap"><input type="checkbox" ' + (entry.alwaysActive === true ? 'checked ' : '') + 'onchange="updateLorebookEntry(' + index + ', \'alwaysActive\', this.checked)">常驻</label>'
+      + '<span class="whitespace-nowrap">' + escapeHtml(formatLorebookMention(entry)) + '</span></div>';
+    html += '<input type="text" value="' + escapeHtml((entry.keywords || []).join('、')) + '" placeholder="触发关键词（用、或逗号分隔；常驻条目可留空）" oninput="updateLorebookEntry(' + index + ', \'keywords\', this.value)" class="w-full rounded-lg px-2 py-1.5 text-xs" style="' + inputStyle + '">';
+    html += '<textarea rows="2" placeholder="命中后注入的设定内容" oninput="updateLorebookEntry(' + index + ', \'content\', this.value)" class="w-full rounded-lg px-2 py-1.5 text-xs" style="' + inputStyle + '">' + escapeHtml(entry.content || '') + '</textarea>';
     html += '</div>';
   });
   html += '</div>';
@@ -2858,7 +3098,7 @@ function renderCharacterModalContent(char) {
     var groupInfo = char.groupInfo || {};
     basicContainer.innerHTML = '<div><label class="block text-xs text-muted-c mb-1">群组名称</label><input id="modal_group_name" value="' + escapeHtml(groupInfo.name || char.basicInfo.name) + '" class="w-full rounded-lg px-2 py-1.5 text-xs" style="background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text-color);"></div>' +
       '<div><label class="block text-xs text-muted-c mb-1">群组头像</label><input id="modal_group_avatar" value="' + escapeHtml(groupInfo.avatar || char.basicInfo.avatar) + '" class="w-full rounded-lg px-2 py-1.5 text-xs" style="background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text-color);"></div>' +
-      '<div><label class="block text-xs text-muted-c mb-1">群组描述</label><textarea id="modal_group_description" rows="2" class="w-full rounded-lg px-2 py-1.5 text-xs" style="background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text-color);">' + escapeHtml(groupInfo.description) + '</textarea></div>' +
+      '<div><label class="block text-xs text-muted-c mb-1">群组前提</label><textarea id="modal_group_description" rows="2" class="w-full rounded-lg px-2 py-1.5 text-xs" style="background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text-color);">' + escapeHtml(groupInfo.description) + '</textarea></div>' +
       '<div><label class="block text-xs text-muted-c mb-1">共同场景</label><textarea id="modal_group_scene" rows="2" class="w-full rounded-lg px-2 py-1.5 text-xs" style="background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text-color);">' + escapeHtml(groupInfo.scene) + '</textarea></div>' +
       '<div><label class="block text-xs text-muted-c mb-1">成员互动规则</label><textarea id="modal_group_rules" rows="3" class="w-full rounded-lg px-2 py-1.5 text-xs" style="background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text-color);">' + escapeHtml(groupInfo.interactionRules) + '</textarea></div>' +
       '<div class="text-xs text-muted-c">成员：' + escapeHtml((char.members || []).map(function(member) { return member.basicInfo.name; }).join('、')) + '</div>';
@@ -2868,7 +3108,7 @@ function renderCharacterModalContent(char) {
     { key: 'age', label: '年龄' }, { key: 'race', label: '种族' },
     { key: 'appearance', label: '外貌特征' },
     { key: 'personality', label: '性格特征' }, { key: 'values', label: '价值观' },
-    { key: 'fears', label: '恐惧/弱点' }, { key: 'background', label: '背景故事', type: 'textarea' },
+    { key: 'fears', label: '恐惧/弱点' }, { key: 'background', label: '个人背景', type: 'textarea' },
     { key: 'keyEvents', label: '关键过往' },
     { key: 'speakingStyle', label: '说话风格' },
     { key: 'language', label: '语言/方言' },
@@ -3280,6 +3520,15 @@ async function autoFillStaticFields() {
 // 重新整理进新字段，直到迁移完成（或用户勾选"以后不再询问"后跳过）为止。
 var FIELD_MIGRATION_SKIP_KEY = 'deeptalking_field_migration_skip_v1';
 var FIELD_MIGRATION_TARGETS = [];
+var LOREBOOK_MIGRATION_SKIP_KEY = 'deeptalking_lorebook_migration_skip_v1';
+
+function lorebookMigrationSkipRequested() {
+  try { return localStorage.getItem(LOREBOOK_MIGRATION_SKIP_KEY) === '1'; } catch (e) { return false; }
+}
+
+function markLorebookMigrationSkip() {
+  try { localStorage.setItem(LOREBOOK_MIGRATION_SKIP_KEY, '1'); } catch (e) {}
+}
 
 function collectFieldMigrationTargets(rawCharacters) {
   FIELD_MIGRATION_TARGETS = [];
@@ -3437,6 +3686,129 @@ function markEntityFieldMigrated(entity) {
   (entity.members || []).forEach(function(member) { member.fieldsMigrationVersion = FIELDS_MIGRATION_VERSION; });
 }
 
+// ==================== 世界书一次性迁移 ====================
+// 把旧数据里写在"群组前提/个人背景"中的世界层内容（地点/组织/专有名词/历史/规则）
+// 整理成世界书条目。原文默认保留，用户可勾选同时精简原文。
+function collectLorebookMigrationTargets() {
+  var targets = [];
+  Object.keys(state.characters || {}).forEach(function(charId) {
+    var entity = state.characters[charId];
+    if (!entity || entity.lorebookMigratedAt) return;
+    var sourceText = entity.entityType === 'group'
+      ? toText(entity.groupInfo && entity.groupInfo.description)
+      : toText(entity.basicInfo && entity.basicInfo.background);
+    if (trimText(sourceText, 4000).length >= 40) targets.push({ id: charId, entity: entity, sourceText: trimText(sourceText, 2000) });
+    else entity.lorebookMigratedAt = new Date().toISOString();
+  });
+  return targets;
+}
+
+function askLorebookMigration(count) {
+  return new Promise(function(resolve) {
+    var overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;padding:16px;';
+    overlay.innerHTML = '<div style="max-width:30rem;width:100%;background:var(--input-bg,#1c1c1e);color:var(--text-color,#eee);border:1px solid var(--input-border,#333);border-radius:14px;padding:18px;">'
+      + '<div style="font-weight:600;margin-bottom:8px;">世界书整理</div>'
+      + '<p style="font-size:13px;line-height:1.6;margin:0 0 12px;">检测到 ' + count + ' 个角色/群组的描述里含有世界观类内容。世界书已改为<b>由 AI 自动维护</b>：是否用 AI 把这些内容整理成世界书条目？（不整理也能用，只是世界观会一直常驻占字数）</p>'
+      + '<label style="display:flex;align-items:center;gap:8px;font-size:12px;margin-bottom:8px;"><input type="checkbox" id="lorebookTrimSource"> 同时把已迁出的内容从原文里精简掉</label>'
+      + '<label style="display:flex;align-items:center;gap:8px;font-size:12px;margin-bottom:14px;"><input type="checkbox" id="lorebookMigrateSkipForever"> 以后不再询问</label>'
+      + '<div style="display:flex;gap:8px;justify-content:flex-end;">'
+      + '<button id="lorebookMigrateSkip" class="btn-secondary" style="padding:7px 14px;border-radius:10px;font-size:13px;">跳过</button>'
+      + '<button id="lorebookMigrateRun" class="btn-secondary" style="padding:7px 14px;border-radius:10px;font-size:13px;">开始整理</button>'
+      + '</div></div>';
+    document.body.appendChild(overlay);
+    function finish(run) {
+      var trimSource = !!(overlay.querySelector('#lorebookTrimSource') && overlay.querySelector('#lorebookTrimSource').checked);
+      var skipForever = !!(overlay.querySelector('#lorebookMigrateSkipForever') && overlay.querySelector('#lorebookMigrateSkipForever').checked);
+      overlay.remove();
+      resolve({ run: run, trimSource: trimSource, skipForever: skipForever });
+    }
+    overlay.querySelector('#lorebookMigrateRun').addEventListener('click', function() { finish(true); });
+    overlay.querySelector('#lorebookMigrateSkip').addEventListener('click', function() { finish(false); });
+  });
+}
+
+// 用 AI 把原文里的世界层内容拆成世界书条目；用户手写条目不受影响（upsert 会拒绝覆盖）
+async function migrateWorldLoreForEntity(entity, trimSource) {
+  var isGroup = entity.entityType === 'group';
+  var sourceText = isGroup ? toText(entity.groupInfo && entity.groupInfo.description) : toText(entity.basicInfo && entity.basicInfo.background);
+  if (!trimText(sourceText, 2000)) return true;
+  var existing = normalizeLorebook(entity.lorebook).map(function(entry) { return { name: entry.name, keywords: entry.keywords, alwaysActive: entry.alwaysActive }; });
+  var prompt = '下面是一个' + (isGroup ? '群组前提' : '角色的个人背景') + '文本，其中可能混有世界观类内容（时代/世界观、地点、组织、专有名词、历史、规则）。\n'
+    + '请把其中的**世界层设定**整理成世界书条目；只整理原文已有的信息，禁止编造或扩写；角色/群组本人的性格、经历、关系不要抽成条目。\n'
+    + '每条给出 name（条目名）、keywords（剧情里可能出现的称呼）、content（该条目本身的信息，不要理由与解释）、alwaysActive（世界前提/规则这类需要每轮生效的设 true，其余 false）。最多 6 条；没有世界层内容就返回空数组。\n'
+    + (trimSource ? '另外请给出精简后的原文：删掉已经抽成条目的世界观内容，只保留角色/群组本人相关的部分，其他内容一字不改；没有可精简的就原样返回。\n' : '')
+    + '只返回 JSON：{"entries":[{"name":"","keywords":[],"content":"","alwaysActive":false}]' + (trimSource ? ',"trimmedSource":""' : '') + '}。\n\n'
+    + '现有世界书条目：' + (existing.length ? JSON.stringify(existing) : '（空）')
+    + '\n\n' + (isGroup ? '群组前提' : '个人背景') + '：\n' + trimText(sourceText, 2000);
+  var response = await callAPI([
+    { role: 'system', content: '你是世界书整理助手。只返回JSON。' },
+    { role: 'user', content: prompt }
+  ]);
+  var data = parseJsonPayload(response.choices[0].message.content);
+  if (!isPlainObject(data)) return false;
+  var entries = Array.isArray(data.entries) ? data.entries.slice(0, 6) : [];
+  entries.forEach(function(item) {
+    if (!isPlainObject(item) || !toText(item.name).trim() || !toText(item.content).trim()) return;
+    upsertLorebookEntry(entity, {
+      name: item.name,
+      content: item.content,
+      keywords: item.keywords,
+      alwaysActive: item.alwaysActive === true
+    }, { evidence: '世界书一次性迁移：整理自原有设定文本' });
+  });
+  if (trimSource && data.trimmedSource != null) {
+    var trimmed = trimText(cleanFieldValue(isGroup ? 'description' : 'background', toText(data.trimmedSource)), isGroup ? 1200 : 800);
+    // 只在确实变短且非空时替换，避免 AI 反而写长
+    if (trimmed && trimmed.length < sourceText.trim().length) {
+      if (isGroup) entity.groupInfo.description = trimmed;
+      else entity.basicInfo.background = trimmed;
+    }
+  }
+  entity.lorebookMigratedAt = new Date().toISOString();
+  return true;
+}
+
+async function maybeMigrateLorebookWorld() {
+  if (window.__lorebookMigrationRunning) return;
+  if (lorebookMigrationSkipRequested()) return;
+  var targets = collectLorebookMigrationTargets();
+  if (targets.length === 0) return;
+  if (!state.config || !state.config.apiKey) {
+    targets.forEach(function(target) { target.entity.lorebookMigratedAt = null; });
+    return;
+  }
+  window.__lorebookMigrationRunning = true;
+  try {
+    var answer = await askLorebookMigration(targets.length);
+    if (answer.skipForever) {
+      markLorebookMigrationSkip();
+      targets.forEach(function(target) { target.entity.lorebookMigratedAt = new Date().toISOString(); });
+      scheduleSave();
+      return;
+    }
+    if (!answer.run) {
+      // 本次跳过不标记，下次启动再问
+      targets.forEach(function(target) { target.entity.lorebookMigratedAt = null; });
+      return;
+    }
+    for (var i = 0; i < targets.length; i++) {
+      setActivity('正在整理世界书（' + (i + 1) + '/' + targets.length + '）…');
+      await migrateWorldLoreForEntity(targets[i].entity, answer.trimSource);
+    }
+    scheduleSave();
+    renderCharacterList();
+    setActivity('');
+    alert('世界书整理完成。');
+  } catch (error) {
+    console.warn('世界书迁移失败:', error && error.message);
+    setActivity('');
+    alert('世界书整理失败：' + (error && error.message ? error.message : '未知错误') + '，下次启动可重试。');
+  } finally {
+    window.__lorebookMigrationRunning = false;
+  }
+}
+
 async function migrateEntityFields(entity) {
   if (!entity || entity.fieldsMigrationVersion === FIELDS_MIGRATION_VERSION) return;
   if (entity.entityType === 'group') {
@@ -3444,7 +3816,7 @@ async function migrateEntityFields(entity) {
     var groupDesc = toText(entity.groupInfo && entity.groupInfo.description);
     if (groupDesc) {
       var ds = entity.dynamicState || {};
-      var prompt = '下面是群组的描述与共同状态文本，请整理：只返回JSON {"description":"整合后的群组描述（去重、保留世界观与背景）","currentSituation":"当前共同处境（绝对日期）","currentLocation":"共同场景"}。只整理已有信息，不编造。\n' + JSON.stringify({ description: groupDesc, currentSituation: toText(ds.currentSituation), currentLocation: toText(ds.currentLocation) });
+      var prompt = '下面是群组的前提与共同状态文本，请整理：只返回JSON {"description":"整合后的群组前提（去重；只保留这群人是谁、为何在一起，世界观/地点/组织等世界层内容不要塞进来）","currentSituation":"当前共同处境（绝对日期）","currentLocation":"共同场景"}。只整理已有信息，不编造。\n' + JSON.stringify({ description: groupDesc, currentSituation: toText(ds.currentSituation), currentLocation: toText(ds.currentLocation) });
       var response = await callAPI([
         { role: 'system', content: '你是角色字段结构迁移助手。只返回JSON。' },
         { role: 'user', content: prompt }
@@ -3794,6 +4166,9 @@ async function sendMessage(options) {
       if (toolState && Array.isArray(toolState.staticChanges) && toolState.staticChanges.length > 0) {
         loadingMsg.staticChanges = Array.from(new Set((loadingMsg.staticChanges || []).concat(toolState.staticChanges)));
       }
+      if (toolState && Array.isArray(toolState.lorebookChanges) && toolState.lorebookChanges.length > 0) {
+        loadingMsg.lorebookChanges = Array.from(new Set((loadingMsg.lorebookChanges || []).concat(toolState.lorebookChanges)));
+      }
     } else if (salvagedReply != null) {
       displayText = unescapeLiteralNewlines(salvagedReply);
       loadingMsg.content = displayText;
@@ -3816,6 +4191,17 @@ async function sendMessage(options) {
       }
     }
     displayText = dedupeRepeatedEnding(displayText, char);
+    // 语气/风格遵从：先做客户端违规检测；命中且开了修订开关时跑一次 critique（只修文风、不改剧情）
+    var styleViolations = detectStyleViolations(displayText, char, getRecentReplyEndings(char, STYLE_GUARD.lookbackReplies));
+    if (styleViolations.length > 0 && state.config.styleCritique !== false) {
+      setActivity('正在校正文风…');
+      var critiqued = await critiqueReplyStyle(char, displayText, styleViolations);
+      if (critiqued && critiqued !== displayText) {
+        displayText = dedupeRepeatedEnding(critiqued, char);
+        styleViolations = detectStyleViolations(displayText, char, getRecentReplyEndings(char, STYLE_GUARD.lookbackReplies));
+      }
+    }
+    loadingMsg.styleViolations = styleViolations;
     loadingMsg.content = displayText;
     loadingMsg.isLoading = false;
     loadingMsg.timestamp = new Date().toISOString();
@@ -5331,7 +5717,7 @@ function buildRoleContext(char, staticOnly) {
     var group = char.groupInfo || {};
     var groupLines = [
       '群组名称: ' + trimText(group.name || char.basicInfo.name, 160),
-      '群组描述: ' + maskUserWord(char, trimText(group.description || char.basicInfo.personality, 700)),
+      '群组前提: ' + maskUserWord(char, trimText(group.description || char.basicInfo.personality, 700)),
       '场景: ' + maskUserWord(char, trimText(group.scene || (char.dynamicState && char.dynamicState.currentLocation), 500)),
       '互动规则: ' + maskUserWord(char, trimText(group.interactionRules, 700))
     ];
@@ -5582,6 +5968,175 @@ function buildNarrativePatternDirective() {
   return '【本轮节奏骨架（每轮随机给出，仅作节奏参考）】建议本轮按“' + pattern.label + '”的顺序组织内容：' + pattern.hint + '骨架只约束节奏与详略分布，不要写出任何结构标签或说明文字，措辞与语气一律服从角色设定。\n\n';
 }
 
+// ==================== 语气/风格遵从（attention）====================
+// 从说话风格里抽出示例台词：约定格式为「调性描述；示例：<台词1> / <台词2> / <台词3>」
+function extractSpeakingSamples(style) {
+  var text = toText(style);
+  var idx = text.indexOf('示例');
+  if (idx === -1) return [];
+  var tail = text.slice(idx).replace(/^示例\s*[：:]?\s*/, '');
+  return tail.split(/\s*[\/／]\s*|\n+/)
+    .map(function(part) { return trimText(toText(part).replace(/[「」『』“”"]/g, '').trim(), 80); })
+    .filter(function(part) { return part.length >= 2; })
+    .slice(0, 3);
+}
+
+// 语气锚：把说话风格与示例台词放到生成点最近处（volatile 末尾），是遵从度最高的一条
+function buildStyleAnchor(char) {
+  var info = (char && char.basicInfo) || {};
+  var style = trimText(toText(info.speakingStyle), STYLE_GUARD.anchorStyleChars);
+  if (!style) return '';
+  var samples = extractSpeakingSamples(style).slice(0, STYLE_GUARD.anchorSamples);
+  var address = normalizeUserAddress(info.userAddress);
+  var lines = ['【本轮语气锚（离生成最近，优先级高于一切风格偏好）】'];
+  lines.push('说话风格：' + style);
+  if (samples.length) {
+    lines.push('照此口吻说话（只借用语气，不要照抄内容）：' + samples.map(function(sample) { return '「' + sample + '」'; }).join(' '));
+  }
+  if (address) lines.push('对用户的称呼：' + address);
+  lines.push('本轮必须：用自己的口吻说话；不复述设定、不解释自己在怎么做；不替用户说话或行动；收尾不与上一轮雷同。');
+  return lines.join('\n') + '\n\n';
+}
+
+// 客户端违规检测（纯函数）：返回命中标签数组，供下一轮内部提醒与 critique 使用
+function detectStyleViolations(reply, char, prevReplies) {
+  var text = toText(reply);
+  var hits = [];
+  if (!text.trim()) return hits;
+  var info = (char && char.basicInfo) || {};
+  var address = normalizeUserAddress(info.userAddress);
+
+  if (/(好的|收到|明白|知道了)[，,。、]?\s*(我)?(会|改成|改用|调整|照做|注意|这样(说话|说))|以后我(就)?(用|按)这(种|个)(方式|语气)|我(会)?照你说的(来|说|做)/.test(text)) {
+    hits.push('metaTalk');
+  }
+  var quotedUserLine = new RegExp('(^|\\n)\\s*(用户|' + (address ? address.replace(/[^0-9A-Za-z\u4e00-\u9fff]/g, '') + '|' : '') + '你)\\s*[：:]\\s*[「『“"]');
+  if (quotedUserLine.test(text)) hits.push('speaksForUser');
+  if (STYLE_CLICHES.some(function(word) { return text.indexOf(word) !== -1; })) hits.push('cliche');
+
+  var priors = (prevReplies || []).filter(Boolean).map(function(item) { return toText(item); });
+  if (priors.length) {
+    var currentEnding = extractReplyEnding(text);
+    if (currentEnding && priors.some(function(prior) { return extractReplyEnding(prior) === currentEnding; })) {
+      hits.push('reusedImagery');
+    } else if (sharesDistinctivePhrase(text, priors)) {
+      hits.push('reusedImagery');
+    }
+  }
+
+  // 口癖类判据太容易误报（示例台词常共享通用词），只保留"句长过于整齐"这一条硬信号
+  if (isSentenceLengthUniform(text)) hits.push('toneDrift');
+
+  var entries = (char && Array.isArray(char.lorebook)) ? char.lorebook : [];
+  if (entries.some(function(entry) {
+    var name = toText(entry && entry.name).trim();
+    if (!name || name.length < 2 || text.indexOf(name) === -1) return false;
+    var content = toText(entry && entry.content).trim();
+    return content.length >= 12 && text.indexOf(content.slice(0, 12)) !== -1;
+  })) hits.push('recitedLore');
+
+  return hits.filter(function(item, index) { return hits.indexOf(item) === index; });
+}
+
+// 句长是否过于整齐（≥5 句且极差很小）——真人感要求长短句起伏
+function isSentenceLengthUniform(text) {
+  var sentences = toText(text).split(/[。！？!?…]+/).map(function(part) { return part.replace(/\s+/g, ''); }).filter(function(part) { return part.length > 0; });
+  if (sentences.length < 5) return false;
+  var lengths = sentences.map(function(part) { return part.length; });
+  var min = Math.min.apply(null, lengths);
+  var max = Math.max.apply(null, lengths);
+  return min >= 8 && (max - min) <= 4;
+}
+
+// 与近期回复共享 N 字以上的独特片段（比喻/意象复用）
+function sharesDistinctivePhrase(text, priors) {
+  var span = STYLE_GUARD.reusePhraseChars;
+  var current = toText(text).replace(/\s+/g, '');
+  if (current.length < span) return false;
+  var priorsText = priors.map(function(prior) { return toText(prior).replace(/\s+/g, ''); });
+  for (var i = 0; i + span <= current.length; i += 3) {
+    var chunk = current.slice(i, i + span);
+    if (!/[^\u4e00-\u9fff]/.test(chunk) && priorsText.some(function(prior) { return prior.indexOf(chunk) !== -1; })) return true;
+  }
+  return false;
+}
+
+// 上一轮回复的违规标签（内部提醒的数据来源）
+function getLastStyleViolations(char) {
+  var messages = (char && char.memory && Array.isArray(char.memory.instant)) ? char.memory.instant : [];
+  for (var i = messages.length - 1; i >= 0; i--) {
+    var message = messages[i];
+    if (!message || message.isLoading || message.role !== 'assistant') continue;
+    return Array.isArray(message.styleViolations) ? message.styleViolations.filter(function(key) { return STYLE_VIOLATION_LABELS[key]; }) : [];
+  }
+  return [];
+}
+
+// 最近 N 条 assistant 回复里出现过的违规标签（每 N 轮回顾用）
+function collectRecentStyleViolations(char, limit) {
+  var messages = (char && char.memory && Array.isArray(char.memory.instant)) ? char.memory.instant : [];
+  var collected = [];
+  for (var i = messages.length - 1; i >= 0 && collected.length < limit; i--) {
+    var message = messages[i];
+    if (!message || message.isLoading || message.role !== 'assistant') continue;
+    collected.push(message);
+  }
+  var labels = [];
+  collected.forEach(function(message) {
+    (Array.isArray(message.styleViolations) ? message.styleViolations : []).forEach(function(key) {
+      if (STYLE_VIOLATION_LABELS[key] && labels.indexOf(key) === -1) labels.push(key);
+    });
+  });
+  return labels;
+}
+
+// 每 N 轮一次的语气回顾（内部提醒；有违规就点名，没有就重申契约）
+function buildStyleReview(char) {
+  var assistantTurnCount = ((char && char.memory && Array.isArray(char.memory.instant)) ? char.memory.instant : [])
+    .filter(function(message) { return message && !message.isLoading && message.role === 'assistant'; }).length;
+  if (assistantTurnCount === 0 || assistantTurnCount % STYLE_GUARD.reviewEveryTurns !== 0) return '';
+  var labels = collectRecentStyleViolations(char, STYLE_GUARD.reviewEveryTurns);
+  var lines = ['【语气回顾（每 ' + STYLE_GUARD.reviewEveryTurns + ' 轮一次，内部提醒）】'];
+  lines.push('语气永远以角色设定的说话风格为准，优先级高于你的默认文风与最近的写法。');
+  if (labels.length) lines.push('最近几轮出现的问题：' + labels.map(function(key) { return STYLE_VIOLATION_LABELS[key]; }).join('；') + '。');
+  lines.push('本轮务必：用自己的口吻、长短句有起伏、不复用近期比喻与收尾、不替用户说话。');
+  return lines.join('\n') + '\n\n';
+}
+
+// 上一轮违规的内部纠正提醒（只进上下文，不展示给用户）
+function buildStyleCorrectionReminder(char) {
+  var labels = getLastStyleViolations(char);
+  if (labels.length === 0) return '';
+  return '【上一轮需要纠正（内部提醒）】' + labels.map(function(key) { return STYLE_VIOLATION_LABELS[key]; }).join('；') + '。本轮必须做到，不要重复上一轮的问题。\n\n';
+}
+
+// critique 调用（来源：talemate 的 arc-expand-critique）：一次独立的后置文风修订调用。
+// 只改文风、不改剧情；解析失败或长度异常一律回退原文。
+async function critiqueReplyStyle(char, reply, violationKeys) {
+  var original = toText(reply);
+  if (!original.trim()) return original;
+  var rules = (violationKeys || []).map(function(key) { return '- ' + (STYLE_VIOLATION_LABELS[key] || key); }).join('\n');
+  var prompt = '下面是一段角色扮演回复，以及它违反的文风规则清单。请修订文风。\n'
+    + '硬性要求：①只改文风，绝不改动情节、事实、对话含义与人物关系；②保持大体长度与段落数；③不要新增情节要素、不要加解释或旁白；④不得复述规则本身。\n'
+    + '违反的规则：\n' + rules + '\n\n'
+    + '只返回 JSON：{"reply":"修订后的正文"}，换行写 \\n，双引号写 \\"。\n\n原文：\n' + original;
+  try {
+    var response = await callAPI([
+      { role: 'system', content: '你是文风校对助手。只返回JSON。' },
+      { role: 'user', content: prompt }
+    ]);
+    var data = parseJsonPayload(response.choices[0].message.content);
+    var revised = data && typeof data.reply === 'string' ? unescapeLiteralNewlines(data.reply).trim() : '';
+    if (!revised || revised === original) return original;
+    if (revised.length > STYLE_GUARD.critiqueMaxChars) return original;
+    if (revised.length < original.length * STYLE_GUARD.critiqueMinRatio) return original;
+    if (revised.length > original.length * STYLE_GUARD.critiqueMaxRatio) return original;
+    return revised;
+  } catch (error) {
+    console.error('critiqueReplyStyle failed:', error);
+    return original;
+  }
+}
+
 function buildVolatileContext(char, query) {
   var time = getTimeContext(new Date());
   var replyGap = getLastReplyGap(char);
@@ -5634,8 +6189,13 @@ volatileContext += '日程日界: 每天从 02:00 开始计算；00:00-02:00 属
       volatileContext += '【成员当前状态（每人独立，可随对话变化）】\n' + memberStateLines.join('\n\n') + '\n\n';
     }
   }
-  var lorebookContext = buildLorebookContext(char, query);
-  if (lorebookContext) volatileContext += lorebookContext;
+  var lorebookUsed = [];
+  var lorebookContext = buildLorebookContext(char, query, lorebookUsed);
+  if (lorebookContext) {
+    volatileContext += lorebookContext;
+    // 只有真正注入的条目才算"被提及"：UI 显示来源/最近提及，也是自动淘汰的判定依据
+    markLorebookMentions(lorebookUsed, new Date().toISOString());
+  }
   volatileContext += '【本轮主动召回的相关长期记忆】\n' + (memoryLines.join('\n') || '无相关长期记忆');
   volatileContext += '\n【记忆取用说明】以上条目是按关键词与时间粗略召回的，可能只有部分相关，也可能已经过时或与当前语境无关；仅在与当前话题自然相关时提及，不要为了用上记忆而硬提旧事，也不要把它们当成用户刚刚说过的话。\n';
   volatileContext += '\n【记忆主体约定】方括号里标注的是"这条记忆讲的是谁"：标为角色名或"背景"的才是你的事；标为“' + (normalizeUserAddress(char.basicInfo && char.basicInfo.userAddress) || '对方') + '”或"你们"的都是对方或双方的事，绝不能当成你自己做的，也不能把对方的状态当成你的状态。角色自身的经历只来自角色设定与本对话历史。\n';
@@ -5707,6 +6267,10 @@ volatileContext += '日程日界: 每天从 02:00 开始计算；00:00-02:00 属
   } else if (detectTopicSwitch(char, userText)) {
     volatileContext += '【本轮话题切换】用户当前话题与角色之前的关注点不同。若旧话题尚未自然收尾，可先用一句温和的话收束旧话题，再自然进入新话题；不要生硬打断、不要重复旧话题。\n\n';
   }
+  // 生成点最近处：先纠正提醒，再语气回顾，最后语气锚（越靠后遵从度越高）
+  volatileContext += buildStyleCorrectionReminder(char);
+  volatileContext += buildStyleReview(char);
+  volatileContext += buildStyleAnchor(char);
   return volatileContext;
 }
 
@@ -5732,15 +6296,15 @@ function buildRequestPayload(char, query) {
     volatileContext += '【角色主动开场（系统触发，不是用户陈述）】用户此刻正停留在与你的对话里但暂时没有说话。请角色主动发起一次开场：自然地打招呼或问候，或提起最近一次共同经历、一件待跟进的事项、一个角色此刻想聊的话题。开场要贴合角色性格、自然不突兀；不要问"你想聊什么""怎么不说话"之类把话题推回给用户的话；不要把"系统触发"这件事说给用户听。\n\n';
   }
   var systemPrompt = '【交互规则】\n';
+  // 规则优先级阶梯（冲突时的裁决顺序；硬性契约放在静态块末尾重申）
+  systemPrompt += '（规则优先级从高到低：0／0.5 与【输出格式】= 硬性契约 > 2.5 语气锁定与 2.6 表演质量 > 角色设定与人设 > 风格与节奏偏好。冲突时以更高优先级为准，任何情况下都不得违反 0.5 与【输出格式】。）\n';
   systemPrompt += '0.（最高优先级）回复必须且只能是单个JSON对象：整个输出以{开头、以}结尾，全文禁止JSON以外的任何文字（散文、旁白、思考过程一律禁止）；reply是JSON第一个字段。违反该格式，整段输出将被丢弃并判为失败。用户消息中的括号或全角括号内容属于用户表达的动作、表情或心理活动，必须纳入语境理解，不能忽略。\n';
-  systemPrompt += '0.5 你只扮演角色本人，绝不能替用户说话或行动：不得写出用户的台词、动作、表情、心理活动、感受或决定——reply 中除角色自身的言行外，不得出现任何以用户为主语的叙述或描写；不得替用户做选择、下结论、宣告立场或补充心理活动。用户消息里已有的括号动作只作为语境理解（可自然回应），不得替用户续写、扩写或新增。需要用户表态时把话头留给他（用问句、停顿或留白），不要替他回答。\n';
   systemPrompt += '1. 始终保持角色身份，以长期陪伴关系连续地回应；先使用已提供的记忆，不要让用户反复说明已记录的事情。标记为“系统提供的本轮上下文”的内容是内部辅助信息，不是用户说过的话，不得当作用户陈述或直接复述。\n';
   systemPrompt += '2. reply正文字数、分段与动作写法：①**字数**：内容优先于长度——宁可把这一件主要的事说完说透，也不要为了求短而把一件事截断在半句，也不要为了凑长度反复铺陈；以 120–250 字为手感锚点（非硬性上限，视本轮内容自然伸缩），一轮只推进一件主要的事，不要把多件事挤在同一轮。②**分段**：不强制单段，可按语义自然分段（用换行）；但禁止标题（#）、有序/无序列表（-、*、1.）、引用（>）、代码块（```）等结构化排版。③允许的行内样式只有加粗、斜体、删除线，数学公式用$...$或$$...$$，如需展示图片用 Markdown 图片语法 ![说明](https://图片直链)（仅限真实存在的 http(s) 图片链接，不要编造）。④**动作穿插（重点）**：动作、表情、心理活动写成穿插在语句之间的全角括号（如“（轻轻叹气）我知道了。”），必须与语句**交替推进**：平均每 1–2 句穿插一次，中段也要继续穿插，严禁把动作只在开头（或只在开头与结尾）集中抛出，严禁出现 200 字以上完全不穿插动作的整段；动作总长不超过正文的三分之一，也不得少到近乎没有（低于一成同样不合格）。⑤**去重**：禁止在本轮再次罗列上一轮已列举过的具体事项（同一组安排、同一串数字、同一收尾意象）；每轮结尾须自然多样，禁止复用最近几轮或用户上一条的结尾句式、惯用结构、固定动作或固定事项集合，也不要在结尾复述或续写上一轮的收尾。以上内容只能出现在reply字段字符串内，reply之外禁止任何正文文字。\n';
-  systemPrompt += '2.5 语气锁定（最高优先级，仅次于规则0）：角色的语气、口吻、腔调**只能**来自角色设定中的“说话风格”与“对用户的称呼”，其优先级**高于**模型自身的通用腔调与惯用文风；不得让本角色的说话方式向任何默认腔调靠拢。**不同角色之间的语气差异必须显著**：同一段话若换到另一个角色口中，读起来应当像另一个人说的。同时，语气只界定**整体调性**（如慵懒、爽利、疏离、黏人、克制、张扬等），不得据此限制细节发挥——语气词、口头禅、句尾助词、拟声、标点习惯、称呼的具体选取与出现频率，一律由“说话风格”和当下剧情自然决定，本规则不对其做任何数量或类型上的限制。\n';
   systemPrompt += '2.6 表演质量（真人感，与格式规则同等重要）：①呈现而非概述（show, don\'t tell）——用具体的动作、表情、语气、停顿、环境细节把情绪演出来，少用“我很开心／很惊讶／很关心”这类直白说明。②句长与节奏要有起伏：长短句交替，允许短句、独字反应、省略与留白，避免每句长度相近、每段结构雷同。③对白为主、叙述为辅：该由台词完成的内容就写进台词，不要改写成旁白转述。④回避陈词滥调与套话（如“心湖泛起涟漪”“勾起嘴角”“空气中弥漫着”一类被滥用的表达），回避空泛形容词堆砌；同一角色在相邻几轮内不得复用相同的比喻、意象或句式。⑤每轮只推进一件主要的事，不做总结、不刻意升华、不在结尾强行抛出开放式提问凑字数；角色可以有情绪起伏、可以拒绝、可以转移话题、可以沉默，不必永远体贴周到。⑥保持人物的稳定与连续：性格、说话方式、对用户的称呼与关系状态前后一致，不要为了讨好用户而突然改变立场或口吻。\n';
    var dynamicFieldList = DYNAMIC_STATE_FIELDS.map(function(field) { return field.key + '（' + field.label + '）'; }).join('、');
    systemPrompt += '3. 人格、背景与角色设定锁定。dynamicState可更新字段：' + dynamicFieldList + '。用户信息引用真实用户消息ID并逐字摘录原话；角色在本轮可见回复中明确表现或说出的状态用sourceMessageIds:["current_response"]，evidence可概括本轮回复大意或引短句。每个字段只能选一种来源，禁止混用current_response与真实ID，禁止按未写出的心理活动或猜测更新。每轮回复后，仅更新本轮确有可见依据的动态字段（处境、地点、情绪、职业、目标、关系、重要他人）：只要角色在回复中明显表现或说出某字段的变化，就更新对应字段；确实无变化或无可引用依据的字段则省略，不要为凑字段而反复盘点或凭空填写。标记为(未设置)的空字段，若本轮回复中有明确可见依据，应一并补全该字段，不得凭猜测或心理活动编造。currentSituation的时间描述一律写成具体日期+时段（如2026-08-06 晚上），时段只能用 深夜、凌晨、清晨、早晨、上午、中午、下午、傍晚、晚上、夜里 这十个词，且一天从02:00起算（00:00-02:00算前一天的深夜），禁止使用今晚、今早、今天、明天、昨天等相对时间词。群组整体只维护currentSituation与currentLocation两项共同状态，成员各自的完整状态写入memberDynamicState，不要混入群组整体dynamicState。\n';
-    systemPrompt += '3.5 谨慎修改字段（基础设定）：以下字段（性别、年龄、种族、外貌特征、性格特征、价值观、恐惧/弱点、背景故事、关键过往、说话风格、语言/方言、对用户的称呼）分两种情况处理。群组实体不再单独维护基础设定字段，其世界观并入"群组描述"，成员各自使用完整字段。①用户直接要求修改时（如“把我职业改成教师”“我现在是学生了”“你性格应该更冷酷些”“别叫我用户，叫我明明”）：必须调用 update_character_field 工具精准修改用户明确指定的字段，sourceMessageIds引用用户消息ID、evidence逐字摘录用户原话；只改用户提到的字段，用户未提及的字段不得连带改动。②无用户直接要求时：仅在剧情出现决定性、不可逆的转折（如角色死亡、身份彻底改变）且证据明确时才可通过staticFields修改，严禁仅凭情绪、猜测或轻微剧情改动。value一律以段落式的陈述句书写：用自然、完整的陈述句把内容写成简短段落（可多句），把用户表述整理成清楚的陈述（如性格写“性格冷静克制，遇事沉稳。”）；禁止括号注释、理由、前后缀或任何解释性文字，解释性内容只能放在evidence。“关键过往”只写里程碑式的重要节点，日常事件交给长期记忆，不要写成流水账。“对用户的称呼”只填一个简短称呼词（如“明明”“老公”），不带任何解释。调用工具修改后系统会在该轮回复下方向用户提示“xx字段已修改”，不要在本轮回复中再向用户复述“我改了设定”之类的话。\n';
+    systemPrompt += '3.5 谨慎修改字段（基础设定）：以下字段（性别、年龄、种族、外貌特征、性格特征、价值观、恐惧/弱点、个人背景、关键过往、说话风格、语言/方言、对用户的称呼）分两种情况处理。群组实体不再单独维护基础设定字段，其"群组前提"与共同场景是全体共用的前提，成员各自使用完整字段。①用户直接要求修改时（如“把我职业改成教师”“我现在是学生了”“你性格应该更冷酷些”“别叫我用户，叫我明明”）：必须调用 update_character_field 工具精准修改用户明确指定的字段，sourceMessageIds引用用户消息ID、evidence逐字摘录用户原话；只改用户提到的字段，用户未提及的字段不得连带改动。②无用户直接要求时：仅在剧情出现决定性、不可逆的转折（如角色死亡、身份彻底改变）且证据明确时才可通过staticFields修改，严禁仅凭情绪、猜测或轻微剧情改动。③**世界层设定（时代/世界观、地点、组织、专有名词、历史、规则）不进基础设定字段**：剧情确立或需要补充这类设定时用 upsert_lorebook_entry 写入世界书；已有条目内容、尤其是用户手写条目，一律不得改写或删除。value一律以段落式的陈述句书写：用自然、完整的陈述句把内容写成简短段落（可多句），把用户表述整理成清楚的陈述（如性格写“性格冷静克制，遇事沉稳。”）；禁止括号注释、理由、前后缀或任何解释性文字，解释性内容只能放在evidence。“关键过往”只写里程碑式的重要节点，日常事件交给长期记忆，不要写成流水账。“对用户的称呼”只填一个简短称呼词（如“明明”“老公”），不带任何解释。调用工具修改后系统会在该轮回复下方向用户提示“xx字段已修改”，不要在本轮回复中再向用户复述“我改了设定”之类的话。\n';
     systemPrompt += '3.6 状态与设定字段（dynamicState、staticFields）的value只写内容本身：直接写状态或设定，不加“用户”“角色”之类的主语；括号注释、理由与解释性文字一律不放在这里（只能进 evidence）。\n';
     systemPrompt += '3.7 记忆字段（shortTerm的content、longTerm的key与value）必须写明“是谁”，禁止使用“我/你/TA/他/她”这类指代不清的代词：涉及用户写“用户”，涉及角色写角色名（群组写具体成员名），双方共同的事写清各自做了什么（正确如“用户喜欢喝美式咖啡。”）；解释性内容只能放在 evidence。\n';
     systemPrompt += '3.8 时间一律写绝对日期，禁止写“明天/上周/三天后”这类相对时间词：shortTerm.content、longTerm.key与value、dynamicState与staticFields的value都必须写“YYYY-MM-DD”或“YYYY-MM-DD 时段”。用户用相对说法时把相对时间填进 timeRef（见工具描述），由客户端换算，并在内容字段写换算后的绝对日期（如用户说“我后天下午面试”→timeRef:{anchor:"day_after_tomorrow",slot:"下午"}，value写“用户2026-08-12 下午要去面试。”）。\n';
@@ -5759,11 +6323,16 @@ function buildRequestPayload(char, query) {
   if (char.entityType === 'group') {
     systemPrompt += '10. 当前是群组对话。只能由已列出的成员发言，可由一人或多人回应。reply字段中用户可见回复必须使用每人独立一行的“成员名：\"内容\"”格式，例如“张三：\"（看了一眼纸）这件事我先说说我的看法。\"\n李四：\"我补充一点，跟前面的意思不冲突。\"”。**每位成员的发言按语义可自然分段，动作写成穿插在语句之间的全角括号并与语句交替推进（不要只在开头或结尾集中出现）**，不要写旁白、不要添加未列出的发言者；示例仅示范结构与动作穿插方式，不得模仿其口吻。quickReplies同样必须保留两条，内容是用户可以发给全体或某位成员的话。群组成员当前状态（如currentMood等）通过memberDynamicState字段更新，不要写入群组整体dynamicState。\n';
     systemPrompt += '11. 记忆归属：每位成员有自己的私人记忆，互相不知道对方记得什么。只有当某件事实是全体都知道的（如用户公开告诉所有人的信息、群内公开讨论的事）才写入共享记忆（longTerm不填memberName）；若某事实只有某位成员知道、或属于某成员对用户的个人印象/私人约定，则在该条longTerm中填memberName记入其私人记忆。引用成员私人记忆时只能用该成员自己的记忆，不得张冠李戴。\n';
-    systemPrompt += '12. 群组设定分三层：群组的"时代/世界观"与"背景故事"是全体共用设定；群组动态状态（场景、氛围等）也是全体共用；每位成员另有自己的独立设定与当前状态，发言要贴合各自设定，不要把某位成员的设定安到别人身上。\n';
+    systemPrompt += '12. 群组设定分三层：群组前提（这群人是谁、为何在一起）与共同场景是全体共用；世界层设定（时代/世界观、地点、组织、专有名词、历史、规则）统一放在世界书，不在角色设定里重复；每位成员另有自己的独立设定与当前状态，发言要贴合各自设定，不要把某位成员的设定安到别人身上。需要补充世界层设定时用 upsert_lorebook_entry 写入世界书。\n';
   }
   // 静态角色设定放进可缓存前缀：只在用户改设定或调用 update_character_field 时才变化，
   // 放进 system 末尾可长期命中缓存；动态状态仍留在 volatile 尾部。
   systemPrompt += '\n【角色设定（固定，不随对话变化）】\n' + buildRoleContext(char, true) + '\n';
+  // 生成点最近处：硬性契约与语气锁定放在静态块末尾重申（改动会让前缀缓存 miss 一次，之后恢复命中）
+  systemPrompt += '\n【硬性约束与语气锁定（最高优先级，冲突时以这里为准）】\n';
+  systemPrompt += '0.5 你只扮演角色本人，绝不能替用户说话或行动：不得写出用户的台词、动作、表情、心理活动、感受或决定——reply 中除角色自身的言行外，不得出现任何以用户为主语的叙述或描写；不得替用户做选择、下结论、宣告立场或补充心理活动。用户消息里已有的括号动作只作为语境理解（可自然回应），不得替用户续写、扩写或新增。需要用户表态时把话头留给他（用问句、停顿或留白），不要替他回答。\n';
+  systemPrompt += '2.5 语气锁定（最高优先级，仅次于规则0）：角色的语气、口吻、腔调**只能**来自角色设定中的“说话风格”与“对用户的称呼”，其优先级**高于**模型自身的通用腔调与惯用文风；不得让本角色的说话方式向任何默认腔调靠拢。**不同角色之间的语气差异必须显著**：同一段话若换到另一个角色口中，读起来应当像另一个人说的。同时，语气只界定**整体调性**（如慵懒、爽利、疏离、黏人、克制、张扬等），不得据此限制细节发挥——语气词、口头禅、句尾助词、拟声、标点习惯、称呼的具体选取与出现频率，一律由“说话风格”和当下剧情自然决定，本规则不对其做任何数量或类型上的限制。\n';
+
   systemPrompt += '【输出格式】只输出单个JSON对象：以{开头、以}结尾，reply为第一个字段，全文不得出现JSON以外的文字；reply里的引号写 \\"，换行写 \\n。无条件适用：**即使本轮调用过工具，最终也必须用这一个 JSON 对象收尾**；不得用 Markdown 代码块包裹，不得在 JSON 前后写任何说明、思考或旁白；quickReplies 恒为两条。\n';
 
   // 稳定前缀请求（所有 /responses 平台统一，实测 opencode-go 同样透传前缀缓存字段）：
@@ -5923,6 +6492,21 @@ function buildAgentTools(char) {
       name: 'update_character_field',
       description: '精准修改角色基础设定字段（性别/年龄/种族/外貌特征/性格特征/价值观/恐惧弱点/背景故事/关键过往/说话风格/语言方言/对用户的称呼）。当用户直接要求修改这些设定（如"把我职业改成教师""我现在是学生了""你性格应该更冷酷些""别叫我用户，叫我明明"）时，必须调用本工具立即生效；value一律以段落式的陈述句书写（用自然、完整的陈述句写成简短段落，如性格"性格冷静克制，遇事沉稳。"），禁止括号注释、理由、整句说明或解释性文字；"对用户的称呼"只填一个简短称呼词、不带任何解释。群组实体不维护基础设定字段（世界观并入群组描述），成员的个人字段请在该成员卡片上修改。不要在submit_response的staticFields里重复提交本工具已改的字段。',
       parameters: { type: 'object', properties: { field: { type: 'string', enum: Object.keys(STATIC_PROFILE_FIELDS), description: '要修改的字段' }, value: { type: 'string', description: '字段值：以段落式的陈述句书写（自然、完整的陈述句，简短段落）；禁止括号注释、理由、解释性文字；涉及日期写绝对日期' }, sourceMessageIds: { type: 'array', items: { type: 'string' }, description: '引用用户消息ID（用户原话所在消息）' }, evidence: { type: 'string', description: '逐字摘录用户要求修改的原话' }, timeRef: buildTimeRefSchema() }, required: ['field', 'value', 'sourceMessageIds', 'evidence'], additionalProperties: false }
+    },
+    {
+      type: 'function',
+      name: 'upsert_lorebook_entry',
+      description: '写入/更新世界书条目——世界层设定的唯一去处（时代与世界观、地点、组织、专有名词、历史、规则、背景事实）。当近期对话里已经出现/确立、且值得日后复用的这类信息，或用户补充修正了这类设定时使用。按 entryId 或 name 精确匹配：命中已有条目就更新，否则新建。**用户手写条目（origin=user）受保护，不得覆盖或改写，只能另建条目**；已有 AI 条目只补新信息，不要整段重写。keywords 写剧情里可能出现的称呼（命中才注入）；想让条目每轮都生效（如世界前提、规则）就把 alwaysActive 设为 true。必须给出 sourceMessageIds 与 evidence 证明该设定已在对话中出现（本轮新编、尚未落库的内容不要写，等它出现在消息里再由整理任务沉淀）；拿不出依据就不要写。',
+      parameters: { type: 'object', properties: {
+        name: { type: 'string', description: '条目名（如「赤月王国」「银月商会」）；未给 entryId 时按名字匹配已有条目' },
+        content: { type: 'string', description: '命中后注入的设定内容，只写该条目本身的信息，不写理由或解释' },
+        keywords: { type: 'array', items: { type: 'string' }, description: '触发关键词（剧情里可能出现的称呼）；常驻条目可留空' },
+        alwaysActive: { type: 'boolean', description: 'true=常驻（每轮都注入，用于世界前提/规则）；默认 false=只在关键词命中时注入' },
+        entryId: { type: 'string', description: '可选，明确要更新的条目ID（比按名字匹配更精确）' },
+        memberName: { type: 'string', description: '可选，群组对话中写入某位成员的私人世界书（不传则写入共享世界书）' },
+        sourceMessageIds: { type: 'array', items: { type: 'string' }, description: '该设定所在的消息ID（必须是上下文里真实的已存在消息ID）' },
+        evidence: { type: 'string', description: '逐字摘录或紧扣原文的短句，体现该设定' }
+      }, required: ['name', 'content', 'sourceMessageIds', 'evidence'], additionalProperties: false }
     },
     {
       type: 'function',
@@ -6416,6 +7000,22 @@ async function executeToolCall(call, char, toolState) {
       scheduleSave();
       return JSON.stringify({ ok: true, field: staticFieldKey, label: STATIC_PROFILE_FIELDS[staticFieldKey].label, value: staticValue, changed: true });
     }
+    if (name === 'upsert_lorebook_entry') {
+      var lorebookSources = resolveLorebookSources(char, args.sourceMessageIds, args.evidence);
+      if (!lorebookSources) return JSON.stringify({ ok: false, reason: 'sourceMessageIds 必须是上下文里真实存在的消息ID，且 evidence 要能对上原话或明确描述；拿不出依据时不要写世界书（本轮新编、还没出现在消息里的内容也不要写）' });
+      var lorebookResult = upsertLorebookEntry(char, args, {
+        sourceMessageIds: lorebookSources.map(function(entry) { return entry.id; }),
+        evidence: args.evidence
+      });
+      if (!lorebookResult.ok) return JSON.stringify({ ok: false, reason: lorebookResult.reason });
+      var lorebookEntry = lorebookResult.entry;
+      if (toolState) {
+        if (!Array.isArray(toolState.lorebookChanges)) toolState.lorebookChanges = [];
+        toolState.lorebookChanges.push((lorebookResult.created ? '新增' : '更新') + '世界书「' + toText(lorebookEntry.name) + '」' + (lorebookEntry.alwaysActive ? '（常驻）' : ''));
+      }
+      scheduleSave();
+      return JSON.stringify({ ok: true, entryId: lorebookEntry.id, name: lorebookEntry.name, alwaysActive: lorebookEntry.alwaysActive, keywords: lorebookEntry.keywords, created: lorebookResult.created, changed: true });
+    }
     if (name === 'web_fetch') {
       var fetchKeyword = toText(args.keyword).trim();
       if (fetchKeyword) return await biliSearchVideos(fetchKeyword);
@@ -6868,6 +7468,7 @@ function consumeInjectedRecalls(char) {
 function memoryTaskKeys(task) {
   if (task === 'extraction') return { failures: 'extractionFailures', retryAt: 'extractionRetryAt' };
   if (task === 'scene') return { failures: 'sceneFailures', retryAt: 'sceneRetryAt' };
+  if (task === 'lorebook') return { failures: 'lorebookFailures', retryAt: 'lorebookRetryAt' };
   return { failures: 'analysisFailures', retryAt: 'analysisRetryAt' };
 }
 
@@ -6970,6 +7571,65 @@ async function summarizeScene(char, sceneKey) {
   }
 }
 
+// 世界书整理任务：把近期已沉淀的事件事实补进世界书，并淘汰长期没人碰的 AI 条目。
+// 只沉淀"已经出现在对话里"的内容（用短期记忆作为依据），不凭空发明设定。
+async function consolidateLorebook(char) {
+  var counters = char.memory.counters;
+  var books = [char.lorebook];
+  if (char.entityType === 'group' && Array.isArray(char.members)) {
+    char.members.forEach(function(member) { if (member) books.push(member.lorebook); });
+  }
+  books.forEach(function(book) { evictStaleLorebookEntries(book); });
+  var fresh = char.memory.shortTerm.filter(function(item) { return item.analyzedAt && !item.lorebookScannedAt; });
+  if (fresh.length === 0) return true;
+  var existingLines = [];
+  books.forEach(function(book) {
+    (book || []).forEach(function(entry) {
+      existingLines.push('- ' + toText(entry.name) + '｜关键词: ' + (entry.keywords || []).join('、') + (entry.alwaysActive ? '｜常驻' : ''));
+    });
+  });
+  var sourceEntries = fresh.slice(-MEMORY_LIMITS.analysisBatch).map(function(item) {
+    return { id: item.id, content: trimText(item.content, 600) };
+  });
+  var speakerName = toText(char.basicInfo && char.basicInfo.name) || '角色';
+  var prompt = '下面是一段角色扮演对话里已经发生的事件摘要，以及现有的世界书条目清单。\n'
+    + '请找出其中**已经出现、值得日后复用**的世界层设定（时代/世界观、地点、组织、专有名词、历史、规则、背景事实），整理成世界书条目。\n'
+    + '要求：①只写已经出现或已被明确说出的内容，禁止推测、扩写或发明新设定；②已有条目能用就复用它的名字（同名会被更新），只有确实是一条新设定才起新名字；③每条 content 只写该条目本身的信息，不写理由、解释或出处；④keywords 写剧情里可能出现的称呼；若这条是世界前提/规则这类需要每轮生效的设定，把 alwaysActive 设为 true；⑤最多 3 条；没有值得沉淀的就返回空数组。\n'
+    + '只返回 JSON：{"entries":[{"name":"条目名","keywords":["触发词"],"content":"设定内容","alwaysActive":false,"sourceShortTermIds":["上面的摘要ID"]}]}。sourceShortTermIds 必须是上面出现过的摘要ID，至少要有一个；没有可引用ID的条目不要返回。\n\n'
+    + '现有条目清单：\n' + (existingLines.join('\n') || '（空）')
+    + '\n\n事件摘要（角色名：' + speakerName + '）：\n' + sourceEntries.map(function(item) { return '[' + item.id + '] ' + item.content; }).join('\n');
+  try {
+    var response = await callAPI([
+      { role: 'system', content: '你是世界书整理助手。只返回 JSON，不要任何额外文字。' },
+      { role: 'user', content: prompt }
+    ]);
+    var parsed = parseJsonPayload(response.choices[0].message.content);
+    var allowedIds = {};
+    sourceEntries.forEach(function(item) { allowedIds[item.id] = true; });
+    var items = parsed && Array.isArray(parsed.entries) ? parsed.entries.slice(0, LOREBOOK_LIMITS.autoEntriesPerPass) : [];
+    var applied = 0;
+    items.forEach(function(item) {
+      if (!isPlainObject(item)) return;
+      var sourceIds = Array.isArray(item.sourceShortTermIds) ? item.sourceShortTermIds.map(function(id) { return toText(id); }).filter(Boolean) : [];
+      if (sourceIds.length === 0 || sourceIds.some(function(id) { return !allowedIds[id]; })) return;
+      if (!toText(item.name).trim() || !toText(item.content).trim()) return;
+      var result = upsertLorebookEntry(char, {
+        name: item.name,
+        content: item.content,
+        keywords: item.keywords,
+        alwaysActive: item.alwaysActive === true
+      }, { sourceMessageIds: sourceIds, evidence: trimText(item.content, 300) });
+      if (result.ok) applied++;
+    });
+    // 本轮看过的摘要打标记，避免下一轮重复整理（后续新摘要会再次覆盖同类事实）
+    fresh.forEach(function(item) { item.lorebookScannedAt = new Date().toISOString(); });
+    return true;
+  } catch (error) {
+    console.error('consolidateLorebook failed:', error);
+    return false;
+  }
+}
+
 async function checkMemoryTriggers(char) {
   var counters = char.memory.counters;
   selfLearnMemoryImportance(char);
@@ -7013,6 +7673,18 @@ async function checkMemoryTriggers(char) {
     }
   } else if (!sceneReady) {
     sceneState.key = currentSceneKey;
+  }
+  // 世界书整理 + 自动淘汰：每积累若干条短期记忆就跑一次（没有新摘要时也会跑，用于淘汰计数）
+  var lorebookDue = (char.memory.shortTerm.length - (Number(counters.lorebookScannedCount) || 0)) >= LOREBOOK_LIMITS.consolidateSpan;
+  if (lorebookDue && canRunMemoryTask(counters, 'lorebook')) {
+    setActivity('正在整理世界书…');
+    var lorebookConsolidated = await consolidateLorebook(char);
+    if (lorebookConsolidated) {
+      resetMemoryRetry(counters, 'lorebook');
+      counters.lorebookScannedCount = char.memory.shortTerm.length;
+    } else {
+      scheduleMemoryRetry(counters, 'lorebook');
+    }
   }
   trimCharacterMemory(char);
   return true;
@@ -7187,8 +7859,8 @@ async function quickGenerateCharacter() {
   btn.innerHTML = '<svg class="icon icon-spin"><use href="#icon-loader"></use></svg>';
   try {
     var prompt = entityType === 'group'
-      ? '根据以下描述生成一个角色群组。只返回JSON：{"groupInfo":{"name":"群组名","avatar":"emoji","description":"群组描述（可包含全体共用的时代/世界观）","scene":"场景","interactionRules":"成员互动规则"},"members":[{"name":"成员名","avatar":"emoji","gender":"性别","age":"年龄","race":"种族","appearance":"外貌","personality":"性格","values":"价值观","fears":"恐惧或弱点","background":"背景","keyEvents":"关键过往（里程碑）","speakingStyle":"说话风格","language":"语言","userAddress":"该成员对用户的称呼（一个短称呼词）","roleInGroup":"群内定位","dynamicState":{"currentSituation":"当前处境","currentLocation":"当前位置","currentMood":"当前情绪","currentOccupation":"当前职业/身份","currentGoal":"当前目标","currentRelationship":"当前关系","currentImportantOthers":"当前重要他人"}}]}。群组的 description/scene 是全体成员共用的设定，必须填写；至少生成两名成员；每名成员必须尽可能填满所有字段，不能只返回名称和性格；成员之间的说话方式必须显著不同（看台词就能分辨是谁）。' + CHARACTER_QUALITY_RULE + SPEAKING_STYLE_SAMPLES_RULE + '\n描述: ' + desc
-      : '根据以下描述，生成一个角色设定。返回JSON格式，包含这些字段: name, avatar(emoji), gender, age, race, appearance, personality, values, fears, background, keyEvents, speakingStyle, language, userAddress(角色对用户的称呼，只填一个短称呼词), dynamicState（包含currentSituation、currentLocation、currentMood、currentOccupation、currentGoal、currentRelationship、currentImportantOthers）。' + CHARACTER_QUALITY_RULE + SPEAKING_STYLE_SAMPLES_RULE + '\n描述: ' + desc;
+      ? '根据以下描述生成一个角色群组。只返回JSON：{"groupInfo":{"name":"群组名","avatar":"emoji","description":"群组前提（这群人是谁、为什么在一起，1-2 句；不要写世界观/时代/地点/组织等世界层设定）","scene":"场景","interactionRules":"成员互动规则"},"lorebook":[{"name":"条目名（地点/组织/专有名词/规则等）","keywords":["触发词"],"content":"命中后注入的世界层设定","alwaysActive":false}],"members":[{"name":"成员名","avatar":"emoji","gender":"性别","age":"年龄","race":"种族","appearance":"外貌","personality":"性格","values":"价值观","fears":"恐惧或弱点","background":"背景","keyEvents":"关键过往（里程碑）","speakingStyle":"说话风格","language":"语言","userAddress":"该成员对用户的称呼（一个短称呼词）","roleInGroup":"群内定位","dynamicState":{"currentSituation":"当前处境","currentLocation":"当前位置","currentMood":"当前情绪","currentOccupation":"当前职业/身份","currentGoal":"当前目标","currentRelationship":"当前关系","currentImportantOthers":"当前重要他人"}}]}。群组的 description/scene 是全体成员共用的前提，必须填写；**世界层设定（时代/世界观、地点、组织、专有名词、历史、规则）一律写进 lorebook（2-4 条），绝不能塞进 description 或成员的 background**；lorebook 条目要能被日后复用，keywords 写剧情里可能出现的称呼（常驻内容把 alwaysActive 设为 true），content 只写该条目本身的信息。至少生成两名成员；每名成员必须尽可能填满所有字段，不能只返回名称和性格；成员之间的说话方式必须显著不同（看台词就能分辨是谁）。' + CHARACTER_QUALITY_RULE + SPEAKING_STYLE_SAMPLES_RULE + '\n描述: ' + desc
+      : '根据以下描述，生成一个角色设定。返回JSON格式，包含这些字段: name, avatar(emoji), gender, age, race, appearance, personality, values, fears, background(角色个人经历，不要写世界观), keyEvents, speakingStyle, language, userAddress(角色对用户的称呼，只填一个短称呼词), lorebook(数组，2-4 条世界层设定条目，每条 {"name":"条目名","keywords":["触发词"],"content":"命中后注入的世界层设定","alwaysActive":false})。**世界层设定（时代/世界观、地点、组织、专有名词、历史、规则）一律写进 lorebook，不要写进 background。**' + CHARACTER_QUALITY_RULE + SPEAKING_STYLE_SAMPLES_RULE + '\n描述: ' + desc;
     var response = await callAPI([
       { role: 'system', content: entityType === 'group' ? '你是群组角色设计助手。只返回JSON。' : '你是角色设计助手。根据用户描述生成详细角色设定。只返回JSON。' },
       { role: 'user', content: prompt }
@@ -7233,17 +7905,22 @@ function createCharacter() {
     group.groupInfo.scene = background;
     if (generatedGroup) {
       group.groupInfo.interactionRules = cleanFieldValue('interactionRules', toText(generatedGroup.interactionRules));
-      // 群组不再镜像基础设定字段：世界观/背景并入群组描述
-      var groupExtraDescriptions = [toText(generatedGroup.description), toText(generatedGroup.worldView), toText(generatedGroup.background)]
-        .map(function(part) { return cleanFieldValue('description', part); })
-        .filter(function(part) { return part && group.groupInfo.description.indexOf(part) === -1; });
-      if (groupExtraDescriptions.length) {
-        group.groupInfo.description = [group.groupInfo.description].concat(groupExtraDescriptions).filter(Boolean).join('\n');
+      // 群组不再镜像基础设定字段：新版响应把世界层设定放在 lorebook 里，不再并进群组前提
+      if (!Array.isArray(window._tempCharData.lorebook)) {
+        var groupExtraDescriptions = [toText(generatedGroup.description), toText(generatedGroup.worldView), toText(generatedGroup.background)]
+          .map(function(part) { return cleanFieldValue('description', part); })
+          .filter(function(part) { return part && group.groupInfo.description.indexOf(part) === -1; });
+        if (groupExtraDescriptions.length) {
+          group.groupInfo.description = [group.groupInfo.description].concat(groupExtraDescriptions).filter(Boolean).join('\n');
+        }
       }
       if (Array.isArray(generatedGroup.avatarPixel)) {
         group.basicInfo.avatarPixel = normalizePixelAvatar(generatedGroup.avatarPixel);
         group.groupInfo.avatarPixel = group.basicInfo.avatarPixel;
       }
+    }
+    if (isPlainObject(window._tempCharData) && Array.isArray(window._tempCharData.lorebook)) {
+      group.lorebook = normalizeGeneratedLorebook(window._tempCharData.lorebook);
     }
     window._tempCharData = null;
     addCharacter(group);
@@ -7272,6 +7949,9 @@ function createCharacter() {
     char.basicInfo.avatar = avatar;
     char.basicInfo.personality = personality;
     char.basicInfo.background = background;
+    if (Array.isArray(window._tempCharData.lorebook)) {
+      char.lorebook = normalizeGeneratedLorebook(window._tempCharData.lorebook);
+    }
     window._tempCharData = null;
   }
   addCharacter(char);
@@ -7295,7 +7975,7 @@ async function upgradeToGroup(id) {
     }).join('\n');
     var response = await callAPI([
       { role: 'system', content: '你是群组升级助手。只返回JSON。' },
-      { role: 'user', content: '将以下角色和近期对话升级为群组。原角色会由系统完整保留，因此绝不能在输出成员列表中再次生成原角色，也不要生成同名或明显重复的变体。请列出所有近期对话中已出现、应成为固定成员的其他角色；若不足一人，再新增一名最适合当前剧情的成员。返回JSON：{"groupInfo":{"name":"群组名","avatar":"emoji","description":"群组描述（可包含全体共用的时代/世界观）","scene":"场景","interactionRules":"成员互动规则"},"additionalMembers":[{"name":"新增成员名","avatar":"emoji","gender":"性别","age":"年龄","race":"种族","appearance":"外貌","personality":"性格","values":"价值观","fears":"恐惧或弱点","background":"背景","keyEvents":"关键过往（里程碑）","speakingStyle":"说话风格","language":"语言","userAddress":"该成员对用户的称呼（一个短称呼词）","roleInGroup":"群内定位","dynamicState":{"currentSituation":"当前处境","currentLocation":"当前位置","currentMood":"当前情绪","currentOccupation":"当前职业/身份","currentGoal":"当前目标","currentRelationship":"当前关系","currentImportantOthers":"当前重要他人"}}]}。additionalMembers只能包含新增成员，至少一名，且姓名必须互不重复；每名成员必须尽可能填满所有字段，不能只返回名称和性格；成员之间的说话方式必须显著不同（看台词就能分辨是谁）。' + CHARACTER_QUALITY_RULE + SPEAKING_STYLE_SAMPLES_RULE + '\n原角色（禁止重复输出）:\n' + JSON.stringify(char.basicInfo) + '\n近期对话:\n' + transcript }
+      { role: 'user', content: '将以下角色和近期对话升级为群组。原角色会由系统完整保留，因此绝不能在输出成员列表中再次生成原角色，也不要生成同名或明显重复的变体。请列出所有近期对话中已出现、应成为固定成员的其他角色；若不足一人，再新增一名最适合当前剧情的成员。返回JSON：{"groupInfo":{"name":"群组名","avatar":"emoji","description":"群组前提（这群人是谁、为什么在一起，1-2 句；不要写世界观/时代/地点/组织等世界层设定）","scene":"场景","interactionRules":"成员互动规则"},"lorebook":[{"name":"条目名（地点/组织/专有名词/规则等）","keywords":["触发词"],"content":"命中后注入的世界层设定","alwaysActive":false}],"additionalMembers":[{"name":"新增成员名","avatar":"emoji","gender":"性别","age":"年龄","race":"种族","appearance":"外貌","personality":"性格","values":"价值观","fears":"恐惧或弱点","background":"背景","keyEvents":"关键过往（里程碑）","speakingStyle":"说话风格","language":"语言","userAddress":"该成员对用户的称呼（一个短称呼词）","roleInGroup":"群内定位","dynamicState":{"currentSituation":"当前处境","currentLocation":"当前位置","currentMood":"当前情绪","currentOccupation":"当前职业/身份","currentGoal":"当前目标","currentRelationship":"当前关系","currentImportantOthers":"当前重要他人"}}]}。lorebook 只需补上近期对话中出现、值得日后复用的世界层设定（没有就返回空数组）；additionalMembers只能包含新增成员，至少一名，且姓名必须互不重复；每名成员必须尽可能填满所有字段，不能只返回名称和性格；成员之间的说话方式必须显著不同（看台词就能分辨是谁）。' + CHARACTER_QUALITY_RULE + SPEAKING_STYLE_SAMPLES_RULE + '\n原角色（禁止重复输出）:\n' + JSON.stringify(char.basicInfo) + '\n近期对话:\n' + transcript }
     ]);
     var data = parseJsonPayload(response.choices[0].message.content);
     var additionalMembers = Array.isArray(data && data.additionalMembers) ? data.additionalMembers : (Array.isArray(data && data.members) ? data.members : null);
@@ -7321,13 +8001,15 @@ async function upgradeToGroup(id) {
       scene: cleanFieldValue('scene', toText(data.groupInfo.scene, char.dynamicState.currentLocation)),
       interactionRules: cleanFieldValue('interactionRules', toText(data.groupInfo.interactionRules))
     };
-    // 群组不再镜像基础设定字段：世界观/背景并入群组描述
-    [toText(data.groupInfo.worldView), toText(data.groupInfo.background)].forEach(function(part) {
-      var cleaned = cleanFieldValue('description', part);
-      if (cleaned && groupInfo.description.indexOf(cleaned) === -1) {
-        groupInfo.description = groupInfo.description ? (groupInfo.description + '\n' + cleaned) : cleaned;
-      }
-    });
+    // 群组不再镜像基础设定字段：新版响应把世界层设定放在 lorebook 里，不再并进群组前提
+    if (!Array.isArray(data.lorebook)) {
+      [toText(data.groupInfo.worldView), toText(data.groupInfo.background)].forEach(function(part) {
+        var cleaned = cleanFieldValue('description', part);
+        if (cleaned && groupInfo.description.indexOf(cleaned) === -1) {
+          groupInfo.description = groupInfo.description ? (groupInfo.description + '\n' + cleaned) : cleaned;
+        }
+      });
+    }
     var group = createGroupObj(groupInfo.name, groupInfo.avatar, groupInfo.description, members, true);
     group.groupInfo = groupInfo;
     group.basicInfo.avatarPixel = groupInfo.avatarPixel;
@@ -7335,6 +8017,15 @@ async function upgradeToGroup(id) {
     group.dynamicStateMeta = JSON.parse(JSON.stringify(char.dynamicStateMeta));
     mergeLegacyDynamicFields(group);
     group.memory = JSON.parse(JSON.stringify(char.memory));
+    // 原角色的世界书条目随升级并入群组（世界层设定是共用的），再合并本次新生成的条目
+    var upgradedBook = normalizeLorebook(char.lorebook).concat(Array.isArray(data.lorebook) ? normalizeGeneratedLorebook(data.lorebook) : []);
+    var seenBookNames = Object.create(null);
+    group.lorebook = upgradedBook.filter(function(entry) {
+      var bookKey = toText(entry.name).trim().toLowerCase() || entry.id;
+      if (seenBookNames[bookKey]) return false;
+      seenBookNames[bookKey] = true;
+      return true;
+    });
     addCharacter(group);
   } catch (error) {
     alert('升级失败：' + error.message);
@@ -8273,11 +8964,13 @@ function loadSettingsForm() {
   document.getElementById('apiThinking').value = normalizeReasoningEffort(state.config.reasoningEffort);
   var proactiveToggle = document.getElementById('proactiveToggle');
   if (proactiveToggle) proactiveToggle.checked = state.config.proactiveEnabled !== false;
+  var styleCritiqueToggle = document.getElementById('styleCritiqueToggle');
+  if (styleCritiqueToggle) styleCritiqueToggle.checked = state.config.styleCritique !== false;
   renderModelOptions(platform);
   document.getElementById('modelName').value = slot.modelName || state.config.modelName || '';
   renderCacheStats();
   renderDebugInfo();
-  ['apiPlatform', 'apiBaseUrl', 'apiKey', 'modelName', 'apiTemperature', 'apiStream', 'apiThinking', 'proactiveToggle'].forEach(function(id) {
+  ['apiPlatform', 'apiBaseUrl', 'apiKey', 'modelName', 'apiTemperature', 'apiStream', 'apiThinking', 'proactiveToggle', 'styleCritiqueToggle'].forEach(function(id) {
     var el = document.getElementById(id);
     if (el) el.addEventListener('change', saveSettings);
   });
@@ -8321,6 +9014,7 @@ function toolActivityHint(name) {
     delete_memory: '正在清理记忆…',
     set_reminder: '已记下，正在回应…',
     update_character_field: '已按你的要求调整设定…',
+    upsert_lorebook_entry: '已更新世界书…',
     web_search: '正在搜索…',
     web_fetch: '正在读取网页…',
     send_sticker: '正在挑表情…'
@@ -8560,6 +9254,8 @@ function saveSettings() {
   state.config.reasoningEffort = normalizeReasoningEffort(document.getElementById('apiThinking').value);
   var proactiveToggle = document.getElementById('proactiveToggle');
   if (proactiveToggle) state.config.proactiveEnabled = proactiveToggle.checked;
+  var styleCritiqueToggle = document.getElementById('styleCritiqueToggle');
+  if (styleCritiqueToggle) state.config.styleCritique = styleCritiqueToggle.checked;
   savePlatformFields(platform);
   scheduleSave();
 }
@@ -8585,6 +9281,7 @@ window.addEventListener('DOMContentLoaded', function() {
   scheduleProactiveCheck();
   setTimeout(autoFillStaticFields, 3000);
   setTimeout(maybeMigrateFieldStructure, 1200);
+  setTimeout(maybeMigrateLorebookWorld, 2400);
   document.addEventListener('visibilitychange', function() {
     if (document.visibilityState === 'visible') {
       scheduleProactiveCheck();
