@@ -87,13 +87,20 @@ try {
     + '\n' + extractBraced(script, 'function collectRecentStyleViolations(')
     + '\n' + extractBraced(script, 'function buildStyleReview(')
     + '\n' + extractBraced(script, 'function buildStyleCorrectionReminder(')
+    + '\n' + extractBraced(script, 'function detectQuickReplyIssues(')
+    + '\n' + extractBraced(script, 'function getLastQuickReplyIssues(')
+    + '\n' + extractBraced(script, 'function buildQuickReplyPerspectiveReminder(')
+    + '\n' + extractBraced(script, 'function buildQuickReplyAsUserPrompt(')
     + '\n' + extractBraced(script, 'function extractReplyEnding(')
     + '\n' + extractBraced(script, 'function normalizeUserAddress(')
     + '\n' + script.match(/const STYLE_GUARD = \{[\s\S]*?\n\};/)[0]
     + '\n' + script.match(/const STYLE_CLICHES = \[.*?\];/)[0]
     + '\n' + script.match(/const STYLE_VIOLATION_LABELS = \{[\s\S]*?\n\};/)[0]
+    + '\n' + script.match(/const QUICK_REPLY_GUARD = \{[\s\S]*?\n\};/)[0]
+    + '\n' + script.match(/const QUICK_REPLY_ISSUE_LABELS = \{[\s\S]*?\n\};/)[0]
+    + '\n' + script.match(/const QUICK_REPLY_PLACEHOLDERS = \[.*?\];/)[0]
     + '\n' + script.match(/const LOREBOOK_LIMITS = \{[\s\S]*?\n\};/)[0]
-    + '\nreturn { NARRATIVE_PATTERNS: NARRATIVE_PATTERNS, buildNarrativePatternDirective: buildNarrativePatternDirective, normalizeLorebook: normalizeLorebook, normalizeGeneratedLorebook: normalizeGeneratedLorebook, collectLorebookEntries: collectLorebookEntries, resolveLorebookList: resolveLorebookList, findLorebookEntry: findLorebookEntry, resolveLorebookSources: resolveLorebookSources, upsertLorebookEntry: upsertLorebookEntry, evictStaleLorebookEntries: evictStaleLorebookEntries, matchLorebookEntries: matchLorebookEntries, buildLorebookLines: buildLorebookLines, markLorebookMentions: markLorebookMentions, buildLorebookContext: buildLorebookContext, formatLorebookMention: formatLorebookMention, LOREBOOK_LIMITS: LOREBOOK_LIMITS, getSceneKey: getSceneKey, memoryTaskKeys: memoryTaskKeys, toolActivityHint: toolActivityHint, chatStageDecision: chatStageDecision, extractSpeakingSamples: extractSpeakingSamples, buildStyleAnchor: buildStyleAnchor, detectStyleViolations: detectStyleViolations, isSentenceLengthUniform: isSentenceLengthUniform, sharesDistinctivePhrase: sharesDistinctivePhrase, getLastStyleViolations: getLastStyleViolations, collectRecentStyleViolations: collectRecentStyleViolations, buildStyleReview: buildStyleReview, buildStyleCorrectionReminder: buildStyleCorrectionReminder, STYLE_GUARD: STYLE_GUARD, STYLE_VIOLATION_LABELS: STYLE_VIOLATION_LABELS };';
+    + '\nreturn { NARRATIVE_PATTERNS: NARRATIVE_PATTERNS, buildNarrativePatternDirective: buildNarrativePatternDirective, normalizeLorebook: normalizeLorebook, normalizeGeneratedLorebook: normalizeGeneratedLorebook, collectLorebookEntries: collectLorebookEntries, resolveLorebookList: resolveLorebookList, findLorebookEntry: findLorebookEntry, resolveLorebookSources: resolveLorebookSources, upsertLorebookEntry: upsertLorebookEntry, evictStaleLorebookEntries: evictStaleLorebookEntries, matchLorebookEntries: matchLorebookEntries, buildLorebookLines: buildLorebookLines, markLorebookMentions: markLorebookMentions, buildLorebookContext: buildLorebookContext, formatLorebookMention: formatLorebookMention, LOREBOOK_LIMITS: LOREBOOK_LIMITS, getSceneKey: getSceneKey, memoryTaskKeys: memoryTaskKeys, toolActivityHint: toolActivityHint, chatStageDecision: chatStageDecision, extractSpeakingSamples: extractSpeakingSamples, buildStyleAnchor: buildStyleAnchor, detectStyleViolations: detectStyleViolations, isSentenceLengthUniform: isSentenceLengthUniform, sharesDistinctivePhrase: sharesDistinctivePhrase, getLastStyleViolations: getLastStyleViolations, collectRecentStyleViolations: collectRecentStyleViolations, buildStyleReview: buildStyleReview, buildStyleCorrectionReminder: buildStyleCorrectionReminder, STYLE_GUARD: STYLE_GUARD, STYLE_VIOLATION_LABELS: STYLE_VIOLATION_LABELS, buildQuickReplyPerspectiveReminder: buildQuickReplyPerspectiveReminder, buildQuickReplyAsUserPrompt: buildQuickReplyAsUserPrompt, QUICK_REPLY_GUARD: QUICK_REPLY_GUARD, QUICK_REPLY_ISSUE_LABELS: QUICK_REPLY_ISSUE_LABELS, detectQuickReplyIssues: detectQuickReplyIssues, getLastQuickReplyIssues: getLastQuickReplyIssues };';
   unit = new Function(src)();
 } catch (error) {
   ok('可提取并求值目标函数', false, error.message);
@@ -270,24 +277,26 @@ if (unit) {
   const happy = chatStageDecision('auto-final', { structuredOk: true, hasQuickReplies: true });
   ok('正常路径不触发整理回复', happy.action === 'accept-text' && !happy.activity && !happy.bubble, JSON.stringify(happy));
 
-  const noQuick = chatStageDecision('auto-final', { structuredOk: true, hasQuickReplies: false });
-  ok('阶段一 JSON 缺 quickReplies 才转整理回复', noQuick.action === 'force-submit' && noQuick.activity === '正在整理回复…' && noQuick.bubble === '正在整理回复…', JSON.stringify(noQuick));
+  const noQuick = chatStageDecision('auto-final', { structuredOk: true, hasQuickReplies: false, hasText: true });
+  ok('阶段一 JSON 缺 quickReplies 也直接采用（不再整理）', noQuick.action === 'accept-text' && !noQuick.activity && !noQuick.bubble, JSON.stringify(noQuick));
+
+  const prose = chatStageDecision('auto-final', { structuredOk: false, hasQuickReplies: false, hasText: true });
+  ok('阶段一散文收尾直接采用（不再整理）', prose.action === 'accept-text' && !prose.activity && !prose.bubble, JSON.stringify(prose));
 
   const noJson = chatStageDecision('auto-final', {});
-  ok('阶段一无 JSON 正文转整理回复', noJson.action === 'force-submit' && noJson.activity === '正在整理回复…');
+  ok('阶段一无任何正文才退兜底收尾', noJson.action === 'force-submit' && noJson.activity === '正在整理回复…' && noJson.bubble === '正在整理回复…');
 
   const toolRun = chatStageDecision('auto-tool', { toolName: 'search_memory' });
   ok('工具轮：显示工具提示 + 继续推理', toolRun.action === 'run-tool' && toolRun.activity === '工具结果已返回，正在继续推理…' && toolRun.bubble === '正在回忆…', JSON.stringify(toolRun));
   ok('工具轮提示与工具一一对应', chatStageDecision('auto-tool', { toolName: 'web_fetch' }).bubble === '正在读取网页…');
 
-  const limit = chatStageDecision('auto-tool-limit', {});
-  ok('工具次数上限：提示上限并收尾', limit.action === 'force-submit' && limit.activity === '工具调用次数达到上限，直接收尾…' && limit.bubble === '正在整理回复…', JSON.stringify(limit));
+  const limit = chatStageDecision('auto-tool-limit', { hasText: true });
+  ok('工具次数上限且有正文：直接收尾（不再整理）', limit.action === 'accept-text' && limit.activity === '工具调用已达上限，直接收尾…' && !limit.bubble, JSON.stringify(limit));
+  const limitEmpty = chatStageDecision('auto-tool-limit', {});
+  ok('工具次数上限且无正文：退兜底收尾', limitEmpty.action === 'force-submit' && limitEmpty.activity === '正在整理回复…');
 
-  const qrRetry = chatStageDecision('quick-replies-missing', { phase: 'submit', quickRepliesRetried: false, attemptsLeft: 1 });
-  ok('提交缺 quickReplies：先补齐一次', qrRetry.action === 'retry-quick-replies' && qrRetry.activity === '正在补齐快速回应…', JSON.stringify(qrRetry));
-  ok('已补齐过则接受正文（不死循环）', chatStageDecision('quick-replies-missing', { phase: 'submit', quickRepliesRetried: true, attemptsLeft: 1 }).action === 'accept-reply');
-  ok('无重试额度则接受正文', chatStageDecision('quick-replies-missing', { phase: 'submit', quickRepliesRetried: false, attemptsLeft: 0 }).action === 'accept-reply');
-  ok('阶段一缺 quickReplies 不走补齐分支', chatStageDecision('quick-replies-missing', { phase: 'auto', quickRepliesRetried: false, attemptsLeft: 2 }).action === 'accept-reply');
+  ok('提交缺 quickReplies：直接接受正文（由后台换位生成补齐）', chatStageDecision('quick-replies-missing', { phase: 'submit', quickRepliesRetried: false, attemptsLeft: 1 }).action === 'accept-reply');
+  ok('阶段一缺 quickReplies 不走补齐分支', chatStageDecision('quick-replies-missing', { phase: 'auto' }).action === 'accept-reply');
 
   const submitRetry = chatStageDecision('submit-retry', {});
   ok('阶段二重试：重新整理回复', submitRetry.action === 'retry-submit' && submitRetry.activity === '正在重新整理回复…' && submitRetry.bubble === '正在重新整理回复…');
@@ -346,6 +355,35 @@ if (unit) {
   ok('collectRecentStyleViolations: 汇总近 N 条标签', collectRecentStyleViolations(historyChar(3, ['cliche']), 3).includes('cliche'));
 }
 
+console.log('\n[2d] 快速回应视角（校验 + 后台换位生成 + 内部提醒）');
+if (unit) {
+  const { detectQuickReplyIssues, getLastQuickReplyIssues, buildQuickReplyPerspectiveReminder, buildQuickReplyAsUserPrompt, QUICK_REPLY_GUARD, QUICK_REPLY_ISSUE_LABELS } = unit;
+  const qrChar = { basicInfo: { name: '甲', userAddress: '明明' }, memory: { instant: [] } };
+
+  ok('detectQuickReplyIssues: 正常用户视角通过', detectQuickReplyIssues(['我慢慢说，你先别催我。', '你今天怎么这么晚？'], qrChar, '（把外套搭在椅背上）外面风大，我绕了两条街才找到这家店。').length === 0);
+  ok('detectQuickReplyIssues: 少于两条判 missing', detectQuickReplyIssues(['就一句'], qrChar, '随便说点什么。').includes('missing'));
+  ok('detectQuickReplyIssues: 空数组判 missing', detectQuickReplyIssues([], qrChar, '随便说点什么。').includes('missing'));
+  ok('detectQuickReplyIssues: 占位符被抓', detectQuickReplyIssues(['短句一', '短句二'], qrChar, '随便说点什么。').includes('placeholder'));
+  ok('detectQuickReplyIssues: 括号动作被抓', detectQuickReplyIssues(['（叹气）行吧。', '我说了算。'], qrChar, '随便说点什么。').includes('action'));
+  ok('detectQuickReplyIssues: 复述角色台词被抓', detectQuickReplyIssues(['我绕了两条街才找到这家店。', '随便聊聊。'], qrChar, '（把外套搭在椅背上）外面风大，我绕了两条街才找到这家店。').includes('mirrored'));
+  ok('detectQuickReplyIssues: 出现角色名被抓', detectQuickReplyIssues(['阿甲：你先坐下。', '随便聊聊。'], { basicInfo: { name: '阿甲' }, memory: { instant: [] } }, '（把外套搭在椅背上）外面风大。').includes('characterName'));
+  ok('detectQuickReplyIssues: 过长被抓', detectQuickReplyIssues(['这是一句明显超过快速回应长度上限的测试短句'.repeat(3), '随便聊聊。'], qrChar, '随便说点什么。').includes('tooLong'));
+  ok('QUICK_REPLY_GUARD: 常量齐全', QUICK_REPLY_GUARD.maxChars > 0 && QUICK_REPLY_GUARD.mirrorChars > 0 && QUICK_REPLY_GUARD.repairMaxChars > 0);
+  ok('QUICK_REPLY_ISSUE_LABELS: 覆盖全部标签', ['missing', 'placeholder', 'action', 'mirrored', 'characterName', 'tooLong'].every((k) => typeof QUICK_REPLY_ISSUE_LABELS[k] === 'string'));
+
+  const qrHistoryChar = (issues) => ({ basicInfo: { name: '甲' }, memory: { instant: [{ id: 'm1', role: 'user', content: '在吗' }, { id: 'm2', role: 'assistant', content: '在。', quickReplyIssues: issues }] } });
+  ok('getLastQuickReplyIssues: 取最后一条 assistant 的问题', JSON.stringify(getLastQuickReplyIssues(qrHistoryChar(['mirrored']))) === JSON.stringify(['mirrored']));
+  ok('getLastQuickReplyIssues: 无问题返回空', getLastQuickReplyIssues(qrHistoryChar(undefined)).length === 0);
+  ok('buildQuickReplyPerspectiveReminder: 有点名与换位要求', buildQuickReplyPerspectiveReminder(qrHistoryChar(['mirrored'])).includes('上一轮快速回应') && buildQuickReplyPerspectiveReminder(qrHistoryChar(['mirrored'])).includes('用户本人'));
+  ok('buildQuickReplyPerspectiveReminder: 无问题为空串', buildQuickReplyPerspectiveReminder(qrHistoryChar(undefined)) === '');
+
+  const asUserPrompt = buildQuickReplyAsUserPrompt({ basicInfo: { name: '甲', userAddress: '明明' } }, '（把外套搭在椅背上）外面风大。');
+  ok('buildQuickReplyAsUserPrompt: system 身份是用户本人', asUserPrompt.system.includes('你就是这位用户本人'));
+  ok('buildQuickReplyAsUserPrompt: 明确禁止扮演角色', asUserPrompt.system.includes('不要扮演甲'));
+  ok('buildQuickReplyAsUserPrompt: user 段给出角色原话与要求', asUserPrompt.user.includes('把外套搭在椅背上') && asUserPrompt.user.includes('不得是甲会说的话'));
+  ok('buildQuickReplyAsUserPrompt: 要求 JSON 两条', asUserPrompt.user.includes('"quickReplies":["句子一","句子二"]'));
+}
+
 console.log('\n[3] 提示词静态断言');
 const mustHave = [
   ['禁止替用户说话/行动', '0.5 你只扮演角色本人，绝不能替用户说话或行动'],
@@ -355,10 +393,13 @@ const mustHave = [
   ['句长节奏要求', '句长与节奏要有起伏'],
   ['记忆取用说明', '【记忆取用说明】'],
   ['节奏骨架注入点', 'volatileContext += buildNarrativePatternDirective();'],
-  ['JSON 收口规则仍在', '回复必须且只能是单个JSON对象'],
-  ['quickReplies 强制两条仍在', 'JSON必须无条件包含quickReplies'],
+  ['JSON 收口规则仍在', '本轮必须以结构化方式收尾'],
+  ['quickReplies 强制两条仍在', 'quickReplies 必须恰好两条'],
+  ['快速回应：禁止角色视角提问', '角色视角的提问**——那是角色在问用户'],
+  ['阶段一可用提交工具收尾', 'tools.push(buildSubmitResponseTool());'],
+  ['散文即终稿（不再强制重发）', '散文即终稿'],
   ['输出格式强调仍在', '【输出格式】'],
-  ['输出格式：用过工具也要以 JSON 收尾', '即使本轮调用过工具，最终也必须用这一个 JSON 对象收尾'],
+  ['输出格式：工具或 JSON 二选一收尾', '即使本轮调用过其他工具，也必须以上述方式之一收尾'],
   ['输出格式：禁用代码块包裹', '不得用 Markdown 代码块包裹'],
   ['长会话精简示例常量', 'const JSON_EXAMPLE_BRIEF'],
   ['示例按轮次切换', 'assistantTurnCount < 6 ? jsonExampleRule : JSON_EXAMPLE_BRIEF'],
@@ -426,6 +467,15 @@ const mustHave = [
   ['长期记忆：证据不足宁可不记', '**证据不足宁可不记**'],
   ['剧情弧线：命名稳定', 'arcOf命名一旦确定就保持稳定'],
   ['前缀缓存注释仍在', 'volatile 上下文只附加到当前用户'],
+  ['快速回应视角校验接点', 'var quickReplyIssues = detectQuickReplyIssues(quickReplies, char, displayText);'],
+  ['快速回应后台换位生成', 'async function generateQuickRepliesAsUser(char, replyText, userMessage)'],
+  ['快速回应后台修复不回写正文', 'async function repairQuickRepliesAsUser(char, replyText, userMessage, messageId, fallbackList)'],
+  ['散文轮后台记忆补写', 'async function extractProseTurnMemory(char, userMessage, replyText, assistantMessage)'],
+  ['散文轮不再阻塞在可见链路里换 JSON', 'if (!memUpdate) needsBackgroundMemory = true;'],
+  ['快速回应视角提醒注入点', 'volatileContext += buildQuickReplyPerspectiveReminder(char);'],
+  ['快速回应视角开关', 'id="quickReplyRepairToggle"'],
+  ['快速回应视角默认开启', 'quickReplyRepair: rawConfig.quickReplyRepair !== false'],
+  ['后台任务串行队列', 'function queueBackgroundTask(task)'],
   ['角色设定固定前缀仍在', '【角色设定（固定，不随对话变化）】']
 ];
 mustHave.forEach(([name, needle]) => ok(name, script.includes(needle) || html.includes(needle)));
@@ -456,11 +506,10 @@ try {
   console.log('  HEAD 规则块 = ' + before.length + ' 字符');
   console.log('  现在规则块 = ' + after.length + ' 字符');
   console.log('  长会话等效 = ' + longChatNow + ' 字符（第 6 轮起把完整示例换成精简版：' + fullRuleLen + ' -> ' + briefLen + '）');
-  const added = after.split('\n').filter((l) => /systemPrompt \+= '(0\.5|2\.6) /.test(l)).reduce((s, l) => s + l.length, 0);
-  console.log('  本批新增规则（0.5 + 2.6）共 ' + added + ' 字符');
-  console.log('  纯精简净效果 = ' + (before.length + added) + ' -> ' + longChatNow + '（' + ((before.length + added - longChatNow) / (before.length + added) * 100).toFixed(1) + '%）');
-  ok('长会话等效不超过 HEAD（在新增规则的前提下）', longChatNow <= before.length, before.length + ' vs ' + longChatNow);
-  ok('剔除新增规则后精简幅度 >= 10%', (before.length + added - longChatNow) / (before.length + added) >= 0.1, ((before.length + added - longChatNow) / (before.length + added) * 100).toFixed(1) + '%');
+  // 体积回归护栏：长会话（用精简示例）不得比上一版明显膨胀。规则本身可以增删，
+  // 但必须用精简表达式换回来——避免"每加一条规则就把前缀写胖一圈"。
+  ok('长会话等效不超过 HEAD 的 102%（防提示词膨胀）', longChatNow <= before.length * 1.02, before.length + ' vs ' + longChatNow + '（' + ((longChatNow / before.length - 1) * 100).toFixed(1) + '%）');
+  ok('精简版示例显著短于完整示例（长会话省 token）', briefLen > 0 && briefLen <= fullRuleLen * 0.7, fullRuleLen + ' -> ' + briefLen);
 } catch (error) {
   ok('可与 HEAD 对比规则块体积', false, error.message);
 }

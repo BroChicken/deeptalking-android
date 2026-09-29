@@ -939,6 +939,7 @@ input:focus, textarea:focus, select:focus {
           </div>
           <label class="flex items-center gap-2 text-xs text-muted-c"><input type="checkbox" id="proactiveToggle"> 角色主动开口（打开面板停留约 1 分钟未对话时，角色主动发起开场）</label>
           <label class="flex items-center gap-2 text-xs text-muted-c"><input type="checkbox" id="styleCritiqueToggle"> 文风自动校对（回复命中语气/风格问题时，追加一次只改文风的修订请求）</label>
+          <label class="flex items-center gap-2 text-xs text-muted-c"><input type="checkbox" id="quickReplyRepairToggle"> 快速回应视角校正（快速回应不像用户会说的话时，后台用“用户本人”身份重写一次）</label>
            <div id="debugInfoWrap" class="hidden mt-3">
              <div class="flex items-center justify-between mb-1">
                <label class="block text-xs text-muted-c">调试信息（最近一次回应完整内容与活动时间线）</label>
@@ -1138,9 +1139,10 @@ const DEFAULT_CONFIG = {
   reasoningEffort: 'medium',
   proactiveEnabled: true,
   styleCritique: true,
+  quickReplyRepair: true,
   platformSettings: {}
 };
-const APP_VERSION = '1.3.3';
+const APP_VERSION = '1.3.4';
 const PLATFORM_CONFIGS = {
   deepseek: { baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-flash', models: ['deepseek-flash'] },
   opencode: { baseUrl: 'https://opencode.ai/zen/go/v1', model: 'deepseek-flash', keepV1InResponses: true, models: ['deepseek-flash'] },
@@ -1272,6 +1274,26 @@ const STYLE_VIOLATION_LABELS = {
   toneDrift: '没有体现设定的说话风格（口癖/句尾/称呼），或句长过于整齐缺少起伏',
   recitedLore: '复述了世界书或设定条目本身，应当只在需要时自然引用'
 };
+
+// 快速回应（quickReplies）必须是"用户下一句要发给角色的话"：客户端做视角校验，
+// 命中问题就换一个专门扮演"用户本人"的后台小调用重写（不阻塞正文、不占主链路请求）。
+const QUICK_REPLY_GUARD = {
+  maxChars: 60,          // 单条上限（超过则判为不像用户随手打的一句话）
+  mirrorChars: 8,        // 与角色本轮/上轮台词逐字重合多少字即判为"复述角色台词"
+  repairMaxChars: 40     // 换位生成时要求单条不超过的字数
+};
+
+const QUICK_REPLY_ISSUE_LABELS = {
+  missing: '没有给出两条可用短句',
+  placeholder: '把示例占位文字（如"短句一/短句二"）当成了真内容',
+  action: '带了括号动作或旁白（快速回应只写用户会打的字）',
+  mirrored: '复述或镜像了角色刚说过的话',
+  characterName: '出现了角色自己的名字，像是在用角色口吻说话',
+  tooLong: '单条过长，不像用户随手打的一句话'
+};
+
+// 占位符/模板串：模型偶尔会照抄 JSON 示例里的"短句一""用户下一句1"
+const QUICK_REPLY_PLACEHOLDERS = ['短句一', '短句二', '短句1', '短句2', '用户下一句', '用户下一句1', '用户下一句2', '示例一', '示例二', '...', '…'];
 
 function normalizeLorebook(value) {
   if (!Array.isArray(value)) return [];
@@ -1530,7 +1552,7 @@ function buildLorebookContext(char, query, outUsed) {
 
 
 // 长会话使用的精简 JSON 示例（新会话前几轮用完整示例，之后换成这一版，省 token）
-const JSON_EXAMPLE_BRIEF = '8. JSON格式示例（未更新字段直接省略；无合格记忆返回空数组或空对象，但quickReplies仍必须两条）：{"reply":"（穿插全角括号动作）角色本轮回复正文。","quickReplies":["短句一","短句二"],"shortTerm":[{"content":"本轮事件摘要，写明谁做了什么并写绝对日期（如2026-08-10 晚上）","sourceMessageIds":["msg_id"],"timeRef":{"anchor":"today"}}],"dynamicState":{"currentMood":{"value":"当前情绪。","sourceMessageIds":["current_response"],"evidence":"概括本轮回复"},"currentSituation":{"value":"当前处境，写具体日期+时段。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"}},"longTerm":[{"category":"userProfile","subject":"user","key":"稳定标识","value":"用户的具体事实。","tags":["关键词"],"importance":5,"sourceMessageIds":["msg_id"],"evidence":"用户原话","eventTime":"ISO时间"}]}。示例仅示范字段结构与动作穿插方式，**不得模仿其口吻或措辞**（口吻一律以角色设定的“说话风格”为准）。JSON字符串转义：真实换行写\\n，字面反斜杠写\\\\，双引号写\\"。\n';
+const JSON_EXAMPLE_BRIEF = '8. JSON格式示例（未更新字段直接省略；无合格记忆返回空数组或空对象，但quickReplies仍必须两条）：{"reply":"（穿插全角括号动作）角色本轮回复正文。","quickReplies":["我慢慢说，你先别催我。","你绕了两条街？也不嫌累。"],"shortTerm":[{"content":"本轮事件摘要，写明谁做了什么并写绝对日期（如2026-08-10 晚上）","sourceMessageIds":["msg_id"],"timeRef":{"anchor":"today"}}],"dynamicState":{"currentMood":{"value":"当前情绪。","sourceMessageIds":["current_response"],"evidence":"概括本轮回复"},"currentSituation":{"value":"当前处境，写具体日期+时段。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"}},"longTerm":[{"category":"userProfile","subject":"user","key":"稳定标识","value":"用户的具体事实。","tags":["关键词"],"importance":5,"sourceMessageIds":["msg_id"],"evidence":"用户原话","eventTime":"ISO时间"}]}。示例仅示范字段结构、动作穿插方式与quickReplies的用户视角，**不得模仿其口吻或措辞**（口吻一律以角色设定的“说话风格”为准）。JSON字符串转义：真实换行写\\n，字面反斜杠写\\\\，双引号写\\"。\n';
 
 function createMemoryId(prefix) {
   return (prefix || 'mem') + '_' + Date.now() + '_' + Math.random().toString(36).slice(2, 9);
@@ -2667,6 +2689,7 @@ function normalizeAppData(data, strict, skipLegacyRepair) {
        reasoningEffort: normalizeReasoningEffort(rawConfig.reasoningEffort),
        proactiveEnabled: rawConfig.proactiveEnabled !== false,
        styleCritique: rawConfig.styleCritique !== false,
+       quickReplyRepair: rawConfig.quickReplyRepair !== false,
        cacheStats: normalizeCacheStats(rawConfig.cacheStats),
        platformSettings: platformSettings
     },
@@ -3999,7 +4022,6 @@ async function sendMessage(options) {
     var toolState = { items: [], rounds: 0, char: char };
     var phase = 'auto';
     var submitAttempted = false;
-    var quickRepliesRetried = false;
     var structuredFromSubmit = null;
     while (true) {
       var attempt = await performChatRequestWithRetry(messages, text, loadingMsg, toolState, phase);
@@ -4013,19 +4035,11 @@ async function sendMessage(options) {
           structuredFromSubmit = submitResult;
           break;
         }
-        // 协议层守卫：submit_response 有 reply 但缺/非法 quickReplies。重试一次逼模型补全；
-        // 若已重试过仍缺，则接受 reply 并放行（后面会走 quickReplies 兜底），避免死循环。
+        // submit_response 有 reply 但缺/非法 quickReplies：不再重发补一轮，直接接受正文
+        // （记忆字段照常保留），快速回应交给后台"换位生成"补齐。
         if (submitResult && submitResult.reason === 'missing_quick_replies') {
           salvagedReply = submitResult.reply;
-          var quickRepliesDecision = chatStageDecision('quick-replies-missing', { phase: phase, quickRepliesRetried: quickRepliesRetried, attemptsLeft: attemptsLeft });
-          if (quickRepliesDecision.action === 'retry-quick-replies') {
-            quickRepliesRetried = true;
-            attemptsLeft--;
-            setActivity(quickRepliesDecision.activity);
-            updateMessageBubble(loadingMsg.id, getDisplayText(quickRepliesDecision.bubble));
-            continue;
-          }
-          structuredFromSubmit = { ok: true, obj: { reply: submitResult.reply }, reply: submitResult.reply, rawArgs: submitResult.rawArgs };
+          structuredFromSubmit = { ok: true, obj: submitResult.obj || { reply: submitResult.reply }, reply: submitResult.reply, rawArgs: submitResult.rawArgs };
           fullText = submitResult.rawArgs;
           break;
         }
@@ -4043,7 +4057,9 @@ async function sendMessage(options) {
         }
         if (phase === 'auto' && infoCalls.length) {
           if (toolState.rounds >= MAX_TOOL_ROUNDS) {
-            var toolLimitDecision = chatStageDecision('auto-tool-limit', {});
+            var toolLimitDecision = chatStageDecision('auto-tool-limit', { hasText: !!(fullText && fullText.trim()) });
+            if (toolLimitDecision.action === 'accept-text') break;
+            noteStageEvent('forcedSubmitAtToolLimit');
             setActivity(toolLimitDecision.activity);
             phase = 'submit';
             submitAttempted = false;
@@ -4067,17 +4083,18 @@ async function sendMessage(options) {
           continue;
         }
         if (phase === 'auto') {
-          // 阶段一结束：若模型已直接给出含 quickReplies 的合法 JSON 正文，直接用（省一次请求）；
-          // 否则切换阶段二强制 submit_response 收尾，保证结构合规（含快速回应）。
+          // 阶段一结束：拿到正文（合法 JSON 或散文）就直接采用——散文即终稿，不再为了补
+          // quickReplies/记忆而强制重发一轮（历史问题：几乎每轮都出现"正在整理回复…"）。
           var autoStructured = parseStructuredResponse(fullText);
-          var autoFinalDecision = chatStageDecision('auto-final', { structuredOk: !!(autoStructured && autoStructured.ok), hasQuickReplies: !!(autoStructured && autoStructured.hasQuickReplies) });
+          var autoFinalDecision = chatStageDecision('auto-final', { structuredOk: !!(autoStructured && autoStructured.ok), hasQuickReplies: !!(autoStructured && autoStructured.hasQuickReplies), hasText: !!(fullText && fullText.trim()) });
           if (autoFinalDecision.action === 'accept-text') break;
+          // 兜底：阶段一既没有合法 JSON 也没有任何正文，才切阶段二强制 submit_response 收尾
+          noteStageEvent('forcedSubmitAtAutoFinal');
           // 切阶段二前把阶段一的 reasoning 与正文回传，保持 thinking 上下文连续
           (attempt.reasoningItems || []).forEach(function(item) { toolState.items.push(item); });
           if (fullText && fullText.trim()) {
             toolState.items.push({ role: 'assistant', content: trimText(fullText, 1200) });
           }
-          if (autoStructured.ok && autoStructured.reply) salvagedReply = autoStructured.reply;
           phase = 'submit';
           submitAttempted = false;
           setActivity(autoFinalDecision.activity);
@@ -4089,6 +4106,7 @@ async function sendMessage(options) {
           var submitRetryDecision = chatStageDecision('submit-retry', {});
           submitAttempted = true;
           attemptsLeft--;
+          noteStageEvent('submitRetry');
           setActivity(submitRetryDecision.activity);
           updateMessageBubble(loadingMsg.id, getDisplayText(submitRetryDecision.bubble));
           continue;
@@ -4157,6 +4175,9 @@ async function sendMessage(options) {
       throw new Error('收到空回复');
     }
 
+    // 散文收尾（模型没走 JSON、也没调用 submit_response）时的后台记忆提取标记：
+    // 正文直接采用、不等它，记忆/状态由后台"整理助手"补写（不再阻塞、不再重写回复）
+    var needsBackgroundMemory = false;
     var displayText;
     var memUpdate;
     if (structured && structured.ok) {
@@ -4177,18 +4198,7 @@ async function sendMessage(options) {
       displayText = getDisplayText(fullText);
       loadingMsg.content = displayText;
       memUpdate = parseMemoryFromText(fullText, char, loadingMsg);
-      if (!memUpdate) {
-        var converted = null;
-        try { converted = await convertProseToJson(char, userMessage, displayText); } catch (e) { converted = null; }
-        if (!converted || !isPlainObject(converted) || typeof converted.reply !== 'string') {
-          converted = { reply: displayText, quickReplies: ['嗯', '继续'], shortTerm: [], longTerm: [], dynamicState: {}, memberDynamicState: [], promiseUpdates: [] };
-        } else {
-          converted.reply = displayText;
-          if (!Array.isArray(converted.quickReplies) || converted.quickReplies.length === 0) converted.quickReplies = ['嗯', '继续'];
-        }
-        var applied = applyMemoryUpdate(converted, char, loadingMsg);
-        if (applied) memUpdate = applied;
-      }
+      if (!memUpdate) needsBackgroundMemory = true;
     }
     displayText = dedupeRepeatedEnding(displayText, char);
     // 语气/风格遵从：先做客户端违规检测；命中且开了修订开关时跑一次 critique（只修文风、不改剧情）
@@ -4224,13 +4234,34 @@ async function sendMessage(options) {
     if (!hasStructuredMemory && shouldCaptureUserTurn(text)) {
       addShortTermMemory(char, '本轮事件：用户表示“' + text + '”。尚未形成更完整的事件经过。', userMessage.timestamp, { sourceMessageIds: [userMessage.id], sourceRoles: ['user'] });
     }
+    // 快速回应：只做客户端视角校验，不再为了它多发一轮请求。
+    // 校验通过就用；不通过（缺失/占位符/复述角色台词/角色口吻）清空并交给后台换位生成。
     var quickReplies = memUpdate ? parseQuickReplyList(memUpdate.quickReplies) : [];
-    if (quickReplies.length === 0) quickReplies = parseQuickRepliesFromText(fullText);
-    if (quickReplies.length === 0) quickReplies = ['嗯', '继续'];
-    if (quickReplies.length > 0) {
+    if (quickReplies.length < 2) {
+      var textQuickReplies = parseQuickRepliesFromText(fullText);
+      if (textQuickReplies.length > quickReplies.length) quickReplies = textQuickReplies;
+    }
+    var quickReplyMessageId = stickerMsg ? stickerMsg.id : loadingMsg.id;
+    var quickReplyIssues = detectQuickReplyIssues(quickReplies, char, displayText);
+    if (quickReplyIssues.length === 0) {
       state.quickReplies = quickReplies;
       state.quickReplyCharacterId = char.id;
-      state.quickReplyMessageId = stickerMsg ? stickerMsg.id : loadingMsg.id;
+      state.quickReplyMessageId = quickReplyMessageId;
+    } else {
+      // 先留空（不留 '嗯/继续' 这种占位），后台换位生成回来后立即渲染
+      state.quickReplies = [];
+      state.quickReplyCharacterId = char.id;
+      state.quickReplyMessageId = quickReplyMessageId;
+      if (state.config.quickReplyRepair !== false) {
+        loadingMsg.quickReplyIssues = quickReplyIssues;
+        var repairChar = char;
+        queueBackgroundTask(function() {
+          return repairQuickRepliesAsUser(repairChar, displayText, userMessage, quickReplyMessageId, quickReplies);
+        });
+      } else if (quickReplies.length > 0) {
+        // 关掉校正时不做二次生成：模型给什么就用什么
+        state.quickReplies = quickReplies;
+      }
     }
     try {
       localStorage.setItem(DEBUG_REPLY_STORAGE_KEY, JSON.stringify({
@@ -4240,11 +4271,23 @@ async function sendMessage(options) {
         displayText: trimText(displayText, 2000),
         fullText: trimText(fullText, 2000),
         quickReplies: quickReplies,
+        quickReplyIssues: quickReplyIssues,
+        backgroundMemory: needsBackgroundMemory,
+        stageStats: state.config.stageStats || null,
         cacheStats: state.config.cacheStats || null,
         activityLog: state.activityLog.slice(-20)
       }));
       renderDebugInfo();
     } catch (e) { /* 忽略 */ }
+    if (needsBackgroundMemory) {
+      // 散文轮的记忆/状态后台补：把"整理成结构化记忆"从可见链路挪到后台，正文已经显示完毕
+      var memoryChar = char;
+      var memoryUserMessage = userMessage;
+      var memoryReplyText = displayText;
+      queueBackgroundTask(function() {
+        return extractProseTurnMemory(memoryChar, memoryUserMessage, memoryReplyText, loadingMsg);
+      });
+    }
     scheduleSave();
     renderChat();
     await checkMemoryTriggers(char);
@@ -6089,6 +6132,109 @@ function collectRecentStyleViolations(char, limit) {
   return labels;
 }
 
+// 快速回应视角校验（纯函数）：只判断"它像不像用户会打的字"。
+// 返回问题标签数组，空数组=可用。误报代价低（最坏情况是多跑一次后台换位生成）。
+function detectQuickReplyIssues(replies, char, replyText) {
+  var list = Array.isArray(replies) ? replies.map(function(item) { return toText(item).trim(); }).filter(Boolean) : [];
+  var hits = [];
+  if (list.length < 2) hits.push('missing');
+  var spoken = toText(replyText).replace(/\s+/g, '');
+  list.forEach(function(line) {
+    var compact = line.replace(/\s+/g, '');
+    if (QUICK_REPLY_PLACEHOLDERS.indexOf(line) !== -1 || /^短句[一二1-9]$/.test(line)) { hits.push('placeholder'); return; }
+    if (/^[（(]/.test(line) || /[（(][^）)]{1,20}[）)]/.test(line)) { hits.push('action'); return; }
+    if (line.length > QUICK_REPLY_GUARD.maxChars) { hits.push('tooLong'); return; }
+    var charName = toText(char && char.basicInfo && char.basicInfo.name).trim();
+    if (charName.length >= 2 && line.indexOf(charName) !== -1) { hits.push('characterName'); return; }
+    if (compact.length >= 4 && spoken.indexOf(compact) !== -1) { hits.push('mirrored'); return; }
+    if (compact.length >= QUICK_REPLY_GUARD.mirrorChars) {
+      for (var i = 0; i + QUICK_REPLY_GUARD.mirrorChars <= compact.length; i += 2) {
+        var chunk = compact.slice(i, i + QUICK_REPLY_GUARD.mirrorChars);
+        if (!/[^\u4e00-\u9fff]/.test(chunk) && spoken.indexOf(chunk) !== -1) { hits.push('mirrored'); return; }
+      }
+    }
+  });
+  return hits.filter(function(item, index) { return hits.indexOf(item) === index; });
+}
+
+// 上一条回复的快速回应问题（内部提醒的数据来源）
+function getLastQuickReplyIssues(char) {
+  var messages = (char && char.memory && Array.isArray(char.memory.instant)) ? char.memory.instant : [];
+  for (var i = messages.length - 1; i >= 0; i--) {
+    var message = messages[i];
+    if (!message || message.isLoading || message.role !== 'assistant') continue;
+    return Array.isArray(message.quickReplyIssues) ? message.quickReplyIssues.filter(function(key) { return QUICK_REPLY_ISSUE_LABELS[key]; }) : [];
+  }
+  return [];
+}
+
+// 上一轮快速回应视角错误时的内部提醒（只进上下文，不展示给用户）
+function buildQuickReplyPerspectiveReminder(char) {
+  var labels = getLastQuickReplyIssues(char);
+  if (labels.length === 0) return '';
+  return '【上一轮快速回应（内部提醒）】' + labels.map(function(key) { return QUICK_REPLY_ISSUE_LABELS[key]; }).join('；')
+    + '。快速回应必须是用户本人下一句要发给角色的话：写之前先把自己当成用户，写完再逐条默读一遍"用户：<短句>"确认；不得是角色的台词、角色的提问或角色的表态。\n\n';
+}
+
+// 换位生成用的提示词（纯函数，便于单测）：system 身份就是"用户本人"，与被扮演的角色无关
+function buildQuickReplyAsUserPrompt(char, replyText) {
+  var address = normalizeUserAddress(char && char.basicInfo && char.basicInfo.userAddress);
+  var charName = toText(char && char.basicInfo && char.basicInfo.name) || '对方';
+  var system = '你就是这位用户本人，正在手机上和「' + charName + '」聊天。只输出用户此刻最可能打出的两句话，不要扮演' + charName + '，不要写旁白或动作，不要解释。';
+  var user = '「' + charName + '」刚对你说：\n' + trimText(toText(replyText), 800) + '\n\n'
+    + '请写出你（用户' + (address ? '，对方平时叫你“' + address + '”' : '') + '）此刻最可能发给他的两句话：\n'
+    + '①每句都是用户可以原样发送的消息，是"我"（用户自己）的立场、感受、提问或要求；\n'
+    + '②不得是' + charName + '会说的话，不得是把' + charName + '刚说的话换个人称复述一遍；\n'
+    + '③每条不超过 ' + QUICK_REPLY_GUARD.repairMaxChars + ' 字，不用括号动作、不用 Markdown。\n'
+    + '只返回 JSON：{"quickReplies":["句子一","句子二"]}';
+  return { system: system, user: user };
+}
+
+// 后台换位生成：专门扮演用户的小调用。失败返回 null（调用方保留原值/兜底）。
+async function generateQuickRepliesAsUser(char, replyText, userMessage) {
+  try {
+    var prompt = buildQuickReplyAsUserPrompt(char, replyText);
+    var recentUserLines = (char && char.memory && Array.isArray(char.memory.instant) ? char.memory.instant : [])
+      .filter(function(message) { return message && !message.isLoading && message.role === 'user'; })
+      .slice(-3)
+      .map(function(message) { return trimText(toText(message.content), 80); })
+      .filter(Boolean);
+    var userContent = (recentUserLines.length > 1 ? '【用户最近说过的话，仅用于参考语气，不要照抄】\n' + recentUserLines.slice(0, -1).join('\n') + '\n\n' : '') + prompt.user;
+    var response = await callAPI([
+      { role: 'system', content: prompt.system },
+      { role: 'user', content: userContent }
+    ]);
+    var data = parseJsonPayload(response.choices[0].message.content);
+    var list = parseQuickReplyList(data && data.quickReplies ? data.quickReplies : data);
+    if (list.length < 2) return null;
+    var issues = detectQuickReplyIssues(list, char, replyText);
+    if (issues.length > 0) return null;
+    return list;
+  } catch (error) {
+    console.error('generateQuickRepliesAsUser failed:', error);
+    return null;
+  }
+}
+
+// 后台任务串行队列：记忆写入与快速回应补写都不阻塞正文，但要避免互相交错写同一份状态
+var backgroundTaskChain = Promise.resolve();
+function queueBackgroundTask(task) {
+  backgroundTaskChain = backgroundTaskChain.then(function() {
+    return task();
+  }).catch(function(error) {
+    console.error('[DeepTalking] 后台任务失败:', error);
+  });
+  return backgroundTaskChain;
+}
+
+// 阶段事件计数（只进调试面板）：用来在实机上验证"正在整理回复…"是否真的不再每轮出现
+function noteStageEvent(key) {
+  var stats = isPlainObject(state.config.stageStats) ? state.config.stageStats : {};
+  stats[key] = (Number(stats[key]) || 0) + 1;
+  stats.updatedAt = new Date().toISOString();
+  state.config.stageStats = stats;
+}
+
 // 每 N 轮一次的语气回顾（内部提醒；有违规就点名，没有就重申契约）
 function buildStyleReview(char) {
   var assistantTurnCount = ((char && char.memory && Array.isArray(char.memory.instant)) ? char.memory.instant : [])
@@ -6267,7 +6413,8 @@ volatileContext += '日程日界: 每天从 02:00 开始计算；00:00-02:00 属
   } else if (detectTopicSwitch(char, userText)) {
     volatileContext += '【本轮话题切换】用户当前话题与角色之前的关注点不同。若旧话题尚未自然收尾，可先用一句温和的话收束旧话题，再自然进入新话题；不要生硬打断、不要重复旧话题。\n\n';
   }
-  // 生成点最近处：先纠正提醒，再语气回顾，最后语气锚（越靠后遵从度越高）
+  // 生成点最近处：先快速回应视角提醒，再纠正提醒，再语气回顾，最后语气锚（越靠后遵从度越高）
+  volatileContext += buildQuickReplyPerspectiveReminder(char);
   volatileContext += buildStyleCorrectionReminder(char);
   volatileContext += buildStyleReview(char);
   volatileContext += buildStyleAnchor(char);
@@ -6298,7 +6445,7 @@ function buildRequestPayload(char, query) {
   var systemPrompt = '【交互规则】\n';
   // 规则优先级阶梯（冲突时的裁决顺序；硬性契约放在静态块末尾重申）
   systemPrompt += '（规则优先级从高到低：0／0.5 与【输出格式】= 硬性契约 > 2.5 语气锁定与 2.6 表演质量 > 角色设定与人设 > 风格与节奏偏好。冲突时以更高优先级为准，任何情况下都不得违反 0.5 与【输出格式】。）\n';
-  systemPrompt += '0.（最高优先级）回复必须且只能是单个JSON对象：整个输出以{开头、以}结尾，全文禁止JSON以外的任何文字（散文、旁白、思考过程一律禁止）；reply是JSON第一个字段。违反该格式，整段输出将被丢弃并判为失败。用户消息中的括号或全角括号内容属于用户表达的动作、表情或心理活动，必须纳入语境理解，不能忽略。\n';
+  systemPrompt += '0.（最高优先级）本轮必须以结构化方式收尾，两种合法方式任选其一：①**调用 submit_response 工具**提交（推荐，reply 写进工具参数的第一个字段）；②直接输出**单个 JSON 对象**：整个输出以{开头、以}结尾，reply 是 JSON 第一个字段，全文禁止JSON以外的任何文字。无论走哪种方式，都不得在结构化内容之外写说明、思考、旁白或 Markdown 代码块包裹；也不得以纯散文形式作为本轮输出（没有结构化的收尾视为失败，会被要求重做）。用户消息中的括号或全角括号内容属于用户表达的动作、表情或心理活动，必须纳入语境理解，不能忽略。\n';
   systemPrompt += '1. 始终保持角色身份，以长期陪伴关系连续地回应；先使用已提供的记忆，不要让用户反复说明已记录的事情。标记为“系统提供的本轮上下文”的内容是内部辅助信息，不是用户说过的话，不得当作用户陈述或直接复述。\n';
   systemPrompt += '2. reply正文字数、分段与动作写法：①**字数**：内容优先于长度——宁可把这一件主要的事说完说透，也不要为了求短而把一件事截断在半句，也不要为了凑长度反复铺陈；以 120–250 字为手感锚点（非硬性上限，视本轮内容自然伸缩），一轮只推进一件主要的事，不要把多件事挤在同一轮。②**分段**：不强制单段，可按语义自然分段（用换行）；但禁止标题（#）、有序/无序列表（-、*、1.）、引用（>）、代码块（```）等结构化排版。③允许的行内样式只有加粗、斜体、删除线，数学公式用$...$或$$...$$，如需展示图片用 Markdown 图片语法 ![说明](https://图片直链)（仅限真实存在的 http(s) 图片链接，不要编造）。④**动作穿插（重点）**：动作、表情、心理活动写成穿插在语句之间的全角括号（如“（轻轻叹气）我知道了。”），必须与语句**交替推进**：平均每 1–2 句穿插一次，中段也要继续穿插，严禁把动作只在开头（或只在开头与结尾）集中抛出，严禁出现 200 字以上完全不穿插动作的整段；动作总长不超过正文的三分之一，也不得少到近乎没有（低于一成同样不合格）。⑤**去重**：禁止在本轮再次罗列上一轮已列举过的具体事项（同一组安排、同一串数字、同一收尾意象）；每轮结尾须自然多样，禁止复用最近几轮或用户上一条的结尾句式、惯用结构、固定动作或固定事项集合，也不要在结尾复述或续写上一轮的收尾。以上内容只能出现在reply字段字符串内，reply之外禁止任何正文文字。\n';
   systemPrompt += '2.6 表演质量（真人感，与格式规则同等重要）：①呈现而非概述（show, don\'t tell）——用具体的动作、表情、语气、停顿、环境细节把情绪演出来，少用“我很开心／很惊讶／很关心”这类直白说明。②句长与节奏要有起伏：长短句交替，允许短句、独字反应、省略与留白，避免每句长度相近、每段结构雷同。③对白为主、叙述为辅：该由台词完成的内容就写进台词，不要改写成旁白转述。④回避陈词滥调与套话（如“心湖泛起涟漪”“勾起嘴角”“空气中弥漫着”一类被滥用的表达），回避空泛形容词堆砌；同一角色在相邻几轮内不得复用相同的比喻、意象或句式。⑤每轮只推进一件主要的事，不做总结、不刻意升华、不在结尾强行抛出开放式提问凑字数；角色可以有情绪起伏、可以拒绝、可以转移话题、可以沉默，不必永远体贴周到。⑥保持人物的稳定与连续：性格、说话方式、对用户的称呼与关系状态前后一致，不要为了讨好用户而突然改变立场或口吻。\n';
@@ -6313,15 +6460,15 @@ function buildRequestPayload(char, query) {
   systemPrompt += '5. subject只能是user、relationship、world（约定另见下条）。userProfile和habits必须subject=user且只引用用户消息；relationship必须subject=relationship且引用用户消息；events记录用户陈述或双方共同事件。\n';
   systemPrompt += '5.5 约定(promises)要写明承诺方与受约方：promisor与promisee取值只能是 user、character、relationship（群组中可写具体成员名）。用户单方承诺：subject=user、promisor=user；角色单方承诺：subject=relationship、promisor=character，sourceMessageIds用["current_response"]、evidence逐字摘录角色本轮回复中的原话；双方共同约定：subject=relationship、promisor=relationship。约定的时间写绝对日期（dueAt用ISO，或把相对说法填进timeRef）。\n';
   systemPrompt += '6. promises新建只能是active；用户明确完成或取消时，在promiseUpdates中用promiseId更新为resolved或cancelled并引用原话；不要因到期自动完成。\n';
-  systemPrompt += '7. JSON必须无条件包含quickReplies：恰好两条用户下一句可直接发送给角色的短句，即使无任何记忆更新也不能省略。每条先默读为“用户：<短句>”，其中“我”只能指用户；不得复述或延续角色口吻，不得是角色的表态或自我表述。示例：角色说“我会一直陪着你”后，正确是“谢谢你，我现在确实需要有人陪我聊聊。”，错误是“我也会一直陪着你。”。不得编造事实，不用Markdown、括号动作、消息ID、时间元数据或隐藏标签。\n';
+  systemPrompt += '7. quickReplies 必须恰好两条（在 submit_response 里也一样，省略即视为没有快速回应，即使本轮不更新任何记忆也要给出）。写法：**先把自己换成用户**，写出他此刻最可能发给角色的话（表明自己的处境/感受、提出要求、或回问角色），再逐条默读为“用户：<短句>”确认通顺。禁止三类写法：①角色口吻——把角色的表态、承诺、关心照搬一遍（错误“我也会一直陪着你。”）；②**角色视角的提问**——那是角色在问用户，不是用户要说的话（错误“你今天怎么没精神？”“要不要早点休息？”）；③复述角色刚说过的句子，或换个人称重说一遍。正确例：角色说“我会一直陪着你。”之后→“谢谢你，我现在确实需要有人陪我聊聊。”；角色问“今天怎么没精神？”之后→“只是没睡好，别担心。”或“我今天确实有点累，你能陪我说说话吗？”。示例只示范视角，不得照抄措辞；不得编造事实，不用Markdown、括号动作、消息ID、时间元数据或隐藏标签。\n';
   var assistantTurnCount = char.memory.instant.filter(function(message) { return !message.isLoading && message.role === 'assistant'; }).length;
-  var jsonExampleRule = '8. JSON格式示例（未更新字段直接省略；无合格记忆返回空数组或空对象，但quickReplies仍必须两条）：{"reply":"（看了一眼时间）我把刚才那句又说了一遍，你听清了没有。要是还有不清楚的地方，我可以再讲一次，说不准换个说法你就明白了。（把桌面上的纸推过去）你可以先看这个，有疑问随时说。","quickReplies":["短句一","短句二"],"shortTerm":[{"content":"按时间和因果顺序概括本轮事件经过，写明谁做了什么并写绝对日期（如2026-08-10 晚上）","sourceMessageIds":["msg_id"],"timeRef":{"anchor":"today"}}],"dynamicState":{"currentSituation":{"value":"当前正在与对方核对一件待确认的事项，需要把话说清楚。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentMood":{"value":"较为专注，态度平和。","sourceMessageIds":["current_response"],"evidence":"概括本轮回复大意"},"currentLocation":{"value":"当前所处的位置。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentGoal":{"value":"想把这件事说明白，让对方理解。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"}},"staticFields":{"personality":{"value":"性格沉稳，遇事不急。","sourceMessageIds":["真实ID"],"evidence":"用户原话"}}' + (char.entityType === 'group' ? ',"memberDynamicState":[{"memberName":"成员原名","dynamicState":{"currentMood":{"value":"成员情绪","sourceMessageIds":["current_response"],"evidence":"概括本轮回复"}}}]' : '') + ',"promiseUpdates":[{"promiseId":"mem_id","status":"resolved","sourceMessageIds":["msg_id"],"evidence":"用户明确完成或取消的原话"}],"longTerm":[{"category":"userProfile","subject":"user","key":"稳定标识","value":"用户喜欢喝美式咖啡。","tags":["关键词"],"importance":1,"sourceMessageIds":["msg_id"],"evidence":"原话短句","eventTime":"ISO时间"}]}。示例仅示范结构与动作穿插方式，**不得模仿其口吻或措辞**（口吻一律以角色设定的“说话风格”为准）。JSON字符串转义：真实换行写\\n，字面反斜杠写\\\\，双引号写\\"。\n';
+  var jsonExampleRule = '8. JSON格式示例（未更新字段直接省略；无合格记忆返回空数组或空对象，但quickReplies仍必须两条）：{"reply":"（把外套搭在椅背上）外面风大，我绕了两条街才找到这家店。（拉开椅子坐下）你别急着说话，先喝口热的。（把杯子往你那边推了推）刚才那件事我想了一路，等你想说的时候再讲，我不催。","quickReplies":["我慢慢说，你先别催我。","你绕了两条街？也不嫌累。"],"shortTerm":[{"content":"按时间和因果顺序概括本轮事件经过，写明谁做了什么并写绝对日期（如2026-08-10 晚上）","sourceMessageIds":["msg_id"],"timeRef":{"anchor":"today"}}],"dynamicState":{"currentSituation":{"value":"当前正在与对方核对一件待确认的事项，需要把话说清楚。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentMood":{"value":"较为专注，态度平和。","sourceMessageIds":["current_response"],"evidence":"概括本轮回复大意"},"currentLocation":{"value":"当前所处的位置。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentGoal":{"value":"想把这件事说明白，让对方理解。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"}},"staticFields":{"personality":{"value":"性格沉稳，遇事不急。","sourceMessageIds":["真实ID"],"evidence":"用户原话"}}' + (char.entityType === 'group' ? ',"memberDynamicState":[{"memberName":"成员原名","dynamicState":{"currentMood":{"value":"成员情绪","sourceMessageIds":["current_response"],"evidence":"概括本轮回复"}}}]' : '') + ',"promiseUpdates":[{"promiseId":"mem_id","status":"resolved","sourceMessageIds":["msg_id"],"evidence":"用户明确完成或取消的原话"}],"longTerm":[{"category":"userProfile","subject":"user","key":"稳定标识","value":"用户喜欢喝美式咖啡。","tags":["关键词"],"importance":1,"sourceMessageIds":["msg_id"],"evidence":"原话短句","eventTime":"ISO时间"}]}。示例仅示范结构与动作穿插方式、以及quickReplies该有的用户视角，**不得模仿其口吻或措辞**（口吻一律以角色设定的“说话风格”为准）。JSON字符串转义：真实换行写\\n，字面反斜杠写\\\\，双引号写\\"。\n';
   systemPrompt += assistantTurnCount < 6 ? jsonExampleRule : JSON_EXAMPLE_BRIEF;
   systemPrompt += '9. longTerm.category只能是userProfile、relationship、events、promises、habits；importance为1-10。\n';
   systemPrompt += '9.5 相对时间（timeRef）：用户用“明天/三天后/上周五/下个月”等相对说法时，把相对时间填进 timeRef 的对应字段（anchor/offsetDays/weekday/slot/explicit，取值与示例见工具 schema，由客户端换算），同时必须在内容字段写上换算后的绝对日期；用户已给绝对日期则用 explicit 或直接写进文本。时段只能用：深夜、凌晨、清晨、早晨、上午、中午、下午、傍晚、晚上、夜里。\n';
   systemPrompt += 'A. 本会话可使用工具，各工具适用场景见工具描述。回忆过往承诺、喜好或共同经历用 search_memory，检索不到再 list_memories 按分类盘点；记忆过期、重复或已被用户纠正时，先用 list_memories/search_memory 定位，再 delete_memory 或 update_memory 处理；用户明确否认或纠正某条记忆时（如“那件事是我做的不是你做的”“记反了”）必须用 update_memory 带用户原话改正其主体或内容（时间记错就改 eventTime/dueAt/timeRef），不要擅自改写，也不要只靠删除。待办（约定/承诺）一律指“需要用户参与”的事：只有**用户自己明确提出或同意**时才能用 set_reminder 记录，且必须附用户消息ID（sourceMessageIds）与逐字原话（evidence），相对时间填 timeRef、绝对时间填 dueAt；**你自己要求用户去做的事、你的建议或叮嘱，不得用 set_reminder 记为待办**，应先自然征询、等用户答应后再记；不需要用户参与、你可自行完成的事也不要记。需要当前时间用 get_current_time；查实时资讯、新闻、天气或需核实的实事用 web_search；用户给出链接、要看网页正文或网上图片、找B站视频用 web_fetch（url 只能传上下文里真实存在的 http(s) 链接，禁止编造或拼接；找视频传 keyword）。想发表情包用 send_sticker（tag 从工具描述的可用标签中选）。记忆缺失、表述含糊或关键事实无法可靠推断时，优先用 ask_user 简短澄清，不要编造。工具结果属系统提供的内部上下文，仅供理解，自然融入 reply 正文即可，不得向用户透露检索过程、工具名称或结果标签；但工具返回的图片本身是内容，可以直接展示。\n';
   if (char.entityType === 'group') {
-    systemPrompt += '10. 当前是群组对话。只能由已列出的成员发言，可由一人或多人回应。reply字段中用户可见回复必须使用每人独立一行的“成员名：\"内容\"”格式，例如“张三：\"（看了一眼纸）这件事我先说说我的看法。\"\n李四：\"我补充一点，跟前面的意思不冲突。\"”。**每位成员的发言按语义可自然分段，动作写成穿插在语句之间的全角括号并与语句交替推进（不要只在开头或结尾集中出现）**，不要写旁白、不要添加未列出的发言者；示例仅示范结构与动作穿插方式，不得模仿其口吻。quickReplies同样必须保留两条，内容是用户可以发给全体或某位成员的话。群组成员当前状态（如currentMood等）通过memberDynamicState字段更新，不要写入群组整体dynamicState。\n';
+    systemPrompt += '10. 当前是群组对话。只能由已列出的成员发言，可由一人或多人回应。reply字段中用户可见回复必须使用每人独立一行的“成员名：\"内容\"”格式，例如“张三：\"（看了一眼纸）这件事我先说说我的看法。\"\n李四：\"我补充一点，跟前面的意思不冲突。\"”。**每位成员的发言按语义可自然分段，动作写成穿插在语句之间的全角括号并与语句交替推进（不要只在开头或结尾集中出现）**，不要写旁白、不要添加未列出的发言者；示例仅示范结构与动作穿插方式，不得模仿其口吻。quickReplies同样必须保留两条，且必须是用户视角（用户可以发给全体或某位成员的话），不得写成成员的台词、成员的提问或成员的承诺。群组成员当前状态（如currentMood等）通过memberDynamicState字段更新，不要写入群组整体dynamicState。\n';
     systemPrompt += '11. 记忆归属：每位成员有自己的私人记忆，互相不知道对方记得什么。只有当某件事实是全体都知道的（如用户公开告诉所有人的信息、群内公开讨论的事）才写入共享记忆（longTerm不填memberName）；若某事实只有某位成员知道、或属于某成员对用户的个人印象/私人约定，则在该条longTerm中填memberName记入其私人记忆。引用成员私人记忆时只能用该成员自己的记忆，不得张冠李戴。\n';
     systemPrompt += '12. 群组设定分三层：群组前提（这群人是谁、为何在一起）与共同场景是全体共用；世界层设定（时代/世界观、地点、组织、专有名词、历史、规则）统一放在世界书，不在角色设定里重复；每位成员另有自己的独立设定与当前状态，发言要贴合各自设定，不要把某位成员的设定安到别人身上。需要补充世界层设定时用 upsert_lorebook_entry 写入世界书。\n';
   }
@@ -6333,7 +6480,7 @@ function buildRequestPayload(char, query) {
   systemPrompt += '0.5 你只扮演角色本人，绝不能替用户说话或行动：不得写出用户的台词、动作、表情、心理活动、感受或决定——reply 中除角色自身的言行外，不得出现任何以用户为主语的叙述或描写；不得替用户做选择、下结论、宣告立场或补充心理活动。用户消息里已有的括号动作只作为语境理解（可自然回应），不得替用户续写、扩写或新增。需要用户表态时把话头留给他（用问句、停顿或留白），不要替他回答。\n';
   systemPrompt += '2.5 语气锁定（最高优先级，仅次于规则0）：角色的语气、口吻、腔调**只能**来自角色设定中的“说话风格”与“对用户的称呼”，其优先级**高于**模型自身的通用腔调与惯用文风；不得让本角色的说话方式向任何默认腔调靠拢。**不同角色之间的语气差异必须显著**：同一段话若换到另一个角色口中，读起来应当像另一个人说的。同时，语气只界定**整体调性**（如慵懒、爽利、疏离、黏人、克制、张扬等），不得据此限制细节发挥——语气词、口头禅、句尾助词、拟声、标点习惯、称呼的具体选取与出现频率，一律由“说话风格”和当下剧情自然决定，本规则不对其做任何数量或类型上的限制。\n';
 
-  systemPrompt += '【输出格式】只输出单个JSON对象：以{开头、以}结尾，reply为第一个字段，全文不得出现JSON以外的文字；reply里的引号写 \\"，换行写 \\n。无条件适用：**即使本轮调用过工具，最终也必须用这一个 JSON 对象收尾**；不得用 Markdown 代码块包裹，不得在 JSON 前后写任何说明、思考或旁白；quickReplies 恒为两条。\n';
+  systemPrompt += '【输出格式】本轮收尾只能二选一：①调用 submit_response 工具提交（推荐；reply 写进工具参数的 reply 字段）；②直接输出单个 JSON 对象（以{开头、以}结尾，reply 为第一个字段，全文不得出现 JSON 以外的文字）。两种方式都不允许在结构化内容之外写说明、思考或旁白，也不得用 Markdown 代码块包裹；**即使本轮调用过其他工具，也必须以上述方式之一收尾**；reply 里的引号写 \\"，换行写 \\n；quickReplies 恒为两条用户视角的短句。\n';
 
   // 稳定前缀请求（所有 /responses 平台统一，实测 opencode-go 同样透传前缀缓存字段）：
   // 固定 system 在前、全部历史逐字（最旧到最新，不重排），volatile 上下文只附加到当前用户
@@ -6390,6 +6537,38 @@ async function convertProseToJson(char, userMessage, proseText) {
   } catch (e) {
     console.error('convertProseToJson failed:', e);
     return null;
+  }
+}
+
+// 快速回应视角修复：用一个"扮演用户本人"的后台小调用重写，成功后只更新快速回应按钮，
+// 不动已显示的正文。生成失败则退到通用兜底（避免继续展示角色口吻的句子）。
+async function repairQuickRepliesAsUser(char, replyText, userMessage, messageId, fallbackList) {
+  var list = await generateQuickRepliesAsUser(char, replyText, userMessage);
+  if (!list) list = ['嗯', '继续'];
+  if (state.quickReplyMessageId !== messageId) return; // 已被下一轮覆盖，丢弃
+  if (state.activeCharacterId !== char.id) return;
+  state.quickReplies = list;
+  state.quickReplyCharacterId = char.id;
+  state.quickReplyMessageId = messageId;
+  renderChat();
+}
+
+// 散文收尾的后台记忆补写：正文已经展示，这里只把这一轮整理成结构化记忆/状态落盘。
+async function extractProseTurnMemory(char, userMessage, replyText, assistantMessage) {
+  try {
+    // buildVolatileContext 会改写 lastInjectedRecallIds（供本轮结束后的 consumeInjectedRecalls 用）；
+    // 后台调用必须原样还原，避免把"注入过哪些召回记忆"的状态错记到下一轮头上
+    var savedRecallIds = Array.isArray(char.memory.lastInjectedRecallIds) ? char.memory.lastInjectedRecallIds.slice() : [];
+    var converted = await convertProseToJson(char, userMessage, replyText);
+    char.memory.lastInjectedRecallIds = savedRecallIds;
+    if (!converted || !isPlainObject(converted)) return;
+    converted.reply = replyText;
+    var applied = applyMemoryUpdate(converted, char, assistantMessage);
+    if (!applied) return;
+    scheduleSave();
+    renderChat();
+  } catch (error) {
+    console.error('extractProseTurnMemory failed:', error);
   }
 }
 
@@ -6547,6 +6726,9 @@ function buildAgentTools(char) {
     });
   }
   tools.push({ type: 'web_search' });
+  // 收尾工具放进阶段一：模型可以在同一轮里"调完工具 → 调 submit_response 提交"，一次请求收尾；
+  // 阶段二仅在阶段一完全没拿到正文时兜底（历史问题：只靠"正文手写 JSON"导致几乎每轮都要多发一轮）。
+  tools.push(buildSubmitResponseTool());
   return tools;
 }
 
@@ -7107,14 +7289,14 @@ function buildSubmitResponseTool() {
   return {
     type: 'function',
     name: 'submit_response',
-    description: '结束本轮回复：提交用户可见的回复正文与全部记忆更新。每轮对话结束时必须且只能调用一次此工具；回复正文写入 reply 字段。',
+    description: '结束本轮回复：提交用户可见的回复正文与全部记忆更新。每轮对话结束时必须且只能调用一次此工具（推荐用它收尾，而不是在正文里手写 JSON）；回复正文写入 reply 字段。',
     strict: true,
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
         reply: { type: 'string', description: '用户可见的回复正文，支持Markdown；按语义可自然分段；动作、表情、心理活动用括号穿插在语句之间、与语句交替推进（平均每1–2句一次，不要只在开头或结尾集中出现），动作总长不超过回复一半；口吻一律以角色设定的“说话风格”为准' },
-        quickReplies: { type: 'array', description: '恰好两条用户下一句可直接发送给角色的短句，其中"我"指用户', minItems: 2, maxItems: 2, items: { type: 'string' } },
+        quickReplies: { type: 'array', description: '恰好两条"用户下一句"的短句：用户视角，是用户可以原样发给角色的话（其中"我"只能指用户）。不得是角色的台词、角色的表态或角色对用户的提问（如"你今天怎么了？""要不要早点休息？"），也不得复述角色刚说过的话。写前先把自己换成用户。', minItems: 2, maxItems: 2, items: { type: 'string' } },
         shortTerm: { type: 'array', description: '本轮事件流程摘要（对后续几轮有帮助的信息）；content必须写明谁做了什么并写绝对日期，不得写相对时间词；用户用相对时间表述时填timeRef', items: { type: 'object', additionalProperties: false, properties: { content: { type: 'string' }, sourceMessageIds: { type: 'array', items: { type: 'string' } }, timeRef: buildTimeRefSchema() }, required: ['content'] } },
         longTerm: { type: 'array', description: '未来仍有价值的稳定事实；category 只能是 userProfile|relationship|events|promises|habits；evidence 逐字摘录用户原话；key与value必须写明主体（用户写“用户”，角色写角色名）并写绝对日期，不得写“明晚/上周”这类相对时间词（相对时间改用timeRef）；约定必须填promisor与promisee；群组对话中若该事实只属于某位成员（只有那位成员知道/记得），填 memberName 记入其私人记忆，否则记入群组共享记忆', items: { type: 'object', additionalProperties: false, properties: { category: { type: 'string', enum: ['userProfile', 'relationship', 'events', 'promises', 'habits'] }, subject: { type: 'string', enum: ['user', 'relationship', 'world'] }, key: { type: 'string' }, value: { type: 'string' }, tags: { type: 'array', items: { type: 'string' } }, importance: { type: 'integer', minimum: 1, maximum: 10 }, sourceMessageIds: { type: 'array', items: { type: 'string' } }, evidence: { type: 'string' }, eventTime: { type: 'string' }, dueAt: { type: 'string', description: '可选，约定的截止时间（ISO格式）' }, promisor: { type: 'string', description: '可选但约定必填，承诺方：user（用户）/character（角色自己）/relationship（双方）/群组成员名' }, promisee: { type: 'string', description: '可选但约定必填，受约方：user（用户）/character（角色自己）/relationship（双方）/群组成员名' }, timeRef: buildTimeRefSchema(), memberName: { type: 'string', description: '可选，群组对话中指定记入某位成员的私人记忆（不传则记入群组共享记忆）' } }, required: ['category', 'key', 'value'] } },
         dynamicState: { type: 'object', additionalProperties: false, description: '角色当前动态状态，仅在有明确依据时更新', properties: dynFieldProperties },
@@ -7144,7 +7326,8 @@ function extractSubmitResponse(fullResponse) {
         if (normalizedQuickReplies.length >= 2) {
           return { ok: true, obj: args, reply: args.reply, rawArgs: argsText, quickReplies: normalizedQuickReplies };
         }
-        return { ok: false, rawArgs: argsText, reply: args.reply, reason: 'missing_quick_replies' };
+        // 保留已解析出的其余记忆字段（obj），调用方据此仍能落盘，不必丢掉这一轮的记忆
+        return { ok: false, obj: args, rawArgs: argsText, reply: args.reply, reason: 'missing_quick_replies' };
       }
       return { ok: false, rawArgs: argsText };
     }
@@ -8966,11 +9149,13 @@ function loadSettingsForm() {
   if (proactiveToggle) proactiveToggle.checked = state.config.proactiveEnabled !== false;
   var styleCritiqueToggle = document.getElementById('styleCritiqueToggle');
   if (styleCritiqueToggle) styleCritiqueToggle.checked = state.config.styleCritique !== false;
+  var quickReplyRepairToggle = document.getElementById('quickReplyRepairToggle');
+  if (quickReplyRepairToggle) quickReplyRepairToggle.checked = state.config.quickReplyRepair !== false;
   renderModelOptions(platform);
   document.getElementById('modelName').value = slot.modelName || state.config.modelName || '';
   renderCacheStats();
   renderDebugInfo();
-  ['apiPlatform', 'apiBaseUrl', 'apiKey', 'modelName', 'apiTemperature', 'apiStream', 'apiThinking', 'proactiveToggle', 'styleCritiqueToggle'].forEach(function(id) {
+  ['apiPlatform', 'apiBaseUrl', 'apiKey', 'modelName', 'apiTemperature', 'apiStream', 'apiThinking', 'proactiveToggle', 'styleCritiqueToggle', 'quickReplyRepairToggle'].forEach(function(id) {
     var el = document.getElementById(id);
     if (el) el.addEventListener('change', saveSettings);
   });
@@ -9028,15 +9213,18 @@ function chatStageDecision(stage, ctx) {
   ctx = ctx || {};
   switch (stage) {
     case 'quick-replies-missing':
-      return (ctx.phase === 'submit' && !ctx.quickRepliesRetried && ctx.attemptsLeft > 0)
-        ? { action: 'retry-quick-replies', activity: '正在补齐快速回应…', bubble: '正在补齐快速回应…' }
-        : { action: 'accept-reply', activity: '', bubble: '' };
+      // 快速回应不再阻塞收尾：缺失/非法一律接受正文，由后台换位生成补齐（不再多发一轮"补齐快速回应"）
+      return { action: 'accept-reply', activity: '', bubble: '' };
     case 'auto-tool-limit':
-      return { action: 'force-submit', activity: '工具调用次数达到上限，直接收尾…', bubble: '正在整理回复…' };
+      return ctx.hasText
+        ? { action: 'accept-text', activity: '工具调用已达上限，直接收尾…', bubble: '' }
+        : { action: 'force-submit', activity: '正在整理回复…', bubble: '正在整理回复…' };
     case 'auto-tool':
       return { action: 'run-tool', activity: '工具结果已返回，正在继续推理…', bubble: toolActivityHint(ctx.toolName) };
     case 'auto-final':
-      return (ctx.structuredOk && ctx.hasQuickReplies)
+      // 只要拿到了正文（合法 JSON 或散文）就直接采用：散文即终稿，记忆/状态交给后台补。
+      // 仅当阶段一既无合法 JSON 又没有任何正文时，才退到阶段二强制 submit_response。
+      return (ctx.structuredOk || ctx.hasText)
         ? { action: 'accept-text', activity: '', bubble: '' }
         : { action: 'force-submit', activity: '正在整理回复…', bubble: '正在整理回复…' };
     case 'submit-retry':
@@ -9256,6 +9444,8 @@ function saveSettings() {
   if (proactiveToggle) state.config.proactiveEnabled = proactiveToggle.checked;
   var styleCritiqueToggle = document.getElementById('styleCritiqueToggle');
   if (styleCritiqueToggle) state.config.styleCritique = styleCritiqueToggle.checked;
+  var quickReplyRepairToggle2 = document.getElementById('quickReplyRepairToggle');
+  if (quickReplyRepairToggle2) state.config.quickReplyRepair = quickReplyRepairToggle2.checked;
   savePlatformFields(platform);
   scheduleSave();
 }
