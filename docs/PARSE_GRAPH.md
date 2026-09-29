@@ -10,6 +10,10 @@
 - **INV-3 不改字段名集合**（`DYNAMIC_STATE_FIELDS` / `STATIC_PROFILE_FIELDS`）而不检查下游：schema、清洗、迁移、UI、提示词全部由这两个常量驱动。
 - **INV-4 两文件字节一致**：`hub.html` 与 `android-lite/.../hub.html` 必须同步（`tools/check-sync.ps1`）。
 - **INV-5 前缀缓存稳定**：system 固定在前、历史原样递增、volatile 只挂当前用户消息；任何"每轮变化的文本塞进 system 前缀"都会击穿缓存。
+- **INV-6 阶段二只用于兜底**：阶段一（含 `submit_response` 工具）拿到正文就直接收尾；只有"连正文都没有"才进阶段二锁定 `submit_response`。
+- **INV-7 待办必须用户原话证据**（promises 准入）。
+- **INV-8 正文优先，不为 quickReplies 重发**：合法 JSON（即使缺 quickReplies）或散文都直接采用；快速回应由后台补齐，绝不再为它多发一轮。
+- **INV-9 快速回应必须是用户视角**：`detectQuickReplyIssues` 校验，失败由 `generateQuickRepliesAsUser` 换位重写；不得覆盖已显示的正文。
 
 ## 1. 核心机制链（主链）
 
@@ -31,14 +35,17 @@ parseStructuredResponse   extractReplyFromJson      parseQuickReplyList /
  (主回复：必须对象)         (流式气泡 + salvage)        parseQuickRepliesFromText
    │                            │                          │
    ▼                            ▼                          ▼
-applyMemoryUpdate ──► applyDynamicStateUpdates    state.quickReplies（快速回应按钮）
+applyMemoryUpdate ──► applyDynamicStateUpdates    detectQuickReplyIssues（视角校验）
    ├ shortTerm                    │                          │
    ├ longTerm / promises          ▼                          ▼
-   ├ dynamicState（新 7 字段）  memberDynamicState     快速回应渲染 renderQuickReplies
-   └ memberDynamicState
-        │
+   ├ dynamicState（新 7 字段）  memberDynamicState     通过 → state.quickReplies
+   └ memberDynamicState                                 不通过 → generateQuickRepliesAsUser
+        │                                                  （后台换位生成，不改正文）
         ▼
 parseMemoryFromText（从 reply 文本抓 <MEM_UPDATE>）
+        │
+        ▼（散文收尾时）
+extractProseTurnMemory（后台补 shortTerm/longTerm/dynamicState，不阻塞正文）
 ```
 
 ## 2. 全部调用方（谁受 `parseJsonPayload` 影响）
@@ -91,7 +98,7 @@ STATIC_PROFILE_FIELDS ─┬─► submit_response schema (staticFieldProperties
 - 165/165 组用例 `parseJsonPayload` 均返回**对象**且 `quickReplies` 完整（含 `reply`/`value`/`evidence` 内出现 `"`、`}`、`]`、`,`、真实换行、中文引号、数组项含引号）。
 - 真实群组回复格式（`成员名："台词"` + 真实换行、未转义引号）解析为对象且 reply 文本字节一致。
 
-## 4.5 请求体布局与阶段一/二路径（v1.2.3 关键认知）
+## 4.5 请求体布局与阶段一/二路径（v1.3.4 关键认知）
 
 ### 请求体（Responses API，`buildResponsesRequestBody`）
 ```
@@ -102,18 +109,23 @@ STATIC_PROFILE_FIELDS ─┬─► submit_response schema (staticFieldProperties
   tool_choice: 'auto' | {type:'function', name:'submit_response'}
 }
 ```
-- **阶段一 `auto`**：`tools = buildAgentTools()`（10 个），`tool_choice:'auto'`。工具调用只发生在这里。
-- **阶段二 `submit`**：`tools = [submit_response]`（**只有 1 个**），`tool_choice` 锁定。
+- **阶段一 `auto`（正常路径，一次请求收尾）**：`tools = buildAgentTools()`，`tool_choice:'auto'`；工具数组**末尾含 `submit_response`**，所以"调完信息工具 → 调 `submit_response` 提交"在同一轮完成。工具调用只发生在这里。
+- **阶段二 `submit`（兜底，仅当阶段一连正文都没拿到）**：`tools = [submit_response]`（**只有 1 个**），`tool_choice` 锁定，`reasoning.effort='none'`。
 
-### 两条产出路径（都需 quickReplies 守卫，v1.2.3 起）
+### 产出路径（v1.3.4 起：正文优先、quickReplies 不阻塞）
 ```
-主路径：阶段一模型直接返回纯文本 JSON {reply}
-        └─ parseStructuredResponse → ok && hasQuickReplies ? break : 转阶段二
-次路径：阶段二 submit_response 工具
-        └─ extractSubmitResponse → quickReplies>=2 ? ok : 重试一次 → 仍缺则接受reply走兜底
+主路径：阶段一 submit_response 工具调用
+        └─ extractSubmitResponse → ok ? break : （缺 quickReplies）直接接受 reply + obj
+主路径二：阶段一直接返回纯文本 JSON {reply,...}
+        └─ parseStructuredResponse → ok ? break（不再要求 hasQuickReplies）
+主路径三：阶段一直接返回散文
+        └─ 直接采用（散文即终稿）；记忆/状态由后台 extractProseTurnMemory 补写
+兜底：阶段一完全没有正文
+        └─ 阶段二锁定 submit_response → extractSubmitResponse
 ```
-- `parseStructuredResponse` 现返回 `hasQuickReplies`；`extractSubmitResponse` 缺 quickReplies 返回 `ok:false, reason:'missing_quick_replies'`。
-- 兜底 `['嗯','继续']` 仅当两条路径都拿不到时触发。
+- `parseStructuredResponse` 仍返回 `hasQuickReplies`，但**只作为"后台是否需要重写快速回应"的信号**，不再是收尾放行条件（v1.2.3 曾把它当门槛，导致几乎每轮都要多发一轮「正在整理回复…」）。
+- `extractSubmitResponse` 缺 quickReplies 时返回 `ok:false, reason:'missing_quick_replies'`，**同时带上已解析的 `obj`**，调用方据此照常落盘记忆、直接接受正文。
+- quickReplies 由 `detectQuickReplyIssues`（客户端视角校验）+ `generateQuickRepliesAsUser`（后台换位生成）补齐；兜底 `['嗯','继续']` 只在换位生成也失败时出现。
 
 ### 历史回归（务必牢记）
 | 版本 | 阶段二 tools | 结果 |
@@ -121,6 +133,8 @@ STATIC_PROFILE_FIELDS ─┬─► submit_response schema (staticFieldProperties
 | ≤v1.1.1 | `[submit_response]` | quickReplies 正常 |
 | v1.1.2 (bd3dc24) | 全量工具 + 锁定（为命中缓存） | **strict 被稀释，模型只吐 {reply}，quickReplies 长期退化** |
 | v1.2.2+ | 回退为 `[submit_response]` | 恢复；并加协议守卫覆盖主/次两条路径 |
+| v1.2.3 (a713e77) | 同上 | 主路径放行**加严**为"必须含 ≥2 条 quickReplies"，「整理回复」几乎每轮出现 |
+| v1.3.4 | 同上（降级为兜底） | 阶段一含 `submit_response` + 正文优先放行 → 正常轮只有一次请求 |
 
 ## 4.6 待办（promises）准入原则（v1.2.3）
 
@@ -149,8 +163,10 @@ invariants:
   INV-3: {rule: field-set-change-requires-downstream-audit, keys: [DYNAMIC_STATE_FIELDS, STATIC_PROFILE_FIELDS]}
   INV-4: {rule: two-hub-files-identical, check: tools/check-sync.ps1}
   INV-5: {rule: prefix-cache-stability}
-  INV-6: {rule: submit-phase-tools-only-submit_response, why: 'full tools dilute strict schema -> quickReplies dropped (v1.1.2 regression)'}
+  INV-6: {rule: submit-phase-tools-only-submit_response, why: 'full tools dilute strict schema -> quickReplies dropped (v1.1.2 regression); phase 2 is fallback-only since v1.3.4'}
   INV-7: {rule: promises-require-user-evidence, why: 'to-do = needs-user; character instructions must not become to-dos'}
+  INV-8: {rule: body-first-never-refetch-for-quickReplies, why: 'accepting prose/JSON-without-quickReplies avoids the per-turn forced submit round; quick replies are repaired in the background (v1.3.4)'}
+  INV-9: {rule: quickReplies-must-be-user-viewpoint, guard: detectQuickReplyIssues, repair: generateQuickRepliesAsUser}
 
 nodes:
   parseJsonPayload:        {kind: function, role: hub, risk: high}
