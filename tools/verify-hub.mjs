@@ -5,6 +5,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { renderHub } from './build-hub.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const HUB = path.resolve(here, '..', 'hub.html');
@@ -17,6 +18,19 @@ function ok(name, cond, detail) {
 }
 
 const html = fs.readFileSync(HUB, 'utf8');
+console.log('\n[0] Module source and generated assets');
+try {
+  const expected = Buffer.from(renderHub(), 'utf8');
+  ok('Web output matches module sources', fs.readFileSync(HUB).equals(expected));
+  ok('Android output matches module sources', fs.readFileSync(path.resolve(here, '..', 'android-lite/app/src/main/assets/hub.html')).equals(expected));
+  const manifest = JSON.parse(fs.readFileSync(path.resolve(here, '..', 'src/manifest.json'), 'utf8'));
+  for (const file of manifest.scripts) {
+    new Function(fs.readFileSync(path.resolve(here, '..', 'src', file), 'utf8'));
+  }
+  ok('Each JavaScript module has complete syntax boundaries', true);
+} catch (error) {
+  ok('Module build and syntax validation', false, error.message);
+}
 const scriptStart = html.indexOf('\n<script>\n');
 const scriptEnd = html.lastIndexOf('\n</script>');
 if (scriptStart < 0 || scriptEnd < 0) { console.error('无法定位主 script 块'); process.exit(2); }
@@ -306,7 +320,7 @@ if (unit) {
   ok('额度用尽：失败收口', chatStageDecision('empty', { attemptsLeft: 0 }).action === 'fail');
   ok('未知阶段不抛错', chatStageDecision('???', {}).action === 'unknown');
 
-  const mainLoop = script.slice(script.indexOf('var toolState = { items: [], rounds: 0, char: char };'), script.indexOf('var structured = null;'));
+  const mainLoop = script.slice(script.indexOf('var toolState = { items: [], rounds: 0, char: char, config:'), script.indexOf('var structured = null;'));
   const rawStatus = mainLoop.match(/setActivity\('[^']*'\)/g) || [];
   ok('主循环状态文案全部走 chatStageDecision', mainLoop.length > 1000 && rawStatus.length === 0, rawStatus.join(','));
   ok('主循环不再硬编码“正在整理回复…”', !mainLoop.includes("setActivity('正在整理回复…')") && !mainLoop.includes("getDisplayText('正在整理回复…')"));
@@ -392,7 +406,7 @@ const mustHave = [
   ['show dont tell 规则', '呈现而非概述'],
   ['句长节奏要求', '句长与节奏要有起伏'],
   ['记忆取用说明', '【记忆取用说明】'],
-  ['节奏骨架注入点', 'volatileContext += buildNarrativePatternDirective();'],
+  ['节奏骨架注入点', 'tail += buildNarrativePatternDirective();'],
   ['JSON 收口规则仍在', '本轮必须以结构化方式收尾'],
   ['quickReplies 强制两条仍在', 'quickReplies 必须恰好两条'],
   ['快速回应：禁止角色视角提问', '角色视角的提问**——那是角色在问用户'],
@@ -402,7 +416,7 @@ const mustHave = [
   ['输出格式：工具或 JSON 二选一收尾', '即使本轮调用过其他工具，也必须以上述方式之一收尾'],
   ['输出格式：禁用代码块包裹', '不得用 Markdown 代码块包裹'],
   ['长会话精简示例常量', 'const JSON_EXAMPLE_BRIEF'],
-  ['示例按轮次切换', 'assistantTurnCount < 6 ? jsonExampleRule : JSON_EXAMPLE_BRIEF'],
+  ['示例固定使用精简版', 'systemPrompt += JSON_EXAMPLE_BRIEF;'],
   ['timeRef 元表已精简', '9.5 相对时间（timeRef）'],
   ['工具说明已精简', 'A. 本会话可使用工具，各工具适用场景见工具描述'],
   ['世界书 tab 按钮', "switchModalTab('lorebook')"],
@@ -433,9 +447,9 @@ const mustHave = [
   ['静态字段：个人背景改名', "background: { label: '个人背景' }"],
   ['静态字段：群组前提标签', '>群组前提</label>'],
   ['世界书更新气泡提示', 'lorebookChangesHtml'],
-  ['语气锚注入点', 'volatileContext += buildStyleAnchor(char);'],
-  ['违规内部提醒注入点', 'volatileContext += buildStyleCorrectionReminder(char);'],
-  ['每 N 轮语气回顾', 'volatileContext += buildStyleReview(char);'],
+  ['语气锚注入点', 'var styleAnchor = buildStyleAnchor(char);'],
+  ['违规内部提醒注入点', 'tail += buildStyleCorrectionReminder(char);'],
+  ['每 N 轮语气回顾', 'tail += buildStyleReview(char);'],
   ['文风校对开关', "id=\"styleCritiqueToggle\""],
   ['文风校对默认开启', 'styleCritique: rawConfig.styleCritique !== false'],
   ['违规检测调用点', 'var styleViolations = detectStyleViolations('],
@@ -466,13 +480,13 @@ const mustHave = [
   ['长期记忆：价值判据', '**价值判据**'],
   ['长期记忆：证据不足宁可不记', '**证据不足宁可不记**'],
   ['剧情弧线：命名稳定', 'arcOf命名一旦确定就保持稳定'],
-  ['前缀缓存注释仍在', 'volatile 上下文只附加到当前用户'],
+  ['前缀缓存注释仍在', 'per-turn context is an independent trailing item'],
   ['快速回应视角校验接点', 'var quickReplyIssues = detectQuickReplyIssues(quickReplies, char, displayText);'],
   ['快速回应后台换位生成', 'async function generateQuickRepliesAsUser(char, replyText, userMessage)'],
-  ['快速回应后台修复不回写正文', 'async function repairQuickRepliesAsUser(char, replyText, userMessage, messageId, fallbackList)'],
-  ['散文轮后台记忆补写', 'async function extractProseTurnMemory(char, userMessage, replyText, assistantMessage)'],
+  ['快速回应后台修复不回写正文', 'async function repairQuickRepliesAsUser(char, replyText, userMessage, messageId, fallbackList, guard)'],
+  ['散文轮后台记忆补写', 'async function extractProseTurnMemory(char, userMessage, replyText, assistantMessage, taskGuard)'],
   ['散文轮不再阻塞在可见链路里换 JSON', 'if (!memUpdate) needsBackgroundMemory = true;'],
-  ['快速回应视角提醒注入点', 'volatileContext += buildQuickReplyPerspectiveReminder(char);'],
+  ['快速回应视角提醒注入点', 'tail += buildQuickReplyPerspectiveReminder(char);'],
   ['快速回应视角开关', 'id="quickReplyRepairToggle"'],
   ['快速回应视角默认开启', 'quickReplyRepair: rawConfig.quickReplyRepair !== false'],
   ['后台任务串行队列', 'function queueBackgroundTask(task)'],
@@ -498,18 +512,14 @@ try {
   const head = execSync('git show HEAD:hub.html', { encoding: 'utf8', maxBuffer: 1e9, cwd: path.resolve(here, '..') });
   const before = ruleBlock(head);
   const after = ruleBlock(script);
-  const briefSrc = script.match(/const JSON_EXAMPLE_BRIEF = ([\s\S]*?);\n/);
-  const fullSrc = script.match(/var jsonExampleRule = ([\s\S]*?);\n  systemPrompt \+= assistantTurnCount/);
-  const briefLen = briefSrc ? new Function('return ' + briefSrc[1])() .length : 0;
-  const fullRuleLen = fullSrc ? fullSrc[1].length : 0;
-  const longChatNow = after.length - fullRuleLen + briefLen;
+  const exampleSrc = script.match(/const JSON_EXAMPLE_BRIEF = ([\s\S]*?);\n/);
+  const exampleLen = exampleSrc ? new Function('return ' + exampleSrc[1])().length : 0;
   console.log('  HEAD 规则块 = ' + before.length + ' 字符');
   console.log('  现在规则块 = ' + after.length + ' 字符');
-  console.log('  长会话等效 = ' + longChatNow + ' 字符（第 6 轮起把完整示例换成精简版：' + fullRuleLen + ' -> ' + briefLen + '）');
-  // 体积回归护栏：长会话（用精简示例）不得比上一版明显膨胀。规则本身可以增删，
-  // 但必须用精简表达式换回来——避免"每加一条规则就把前缀写胖一圈"。
-  ok('长会话等效不超过 HEAD 的 102%（防提示词膨胀）', longChatNow <= before.length * 1.02, before.length + ' vs ' + longChatNow + '（' + ((longChatNow / before.length - 1) * 100).toFixed(1) + '%）');
-  ok('精简版示例显著短于完整示例（长会话省 token）', briefLen > 0 && briefLen <= fullRuleLen * 0.7, fullRuleLen + ' -> ' + briefLen);
+  console.log('  固定 JSON 示例 = ' + exampleLen + ' 字符（每轮都用同一份，保证 system 前缀从首轮起稳定）');
+  // 体积回归护栏：静态前缀不得比上一版明显膨胀，避免"每加一条规则就把前缀写胖一圈"。
+  ok('规则块不超过 HEAD 的 102%（防提示词膨胀）', after.length <= before.length * 1.02, before.length + ' vs ' + after.length + '（' + ((after.length / before.length - 1) * 100).toFixed(1) + '%）');
+  ok('JSON 示例固定且精简', exampleLen > 0 && exampleLen <= 900, 'len ' + exampleLen);
 } catch (error) {
   ok('可与 HEAD 对比规则块体积', false, error.message);
 }
@@ -548,10 +558,10 @@ console.log('\n[6] 版本号同步（APP_VERSION 与 versionName）');
 
 console.log('\n[7] 语气遵从注入点与缓存安全');
 {
-  const idxBone = script.indexOf('volatileContext += buildNarrativePatternDirective();');
-  const idxCorrection = script.indexOf('volatileContext += buildStyleCorrectionReminder(char);');
-  const idxReview = script.indexOf('volatileContext += buildStyleReview(char);');
-  const idxAnchor = script.indexOf('volatileContext += buildStyleAnchor(char);');
+  const idxBone = script.indexOf('tail += buildNarrativePatternDirective();');
+  const idxCorrection = script.indexOf('tail += buildStyleCorrectionReminder(char);');
+  const idxReview = script.indexOf('tail += buildStyleReview(char);');
+  const idxAnchor = script.indexOf('var styleAnchor = buildStyleAnchor(char);');
   ok('语气相关注入点都在 volatile 中', idxBone > 0 && idxCorrection > 0 && idxReview > 0 && idxAnchor > 0);
   ok('注入顺序：节奏骨架 → 纠正提醒 → 语气回顾 → 语气锚（越靠后越近生成点）',
     idxBone < idxCorrection && idxCorrection < idxReview && idxReview < idxAnchor);

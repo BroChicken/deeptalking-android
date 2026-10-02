@@ -1,5 +1,6 @@
 # Verify that the repo-root hub.html and the APK copy
 # (android-lite/app/src/main/assets/hub.html) are byte-identical.
+# Both files are generated from src/. Never edit or manually copy either output.
 # Per AGENTS.md rule 2 both files must match, otherwise committing is forbidden.
 # Usage: powershell -File tools/check-sync.ps1   (exit 0 = match, exit 1 = mismatch)
 # NOTE: keep this file ASCII-only so Windows PowerShell 5.1 parses it correctly.
@@ -23,7 +24,7 @@ if ($devHash -ne $apkHash) {
   Write-Host 'SHA256 MISMATCH - do not commit:' -ForegroundColor Red
   Write-Host ("  hub.html                                  " + $devHash)
   Write-Host ("  android-lite/app/src/main/assets/hub.html " + $apkHash)
-  Write-Host 'Sync first: Copy-Item -LiteralPath .\hub.html -Destination .\android-lite\app\src\main\assets\hub.html -Force'
+  Write-Host 'Rebuild from module sources: node tools/build-hub.mjs'
   exit 1
 }
 

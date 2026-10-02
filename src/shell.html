@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DeepTalking - 深度对话</title>
+<link rel="stylesheet" href="katex/katex.min.css">
+<style>{{styles/mobile.css}}</style>
+<style id="tailwind-compiled">{{styles/utilities.css}}</style>
+<style>{{styles/app.css}}</style>
+</head>
+<body class="ui-a app-shell flex flex-col">
+<svg aria-hidden="true" width="0" height="0" style="position:absolute;overflow:hidden">
+  <symbol id="icon-menu" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></symbol>
+  <symbol id="icon-contrast" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3v18"/><path d="M12 3a9 9 0 0 1 0 18Z" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="icon-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="icon-settings" viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h2M10 12h10M4 18h7M15 18h5"/><circle cx="16" cy="6" r="2"/><circle cx="8" cy="12" r="2"/><circle cx="13" cy="18" r="2"/></symbol>
+  <symbol id="icon-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="icon-download" viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></symbol>
+  <symbol id="icon-upload" viewBox="0 0 24 24"><path d="M12 15V3M7 8l5-5 5 5M5 21h14"/></symbol>
+  <symbol id="icon-bot" viewBox="0 0 24 24"><rect x="3" y="6" width="18" height="14" rx="3"/><path d="M12 2v4M8 11h.01M16 11h.01M8 16h8"/></symbol>
+  <symbol id="icon-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></symbol>
+  <symbol id="icon-smile" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><path d="M9 9h.01M15 9h.01"/></symbol>
+  <symbol id="icon-send" viewBox="0 0 24 24"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></symbol>
+  <symbol id="icon-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+  <symbol id="icon-edit" viewBox="0 0 24 24"><path d="M12 20h9M16.5 3.5a2.12 2.12 0 0 1 3 3L8 18l-4 1 1-4Z"/></symbol>
+  <symbol id="icon-refresh" viewBox="0 0 24 24"><path d="M21 12a9 9 0 0 1-15.2 6.5L3 16m0 5v-5h5M3 12A9 9 0 0 1 18.2 5.5L21 8m0-5v5h-5"/></symbol>
+  <symbol id="icon-trash" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4h8v2M19 6l-1 15H6L5 6M10 11v6M14 11v6"/></symbol>
+  <symbol id="icon-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+  <symbol id="icon-loader" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-6.2-8.56"/></symbol>
+</svg>
+
+<!-- Top Bar -->
+<header class="app-header border-b border-theme flex items-center justify-between bg-header-c z-20 relative">
+  <div class="flex items-center gap-3">
+    <button onclick="toggleSidebar()" class="top-icon-button" title="角色列表" aria-label="打开角色列表">
+      <svg class="icon"><use href="#icon-menu"></use></svg>
+    </button>
+    <div class="flex items-center gap-2" id="chatHeader">
+      <span class="text-muted-c text-sm">选择一个角色开始对话</span>
+    </div>
+  </div>
+  <div class="flex items-center gap-2">
+    <div class="theme-menu-wrap">
+      <button id="themeMenuToggle" onclick="event.stopPropagation(); toggleThemeMenu()" class="top-icon-button" title="切换主题" aria-label="切换主题" aria-expanded="false">
+        <svg class="icon"><use href="#icon-contrast"></use></svg>
+      </button>
+      <div id="themeMenu" class="theme-menu hidden">
+        <button onclick="setTheme('')" class="theme-option" data-theme=""><span class="theme-swatch" style="background:#edf0f4"></span><span>清浅</span></button>
+        <button onclick="setTheme('theme-black')" class="theme-option" data-theme="theme-black"><span class="theme-swatch" style="background:#0f151c"></span><span>夜色</span></button>
+        <button onclick="setTheme('theme-blue')" class="theme-option" data-theme="theme-blue"><span class="theme-swatch" style="background:#0f202c"></span><span>深海</span></button>
+        <button onclick="setTheme('theme-yellow')" class="theme-option" data-theme="theme-yellow"><span class="theme-swatch" style="background:#2a271b"></span><span>旧灯</span></button>
+      </div>
+    </div>
+  </div>
+  <span id="cacheStatsBar" class="hidden" title="DeepSeek 上下文缓存（仅主聊天请求）"></span>
+  <span id="activityStatusBar" class="hidden text-[11px] text-accent" title="当前活动"></span>
+  <span id="appVersionBadge" class="text-[10px] text-muted-c" title="应用版本"></span>
+</header>
+
+<!-- Main Layout -->
+<div class="flex flex-1 overflow-hidden relative">
+  <!-- Sidebar Overlay -->
+  <div id="sidebarOverlay" class="absolute inset-0 z-30 hidden" style="background: var(--overlay-bg)" onclick="toggleSidebar()"></div>
+
+  <!-- Sidebar -->
+  <aside id="sidebar" class="w-80 h-full flex flex-col border-r border-theme bg-sidebar-c absolute md:relative z-40 hidden-sidebar">
+    <!-- Tabs -->
+    <div class="flex border-b border-theme">
+      <button onclick="switchTab('characters')" id="tab-characters" class="tab-btn active flex-1 py-3 text-sm font-medium text-secondary-c">
+        <svg class="icon mr-1"><use href="#icon-users"></use></svg> 角色
+      </button>
+      <button onclick="switchTab('settings')" id="tab-settings" class="tab-btn flex-1 py-3 text-sm font-medium text-secondary-c">
+        <svg class="icon mr-1"><use href="#icon-settings"></use></svg> 设置
+      </button>
+    </div>
+
+    <!-- Content: Characters -->
+    <div id="content-characters" class="flex-1 flex flex-col overflow-hidden">
+      <div class="p-3">
+        <button onclick="openCreateModal()" class="w-full btn-primary text-white py-2.5 rounded-xl flex items-center justify-center gap-2 font-medium text-sm">
+          <svg class="icon"><use href="#icon-plus"></use></svg> 新建角色或群组
+        </button>
+        <button id="repairAvatarsBtn" onclick="repairAllAvatars()" class="w-full btn-secondary text-secondary-c py-2 mt-2 rounded-lg text-xs flex items-center justify-center gap-1" title="为所有默认/损坏头像一键生成贴切 emoji">
+          <svg class="icon"><use href="#icon-refresh"></use></svg> 补全头像
+        </button>
+      </div>
+      <div class="flex-1 overflow-y-auto chat-scroll px-2 pb-2" id="characterList"></div>
+      <div class="sidebar-footer p-3 border-t border-theme flex gap-2">
+        <button onclick="exportAllData()" class="flex-1 btn-secondary text-secondary-c py-2 rounded-lg text-xs flex items-center justify-center gap-1">
+          <svg class="icon"><use href="#icon-download"></use></svg> 导出
+        </button>
+        <label class="flex-1 btn-secondary text-secondary-c py-2 rounded-lg text-xs flex items-center justify-center gap-1 cursor-pointer">
+          <svg class="icon"><use href="#icon-upload"></use></svg> 导入
+          <input type="file" id="importFile" accept=".json" class="hidden" onchange="importData(event)">
+        </label>
+      </div>
+    </div>
+
+    <!-- Content: Settings -->
+    <div id="content-settings" class="flex-1 flex flex-col overflow-hidden hidden">
+      <div class="flex-1 overflow-y-auto chat-scroll p-4">
+        <h3 class="text-xs text-muted-c mb-2 font-medium">API 配置</h3>
+        <div class="space-y-2">
+          <div>
+            <label class="block text-xs text-muted-c mb-1">API 平台</label>
+            <select id="apiPlatform" onchange="changePlatform()" class="w-full rounded-lg px-2 py-1.5 text-xs" style="background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text-color);">
+              <option value="deepseek">DeepSeek</option>
+              <option value="opencode">OpenCode</option>
+              <option value="custom">自定义</option>
+            </select>
+          </div>
+          <div id="apiBaseUrlWrap">
+            <label class="block text-xs text-muted-c mb-1">API Base URL（OpenAI 兼容）</label>
+            <input type="text" id="apiBaseUrl" placeholder="https://api.example.com/v1" class="w-full rounded-lg px-2 py-1.5 text-xs" style="background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text-color);">
+          </div>
+          <div>
+            <label class="block text-xs text-muted-c mb-1">API Key</label>
+            <input type="password" id="apiKey" placeholder="sk-..." class="w-full rounded-lg px-2 py-1.5 text-xs" style="background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text-color);">
+          </div>
+          <div class="grid grid-cols-2 gap-2">
+            <button id="testConnBtn" onclick="testApiConnection()" class="rounded-lg px-2 py-1.5 text-xs" style="background: var(--accent-bg); border: 1px solid var(--input-border); color: var(--text-color);">测试连接</button>
+            <button onclick="saveSettings()" class="rounded-lg px-2 py-1.5 text-xs" style="background: var(--accent-bg); border: 1px solid var(--input-border); color: var(--text-color);">保存设置</button>
+          </div>
+          <div id="testConnResult" class="text-xs text-muted-c whitespace-pre-wrap hidden" style="line-height: 1.6;"></div>
+          <div>
+            <label class="block text-xs text-muted-c mb-1">模型名称</label>
+            <input type="text" id="modelName" list="modelOptions" class="w-full rounded-lg px-2 py-1.5 text-xs" style="background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text-color);">
+            <datalist id="modelOptions"></datalist>
+          </div>
+          <div class="grid grid-cols-2 gap-2">
+            <div>
+              <label class="block text-xs text-muted-c mb-1">Temperature</label>
+              <input type="number" id="apiTemperature" min="0" max="2" step="0.1" class="w-full rounded-lg px-2 py-1.5 text-xs" style="background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text-color);">
+            </div>
+            <label class="flex items-end gap-2 pb-1 text-xs text-muted-c"><input type="checkbox" id="apiStream"> 流式回复</label>
+          </div>
+          <div>
+            <div class="mt-1">
+              <label class="block text-xs text-muted-c mb-1">思考强度（DeepSeek）</label>
+              <select id="apiThinking" class="w-full rounded-lg px-2 py-1.5 text-xs" style="background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text-color);">
+                <option value="none">无</option>
+                <option value="low">低</option>
+                <option value="medium">中</option>
+                <option value="high">高</option>
+                <option value="max">最高</option>
+              </select>
+            </div>
+          </div>
+          <label class="flex items-center gap-2 text-xs text-muted-c"><input type="checkbox" id="proactiveToggle"> 角色主动开口（打开面板停留约 1 分钟未对话时，角色主动发起开场）</label>
+          <label class="flex items-center gap-2 text-xs text-muted-c"><input type="checkbox" id="styleCritiqueToggle"> 文风自动校对（回复命中语气/风格问题时，追加一次只改文风的修订请求）</label>
+          <label class="flex items-center gap-2 text-xs text-muted-c"><input type="checkbox" id="quickReplyRepairToggle"> 快速回应视角校正（快速回应不像用户会说的话时，后台用“用户本人”身份重写一次）</label>
+           <div id="debugInfoWrap" class="hidden mt-3">
+             <div class="flex items-center justify-between mb-1">
+               <label class="block text-xs text-muted-c">调试信息（最近一次回应完整内容与活动时间线）</label>
+               <button onclick="copyDebugInfo()" class="text-[11px] px-2 py-0.5 rounded" style="background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text-color);">复制</button>
+             </div>
+             <pre id="debugInfo" class="text-[10px] leading-relaxed whitespace-pre-wrap break-all p-2 rounded-lg max-h-48 overflow-auto" style="background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text-color);"></pre>
+            </div>
+          </div>
+       </div>
+    </div>
+  </aside>
+
+  <!-- Main Chat Area -->
+  <main class="flex-1 flex flex-col h-full">
+    <div class="flex-1 overflow-y-auto chat-scroll p-6 space-y-4" id="messageContainer">
+      <div class="h-full flex flex-col items-center justify-center text-center">
+        <div class="w-24 h-24 rounded-full bg-accent-soft flex items-center justify-center mb-4">
+          <svg class="icon text-4xl text-muted-c"><use href="#icon-bot"></use></svg>
+        </div>
+        <h2 class="text-xl font-medium text-secondary-c mb-2">欢迎使用 DeepTalking</h2>
+        <p class="text-muted-c max-w-md">一个具有三级记忆系统的深度对话应用。点击左上角菜单按钮，创建或选择角色，开始一段有记忆的对话。</p>
+      </div>
+    </div>
+    <div class="composer p-4 border-t border-theme bg-header-c">
+      <div id="imagePreviewRow" class="max-w-4xl mx-auto mb-2" style="display:none;flex-wrap:wrap;gap:8px;"></div>
+      <div class="max-w-4xl mx-auto flex items-end gap-2">
+        <button type="button" data-sticker-toggle onclick="toggleStickerPanel()" class="btn-secondary text-secondary-c p-2 w-8 h-8 text-sm flex items-center justify-center rounded-full flex-shrink-0" title="表情包" aria-label="表情包">
+          <svg class="icon"><use href="#icon-smile"></use></svg>
+        </button>
+        <button type="button" onclick="triggerImagePick()" class="btn-secondary text-secondary-c p-2 w-8 h-8 text-sm flex items-center justify-center rounded-full flex-shrink-0" title="添加图片" aria-label="添加图片">
+          <svg class="icon"><use href="#icon-image"></use></svg>
+        </button>
+        <input type="file" id="imageInput" accept="image/*" multiple class="hidden" onchange="handleImagePick(event)">
+        <div class="flex-1 glass-panel rounded-2xl">
+          <textarea id="messageInput" rows="1" placeholder="输入消息" class="w-full bg-transparent px-4 py-3 resize-none focus:outline-none placeholder:text-muted-c" style="color: var(--text-color);" onkeydown="handleInputKey(event)" oninput="autoResize(this)"></textarea>
+        </div>
+        <button onclick="sendMessage()" class="send-button btn-primary text-white p-3 w-12 h-12 flex items-center justify-center flex-shrink-0" title="发送" aria-label="发送消息">
+          <svg class="icon"><use href="#icon-send"></use></svg>
+        </button>
+      </div>
+    </div>
+    <div id="stickerPanel" class="sticker-panel" style="display:none;">
+      <div class="sticker-panel-bar">
+        <button type="button" class="sticker-upload" onclick="triggerStickerUpload()">+ 上传表情</button>
+        <span id="stickerCount" class="sticker-count"></span>
+      </div>
+      <div id="stickerGrid" class="sticker-grid"></div>
+    </div>
+    <input type="file" id="stickerInput" accept="image/*" multiple class="hidden" onchange="handleStickerPick(event)">
+    <div id="imageLightbox" class="image-lightbox" style="display:none;" onclick="closeImagePreview()"><img id="imageLightboxImg" src="" alt=""></div>
+  </main>
+</div>
+
+<!-- Create Character Modal -->
+<div id="createModal" class="fixed inset-0 modal-bg z-50 hidden items-center justify-center p-4">
+  <div class="glass-panel rounded-2xl w-full max-w-md p-6 max-h-[90vh] overflow-y-auto chat-scroll">
+    <div class="flex justify-between items-center mb-4">
+        <h2 class="text-xl font-bold" id="createModalTitle" style="color: var(--text-color);">创建新角色</h2>
+      <button onclick="closeCreateModal()" class="modal-close" title="关闭" aria-label="关闭创建角色"><svg class="icon"><use href="#icon-x"></use></svg></button>
+    </div>
+    <div class="mb-4">
+      <label class="block text-sm text-secondary-c mb-2">一句话生成 (可选)</label>
+      <div class="quick-gen-row flex gap-2">
+        <input type="text" id="quickGenInput" placeholder="描述你想要的角色..." class="flex-1 rounded-lg px-3 py-2 text-sm" style="background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text-color);">
+        <button onclick="quickGenerateCharacter()" id="quickGenBtn" class="btn-secondary px-4 rounded-lg text-sm whitespace-nowrap text-secondary-c">生成</button>
+      </div>
+      <p class="text-xs text-muted-c mt-1">AI将根据描述自动填充下方字段</p>
+    </div>
+    <div class="border-t border-theme my-4"></div>
+    <div class="space-y-3">
+      <div>
+        <label class="block text-sm text-secondary-c mb-1">创建类型</label>
+        <select id="newEntityType" onchange="syncCreateEntityForm()" class="w-full rounded-lg px-3 py-2" style="background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text-color);">
+          <option value="character">单角色</option>
+          <option value="group">群组</option>
+        </select>
+      </div>
+      <div>
+        <label class="block text-sm text-secondary-c mb-1" id="newEntityNameLabel">角色名称 *</label>
+        <input type="text" id="newCharName" class="w-full rounded-lg px-3 py-2" style="background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text-color);">
+      </div>
+      <div>
+        <label class="block text-sm text-secondary-c mb-1">头像</label>
+        <input type="text" id="newCharAvatar" placeholder="🌸" class="w-full rounded-lg px-3 py-2" style="background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text-color);">
+      </div>
+      <div>
+        <label class="block text-sm text-secondary-c mb-1">性格简述</label>
+        <textarea id="newCharPersonality" rows="2" class="w-full rounded-lg px-3 py-2" style="background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text-color);"></textarea>
+      </div>
+      <div>
+        <label class="block text-sm text-secondary-c mb-1">背景故事</label>
+        <textarea id="newCharBackground" rows="3" class="w-full rounded-lg px-3 py-2" style="background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text-color);"></textarea>
+      </div>
+      <div id="newGroupMembersWrap" class="hidden">
+        <label class="block text-sm text-secondary-c mb-1">群成员</label>
+        <textarea id="newGroupMembers" rows="3" placeholder="每行：名称｜性格简述" class="w-full rounded-lg px-3 py-2" style="background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text-color);"></textarea>
+      </div>
+    </div>
+    <div class="flex gap-3 mt-6">
+      <button onclick="closeCreateModal()" class="flex-1 btn-secondary text-secondary-c py-2.5 rounded-xl">取消</button>
+      <button onclick="createCharacter()" class="flex-1 btn-primary text-white py-2.5 rounded-xl">创建角色</button>
+    </div>
+  </div>
+</div>
+
+<!-- Character Card Modal -->
+<div id="characterModal" class="fixed inset-0 modal-bg z-50 hidden items-center justify-center p-4">
+  <div class="glass-panel rounded-2xl w-full max-w-lg max-h-[90vh] overflow-hidden flex flex-col">
+    <div class="flex justify-between items-center p-4 border-b border-theme">
+      <h2 class="text-lg font-bold" id="charModalTitle" style="color: var(--text-color);">角色卡</h2>
+      <button onclick="closeCharacterModal()" class="modal-close" title="关闭" aria-label="关闭角色卡"><svg class="icon"><use href="#icon-x"></use></svg></button>
+    </div>
+    <div class="flex border-b border-theme">
+      <button onclick="switchModalTab('basic')" id="modal-tab-basic" class="modal-tab-btn active flex-1 py-2 text-sm font-medium">基础设定</button>
+      <button onclick="switchModalTab('state')" id="modal-tab-state" class="modal-tab-btn flex-1 py-2 text-sm font-medium">当前状态</button>
+      <button onclick="switchModalTab('lorebook')" id="modal-tab-lorebook" class="modal-tab-btn flex-1 py-2 text-sm font-medium">世界书</button>
+    </div>
+    <div class="flex-1 overflow-y-auto chat-scroll p-4">
+      <div id="modal-content-basic" class="modal-tab-content active space-y-2"></div>
+       <div id="modal-content-state" class="modal-tab-content"></div>
+       <div id="modal-content-lorebook" class="modal-tab-content"></div>
+    </div>
+    <div class="p-4 border-t border-theme">
+      <button onclick="saveCharacterModal()" class="w-full btn-primary text-white py-2 rounded-lg">保存修改</button>
+    </div>
+  </div>
+</div>
+
+<script src="katex/katex.min.js"></script>
+<script>
+{{scripts}}</script>
+</body>
+</html>

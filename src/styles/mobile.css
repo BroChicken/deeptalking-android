@@ -1,0 +1,6 @@
+
+/* ==================== 防横向溢出（移动端） ==================== */
+html { overflow-x: hidden; }
+main, .flex-1 { min-width: 0; }
+.message-content { overflow-wrap: anywhere; word-break: break-word; }
+.action-text { white-space: normal; }

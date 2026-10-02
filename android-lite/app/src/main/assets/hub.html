@@ -1142,7 +1142,7 @@ const DEFAULT_CONFIG = {
   quickReplyRepair: true,
   platformSettings: {}
 };
-const APP_VERSION = '1.3.4';
+const APP_VERSION = '1.3.5';
 const PLATFORM_CONFIGS = {
   deepseek: { baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-flash', models: ['deepseek-flash'] },
   opencode: { baseUrl: 'https://opencode.ai/zen/go/v1', model: 'deepseek-flash', keepV1InResponses: true, models: ['deepseek-flash'] },
@@ -1167,6 +1167,7 @@ let state = {
   activityLog: []
 };
 const STICKER_TAGS = ['开心', '大笑', '难过', '委屈', '生气', '无语', '惊讶', '疑惑', '害羞', '得意', '爱意', '亲亲', '抱抱', '加油', '点赞', '拒绝', '睡觉', '干杯'];
+const API_LIMITS = { auxiliaryTimeoutMs: 90000, requestMetrics: 60, prefixSnapshots: 12 };
 const STICKER_LIMITS = {
   maxDimension: 384,
   targetBytes: 120 * 1024,
@@ -1180,7 +1181,8 @@ const MEMORY_LIMITS = {
   shortTermTrimFloor: 20,
   longTermPerCategory: 40,
   pendingRecall: 6,
-  analysisBatch: 40
+  analysisBatch: 40,
+  summarySources: 160
 };
 const PROMPT_LIMITS = {
   roleChars: 8000,
@@ -1243,11 +1245,12 @@ const LOREBOOK_LIMITS = {
 
 // 记忆注入预算（字符）：检索记忆与摘要记忆共用一个池子，某一路没用完的额度让给另一路
 const CONTEXT_BUDGET = {
-  retrievedChars: 2600,
-  summaryChars: 2600,
+  retrievedChars: 1200,
+  summaryChars: 1600,
   sceneSummaries: 2,
-  sceneInjectionChars: 900,
-  sceneSpan: 24
+  sceneInjectionChars: 600,
+  sceneSpan: 24,
+  volatileChars: 6000
 };
 
 // 语气/风格遵从度（attention）：把最容易违反的约束放到生成点最近处，并做客户端违规检测
@@ -1294,7 +1297,6 @@ const QUICK_REPLY_ISSUE_LABELS = {
 
 // 占位符/模板串：模型偶尔会照抄 JSON 示例里的"短句一""用户下一句1"
 const QUICK_REPLY_PLACEHOLDERS = ['短句一', '短句二', '短句1', '短句2', '用户下一句', '用户下一句1', '用户下一句2', '示例一', '示例二', '...', '…'];
-
 function normalizeLorebook(value) {
   if (!Array.isArray(value)) return [];
   return value.filter(isPlainObject).slice(0, LOREBOOK_LIMITS.entries).map(function(entry, index) {
@@ -1564,6 +1566,7 @@ function normalizeUserAddress(value) {
 }
 
 function normalizeTimestamp(value, fallback) {
+  if (value == null || value === '') return fallback;
   var date = new Date(value);
   return isNaN(date.getTime()) ? fallback : date.toISOString();
 }
@@ -1586,9 +1589,9 @@ function normalizeReasoningEffort(value) {
 
 function normalizeCacheStats(value) {
   if (!isPlainObject(value)) return null;
-  var hitTokens = Number(value.hitTokens);
-  var missTokens = Number(value.missTokens);
-  var promptTokens = Number(value.promptTokens);
+  var hitTokens = typeof value.hitTokens === 'number' ? value.hitTokens : NaN;
+  var missTokens = typeof value.missTokens === 'number' ? value.missTokens : NaN;
+  var promptTokens = typeof value.promptTokens === 'number' ? value.promptTokens : NaN;
   var hasCacheFields = Number.isFinite(hitTokens) && Number.isFinite(missTokens);
   if (!hasCacheFields && !Number.isFinite(promptTokens)) return null;
   return {
@@ -1623,11 +1626,11 @@ function buildApiHeaders(config, sessionId) {
   return headers;
 }
 
+
 function trimText(value, maxLength) {
   var text = toText(value).trim();
   return maxLength && text.length > maxLength ? text.slice(0, maxLength) + '…' : text;
 }
-
 // ==================== Pixel Avatar（试验失败品，已弃用） ====================
 // ⚠️ 像素头像生成不稳定（模型输出的 16x16 网格常缺行/缺色/尺寸错误），与 TTS 一样属于
 //    试验失败品。仅保留 normalizePixelAvatar / avatarPixel 字段做数据兼容，
@@ -1835,11 +1838,13 @@ function buildResolvedTime(dayDate, slot, rangeLabel) {
   var text = dayLabel ? (dayLabel + (normalizedSlot ? ' ' + normalizedSlot : '')) : (range ? (range + (normalizedSlot ? ' ' + normalizedSlot : '')) : '');
   if (!text) return null;
   var iso = null;
-  if (dayDate) {
+  if (dayDate && normalizedSlot) {
     var entry = TIME_SLOT_TABLE.filter(function(item) { return item.slot === normalizedSlot; })[0];
-    var hour = entry ? entry.isoHour : 12;
+    var hour = entry.isoHour;
     var wholeHour = Math.floor(hour);
-    iso = dayLabel + 'T' + padTwoDigits(wholeHour) + ':' + padTwoDigits(Math.round((hour - wholeHour) * 60)) + ':00';
+    var resolved = new Date(dayDate.getTime());
+    resolved.setHours(wholeHour, Math.round((hour - wholeHour) * 60), 0, 0);
+    iso = resolved.toISOString();
   }
   return { day: dayLabel, range: range, slot: normalizedSlot, text: text, iso: iso };
 }
@@ -1852,16 +1857,24 @@ function resolveTimeRef(ref, baseDate) {
   var slot = normalizeTimeSlot(ref.slot);
   var explicitRaw = toText(ref.explicit).trim();
   if (explicitRaw) {
-    var explicitDate = new Date(explicitRaw);
+    var dateOnly = explicitRaw.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$/);
+    var explicitDate = dateOnly ? new Date(Number(dateOnly[1]), Number(dateOnly[2]) - 1, Number(dateOnly[3])) : new Date(explicitRaw);
+    if (dateOnly && (explicitDate.getFullYear() !== Number(dateOnly[1]) || explicitDate.getMonth() + 1 !== Number(dateOnly[2]) || explicitDate.getDate() !== Number(dateOnly[3]))) return null;
     if (isNaN(explicitDate.getTime())) explicitDate = new Date(explicitRaw.replace(/[/.]/g, '-'));
     if (!isNaN(explicitDate.getTime())) {
+      if (!dateOnly && /[T ]\d{2}:\d{2}/.test(explicitRaw)) {
+        return { day: formatDayLabel(explicitDate), range: null, slot: getTimeSlot(explicitDate),
+          text: explicitRaw, iso: explicitDate.toISOString() };
+      }
       var explicitDay = new Date(explicitDate.getTime());
       explicitDay.setHours(0, 0, 0, 0);
       return buildResolvedTime(explicitDay, slot, null);
     }
+    return null;
   }
   var anchor = toText(ref.anchor).trim().toLowerCase();
-  if (TIME_REF_ANCHORS.indexOf(anchor) === -1) anchor = 'today';
+  if (!anchor && (ref.offsetDays != null || ref.slot)) anchor = 'today';
+  if (TIME_REF_ANCHORS.indexOf(anchor) === -1) return null;
   var logicalDay = getLogicalDayDate(base);
   var weekday = TIME_REF_WEEKDAYS.indexOf(toText(ref.weekday).trim().toLowerCase());
   var extraDays = Number(ref.offsetDays);
@@ -2019,7 +2032,6 @@ function cleanFieldValue(key, value) {
   }
   return trimText(text.replace(/\s+/g, ' ').trim(), 700);
 }
-
 // 记忆衰减：按距上次召回的时长衰减有效重要性（未召回越久权重越低）
 function computeEffectiveImportance(item, now) {
   now = now || Date.now();
@@ -2057,7 +2069,7 @@ function dedupeLongTermList(items, category) {
   var seen = new Map();
   (items || []).forEach(function(item) {
     var identity = category === 'events'
-      ? getEventIdentity(item.eventTime, item.participants, item.location)
+      ? getEventIdentity(item.eventTime, item.participants, item.location) + ':' + trimText(item.key).toLowerCase()
       : trimText(item.key).toLowerCase();
     if (!identity || !seen.has(identity)) {
       result.push(item);
@@ -2097,19 +2109,65 @@ function dedupeLongTermList(items, category) {
   return result;
 }
 
-// 短程记忆裁剪：保留所有未分析项，只从已分析项里裁剪，避免未提升到长期的记忆被提前丢弃
+// Both consumers must acknowledge the same summary revision before pruning.
 function trimShortTermList(list) {
   if (!Array.isArray(list)) return [];
-  if (list.length <= MEMORY_LIMITS.shortTerm) return list;
-  var unanalyzed = list.filter(function(item) { return !item.analyzedAt; });
-  var analyzed = list.filter(function(item) { return item.analyzedAt; });
-  var keepAnalyzed = analyzed.slice(-Math.max(0, MEMORY_LIMITS.shortTerm - unanalyzed.length));
-  return unanalyzed.concat(keepAnalyzed);
+  var recentStart = Math.max(0, list.length - MEMORY_LIMITS.shortTermTrimFloor);
+  return list.filter(function(item, index) {
+    var revision = Number(item.revision) || 1;
+    var analyzed = item.analyzedAt && (Number(item.analyzedRevision) || 1) === revision;
+    var scanned = item.lorebookScannedAt && (Number(item.lorebookScannedRevision) || 1) === revision;
+    return index >= recentStart || !analyzed || !scanned;
+  });
+}
+
+function ensureMessageSequences(character) {
+  var memory = character.memory;
+  if (!isPlainObject(memory.counters)) memory.counters = {};
+  var last = 0;
+  var next = Math.max(0, Number(memory.counters.messageSequence) || 0);
+  (memory.instant || []).forEach(function(message) {
+    var sequence = Number(message.sequence);
+    if (!Number.isSafeInteger(sequence) || sequence <= last) sequence = Math.max(last, next) + 1;
+    message.sequence = sequence;
+    last = sequence;
+    next = Math.max(next, sequence);
+  });
+  memory.counters.messageSequence = next;
+  if (!isPlainObject(memory.sceneState)) memory.sceneState = { key: '', startCount: 0, messageCount: 0 };
+  var scene = memory.sceneState;
+  if (!Number.isSafeInteger(scene.startSequence)) {
+    var scenes = memory.scenes || [];
+    var end = scenes.length ? Date.parse(scenes[scenes.length - 1].endedAt || '') : NaN;
+    var anchor = 0;
+    if (Number.isFinite(end)) {
+      (memory.instant || []).forEach(function(message) {
+        if (Date.parse(message.timestamp || '') <= end) anchor = message.sequence;
+      });
+    } else if (scene.startCount > 0 && scene.startCount <= memory.instant.length) {
+      anchor = memory.instant[scene.startCount - 1].sequence;
+    }
+    scene.startSequence = anchor;
+  }
+  scene.startSequence = Math.max(0, Math.min(next, scene.startSequence));
+}
+
+function captureMemoryTask(char) {
+  return { character: char, revision: Number(char.memory.revision) || 0,
+    lastMessageId: char.memory.instant.length ? char.memory.instant[char.memory.instant.length - 1].id : null };
+}
+
+function isMemoryTaskCurrent(task) {
+  var char = task && task.character;
+  if (!char || state.characters[char.id] !== char || (Number(char.memory.revision) || 0) !== task.revision) return false;
+  var last = char.memory.instant.length ? char.memory.instant[char.memory.instant.length - 1].id : null;
+  return last === task.lastMessageId;
 }
 
 function trimCharacterMemory(character) {
   if (!character || !character.memory) return;
   character.memory.instant = Array.isArray(character.memory.instant) ? character.memory.instant : [];
+  ensureMessageSequences(character);
   // Batch trim at the high watermark: only remove extracted messages down to the low
   // watermark, one pass, FIFO. Un-extracted messages are never dropped.
   if (character.memory.instant.length >= MEMORY_LIMITS.instant) {
@@ -2189,7 +2247,6 @@ function applyMemoryDecay(character, memoryStore) {
     });
   });
 }
-
 // ==================== Data Persistence ====================
 function saveData() {
   try {
@@ -2413,29 +2470,34 @@ function normalizeCharacter(rawCharacter, id, strict, skipLegacyRepair) {
     return {
       id: toText(message.id, character.id + '_msg_' + index),
        role: message.role === 'user' ? 'user' : 'assistant',
-       content: toText(message.content),
+        content: toText(message.content),
+        sequence: Number.isSafeInteger(message.sequence) ? message.sequence : 0,
        timestamp: toText(message.timestamp, new Date().toISOString()),
         extractedAt: message.extractedAt ? normalizeTimestamp(message.extractedAt, null) : null,
         images: Array.isArray(message.images) ? message.images.filter(function(uri) { return typeof uri === 'string' && uri; }).slice(0, 4) : undefined,
       internalOnly: message.internalOnly === true ? true : undefined,
       staticChanges: Array.isArray(message.staticChanges) ? message.staticChanges.map(function(label) { return toText(label); }).filter(Boolean) : undefined,
       lorebookChanges: Array.isArray(message.lorebookChanges) ? message.lorebookChanges.map(function(label) { return toText(label); }).filter(Boolean) : undefined,
-      styleViolations: Array.isArray(message.styleViolations) ? message.styleViolations.filter(function(key) { return STYLE_VIOLATION_LABELS[key]; }) : undefined
+      styleViolations: Array.isArray(message.styleViolations) ? message.styleViolations.filter(function(key) { return STYLE_VIOLATION_LABELS[key]; }) : undefined,
+      quickReplyIssues: Array.isArray(message.quickReplyIssues) ? message.quickReplyIssues.filter(function(key) { return QUICK_REPLY_ISSUE_LABELS[key]; }) : undefined
     };
   }) : [];
   character.memory.shortTerm = Array.isArray(rawMemory.shortTerm) ? rawMemory.shortTerm.filter(isPlainObject).map(function(item) {
-    var sourceMessageIds = Array.isArray(item.sourceMessageIds) ? item.sourceMessageIds.map(function(sourceId) { return toText(sourceId); }).filter(Boolean).slice(0, 8) : [];
+    var sourceMessageIds = Array.isArray(item.sourceMessageIds) ? item.sourceMessageIds.map(function(sourceId) { return toText(sourceId); }).filter(Boolean).slice(0, MEMORY_LIMITS.summarySources) : [];
     var userEvidence = Array.isArray(item.userEvidence) ? item.userEvidence.filter(isPlainObject).map(function(entry) {
       return { sourceMessageId: toText(entry.sourceMessageId), text: trimText(entry.text, 300) };
-    }).filter(function(entry) { return entry.sourceMessageId && entry.text; }).slice(0, 8) : [];
+    }).filter(function(entry) { return entry.sourceMessageId && entry.text; }).slice(0, MEMORY_LIMITS.summarySources) : [];
     return {
       id: toText(item.id, createMemoryId('short')),
       content: toText(item.content),
       timestamp: toText(item.timestamp, new Date().toISOString()),
       analyzedAt: Date.parse(item.analyzedAt || '') ? toText(item.analyzedAt) : null,
       lorebookScannedAt: Date.parse(item.lorebookScannedAt || '') ? toText(item.lorebookScannedAt) : null,
+      revision: Math.max(1, Number(item.revision) || 1),
+      analyzedRevision: Number(item.analyzedRevision) || (item.analyzedAt ? 1 : 0),
+      lorebookScannedRevision: Number(item.lorebookScannedRevision) || (item.lorebookScannedAt ? 1 : 0),
       sourceMessageIds: sourceMessageIds,
-      sourceRoles: Array.isArray(item.sourceRoles) ? item.sourceRoles.filter(function(role) { return role === 'user' || role === 'assistant'; }).slice(0, 8) : [],
+      sourceRoles: Array.isArray(item.sourceRoles) ? item.sourceRoles.map(function(role) { return role === 'user' || role === 'assistant' ? role : ''; }).slice(0, MEMORY_LIMITS.summarySources) : [],
       userEvidence: userEvidence,
       eventTime: normalizeTimestamp(item.eventTime, toText(item.timestamp, new Date().toISOString())),
       participants: Array.isArray(item.participants) ? item.participants.map(function(value) { return trimText(value, 80); }).filter(Boolean).slice(0, 8) : [],
@@ -2460,6 +2522,7 @@ function normalizeCharacter(rawCharacter, id, strict, skipLegacyRepair) {
   character.memory.counters.sceneFailures = Number.isFinite(Number(rawCounters.sceneFailures)) ? Math.max(0, Number(rawCounters.sceneFailures)) : 0;
   character.memory.counters.lorebookFailures = Number.isFinite(Number(rawCounters.lorebookFailures)) ? Math.max(0, Number(rawCounters.lorebookFailures)) : 0;
   character.memory.counters.lorebookScannedCount = Number.isFinite(Number(rawCounters.lorebookScannedCount)) ? Math.max(0, Number(rawCounters.lorebookScannedCount)) : 0;
+  character.memory.counters.messageSequence = Math.max(0, Number(rawCounters.messageSequence) || 0);
   character.memory.scenes = Array.isArray(rawMemory.scenes) ? rawMemory.scenes.filter(isPlainObject).map(function(scene, index) {
     return {
       id: toText(scene.id, 'scene_' + index),
@@ -2474,11 +2537,13 @@ function normalizeCharacter(rawCharacter, id, strict, skipLegacyRepair) {
   character.memory.sceneState = {
     key: toText(rawSceneState.key),
     startCount: Number.isFinite(Number(rawSceneState.startCount)) ? Math.max(0, Number(rawSceneState.startCount)) : 0,
+    startSequence: Number.isSafeInteger(rawSceneState.startSequence) ? rawSceneState.startSequence : undefined,
     messageCount: 0
   };
   character.memory.pendingRecall = Array.isArray(rawMemory.pendingRecall) ? rawMemory.pendingRecall.map(normalizeLongTermItem).filter(Boolean) : [];
   character.memory.lastInjectedRecallIds = Array.isArray(rawMemory.lastInjectedRecallIds) ? rawMemory.lastInjectedRecallIds.map(function(id) { return toText(id); }).filter(Boolean).slice(0, MEMORY_LIMITS.pendingRecall) : [];
   character.memory.revision = Number.isFinite(Number(rawMemory.revision)) ? Math.max(0, Number(rawMemory.revision)) : 0;
+  ensureMessageSequences(character);
   if (character.entityType === 'group') {
     var rawGroupInfo = isPlainObject(rawCharacter.groupInfo) ? rawCharacter.groupInfo : {};
     // 旧版 worldView 并入 groupInfo.description（空才回填，幂等）
@@ -2690,7 +2755,8 @@ function normalizeAppData(data, strict, skipLegacyRepair) {
        proactiveEnabled: rawConfig.proactiveEnabled !== false,
        styleCritique: rawConfig.styleCritique !== false,
        quickReplyRepair: rawConfig.quickReplyRepair !== false,
-       cacheStats: normalizeCacheStats(rawConfig.cacheStats),
+        cacheStats: normalizeCacheStats(rawConfig.cacheStats),
+        requestMetrics: Array.isArray(rawConfig.requestMetrics) ? rawConfig.requestMetrics.filter(isPlainObject).slice(-60) : [],
        platformSettings: platformSettings
     },
     characters: characters,
@@ -2740,7 +2806,6 @@ function applyNormalizedData(data, isImport) {
     alert('检测到 ' + repairs + ' 条旧格式记忆，已自动修补为新的事件格式。');
   }
 }
-
 // ==================== Theme Management ====================
 function setTheme(theme) {
   state.activeTheme = theme;
@@ -3461,6 +3526,7 @@ function canAttemptStaticFill(target, now) {
 
 async function fillStaticFieldsForJob(job) {
   var target = job.target;
+  var guard = captureMemoryTask(job.host);
   var labels = job.missing.map(function(key) { return STATIC_PROFILE_FIELDS[key].label + '(' + key + ')'; }).join('、');
   var contextLines = [];
   if (job.host && job.host !== target && job.host.entityType === 'group') {
@@ -3490,9 +3556,11 @@ async function fillStaticFieldsForJob(job) {
     { role: 'user', content: prompt }
   ]);
   var data = parseJsonPayload(response.choices[0].message.content);
+  if (!isMemoryTaskCurrent(guard)) return [];
   if (!isPlainObject(data)) throw new Error('补全结果格式错误');
   var filled = [];
   job.missing.forEach(function(key) {
+    if (toText(target.basicInfo[key]).trim()) return;
     if (data[key] == null || !toText(data[key]).trim()) return;
       var value = key === 'userAddress' ? normalizeUserAddress(data[key]) : cleanFieldValue(key, parseRelativeText(toText(data[key]), new Date()));
     if (!value) return;
@@ -3537,7 +3605,6 @@ async function autoFillStaticFields() {
     window.__staticFillRunning = false;
   }
 }
-
 // ==================== 1.2.0 旧字段结构 AI 迁移 ====================
 // 本地合并（normalize 时已完成）是兜底；此处在启动时询问用户是否用 AI 把旧字段内容
 // 重新整理进新字段，直到迁移完成（或用户勾选"以后不再询问"后跳过）为止。
@@ -3865,6 +3932,7 @@ async function migrateEntityFields(entity) {
 function discardConversationBranch(char, startIndex) {
   var removed = char.memory.instant.slice(startIndex);
   var removedIds = new Set(removed.map(function(message) { return message.id; }).filter(Boolean));
+  char.memory.revision = (Number(char.memory.revision) || 0) + 1;
   char.memory.instant = char.memory.instant.slice(0, startIndex);
   function hasRemovedSource(item) {
     return (item.sourceMessageIds || []).some(function(id) { return removedIds.has(id); });
@@ -4011,7 +4079,8 @@ async function sendMessage(options) {
   state.activityLog = [{ at: new Date().toISOString(), text: isProactive ? '角色主动开口' : '发送消息' }];
   state._receiveLogged = false;
   try {
-    var messages = buildRequestPayload(char, text);
+    var requestContext = {};
+    var messages = buildRequestPayload(char, text, requestContext);
     var fullText = '';
     var fullResponse = null;
     var salvagedReply = null;
@@ -4019,7 +4088,7 @@ async function sendMessage(options) {
     var attemptsLeft = 2;
     var didRetry = false;
     var requestStartTime = Date.now();
-    var toolState = { items: [], rounds: 0, char: char };
+    var toolState = { items: [], rounds: 0, char: char, config: Object.assign({}, state.config) };
     var phase = 'auto';
     var submitAttempted = false;
     var structuredFromSubmit = null;
@@ -4030,19 +4099,6 @@ async function sendMessage(options) {
       salvagedReply = attempt.salvagedReply;
       seenEventTypes = attempt.seenEventTypes;
       var submitResult = extractSubmitResponse(fullResponse);
-        if (submitResult && submitResult.ok) {
-          fullText = submitResult.rawArgs;
-          structuredFromSubmit = submitResult;
-          break;
-        }
-        // submit_response 有 reply 但缺/非法 quickReplies：不再重发补一轮，直接接受正文
-        // （记忆字段照常保留），快速回应交给后台"换位生成"补齐。
-        if (submitResult && submitResult.reason === 'missing_quick_replies') {
-          salvagedReply = submitResult.reply;
-          structuredFromSubmit = { ok: true, obj: submitResult.obj || { reply: submitResult.reply }, reply: submitResult.reply, rawArgs: submitResult.rawArgs };
-          fullText = submitResult.rawArgs;
-          break;
-        }
         var infoCalls = (attempt.functionCalls || []).filter(function(call) { return call.name !== 'submit_response'; });
         // 特判：模型只发起 ask_user 时，直接把提问作为本轮回复输出，不进入工具循环
         if (phase === 'auto' && infoCalls.length === 1 && infoCalls[0].name === 'ask_user') {
@@ -4056,9 +4112,9 @@ async function sendMessage(options) {
           }
         }
         if (phase === 'auto' && infoCalls.length) {
-          if (toolState.rounds >= MAX_TOOL_ROUNDS) {
+          if (toolState.rounds >= MAX_TOOL_ROUNDS || (Number(toolState.executedCalls) || 0) >= MAX_TOOL_CALLS) {
+            await executeAgentToolBatch(infoCalls, char, toolState, attempt.reasoningItems, false);
             var toolLimitDecision = chatStageDecision('auto-tool-limit', { hasText: !!(fullText && fullText.trim()) });
-            if (toolLimitDecision.action === 'accept-text') break;
             noteStageEvent('forcedSubmitAtToolLimit');
             setActivity(toolLimitDecision.activity);
             phase = 'submit';
@@ -4067,20 +4123,16 @@ async function sendMessage(options) {
             continue;
           }
           toolState.rounds++;
-          // 关键：DeepSeek thinking 模式不支持并行 function_call 回传（会报 400）。
-          // 因此即使模型一次发出多个工具调用，也只逐个回传执行——每轮仅处理一个，
-          // 其余调用丢弃（模型会在下一轮基于结果继续决定是否再调）。
-          var primaryCall = infoCalls[0];
-          // thinking 模式的 reasoning_text 必须回传：先推 reasoning，再推 function_call/function_call_output
-          (attempt.reasoningItems || []).forEach(function(item) { toolState.items.push(item); });
-          var callId = primaryCall.call_id || primaryCall.id;
-          toolState.items.push({ type: 'function_call', call_id: callId, name: primaryCall.name, arguments: primaryCall.arguments });
-          var output = await executeToolCall(primaryCall, char, toolState);
-          toolState.items.push({ type: 'function_call_output', call_id: callId, output: output });
-          var toolDecision = chatStageDecision('auto-tool', { toolName: primaryCall.name });
+          var batch = await executeAgentToolBatch(infoCalls, char, toolState, attempt.reasoningItems, true);
+          var toolDecision = chatStageDecision('auto-tool', { toolName: infoCalls[infoCalls.length - 1].name });
           setActivity(toolDecision.activity);
           updateMessageBubble(loadingMsg.id, getDisplayText(toolDecision.bubble));
-          continue;
+          if (!submitResult || batch.failed) continue;
+        }
+        if (submitResult && (submitResult.ok || submitResult.reason === 'missing_quick_replies')) {
+          fullText = submitResult.rawArgs;
+          structuredFromSubmit = { ok: true, obj: submitResult.obj, reply: submitResult.reply, rawArgs: submitResult.rawArgs };
+          break;
         }
         if (phase === 'auto') {
           // 阶段一结束：拿到正文（合法 JSON 或散文）就直接采用——散文即终稿，不再为了补
@@ -4202,20 +4254,21 @@ async function sendMessage(options) {
     }
     displayText = dedupeRepeatedEnding(displayText, char);
     // 语气/风格遵从：先做客户端违规检测；命中且开了修订开关时跑一次 critique（只修文风、不改剧情）
-    var styleViolations = detectStyleViolations(displayText, char, getRecentReplyEndings(char, STYLE_GUARD.lookbackReplies));
+    var styleViolations = detectStyleViolations(displayText, char, getRecentReplyTexts(char, STYLE_GUARD.lookbackReplies));
     if (styleViolations.length > 0 && state.config.styleCritique !== false) {
       setActivity('正在校正文风…');
       var critiqued = await critiqueReplyStyle(char, displayText, styleViolations);
       if (critiqued && critiqued !== displayText) {
         displayText = dedupeRepeatedEnding(critiqued, char);
-        styleViolations = detectStyleViolations(displayText, char, getRecentReplyEndings(char, STYLE_GUARD.lookbackReplies));
+        styleViolations = detectStyleViolations(displayText, char, getRecentReplyTexts(char, STYLE_GUARD.lookbackReplies));
       }
     }
     loadingMsg.styleViolations = styleViolations;
     loadingMsg.content = displayText;
     loadingMsg.isLoading = false;
     loadingMsg.timestamp = new Date().toISOString();
-    consumeInjectedRecalls(char);
+    consumeInjectedRecalls(char, requestContext.recallIds);
+    markLorebookMentions(requestContext.lorebookEntries, new Date().toISOString());
     var stickerMsg = null;
     if (toolState && toolState.stickerToSend && toolState.stickerToSend.dataUrl) {
       // 表情包作为紧跟其后的独立消息（不并入正文气泡，相当于两条消息）
@@ -4255,8 +4308,9 @@ async function sendMessage(options) {
       if (state.config.quickReplyRepair !== false) {
         loadingMsg.quickReplyIssues = quickReplyIssues;
         var repairChar = char;
+        var repairGuard = captureMemoryTask(char);
         queueBackgroundTask(function() {
-          return repairQuickRepliesAsUser(repairChar, displayText, userMessage, quickReplyMessageId, quickReplies);
+          return repairQuickRepliesAsUser(repairChar, displayText, userMessage, quickReplyMessageId, quickReplies, repairGuard);
         });
       } else if (quickReplies.length > 0) {
         // 关掉校正时不做二次生成：模型给什么就用什么
@@ -4284,8 +4338,9 @@ async function sendMessage(options) {
       var memoryChar = char;
       var memoryUserMessage = userMessage;
       var memoryReplyText = displayText;
+      var memoryTaskGuard = captureMemoryTask(char);
       queueBackgroundTask(function() {
-        return extractProseTurnMemory(memoryChar, memoryUserMessage, memoryReplyText, loadingMsg);
+        return extractProseTurnMemory(memoryChar, memoryUserMessage, memoryReplyText, loadingMsg, memoryTaskGuard);
       });
     }
     scheduleSave();
@@ -4311,6 +4366,9 @@ async function sendMessage(options) {
 }
 
 async function performChatRequest(messages, text, loadingMsg, toolState, phase) {
+  var config = toolState.config || state.config;
+  var body = buildResponsesRequestBody(messages, config.stream, toolState, phase, config);
+  var trace = startRequestTrace(body, { char: toolState.char, taskType: 'chat', phase: phase, platform: config.apiPlatform });
   var priorCache = state.config.cacheStats;
   var hadCacheMiss = priorCache && priorCache.hitTokens === 0 && priorCache.promptTokens > 0;
   setActivity(hadCacheMiss ? '缓存未命中，正在更新队列…' : '正在请求 API…');
@@ -4328,11 +4386,12 @@ async function performChatRequest(messages, text, loadingMsg, toolState, phase) 
     if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
   }
   var response;
+  var reader = null;
   try {
-    response = await fetch(getResponsesEndpoint(state.config), {
+    response = await fetch(getResponsesEndpoint(config), {
       method: 'POST',
-headers: buildApiHeaders(state.config, getActiveSessionId()),
-      body: JSON.stringify(buildResponsesRequestBody(messages, state.config.stream, toolState, phase)),
+headers: buildApiHeaders(config, getSessionIdFor(toolState.char)),
+      body: JSON.stringify(body),
       signal: abortController ? abortController.signal : undefined
     });
   } catch (fetchError) {
@@ -4341,6 +4400,8 @@ headers: buildApiHeaders(state.config, getActiveSessionId()),
       if (!fetchError.status) fetchError.network = true;
       if (fetchError.name === 'AbortError') fetchError.aborted = true;
     }
+    trace.status = 'failed';
+    recordCacheUsage(null, trace);
     throw fetchError;
   }
   if (!response.ok) {
@@ -4348,6 +4409,8 @@ headers: buildApiHeaders(state.config, getActiveSessionId()),
     clearRequestTimers();
     var httpError = new Error(errData.error ? errData.error.message : 'HTTP ' + response.status);
     httpError.status = response.status;
+    trace.status = 'failed';
+    recordCacheUsage(null, trace);
     throw httpError;
   }
 
@@ -4360,6 +4423,8 @@ headers: buildApiHeaders(state.config, getActiveSessionId()),
   var fullResponse = null;
   var seenEventTypes = [];
   var functionCalls = [];
+  var usageRecorded = false;
+  try {
   var pendingFunctionCall = null;
   var reasoningItems = [];
   var pendingReasoning = null;
@@ -4510,7 +4575,8 @@ headers: buildApiHeaders(state.config, getActiveSessionId()),
       if (event.type === 'response.completed' || event.type === 'response.incomplete') {
         if (event.response) {
           fullResponse = event.response;
-          recordCacheUsage(event.response.usage);
+          recordCacheUsage(event.response.usage, trace);
+          usageRecorded = true;
         }
         streamFinished = true;
         return;
@@ -4520,7 +4586,7 @@ headers: buildApiHeaders(state.config, getActiveSessionId()),
       }
       return;
     }
-    recordCacheUsage(event.usage);
+      recordCacheUsage(event.usage, trace);
     var delta = extractStreamText(event);
     if (!delta) return;
     if (!state._receiveLogged) { state._receiveLogged = true; setActivity('正在接收回复…'); }
@@ -4529,7 +4595,7 @@ headers: buildApiHeaders(state.config, getActiveSessionId()),
   };
   if (isStreaming) {
     if (!response.body || !response.body.getReader) { clearRequestTimers(); throw new Error('当前浏览器不支持流式响应'); }
-    var reader = response.body.getReader();
+    reader = response.body.getReader();
     var decoder = new TextDecoder();
     var buffer = '';
     var frameEventName = '';
@@ -4584,7 +4650,8 @@ headers: buildApiHeaders(state.config, getActiveSessionId()),
     }
   } else {
     var responseJson = await response.json();
-    recordCacheUsage(responseJson.usage);
+    recordCacheUsage(responseJson.usage, trace);
+    usageRecorded = true;
     fullText = extractResponsesText(responseJson);
     {
       fullResponse = responseJson;
@@ -4616,8 +4683,18 @@ headers: buildApiHeaders(state.config, getActiveSessionId()),
   flushBubbleUpdate();
   clearRequestTimers();
   return { fullText: fullText, fullResponse: fullResponse, salvagedReply: salvagedReply, seenEventTypes: seenEventTypes, functionCalls: functionCalls, reasoningItems: reasoningItems };
+  } catch (error) {
+    trace.status = 'failed';
+    if (!usageRecorded) recordCacheUsage(null, trace);
+    throw error;
+  } finally {
+    clearRequestTimers();
+    if (reader) {
+      try { await reader.cancel(); } catch (error) { /* Already closed or aborted. */ }
+      try { reader.releaseLock(); } catch (error) { /* No outstanding lock. */ }
+    }
+  }
 }
-
 // ==================== API 请求级重试 ====================
 const MAX_API_RETRIES = 3;
 const API_RETRY_DELAYS_MS = [1000, 2000, 4000];
@@ -5049,9 +5126,22 @@ function getSearchTerms(text) {
       for (var i = 0; i < term.length - 1; i++) expanded.push(term.slice(i, i + 2));
     }
   });
-  return Array.from(new Set(expanded)).slice(0, 40);
+  var stop = ['不知道', '知道', '不知', '什么', '怎么', '这个', '那个', '自己', '你的', '我的',
+    '不是', '是的', '一次', '次了', '之前', '现在', '时候', '刚才', '谢谢', '好的', '用户', '角色',
+    'know', 'dont', 'what', 'this', 'that', 'please', 'your', 'with'];
+  return Array.from(new Set(expanded)).filter(function(term) { return stop.indexOf(term) === -1; }).slice(0, 80);
 }
 
+function buildMemoryQuery(char, query) {
+  var text = toText(query).trim();
+  if (!text || !/(填过|记错|记反|不是|不止|那件|那个|之前|刚才|it\b|that\b)/i.test(text)) return text;
+  var messages = (char.memory.instant || []).filter(function(message) { return !message.isLoading && !message.internalOnly; });
+  if (messages.length && messages[messages.length - 1].role === 'user' && messages[messages.length - 1].content === text) messages.pop();
+  var context = messages.slice(-2).map(function(message) {
+    return trimText(toText(message.content).replace(/[（(][^）)]*[）)]/g, ''), 600);
+  }).join('\n');
+  return text + '\n' + context;
+}
 function retrieveRelevantMemories(char, query, memoryStore) {
   memoryStore = memoryStore || char.memory;
   var longTerm = memoryStore.longTerm || {};
@@ -5062,10 +5152,15 @@ function retrieveRelevantMemories(char, query, memoryStore) {
     longTerm[category].forEach(function(item) {
       var searchable = (toText(item.key) + ' ' + toText(item.value) + ' ' + (item.tags || []).join(' ')).toLowerCase();
       var score = computeEffectiveImportance(item, now) * 0.45;
+      var matched = 0;
       terms.forEach(function(term) {
-        if (searchable.indexOf(term) !== -1) score += term.length > 2 ? 4 : 2;
+        if (searchable.indexOf(term) !== -1) {
+          score += term.length > 2 ? 4 : 2;
+          matched++;
+        }
       });
-      var memoryTime = Date.parse(item.updatedAt || item.createdAt || '') || 0;
+      if (matched === 0) return;
+      var memoryTime = Date.parse(item.eventTime || item.createdAt || '') || 0;
       var ageDays = memoryTime ? Math.max(0, (now - memoryTime) / 86400000) : 9999;
       score += Math.max(0, 2 - ageDays / 90);
       if (toText(item.arcOf)) score += 3;
@@ -5073,14 +5168,20 @@ function retrieveRelevantMemories(char, query, memoryStore) {
     });
   });
   candidates.sort(function(a, b) { return b.score - a.score; });
-  var selected = candidates.slice(0, 12);
-  var seen = new Set(selected.map(function(entry) { return entry.item.id || entry.category + ':' + entry.item.key; }));
+  var selected = [];
+  var seen = new Set();
   (memoryStore.pendingRecall || []).forEach(function(item) {
     var id = item.id || 'pending:' + item.key;
     if (!seen.has(id) && selected.length < 12) {
-      selected.unshift({ item: item, category: 'recalled', score: 999 });
+      selected.push({ item: item, category: 'recalled', score: 999 });
       seen.add(id);
     }
+  });
+  candidates.forEach(function(entry) {
+    var id = entry.item.id || entry.category + ':' + entry.item.key;
+    if (selected.length >= 12 || seen.has(id)) return;
+    seen.add(id);
+    selected.push(entry);
   });
   var finalList = selected.slice(0, 12);
   return finalList.map(function(entry) {
@@ -5335,7 +5436,7 @@ function mergeUserEvidence(a, b) {
 function addShortTermMemory(char, content, timestamp, sourceData, sources) {
   var text = trimText(content, 500);
   if (!text) return false;
-  var sourceIds = sourceData && Array.isArray(sourceData.sourceMessageIds) ? sourceData.sourceMessageIds.map(function(id) { return toText(id); }).filter(Boolean).slice(0, 8) : [];
+  var sourceIds = sourceData && Array.isArray(sourceData.sourceMessageIds) ? Array.from(new Set(sourceData.sourceMessageIds.map(function(id) { return toText(id); }).filter(Boolean))).slice(0, MEMORY_LIMITS.summarySources) : [];
   var knownSources = sources || getKnownSources(char);
   if (sourceIds.length === 0 || sourceIds.some(function(id) { return !knownSources[id]; })) return false;
   var sourceRoles = sourceIds.map(function(id) { return knownSources[id].role; });
@@ -5351,19 +5452,15 @@ function addShortTermMemory(char, content, timestamp, sourceData, sources) {
   var location = trimText(sourceData && sourceData.location, 160);
   var eventIdentity = getEventIdentity(eventTime, participants, location);
   var existing = eventIdentity && char.memory.shortTerm.find(function(item) {
-    return getEventIdentity(item.eventTime, item.participants, item.location) === eventIdentity;
+    return item.content === text && getEventIdentity(item.eventTime, item.participants, item.location) === eventIdentity;
   });
   if (existing) {
-    var previousContent = existing.content;
-    var contentChanged = text !== previousContent;
-    existing.content = text;
     existing.timestamp = timestamp || existing.timestamp;
-    if (contentChanged) existing.analyzedAt = null;
-    existing.sourceMessageIds = Array.from(new Set((existing.sourceMessageIds || []).concat(sourceIds))).slice(-8);
+    existing.sourceMessageIds = Array.from(new Set((existing.sourceMessageIds || []).concat(sourceIds))).slice(-MEMORY_LIMITS.summarySources);
     existing.sourceRoles = existing.sourceMessageIds.map(function(id) { return knownSources[id] ? knownSources[id].role : ''; });
     existing.userEvidence = (existing.userEvidence || []).concat(userEvidence).filter(function(entry, index, list) {
       return list.findIndex(function(other) { return other.sourceMessageId === entry.sourceMessageId && other.text === entry.text; }) === index;
-    }).filter(function(entry) { return existing.sourceMessageIds.indexOf(entry.sourceMessageId) !== -1; }).slice(-8);
+    }).filter(function(entry) { return existing.sourceMessageIds.indexOf(entry.sourceMessageId) !== -1; }).slice(-MEMORY_LIMITS.summarySources);
     return true;
   }
   char.memory.shortTerm.push({
@@ -5371,6 +5468,9 @@ function addShortTermMemory(char, content, timestamp, sourceData, sources) {
     content: text,
     timestamp: timestamp || new Date().toISOString(),
     analyzedAt: null,
+    revision: 1,
+    analyzedRevision: 0,
+    lorebookScannedRevision: 0,
     sourceMessageIds: sourceIds,
     sourceRoles: sourceRoles,
     userEvidence: userEvidence,
@@ -5402,17 +5502,39 @@ function evidenceMatchesSource(source, evidence) {
   return evidenceText.length >= 2 && sourceText.indexOf(evidenceText) !== -1;
 }
 
-// current_response 来源的宽松匹配：先试逐字摘录；无重叠词但证据为成句概述（>=8字）时采信，提升情绪/关注类字段更新通过率
+// Summarized evidence still needs multiple overlapping substantive fragments.
 function evidenceMatchesSummary(source, evidence) {
   if (evidenceMatchesSource(source, evidence)) return true;
   var ev = toText(evidence).trim();
   var src = toText(source).toLowerCase();
   if (ev.length < 4 || src.length < 4) return false;
+  var pairs = [];
+  var matches = 0;
   for (var i = 0; i + 2 <= ev.length; i++) {
     var pair = ev.substr(i, 2).toLowerCase();
-    if (/^[\u4e00-\u9fff\w]/.test(pair.charAt(0)) && /[\u4e00-\u9fff\w]/.test(pair.charAt(1)) && src.indexOf(pair) !== -1) return true;
+    if (!/^[\u4e00-\u9fff\w]{2}$/.test(pair) || pairs.indexOf(pair) !== -1) continue;
+    pairs.push(pair);
+    if (src.indexOf(pair) !== -1) matches++;
   }
-  return ev.length >= 8;
+  return matches >= 2 && matches / Math.max(1, pairs.length) >= 0.35;
+}
+
+function hasStaticEditIntent(field, resolvedSources) {
+  var aliases = {
+    gender: /性别|gender/, age: /年龄|岁|age/, race: /种族|race|species/,
+    appearance: /外貌|长相|头发|衣服|appearance/, personality: /性格|personality/,
+    values: /价值观|values/, fears: /恐惧|弱点|害怕|fears/,
+    background: /背景|经历|background/, keyEvents: /关键过往|里程碑|key.events/,
+    speakingStyle: /说话|语气|口吻|风格|speaking.style|tone/,
+    language: /语言|方言|中文|英文|language/,
+    userAddress: /叫我|称呼|喊我|call.me|address/
+  };
+  return (resolvedSources || []).some(function(entry) {
+    var text = toText(entry.source && entry.source.text);
+    if (/不要(?:修改|改变|改|换)|别(?:修改|改|换)|do not change|don't change/i.test(text)) return false;
+    return entry.source.role === 'user' && aliases[field] && aliases[field].test(text.toLowerCase())
+      && /改|修改|设置|设定|换|叫我|喊我|别叫|不要|说话.{0,12}(点|些|一点)|用.{0,12}(说|讲)|请.{0,16}(说|讲)|change|set|call.me|speak|use /i.test(text);
+  });
 }
 
 function resolveDynamicStateSources(char, sourceMessageIds, evidence, assistantMessage, sources) {
@@ -5460,8 +5582,8 @@ function applyStaticFieldUpdates(char, updates, assistantMessage, sources) {
     if (!isPlainObject(update)) return;
     var staticResolvedTime = resolveTimeRef(update.timeRef, new Date());
     var value = trimText(cleanFieldValue(key, parseRelativeText(toText(update.value), (staticResolvedTime && staticResolvedTime.iso) || new Date())), 700);
-    var sourcesResolved = resolveDynamicStateSources(char, update.sourceMessageIds, update.evidence, assistantMessage, sources);
-    if (!value || !sourcesResolved) return;
+    var sourcesResolved = hasValidUserEvidence(char, update.sourceMessageIds, update.evidence, sources);
+    if (!value || !sourcesResolved || !hasStaticEditIntent(key, sourcesResolved)) return;
     if (!('staticFieldMeta' in char)) char.staticFieldMeta = {};
     char.staticFieldMeta[key] = {
       sourceMessageIds: sourcesResolved.map(function(entry) { return entry.id; }),
@@ -5576,7 +5698,8 @@ function upsertLongTermMemory(char, item, sources, memoryStore, assistantMessage
   var location = trimText(item.location, 160);
   var eventIdentity = category === 'events' ? getEventIdentity(eventTime, participants, location) : '';
   var existing = list.find(function(memory) {
-    return eventIdentity ? getEventIdentity(memory.eventTime, memory.participants, memory.location) === eventIdentity : toText(memory.key).toLowerCase() === key.toLowerCase();
+    var sameKey = toText(memory.key).toLowerCase() === key.toLowerCase();
+    return sameKey && (!eventIdentity || getEventIdentity(memory.eventTime, memory.participants, memory.location) === eventIdentity);
   });
   if (category === 'promises' && existing && existing.status !== 'active') return false;
   var importance = Number(item.importance);
@@ -5740,7 +5863,6 @@ function parseMemoryFromText(content, char, assistantMessage) {
   }
   return applyMemoryUpdate(memUpdate, char, assistantMessage);
 }
-
 // 成员上下文：除头像类外，全部静态字段注入；staticOnly 时不注入动态状态（动态状态走 volatile 段落，保证缓存前缀稳定）
 function buildMemberContext(member, staticOnly) {
   var info = (member && member.basicInfo) || {};
@@ -5761,7 +5883,7 @@ function buildRoleContext(char, staticOnly) {
     var groupLines = [
       '群组名称: ' + trimText(group.name || char.basicInfo.name, 160),
       '群组前提: ' + maskUserWord(char, trimText(group.description || char.basicInfo.personality, 700)),
-      '场景: ' + maskUserWord(char, trimText(group.scene || (char.dynamicState && char.dynamicState.currentLocation), 500)),
+      '场景: ' + maskUserWord(char, trimText(group.scene || (staticOnly === true ? '' : (char.dynamicState && char.dynamicState.currentLocation)), 500)),
       '互动规则: ' + maskUserWord(char, trimText(group.interactionRules, 700))
     ];
     if (staticOnly !== true) {
@@ -5830,10 +5952,14 @@ function getLastReplyGap(char) {
   return null;
 }
 
-function getPromiseContext(char) {
+function getPromiseContext(char, query) {
   var now = Date.now();
+  var selectedIds = query == null ? null : new Set(retrieveRelevantMemories(char, query).map(function(entry) { return entry.item.id; }));
   var promises = (char.memory.longTerm.promises || []).filter(function(item) {
-    return (item.status || 'active') === 'active';
+    if ((item.status || 'active') !== 'active') return false;
+    if (!selectedIds || selectedIds.has(item.id)) return true;
+    var due = Date.parse(item.dueAt || '');
+    return Number.isFinite(due) && due >= now - 86400000 && due <= now + 7 * 86400000;
   }).map(function(item) {
     var dueTime = item.dueAt ? Date.parse(item.dueAt) : 0;
     return { item: item, dueTime: dueTime, overdue: dueTime > 0 && dueTime < now };
@@ -5842,7 +5968,7 @@ function getPromiseContext(char) {
     if (!a.dueTime) return 1;
     if (!b.dueTime) return -1;
     return a.dueTime - b.dueTime;
-  }).slice(0, 6);
+  }).slice(0, 3);
   if (promises.length === 0) return '';
   var lines = promises.map(function(entry) {
     var item = entry.item;
@@ -5990,6 +6116,12 @@ function getRecentReplyEndings(char, limit) {
   return endings;
 }
 
+function getRecentReplyTexts(char, limit) {
+  return ((char && char.memory && char.memory.instant) || []).filter(function(message) {
+    return message.role === 'assistant' && !message.isLoading && toText(message.content).trim();
+  }).slice(-(Number(limit) || 2)).map(function(message) { return message.content; });
+}
+
 // 仅当本轮收尾与上一条回复的收尾逐字完全相同时，删掉本轮重复的那一份；不做任何改写
 function dedupeRepeatedEnding(text, char) {
   var current = toText(text);
@@ -6010,7 +6142,6 @@ function buildNarrativePatternDirective() {
   var pattern = NARRATIVE_PATTERNS[Math.floor(Math.random() * NARRATIVE_PATTERNS.length)] || NARRATIVE_PATTERNS[0];
   return '【本轮节奏骨架（每轮随机给出，仅作节奏参考）】建议本轮按“' + pattern.label + '”的顺序组织内容：' + pattern.hint + '骨架只约束节奏与详略分布，不要写出任何结构标签或说明文字，措辞与语气一律服从角色设定。\n\n';
 }
-
 // ==================== 语气/风格遵从（attention）====================
 // 从说话风格里抽出示例台词：约定格式为「调性描述；示例：<台词1> / <台词2> / <台词3>」
 function extractSpeakingSamples(style) {
@@ -6061,7 +6192,11 @@ function detectStyleViolations(reply, char, prevReplies) {
     var currentEnding = extractReplyEnding(text);
     if (currentEnding && priors.some(function(prior) { return extractReplyEnding(prior) === currentEnding; })) {
       hits.push('reusedImagery');
-    } else if (sharesDistinctivePhrase(text, priors)) {
+    } else if (sharesDistinctivePhrase([address, info.name].filter(Boolean).reduce(function(value, name) {
+      return value.split(name).join(' ');
+    }, text), priors.map(function(prior) {
+      return [address, info.name].filter(Boolean).reduce(function(value, name) { return value.split(name).join(' '); }, prior);
+    }))) {
       hits.push('reusedImagery');
     }
   }
@@ -6096,7 +6231,7 @@ function sharesDistinctivePhrase(text, priors) {
   var current = toText(text).replace(/\s+/g, '');
   if (current.length < span) return false;
   var priorsText = priors.map(function(prior) { return toText(prior).replace(/\s+/g, ''); });
-  for (var i = 0; i + span <= current.length; i += 3) {
+  for (var i = 0; i + span <= current.length; i++) {
     var chunk = current.slice(i, i + span);
     if (!/[^\u4e00-\u9fff]/.test(chunk) && priorsText.some(function(prior) { return prior.indexOf(chunk) !== -1; })) return true;
   }
@@ -6203,7 +6338,7 @@ async function generateQuickRepliesAsUser(char, replyText, userMessage) {
     var response = await callAPI([
       { role: 'system', content: prompt.system },
       { role: 'user', content: userContent }
-    ]);
+    ], { char: char, taskType: 'quick-replies' });
     var data = parseJsonPayload(response.choices[0].message.content);
     var list = parseQuickReplyList(data && data.quickReplies ? data.quickReplies : data);
     if (list.length < 2) return null;
@@ -6269,7 +6404,7 @@ async function critiqueReplyStyle(char, reply, violationKeys) {
     var response = await callAPI([
       { role: 'system', content: '你是文风校对助手。只返回JSON。' },
       { role: 'user', content: prompt }
-    ]);
+    ], { char: char, taskType: 'style-critique' });
     var data = parseJsonPayload(response.choices[0].message.content);
     var revised = data && typeof data.reply === 'string' ? unescapeLiteralNewlines(data.reply).trim() : '';
     if (!revised || revised === original) return original;
@@ -6283,144 +6418,6 @@ async function critiqueReplyStyle(char, reply, violationKeys) {
   }
 }
 
-function buildVolatileContext(char, query) {
-  var time = getTimeContext(new Date());
-  var replyGap = getLastReplyGap(char);
-  var relevant = retrieveRelevantMemories(char, query || '');
-  var agentMode = isAgentToolsEnabled();
-  var passiveLimit = agentMode ? AGENT_TOOL_MEMORY_INJECT_LIMIT : 8;
-  var injected = relevant.slice(0, passiveLimit);
-  char.memory.lastInjectedRecallIds = injected.filter(function(entry) { return entry.category === 'recalled' && entry.item && entry.item.id; }).map(function(entry) { return entry.item.id; }).slice(0, MEMORY_LIMITS.pendingRecall);
-  var recent = char.memory.instant.filter(function(msg) { return !msg.isLoading; }).slice(-14);
-  var memoryLines = [];
-  injected.forEach(function(entry) {
-    var item = entry.item;
-    var line = '[' + actorLabel(char, item.subject) + '][' + entry.category + '][事件 ' + formatContextTime(item.eventTime || item.createdAt) + '] ' + maskUserWord(char, trimText(item.key, 100)) + ': ' + maskUserWord(char, trimText(item.value, 700));
-    appendWithinLimit(memoryLines, line, CONTEXT_BUDGET.retrievedChars);
-  });
-  // 检索记忆没用完的额度让给摘要记忆（两道记忆共用一个预算池）
-  var retrievedUsed = memoryLines.join('\n').length;
-  var summaryBudget = CONTEXT_BUDGET.summaryChars + Math.max(0, CONTEXT_BUDGET.retrievedChars - retrievedUsed);
-
-  var shortSource = char.memory.shortTerm.slice(-MEMORY_LIMITS.shortTermTrimFloor);
-  var shortLines = [];
-  // 从最新往前填，保证额度用尽时丢掉的是最旧的摘要而不是最新的
-  for (var shortIndex = shortSource.length - 1; shortIndex >= 0; shortIndex--) {
-    var shortItem = shortSource[shortIndex];
-    var participants = formatParticipants(char, shortItem.participants);
-    var prefix = participants ? '[参与：' + participants + '] ' : '';
-    appendWithinLimit(shortLines, '[' + formatContextTime(shortItem.timestamp) + '] ' + prefix + sanitizeShortTermLine(maskUserWord(char, shortItem.content), shortItem.eventTime || shortItem.timestamp), summaryBudget);
-  }
-  shortLines.reverse();
-
-  var volatileContext = '【时间基准】\n';
-  volatileContext += '当前本地时间: ' + time.local + '\n时区: ' + time.timeZone + ' (' + time.offset + ')\nISO时间: ' + time.iso + '\n';
-volatileContext += '日程日界: 每天从 02:00 开始计算；00:00-02:00 属于前一天的深夜（例如 9月17日 01:30 对角色来说是“9月16日 深夜”）。时段只有十种：深夜(02:00-04:00，含前一日00:00-02:00)、凌晨(04:00-06:00)、清晨(06:00-07:30)、早晨(07:30-10:30)、上午(10:30-12:00)、中午(12:00-13:30)、下午(13:30-17:00)、傍晚(17:00-19:00)、晚上(19:00-22:00)、夜里(22:00-24:00)。\n';
-  volatileContext += '消息和记忆前的时间是事件实际发生时间。处理“今天、昨天、多久以前”等表达时，必须以上述当前时间和对应时间戳计算；不确定时明确说明，不要猜测日期。时间、时区、消息ID和ISO格式均为内部元数据，除非用户明确询问时间或日期，否则严禁在reply正文（用户可见文本）中复述或解释它们；JSON记忆字段中的sourceMessageIds、eventTime等为格式必需，照常输出，不属于复述。\n\n';
-  var timelineLines = [];
-  recent.forEach(function(msg) {
-    appendWithinLimit(timelineLines, msg.id + ' | ' + msg.role + ' | ' + formatContextTime(msg.timestamp), 1400);
-  });
-  volatileContext += '【消息时间元数据，仅供内部推理】\n' + timelineLines.join('\n') + '\n\n';
-  volatileContext += '【角色当前状态，可随对话变化】\n' + buildDynamicStateContext(char) + '\n\n';
-  if (char.entityType === 'group' && Array.isArray(char.members)) {
-    var memberStateLines = [];
-    char.members.forEach(function(member) {
-      var memberStateName = toText(member && member.basicInfo && member.basicInfo.name);
-      if (!memberStateName) return;
-      var memberStateText = buildDynamicStateContext(member);
-      if (memberStateText) memberStateLines.push('【' + memberStateName + '】\n' + trimText(maskUserWord(member, memberStateText), 700));
-    });
-    if (memberStateLines.length > 0) {
-      volatileContext += '【成员当前状态（每人独立，可随对话变化）】\n' + memberStateLines.join('\n\n') + '\n\n';
-    }
-  }
-  var lorebookUsed = [];
-  var lorebookContext = buildLorebookContext(char, query, lorebookUsed);
-  if (lorebookContext) {
-    volatileContext += lorebookContext;
-    // 只有真正注入的条目才算"被提及"：UI 显示来源/最近提及，也是自动淘汰的判定依据
-    markLorebookMentions(lorebookUsed, new Date().toISOString());
-  }
-  volatileContext += '【本轮主动召回的相关长期记忆】\n' + (memoryLines.join('\n') || '无相关长期记忆');
-  volatileContext += '\n【记忆取用说明】以上条目是按关键词与时间粗略召回的，可能只有部分相关，也可能已经过时或与当前语境无关；仅在与当前话题自然相关时提及，不要为了用上记忆而硬提旧事，也不要把它们当成用户刚刚说过的话。\n';
-  volatileContext += '\n【记忆主体约定】方括号里标注的是"这条记忆讲的是谁"：标为角色名或"背景"的才是你的事；标为“' + (normalizeUserAddress(char.basicInfo && char.basicInfo.userAddress) || '对方') + '”或"你们"的都是对方或双方的事，绝不能当成你自己做的，也不能把对方的状态当成你的状态。角色自身的经历只来自角色设定与本对话历史。\n';
-  if (agentMode) {
-    volatileContext += '\n（以上仅为最相关的一部分；若需要回忆更多过往约定、喜好或事件，可调用 search_memory 工具按关键词检索）';
-  }
-  volatileContext += '\n\n';
-  if (char.entityType === 'group' && Array.isArray(char.members)) {
-    var memberMemLines = [];
-    char.members.forEach(function(member) {
-      if (!member || !member.memory || !member.memory.longTerm) return;
-      var memberName = toText(member.basicInfo.name);
-      if (!memberName) return;
-      var memberRelevant = retrieveRelevantMemories(char, query || '', member.memory).slice(0, 3);
-      if (memberRelevant.length === 0) return;
-      var memberLines = [];
-      memberRelevant.forEach(function(entry) {
-        var item = entry.item;
-        var line = '[' + actorLabel(member, item.subject) + '][' + entry.category + '][事件 ' + formatContextTime(item.eventTime || item.createdAt) + '] ' + maskUserWord(member, trimText(item.key, 100)) + ': ' + maskUserWord(member, trimText(item.value, 500));
-        appendWithinLimit(memberLines, line, 1200);
-      });
-      if (memberLines.length) {
-        memberMemLines.push('【' + memberName + '的个人记忆，仅' + memberName + '自己知道】\n' + memberLines.join('\n'));
-      }
-    });
-    if (memberMemLines.length > 0) {
-      volatileContext += '【成员私人记忆（每人记得的事各不相同，不能当作其他成员的认知）】\n' + memberMemLines.join('\n\n') + '\n\n';
-    }
-  }
-  var sceneLines = [];
-  (char.memory.scenes || []).slice(-CONTEXT_BUDGET.sceneSummaries).forEach(function(scene) {
-    appendWithinLimit(sceneLines, '[' + formatContextTime(scene.endedAt || scene.createdAt) + '] ' + maskUserWord(char, toText(scene.content)), CONTEXT_BUDGET.sceneInjectionChars);
-  });
-  if (sceneLines.length > 0) {
-    volatileContext += '【场景概要（较早情节的压缩记录，只供保持连贯，不是最近发生的事）】\n' + sceneLines.join('\n') + '\n\n';
-  }
-  volatileContext += '【近期摘要记忆】\n' + (shortLines.join('\n') || '无') + '\n\n';
-  var promiseContext = getPromiseContext(char);
-  if (promiseContext) {
-    volatileContext += '【待跟进承诺】\n' + promiseContext + '\n已过期不等于已完成或失约；仅在当前话题合适时温和确认，不要突然追问。\n\n';
-  }
-  if (replyGap) {
-    volatileContext += '【互动节奏】距角色上次有效回复已过：' + replyGap.text + '。\n';
-    if (replyGap.reconnect) {
-      volatileContext += '仅本轮：这是一次' + (replyGap.longAbsence ? '较久' : '短暂') + '的重连。若语境自然，可用一句温和、不施压的方式表现出重新见面；不要责备用户、暗示一直在等待，也不要编造这段时间发生过的事。\n';
-      var prominentPromise = getProminentPromise(char);
-      if (prominentPromise) {
-        volatileContext += '仅本轮：若语境自然，可温和地提起一条之前约定的事项（不要逼迫或追问，用户未主动提及时仅在合适时机轻描淡写一带而过）：' + trimText(prominentPromise.key, 60) + '（' + (prominentPromise.overdue ? '约定时间已过' : '约定时间：' + prominentPromise.dueAt) + '）\n';
-      }
-    }
-    volatileContext += '\n';
-  }
-  var topicSuggestions = buildTopicSuggestions(char);
-  if (topicSuggestions.length > 0) {
-    volatileContext += '【可选话题库（角色可能想聊的素材，仅供自然引出，不要生硬报菜名或逐条列举）】\n';
-    topicSuggestions.forEach(function(topic, index) {
-      volatileContext += (index + 1) + '. ' + topic + '\n';
-    });
-    volatileContext += '\n';
-  }
-  var recentEndings = getRecentReplyEndings(char, 1);
-  if (recentEndings.length > 0) {
-    volatileContext += '【结尾多样性】你最近一次回复的结尾是：『' + recentEndings[0] + '』。本轮结尾不得与该结尾相同或高度相似，也不要每轮都用同一句或同一个动作收尾；请自然换一种收尾方式。\n\n';
-  }
-  volatileContext += buildNarrativePatternDirective();
-  var userText = toText(query);
-  if (isColdFieldRequest(userText)) {
-    volatileContext += '【本轮：用户表达了不知聊什么或把话题选择权交给角色】\n必须主动开启一个新话题，直接自然开场，不要反问"你想聊什么"，也不要把话题选择推回给用户；优先从上方可选话题库或两人最近共同经历中挑选一个贴合角色身份与关系的话题。\n\n';
-  } else if (detectTopicSwitch(char, userText)) {
-    volatileContext += '【本轮话题切换】用户当前话题与角色之前的关注点不同。若旧话题尚未自然收尾，可先用一句温和的话收束旧话题，再自然进入新话题；不要生硬打断、不要重复旧话题。\n\n';
-  }
-  // 生成点最近处：先快速回应视角提醒，再纠正提醒，再语气回顾，最后语气锚（越靠后遵从度越高）
-  volatileContext += buildQuickReplyPerspectiveReminder(char);
-  volatileContext += buildStyleCorrectionReminder(char);
-  volatileContext += buildStyleReview(char);
-  volatileContext += buildStyleAnchor(char);
-  return volatileContext;
-}
-
 function buildUserMessageContent(text, images) {
   var imgs = Array.isArray(images) ? images.filter(function(uri) { return typeof uri === 'string' && uri; }) : [];
   if (imgs.length === 0) return text;
@@ -6428,8 +6425,105 @@ function buildUserMessageContent(text, images) {
   imgs.forEach(function(uri) { parts.push({ type: 'input_image', image_url: uri, detail: 'auto' }); });
   return parts;
 }
+function buildVolatileContext(char, query, metadata) {
+  metadata = metadata || {};
+  var now = new Date();
+  var time = getTimeContext(now);
+  var memoryQuery = buildMemoryQuery(char, query || '');
+  var injected = retrieveRelevantMemories(char, memoryQuery).slice(0, AGENT_TOOL_MEMORY_INJECT_LIMIT);
+  metadata.recallIds = injected.filter(function(entry) { return entry.category === 'recalled'; })
+    .map(function(entry) { return entry.item.id; });
+  var memoryLines = [];
+  injected.forEach(function(entry) {
+    var item = entry.item;
+    appendWithinLimit(memoryLines, '[' + actorLabel(char, item.subject) + '][' + entry.category + '] '
+      + maskUserWord(char, trimText(item.key, 80)) + ': ' + maskUserWord(char, trimText(item.value, 400)), CONTEXT_BUDGET.retrievedChars);
+  });
+  var retrievedUsed = memoryLines.join('\n').length;
+  var summaryBudget = CONTEXT_BUDGET.summaryChars + Math.max(0, CONTEXT_BUDGET.retrievedChars - retrievedUsed);
+  var shortSource = char.memory.shortTerm.slice(-MEMORY_LIMITS.shortTermTrimFloor);
+  var shortLines = [];
+  for (var shortIndex = shortSource.length - 1; shortIndex >= 0; shortIndex--) {
+    var item = shortSource[shortIndex];
+    appendWithinLimit(shortLines, '[' + toText(item.eventTime || item.timestamp).slice(0, 10) + '] '
+      + sanitizeShortTermLine(maskUserWord(char, trimText(item.content, 300)), item.eventTime || item.timestamp), summaryBudget);
+  }
+  shortLines.reverse();
 
-function buildRequestPayload(char, query) {
+  var recent = char.memory.instant.filter(function(msg) { return !msg.isLoading; }).slice(-14);
+  var timeline = recent.map(function(msg) { return msg.id + ' | ' + msg.role + ' | ' + msg.timestamp; }).join('\n');
+  var timeBlock = '【时间基准】\n当前本地时间: ' + time.local + '\n时区: ' + time.timeZone + ' (' + time.offset + ')'
+    + '\nISO时间: ' + time.iso + '\n逻辑日: ' + formatDayLabel(getLogicalDayDate(now)) + ' ' + getTimeSlot(now) + '\n';
+  var timelineBlock = '【消息时间元数据，仅供内部推理】\n' + timeline + '\n';
+  var tail = '';
+  var endings = getRecentReplyEndings(char, 1);
+  if (endings.length) tail += '【结尾多样性】不要重复最近的收尾：' + endings[0] + '\n';
+  tail += buildNarrativePatternDirective();
+  if (isColdFieldRequest(query)) tail += '【本轮冷场】角色自然开启新话题，不要把选择推回给用户。\n';
+  else if (detectTopicSwitch(char, query)) tail += '【本轮话题切换】以用户当前话题为准，不要重提旧话题。\n';
+  tail += buildQuickReplyPerspectiveReminder(char);
+  tail += buildStyleCorrectionReminder(char);
+  tail += buildStyleReview(char);
+  var styleAnchor = buildStyleAnchor(char);
+  tail = tail.slice(0, 850) + styleAnchor.slice(0, 650);
+  var reserved = timeBlock.length + timelineBlock.length + tail.length + 10;
+  var budget = Math.max(0, CONTEXT_BUDGET.volatileChars - reserved);
+  var blocks = [];
+  var used = 0;
+  function add(text, limit) {
+    var block = toText(text).trim();
+    var available = Math.min(limit || budget, budget - used - 2);
+    if (!block || available < 80) return '';
+    block = block.slice(0, available);
+    blocks.push(block);
+    used += block.length + 2;
+    return block;
+  }
+  var corrections = recent.filter(function(message) {
+    return message.role === 'user' && /填过|记错|记反|不是|不止|纠正|correct|wrong/i.test(toText(message.content));
+  }).slice(-2).map(function(message) { return '[' + message.id + '] ' + trimText(message.content, 200); });
+  if (corrections.length) add('【用户最新纠正（优先于旧记忆；未明确完成或取消时不得擅自结束约定）】\n' + corrections.join('\n'), 450);
+  var stateLines = DYNAMIC_STATE_FIELDS.filter(function(field) {
+    return char.entityType !== 'group' || GROUP_SHARED_DYNAMIC_FIELDS.indexOf(field.key) !== -1;
+  }).map(function(field) { return field.label + ': ' + trimText(char.dynamicState[field.key], 150); });
+  if (char.entityType === 'group') {
+    (char.members || []).forEach(function(member) {
+      stateLines.push('【' + toText(member.basicInfo.name) + '】' + trimText(buildDynamicStateContext(member), 220));
+    });
+  }
+  add('【角色当前状态，可随对话变化】\n' + stateLines.join('\n'), 1600);
+  var lorebookUsed = [];
+  var lore = add(buildLorebookContext(char, query, lorebookUsed), 1500);
+  metadata.lorebookEntries = lorebookUsed.filter(function(entry) { return lore.indexOf(toText(entry.name) + '：') !== -1; });
+  add('【近期摘要记忆】\n' + (shortLines.join('\n') || '无'), summaryBudget + 30);
+  add('【本轮主动召回的相关长期记忆】\n' + (memoryLines.join('\n') || '无相关长期记忆')
+    + '\n【记忆取用说明】以上条目是按关键词与时间粗略召回的，可能只有部分相关，也可能已经过时；仅在与当前话题自然相关时提及，不要硬提旧事，也不要把它们当成用户刚刚说过的话。'
+    + '\n【记忆主体约定】方括号里是"这条记忆讲的是谁"：标为角色名或"背景"的才是角色的事，标为“'
+    + (normalizeUserAddress(char.basicInfo && char.basicInfo.userAddress) || '对方') + '”或"你们"的都是对方或双方的事，绝不能当成角色自己做的。',
+    CONTEXT_BUDGET.retrievedChars + 240);
+  var topics = buildTopicSuggestions(char);
+  if (topics.length) add('【可选话题库（仅在需要时自然引出，不要生硬报菜名）】\n'
+    + topics.map(function(topic, index) { return (index + 1) + '. ' + topic; }).join('\n'), 500);
+  var promises = getPromiseContext(char, memoryQuery);
+  if (promises) add('【待跟进承诺】\n' + promises, 500);
+  if (char.entityType === 'group') {
+    (char.members || []).forEach(function(member) {
+      var privateEntries = retrieveRelevantMemories(char, memoryQuery, member.memory).slice(0, 2);
+      if (privateEntries.length) add('【' + member.basicInfo.name + '的私人记忆，仅该成员知道】\n'
+        + privateEntries.map(function(entry) { return maskUserWord(member, trimText(entry.item.value, 220)); }).join('\n'), 500);
+    });
+  }
+  var sceneLines = (char.memory.scenes || []).slice(-CONTEXT_BUDGET.sceneSummaries)
+    .map(function(scene) { return trimText(maskUserWord(char, scene.content), 300); });
+  if (sceneLines.length) add('【场景概要（较早情节的压缩记录，只供保持连贯，不是最近发生的事）】\n' + sceneLines.join('\n'), CONTEXT_BUDGET.sceneInjectionChars);
+  var gap = getLastReplyGap(char);
+  if (gap && gap.reconnect) add('【互动节奏】距上次回复已过 ' + gap.text + '。可温和重连，不施压，不编造期间发生的事。', 180);
+  var context = blocks.join('\n\n') + '\n\n' + timeBlock + timelineBlock + '\n' + tail;
+  metadata.contextChars = context.length;
+  return context;
+}
+function buildRequestPayload(char, query, requestContext) {
+  requestContext = requestContext || {};
   var proactiveTurn = false;
   var proactiveScan = char.memory.instant.filter(function(message) { return !message.isLoading; });
   for (var proactiveIndex = proactiveScan.length - 1; proactiveIndex >= 0; proactiveIndex--) {
@@ -6438,7 +6532,7 @@ function buildRequestPayload(char, query) {
       break;
     }
   }
-  var volatileContext = buildVolatileContext(char, query);
+  var volatileContext = buildVolatileContext(char, query, requestContext);
   if (proactiveTurn) {
     volatileContext += '【角色主动开场（系统触发，不是用户陈述）】用户此刻正停留在与你的对话里但暂时没有说话。请角色主动发起一次开场：自然地打招呼或问候，或提起最近一次共同经历、一件待跟进的事项、一个角色此刻想聊的话题。开场要贴合角色性格、自然不突兀；不要问"你想聊什么""怎么不说话"之类把话题推回给用户的话；不要把"系统触发"这件事说给用户听。\n\n';
   }
@@ -6461,9 +6555,7 @@ function buildRequestPayload(char, query) {
   systemPrompt += '5.5 约定(promises)要写明承诺方与受约方：promisor与promisee取值只能是 user、character、relationship（群组中可写具体成员名）。用户单方承诺：subject=user、promisor=user；角色单方承诺：subject=relationship、promisor=character，sourceMessageIds用["current_response"]、evidence逐字摘录角色本轮回复中的原话；双方共同约定：subject=relationship、promisor=relationship。约定的时间写绝对日期（dueAt用ISO，或把相对说法填进timeRef）。\n';
   systemPrompt += '6. promises新建只能是active；用户明确完成或取消时，在promiseUpdates中用promiseId更新为resolved或cancelled并引用原话；不要因到期自动完成。\n';
   systemPrompt += '7. quickReplies 必须恰好两条（在 submit_response 里也一样，省略即视为没有快速回应，即使本轮不更新任何记忆也要给出）。写法：**先把自己换成用户**，写出他此刻最可能发给角色的话（表明自己的处境/感受、提出要求、或回问角色），再逐条默读为“用户：<短句>”确认通顺。禁止三类写法：①角色口吻——把角色的表态、承诺、关心照搬一遍（错误“我也会一直陪着你。”）；②**角色视角的提问**——那是角色在问用户，不是用户要说的话（错误“你今天怎么没精神？”“要不要早点休息？”）；③复述角色刚说过的句子，或换个人称重说一遍。正确例：角色说“我会一直陪着你。”之后→“谢谢你，我现在确实需要有人陪我聊聊。”；角色问“今天怎么没精神？”之后→“只是没睡好，别担心。”或“我今天确实有点累，你能陪我说说话吗？”。示例只示范视角，不得照抄措辞；不得编造事实，不用Markdown、括号动作、消息ID、时间元数据或隐藏标签。\n';
-  var assistantTurnCount = char.memory.instant.filter(function(message) { return !message.isLoading && message.role === 'assistant'; }).length;
-  var jsonExampleRule = '8. JSON格式示例（未更新字段直接省略；无合格记忆返回空数组或空对象，但quickReplies仍必须两条）：{"reply":"（把外套搭在椅背上）外面风大，我绕了两条街才找到这家店。（拉开椅子坐下）你别急着说话，先喝口热的。（把杯子往你那边推了推）刚才那件事我想了一路，等你想说的时候再讲，我不催。","quickReplies":["我慢慢说，你先别催我。","你绕了两条街？也不嫌累。"],"shortTerm":[{"content":"按时间和因果顺序概括本轮事件经过，写明谁做了什么并写绝对日期（如2026-08-10 晚上）","sourceMessageIds":["msg_id"],"timeRef":{"anchor":"today"}}],"dynamicState":{"currentSituation":{"value":"当前正在与对方核对一件待确认的事项，需要把话说清楚。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentMood":{"value":"较为专注，态度平和。","sourceMessageIds":["current_response"],"evidence":"概括本轮回复大意"},"currentLocation":{"value":"当前所处的位置。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"},"currentGoal":{"value":"想把这件事说明白，让对方理解。","sourceMessageIds":["真实ID或current_response"],"evidence":"对应来源逐字摘录"}},"staticFields":{"personality":{"value":"性格沉稳，遇事不急。","sourceMessageIds":["真实ID"],"evidence":"用户原话"}}' + (char.entityType === 'group' ? ',"memberDynamicState":[{"memberName":"成员原名","dynamicState":{"currentMood":{"value":"成员情绪","sourceMessageIds":["current_response"],"evidence":"概括本轮回复"}}}]' : '') + ',"promiseUpdates":[{"promiseId":"mem_id","status":"resolved","sourceMessageIds":["msg_id"],"evidence":"用户明确完成或取消的原话"}],"longTerm":[{"category":"userProfile","subject":"user","key":"稳定标识","value":"用户喜欢喝美式咖啡。","tags":["关键词"],"importance":1,"sourceMessageIds":["msg_id"],"evidence":"原话短句","eventTime":"ISO时间"}]}。示例仅示范结构与动作穿插方式、以及quickReplies该有的用户视角，**不得模仿其口吻或措辞**（口吻一律以角色设定的“说话风格”为准）。JSON字符串转义：真实换行写\\n，字面反斜杠写\\\\，双引号写\\"。\n';
-  systemPrompt += assistantTurnCount < 6 ? jsonExampleRule : JSON_EXAMPLE_BRIEF;
+  systemPrompt += JSON_EXAMPLE_BRIEF;
   systemPrompt += '9. longTerm.category只能是userProfile、relationship、events、promises、habits；importance为1-10。\n';
   systemPrompt += '9.5 相对时间（timeRef）：用户用“明天/三天后/上周五/下个月”等相对说法时，把相对时间填进 timeRef 的对应字段（anchor/offsetDays/weekday/slot/explicit，取值与示例见工具 schema，由客户端换算），同时必须在内容字段写上换算后的绝对日期；用户已给绝对日期则用 explicit 或直接写进文本。时段只能用：深夜、凌晨、清晨、早晨、上午、中午、下午、傍晚、晚上、夜里。\n';
   systemPrompt += 'A. 本会话可使用工具，各工具适用场景见工具描述。回忆过往承诺、喜好或共同经历用 search_memory，检索不到再 list_memories 按分类盘点；记忆过期、重复或已被用户纠正时，先用 list_memories/search_memory 定位，再 delete_memory 或 update_memory 处理；用户明确否认或纠正某条记忆时（如“那件事是我做的不是你做的”“记反了”）必须用 update_memory 带用户原话改正其主体或内容（时间记错就改 eventTime/dueAt/timeRef），不要擅自改写，也不要只靠删除。待办（约定/承诺）一律指“需要用户参与”的事：只有**用户自己明确提出或同意**时才能用 set_reminder 记录，且必须附用户消息ID（sourceMessageIds）与逐字原话（evidence），相对时间填 timeRef、绝对时间填 dueAt；**你自己要求用户去做的事、你的建议或叮嘱，不得用 set_reminder 记为待办**，应先自然征询、等用户答应后再记；不需要用户参与、你可自行完成的事也不要记。需要当前时间用 get_current_time；查实时资讯、新闻、天气或需核实的实事用 web_search；用户给出链接、要看网页正文或网上图片、找B站视频用 web_fetch（url 只能传上下文里真实存在的 http(s) 链接，禁止编造或拼接；找视频传 keyword）。想发表情包用 send_sticker（tag 从工具描述的可用标签中选）。记忆缺失、表述含糊或关键事实无法可靠推断时，优先用 ask_user 简短澄清，不要编造。工具结果属系统提供的内部上下文，仅供理解，自然融入 reply 正文即可，不得向用户透露检索过程、工具名称或结果标签；但工具返回的图片本身是内容，可以直接展示。\n';
@@ -6482,9 +6574,7 @@ function buildRequestPayload(char, query) {
 
   systemPrompt += '【输出格式】本轮收尾只能二选一：①调用 submit_response 工具提交（推荐；reply 写进工具参数的 reply 字段）；②直接输出单个 JSON 对象（以{开头、以}结尾，reply 为第一个字段，全文不得出现 JSON 以外的文字）。两种方式都不允许在结构化内容之外写说明、思考或旁白，也不得用 Markdown 代码块包裹；**即使本轮调用过其他工具，也必须以上述方式之一收尾**；reply 里的引号写 \\"，换行写 \\n；quickReplies 恒为两条用户视角的短句。\n';
 
-  // 稳定前缀请求（所有 /responses 平台统一，实测 opencode-go 同样透传前缀缓存字段）：
-  // 固定 system 在前、全部历史逐字（最旧到最新，不重排），volatile 上下文只附加到当前用户
-  // 消息，保证跨轮次前缀稳定可缓存。历史消息不注入消息 ID，避免内部 ID 暴露给模型/用户。
+  // Stable text and images first; per-turn context is an independent trailing item.
   var recentMessages = [];
   var historyMessages = char.memory.instant.filter(function(message) { return !message.isLoading; }).slice(-MEMORY_LIMITS.instant);
   var currentUserMessage = null;
@@ -6500,11 +6590,7 @@ function buildRequestPayload(char, query) {
     if (message.role === 'user') {
       var userContent = toText(message.content);
       var messageImages = Array.isArray(message.images) ? message.images : null;
-      if (currentUserMessage && message.id === currentUserMessage.id) {
-        recentMessages.push({ role: 'user', content: buildUserMessageContent(trimText(userContent, 2000) + '\n\n【系统提供的本轮上下文，仅供角色理解，不代表用户陈述】\n' + volatileContext, messageImages) });
-      } else {
-        recentMessages.push({ role: 'user', content: buildUserMessageContent(trimText(userContent, 800), messageImages) });
-      }
+      recentMessages.push({ role: 'user', content: buildUserMessageContent(trimText(userContent, 2000), messageImages) });
     } else {
       var assistantHistoryText = trimText(toText(message.content), 1200);
       if (!assistantHistoryText) return; // 纯表情包消息不进请求（图片不发给模型）
@@ -6513,6 +6599,7 @@ function buildRequestPayload(char, query) {
       recentMessages.push({ role: 'assistant', content: '{"reply":' + JSON.stringify(assistantHistoryText) + '}' });
     }
   });
+  if (currentUserMessage) recentMessages.push({ role: 'user', content: '【系统提供的本轮上下文，仅供角色理解，不代表用户陈述】\n' + volatileContext });
   return [{ role: 'system', content: systemPrompt }].concat(recentMessages);
 }
 
@@ -6529,7 +6616,7 @@ async function convertProseToJson(char, userMessage, proseText) {
     var response = await callAPI([
       { role: 'system', content: systemContent },
       { role: 'user', content: userContent }
-    ]);
+    ], { char: char, taskType: 'prose-memory' });
     var content = response.choices[0].message.content;
     var parsed = parseJsonPayload(content);
     if (!isPlainObject(parsed)) return null;
@@ -6542,8 +6629,11 @@ async function convertProseToJson(char, userMessage, proseText) {
 
 // 快速回应视角修复：用一个"扮演用户本人"的后台小调用重写，成功后只更新快速回应按钮，
 // 不动已显示的正文。生成失败则退到通用兜底（避免继续展示角色口吻的句子）。
-async function repairQuickRepliesAsUser(char, replyText, userMessage, messageId, fallbackList) {
+async function repairQuickRepliesAsUser(char, replyText, userMessage, messageId, fallbackList, guard) {
+  guard = guard || captureMemoryTask(char);
+  if (!isMemoryTaskCurrent(guard)) return;
   var list = await generateQuickRepliesAsUser(char, replyText, userMessage);
+  if (!isMemoryTaskCurrent(guard)) return;
   if (!list) list = ['嗯', '继续'];
   if (state.quickReplyMessageId !== messageId) return; // 已被下一轮覆盖，丢弃
   if (state.activeCharacterId !== char.id) return;
@@ -6554,15 +6644,29 @@ async function repairQuickRepliesAsUser(char, replyText, userMessage, messageId,
 }
 
 // 散文收尾的后台记忆补写：正文已经展示，这里只把这一轮整理成结构化记忆/状态落盘。
-async function extractProseTurnMemory(char, userMessage, replyText, assistantMessage) {
+async function extractProseTurnMemory(char, userMessage, replyText, assistantMessage, taskGuard) {
+  taskGuard = taskGuard || captureMemoryTask(char);
+  if (!isMemoryTaskCurrent(taskGuard)) return;
   try {
-    // buildVolatileContext 会改写 lastInjectedRecallIds（供本轮结束后的 consumeInjectedRecalls 用）；
-    // 后台调用必须原样还原，避免把"注入过哪些召回记忆"的状态错记到下一轮头上
-    var savedRecallIds = Array.isArray(char.memory.lastInjectedRecallIds) ? char.memory.lastInjectedRecallIds.slice() : [];
-    var converted = await convertProseToJson(char, userMessage, replyText);
-    char.memory.lastInjectedRecallIds = savedRecallIds;
+    var snapshot = JSON.parse(JSON.stringify(char));
+    var memoryView = Object.assign({}, snapshot, { memory: Object.assign({}, snapshot.memory,
+      { lastInjectedRecallIds: [] }) });
+    var converted = await convertProseToJson(memoryView, userMessage, replyText);
+    if (!isMemoryTaskCurrent(taskGuard) || char.memory.instant.indexOf(assistantMessage) === -1) return;
     if (!converted || !isPlainObject(converted)) return;
     converted.reply = replyText;
+    var sources = getKnownSources(char);
+    var userId = toText(userMessage && userMessage.id);
+    if (!userId || !sources[userId]) return;
+    var allowed = new Set([userId, assistantMessage.id]);
+    if (Array.isArray(converted.shortTerm)) converted.shortTerm.forEach(function(item) {
+      if (isPlainObject(item)) item.sourceMessageIds = (item.sourceMessageIds || []).filter(function(id) { return allowed.has(id); });
+    });
+    if (Array.isArray(converted.longTerm)) converted.longTerm = converted.longTerm.filter(function(item) {
+      return isPlainObject(item) && (item.sourceMessageIds || []).some(function(id) { return allowed.has(id); });
+    });
+    converted.staticFields = {};
+    converted.memberDynamicState = [];
     var applied = applyMemoryUpdate(converted, char, assistantMessage);
     if (!applied) return;
     scheduleSave();
@@ -6572,15 +6676,18 @@ async function extractProseTurnMemory(char, userMessage, replyText, assistantMes
   }
 }
 
-async function callAPI(messages) {
-  if (!state.config.apiKey) {
+async function callAPI(messages, metadata) {
+  metadata = metadata || {};
+  var config = Object.assign({}, state.config, { stream: false });
+  var char = metadata.char || state.characters[state.activeCharacterId];
+  if (!config.apiKey) {
     throw new Error('未配置API Key，请在设置中填写');
   }
   var body = {
-    model: state.config.modelName,
+    model: config.modelName,
     input: [],
     stream: false,
-    temperature: normalizeTemperature(state.config.temperature),
+    temperature: normalizeTemperature(config.temperature),
     reasoning: { effort: 'none' }
   };
   messages.forEach(function(message, index) {
@@ -6590,18 +6697,31 @@ async function callAPI(messages) {
       body.input.push({ role: message.role === 'system' ? 'system' : message.role, content: Array.isArray(message.content) ? message.content : toText(message.content) });
     }
   });
-  var response = await fetch(getResponsesEndpoint(state.config), {
+  var trace = startRequestTrace(body, { char: char, taskType: metadata.taskType || 'auxiliary', platform: config.apiPlatform });
+  var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  var timer = controller ? setTimeout(function() { controller.abort(); }, API_LIMITS.auxiliaryTimeoutMs) : null;
+  try {
+  var response = await fetch(getResponsesEndpoint(config), {
     method: 'POST',
-    headers: buildApiHeaders(state.config, getActiveSessionId()),
-    body: JSON.stringify(body)
+    headers: buildApiHeaders(config, getSessionIdFor(char)),
+    body: JSON.stringify(body),
+    signal: controller ? controller.signal : undefined
   });
   if (!response.ok) {
     var errData = await response.json().catch(function() { return {}; });
     throw new Error(errData.error ? errData.error.message : 'HTTP ' + response.status);
   }
   var responseJson = await response.json();
+  recordCacheUsage(responseJson.usage, trace);
   var content = extractResponsesText(responseJson);
   return { raw: responseJson, choices: [{ message: { content: content } }] };
+  } catch (error) {
+    trace.status = 'failed';
+    recordCacheUsage(null, trace);
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function isResponsesApiEnabled() {
@@ -6618,9 +6738,9 @@ function getResponsesEndpoint(config) {
   if (!preset.keepV1InResponses) baseUrl = baseUrl.replace(/\/v1$/i, '');
   return baseUrl + '/responses';
 }
-
 // ==================== Agent 工具系统 ====================
 const MAX_TOOL_ROUNDS = 5;
+const MAX_TOOL_CALLS = 12;
 const AGENT_TOOL_MEMORY_INJECT_LIMIT = 5;
 
 function isAgentToolsEnabled() {
@@ -6725,7 +6845,10 @@ function buildAgentTools(char) {
       parameters: { type: 'object', properties: { tag: { type: 'string', enum: stickerTags, description: '表情包标签' } }, required: ['tag'], additionalProperties: false }
     });
   }
-  tools.push({ type: 'web_search' });
+  tools.push({ type: 'function', name: 'web_search',
+    description: '搜索实时网页资料，返回实际取得的标题、链接和摘要。失败或无结果时不得编造搜索结果；可请用户提供链接后用 web_fetch 读取。',
+    parameters: { type: 'object', additionalProperties: false,
+      properties: { query: { type: 'string', description: '搜索关键词' } }, required: ['query'] } });
   // 收尾工具放进阶段一：模型可以在同一轮里"调完工具 → 调 submit_response 提交"，一次请求收尾；
   // 阶段二仅在阶段一完全没拿到正文时兜底（历史问题：只靠"正文手写 JSON"导致几乎每轮都要多发一轮）。
   tools.push(buildSubmitResponseTool());
@@ -6755,7 +6878,6 @@ function imageToolResult(url) {
     { type: 'input_image', image_url: url, detail: 'auto' }
   ];
 }
-
 // ==================== 联网内容获取：直连 → Microlink 摘要 / B站 API ====================
 function stripHtmlTags(value) {
   return toText(value)
@@ -6768,6 +6890,30 @@ function stripHtmlTags(value) {
     .replace(/&#39;/gi, "'")
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+async function searchWebContent(query) {
+  var text = trimText(query, 200);
+  if (!text) return JSON.stringify({ ok: false, reason: '缺少搜索关键词 query' });
+  var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  var timer = controller ? setTimeout(function() { controller.abort(); }, 15000) : null;
+  try {
+    var res = await fetch('https://www.bing.com/search?format=rss&q=' + encodeURIComponent(text),
+      { cache: 'no-store', signal: controller ? controller.signal : undefined });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    var xml = new DOMParser().parseFromString(await res.text(), 'application/xml');
+    if (xml.querySelector('parsererror')) throw new Error('搜索响应不是 RSS');
+    var results = Array.prototype.slice.call(xml.querySelectorAll('item')).map(function(item) {
+      var get = function(tag) { var node = item.querySelector(tag); return node ? node.textContent.trim() : ''; };
+      return { title: trimText(get('title'), 160), url: get('link'), description: trimText(get('description'), 400) };
+    }).filter(function(item) { return item.title && /^https?:\/\//i.test(item.url); }).slice(0, 6);
+    return JSON.stringify({ ok: results.length > 0, query: text, results: results,
+      reason: results.length ? undefined : '没有取得搜索结果，不得编造，可请用户提供链接' });
+  } catch (error) {
+    return JSON.stringify({ ok: false, query: text, reason: '搜索服务不可用：' + (error.message || String(error)) + '。可请用户提供链接，不得声称已搜索成功' });
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function normalizeBiliPic(url) {
@@ -6930,7 +7076,6 @@ async function fetchWebContent(url) {
     return await fetchViaMicrolink(url);
   }
 }
-
 async function executeToolCall(call, char, toolState) {
   var name = toText(call && call.name);
   var rawArgs = toText(call && call.arguments);
@@ -7167,6 +7312,7 @@ async function executeToolCall(call, char, toolState) {
       var staticSources = hasValidUserEvidence(char, args.sourceMessageIds, args.evidence, getKnownSources(char));
       if (!staticValue) return JSON.stringify({ ok: false, reason: 'value 为空或全部为说明性文字，请只提供内容本身' });
       if (!staticSources || staticSources.length === 0) return JSON.stringify({ ok: false, reason: 'sourceMessageIds 必须是真实用户消息ID，且 evidence 逐字摘录用户原话；找不到可引用来源时不修改' });
+      if (!hasStaticEditIntent(staticFieldKey, staticSources)) return JSON.stringify({ ok: false, reason: '用户原话没有要求修改该基础设定字段，不修改' });
       if (!isPlainObject(char.basicInfo)) char.basicInfo = {};
       if (!('staticFieldMeta' in char)) char.staticFieldMeta = {};
       char.staticFieldMeta[staticFieldKey] = {
@@ -7215,6 +7361,7 @@ async function executeToolCall(call, char, toolState) {
       }
       return await fetchWebContent(fetchUrl);
     }
+    if (name === 'web_search') return await searchWebContent(toText(args.query));
     if (name === 'send_sticker') {
       var wantedTag = toText(args.tag).trim();
       if (!wantedTag) return JSON.stringify({ ok: false, reason: '缺少 tag，请从可用标签中选择一个' });
@@ -7231,6 +7378,35 @@ async function executeToolCall(call, char, toolState) {
   } catch (e) {
     return JSON.stringify({ ok: false, reason: '工具执行异常: ' + (e && e.message ? e.message : String(e)) });
   }
+}
+
+async function executeAgentToolBatch(calls, char, toolState, reasoningItems, allowExecution) {
+  (reasoningItems || []).forEach(function(item) { toolState.items.push(item); });
+  if (!toolState.callResults) toolState.callResults = Object.create(null);
+  var failed = false;
+  for (var i = 0; i < calls.length; i++) {
+    var call = calls[i];
+    var callId = call.call_id || call.id || createMemoryId('call');
+    var signature = call.name + '\n' + toText(call.arguments);
+    var cached = toolState.callResults[callId];
+    if (cached && cached.signature === signature) {
+      if (typeof cached.output === 'string') try { if (JSON.parse(cached.output).ok === false) failed = true; } catch (error) { failed = true; }
+      continue;
+    }
+    if (cached) throw new Error('工具调用 ID 重复且参数不一致，停止重复执行');
+    var output;
+    if (allowExecution === false || (Number(toolState.executedCalls) || 0) >= MAX_TOOL_CALLS) {
+      output = JSON.stringify({ ok: false, reason: '工具调用已达上限，请基于已有结果收尾，不得声称未执行的修改已完成' });
+    } else {
+      toolState.executedCalls = (Number(toolState.executedCalls) || 0) + 1;
+      output = await executeToolCall(call, char, toolState);
+    }
+    toolState.callResults[callId] = { signature: signature, output: output };
+    toolState.items.push({ type: 'function_call', call_id: callId, name: call.name, arguments: toText(call.arguments) });
+    toolState.items.push({ type: 'function_call_output', call_id: callId, output: output });
+    if (typeof output === 'string') try { if (JSON.parse(output).ok === false) failed = true; } catch (error) { failed = true; }
+  }
+  return { failed: failed };
 }
 
 function extractFunctionCalls(fullResponse) {
@@ -7279,7 +7455,6 @@ function buildDynamicStateFieldSchema() {
     required: ['value']
   };
 }
-
 function buildSubmitResponseTool() {
   var dynField = buildDynamicStateFieldSchema();
   var dynFieldProperties = {};
@@ -7335,12 +7510,13 @@ function extractSubmitResponse(fullResponse) {
   return null;
 }
 
-function buildResponsesRequestBody(messages, stream, toolState, phase) {
+function buildResponsesRequestBody(messages, stream, toolState, phase, config) {
+  config = config || state.config;
   var body = {
-    model: state.config.modelName,
+    model: config.modelName,
     input: [],
     stream: Boolean(stream),
-    temperature: normalizeTemperature(state.config.temperature)
+    temperature: normalizeTemperature(config.temperature)
   };
   body.max_output_tokens = 8192;
   messages.forEach(function(message, index) {
@@ -7355,7 +7531,7 @@ function buildResponsesRequestBody(messages, stream, toolState, phase) {
   }
   var submitPhase = phase === 'submit';
   // 阶段二（提交回复）：必须强制锁定 submit_response，且 DeepSeek 仅支持 effort=none 时锁定
-  body.reasoning = { effort: submitPhase ? 'none' : state.config.reasoningEffort };
+  body.reasoning = { effort: submitPhase ? 'none' : config.reasoningEffort };
   if (submitPhase) {
     // 阶段二只发 submit_response 一个工具：让模型别无选择，必须产出完整字段（含 quickReplies）。
     // 历史教训（见 docs/PARSE_GRAPH.md）：v1.1.2 曾为命中前缀缓存而改成"全量工具 + 锁定 tool_choice"，
@@ -7506,28 +7682,79 @@ function extractStreamText(event) {
   return event && event.choices && event.choices[0] && event.choices[0].delta ? toText(event.choices[0].delta.content) : '';
 }
 
-function recordCacheUsage(usage) {
-  if (!usage) return;
-  var hitTokens = Number(usage.prompt_cache_hit_tokens);
-  var missTokens = Number(usage.prompt_cache_miss_tokens);
-  var promptTokens = Number(usage.prompt_tokens);
-  var hasCacheFields = Number.isFinite(hitTokens) && Number.isFinite(missTokens);
-  if (!hasCacheFields && Number.isFinite(Number(usage.input_tokens))) {
-    var cachedTokens = Number((usage.input_tokens_details || {}).cached_tokens);
-    var inputTokens = Number(usage.input_tokens);
-    hasCacheFields = Number.isFinite(cachedTokens);
-    hitTokens = hasCacheFields ? cachedTokens : NaN;
-    missTokens = hasCacheFields ? Math.max(0, inputTokens - cachedTokens) : NaN;
-    promptTokens = inputTokens;
+var requestPrefixSnapshots = new Map();
+
+function hashRequestPart(value) {
+  var text = typeof value === 'string' ? value : JSON.stringify(value);
+  var hash = 2166136261;
+  for (var i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 16777619);
+  return (hash >>> 0).toString(16);
+}
+
+function startRequestTrace(body, metadata) {
+  metadata = metadata || {};
+  var characterId = metadata.char && metadata.char.id || null;
+  var taskType = metadata.taskType || 'chat';
+  var inputs = (body.input || []).filter(function(item) {
+    return !(typeof item.content === 'string' && item.content.indexOf('【系统提供的本轮上下文') === 0);
+  }).map(function(item) { return JSON.stringify(item); });
+  var snapshot = { instructionsHash: hashRequestPart(body.instructions || ''), toolsHash: hashRequestPart(body.tools || []), inputs: inputs };
+  var key = [characterId, taskType, body.model, metadata.platform || '', metadata.phase || ''].join('|');
+  var previous = requestPrefixSnapshots.get(key);
+  var common = 0;
+  if (previous) while (common < Math.min(previous.inputs.length, inputs.length) && previous.inputs[common] === inputs[common]) common++;
+  var change = !previous ? 'first-request' : previous.instructionsHash !== snapshot.instructionsHash ? 'instructions-changed'
+    : previous.toolsHash !== snapshot.toolsHash ? 'tools-changed' : common < previous.inputs.length ? 'history-rebased' : 'history-extended';
+  requestPrefixSnapshots.delete(key);
+  requestPrefixSnapshots.set(key, snapshot);
+  while (requestPrefixSnapshots.size > API_LIMITS.prefixSnapshots) requestPrefixSnapshots.delete(requestPrefixSnapshots.keys().next().value);
+  var context = (body.input || []).find(function(item) { return typeof item.content === 'string' && item.content.indexOf('【系统提供的本轮上下文') === 0; });
+  return { char: metadata.char, taskType: taskType, model: body.model, platform: metadata.platform || '',
+    phase: metadata.phase || '', startedAt: Date.now(), status: 'completed',
+    instructionsHash: snapshot.instructionsHash, toolsHash: snapshot.toolsHash,
+    historyHash: hashRequestPart(inputs), commonHistoryMessages: common, prefixChange: change,
+    contextChars: context ? context.content.length : 0, inputChars: JSON.stringify(body.input || []).length };
+}
+
+function recordCacheUsage(usage, metadata) {
+  metadata = metadata || {};
+  if (!usage || typeof usage !== 'object') {
+    if (metadata.status !== 'failed') return;
+    usage = {};
   }
-  state.config.cacheStats = {
-    hitTokens: hasCacheFields ? Math.max(0, hitTokens) : null,
-    missTokens: hasCacheFields ? Math.max(0, missTokens) : null,
-    promptTokens: Number.isFinite(promptTokens) && promptTokens >= 0 ? Math.floor(promptTokens) : null,
-    updatedAt: new Date().toISOString()
-  };
+  var input = typeof usage.input_tokens === 'number' ? usage.input_tokens
+    : (typeof usage.prompt_tokens === 'number' ? usage.prompt_tokens : null);
+  var output = typeof usage.output_tokens === 'number' ? usage.output_tokens : null;
+  var hit = null;
+  var miss = null;
+  if (typeof usage.prompt_cache_hit_tokens === 'number' && typeof usage.prompt_cache_miss_tokens === 'number') {
+    hit = Math.max(0, usage.prompt_cache_hit_tokens);
+    miss = Math.max(0, usage.prompt_cache_miss_tokens);
+  } else if (input !== null && typeof (usage.input_tokens_details || {}).cached_tokens === 'number') {
+    hit = Math.max(0, usage.input_tokens_details.cached_tokens);
+    miss = Math.max(0, input - hit);
+  }
+  var record = { at: new Date().toISOString(), characterId: metadata.char && metadata.char.id || null,
+    taskType: toText(metadata.taskType, 'chat'), model: metadata.model || state.config.modelName,
+    platform: metadata.platform || state.config.apiPlatform, phase: metadata.phase || '', status: metadata.status || 'completed',
+    durationMs: metadata.startedAt == null ? null : Math.max(0, Date.now() - metadata.startedAt),
+    instructionsHash: metadata.instructionsHash || null, toolsHash: metadata.toolsHash || null,
+    historyHash: metadata.historyHash || null, prefixChange: metadata.prefixChange || null,
+    commonHistoryMessages: metadata.commonHistoryMessages == null ? null : metadata.commonHistoryMessages,
+    contextChars: metadata.contextChars == null ? null : metadata.contextChars,
+    inputChars: metadata.inputChars == null ? null : metadata.inputChars,
+    inputTokens: input === null ? null : Math.floor(input), outputTokens: output === null ? null : Math.floor(output),
+    hitTokens: hit === null ? null : Math.floor(hit), missTokens: miss === null ? null : Math.floor(miss),
+    hitRate: hit === null || input === null || input === 0 ? null : hit / input };
+  if (!Array.isArray(state.config.requestMetrics)) state.config.requestMetrics = [];
+  state.config.requestMetrics.push(record);
+  state.config.requestMetrics = state.config.requestMetrics.slice(-API_LIMITS.requestMetrics);
+  if (record.taskType === 'chat' && record.status !== 'failed') {
+    state.config.cacheStats = { hitTokens: record.hitTokens, missTokens: record.missTokens,
+      promptTokens: record.inputTokens, updatedAt: record.at };
+    renderCacheStats();
+  }
   scheduleSave();
-  renderCacheStats();
 }
 
 function invalidateQuickReplies() {
@@ -7614,7 +7841,6 @@ async function performMigrationExtraction(char) {
   }
   return char.memory.instant.length <= MEMORY_LIMITS.instant;
 }
-
 function handleRecall(recallRequest, char) {
   var category = toText(recallRequest.category);
   var tags = Array.isArray(recallRequest.tags) ? recallRequest.tags.map(function(tag) { return toText(tag).toLowerCase(); }) : [];
@@ -7633,15 +7859,15 @@ function handleRecall(recallRequest, char) {
     var usageNow = new Date().toISOString();
     results.forEach(function(item) {
       item.lastRecalled = usageNow;
-      item.recallCount++;
+      item.recallCount = (Number(item.recallCount) || 0) + 1;
       item.usageCount = (Number(item.usageCount) || 0) + 1;
       item.lastUsageAt = usageNow;
     });
   }
 }
 
-function consumeInjectedRecalls(char) {
-  var ids = Array.isArray(char.memory.lastInjectedRecallIds) ? char.memory.lastInjectedRecallIds : [];
+function consumeInjectedRecalls(char, injectedIds) {
+  var ids = Array.isArray(injectedIds) ? injectedIds : (Array.isArray(char.memory.lastInjectedRecallIds) ? char.memory.lastInjectedRecallIds : []);
   if (ids.length > 0) {
     char.memory.pendingRecall = (char.memory.pendingRecall || []).filter(function(item) { return ids.indexOf(item.id) === -1; });
   }
@@ -7723,7 +7949,9 @@ function getSceneKey(char) {
 
 // 场景级摘要：场景切换（或场景过长）时，把这一段情节压缩成只含剧情要点的记忆
 async function summarizeScene(char, sceneKey) {
-  var messages = char.memory.instant.filter(function(message) { return !message.isLoading; }).slice(-MEMORY_LIMITS.instantTrimFloor);
+  var guard = captureMemoryTask(char);
+  var start = Number(char.memory.sceneState.startSequence) || 0;
+  var messages = char.memory.instant.filter(function(message) { return !message.isLoading && message.sequence > start; }).slice(-MEMORY_LIMITS.instantTrimFloor);
   if (messages.length < 6) return false;
   var speakerName = toText(char.basicInfo && char.basicInfo.name) || '角色';
   var transcript = messages.map(function(message, index) {
@@ -7736,7 +7964,8 @@ async function summarizeScene(char, sceneKey) {
     var response = await callAPI([
       { role: 'system', content: '你是对话记录整理助手。只输出场景摘要正文，不要任何额外文字。' },
       { role: 'user', content: prompt }
-    ]);
+    ], { char: char, taskType: 'scene' });
+    if (!isMemoryTaskCurrent(guard)) return null;
     var content = toText(response.choices[0].message.content).trim();
     if (content.length < 8) return false;
     char.memory.scenes = (char.memory.scenes || []).concat([{
@@ -7757,13 +7986,15 @@ async function summarizeScene(char, sceneKey) {
 // 世界书整理任务：把近期已沉淀的事件事实补进世界书，并淘汰长期没人碰的 AI 条目。
 // 只沉淀"已经出现在对话里"的内容（用短期记忆作为依据），不凭空发明设定。
 async function consolidateLorebook(char) {
+  var guard = captureMemoryTask(char);
   var counters = char.memory.counters;
   var books = [char.lorebook];
   if (char.entityType === 'group' && Array.isArray(char.members)) {
     char.members.forEach(function(member) { if (member) books.push(member.lorebook); });
   }
-  books.forEach(function(book) { evictStaleLorebookEntries(book); });
-  var fresh = char.memory.shortTerm.filter(function(item) { return item.analyzedAt && !item.lorebookScannedAt; });
+  var fresh = char.memory.shortTerm.filter(function(item) {
+    return !item.lorebookScannedAt || (Number(item.lorebookScannedRevision) || 1) !== (Number(item.revision) || 1);
+  }).slice(0, MEMORY_LIMITS.analysisBatch);
   if (fresh.length === 0) return true;
   var existingLines = [];
   books.forEach(function(book) {
@@ -7771,7 +8002,7 @@ async function consolidateLorebook(char) {
       existingLines.push('- ' + toText(entry.name) + '｜关键词: ' + (entry.keywords || []).join('、') + (entry.alwaysActive ? '｜常驻' : ''));
     });
   });
-  var sourceEntries = fresh.slice(-MEMORY_LIMITS.analysisBatch).map(function(item) {
+  var sourceEntries = fresh.map(function(item) {
     return { id: item.id, content: trimText(item.content, 600) };
   });
   var speakerName = toText(char.basicInfo && char.basicInfo.name) || '角色';
@@ -7785,11 +8016,19 @@ async function consolidateLorebook(char) {
     var response = await callAPI([
       { role: 'system', content: '你是世界书整理助手。只返回 JSON，不要任何额外文字。' },
       { role: 'user', content: prompt }
-    ]);
+    ], { char: char, taskType: 'lorebook' });
+    if (!isMemoryTaskCurrent(guard)) return null;
     var parsed = parseJsonPayload(response.choices[0].message.content);
+    if (!isPlainObject(parsed) || !Array.isArray(parsed.entries)) throw new Error('世界书整理结果缺少 entries 数组');
     var allowedIds = {};
     sourceEntries.forEach(function(item) { allowedIds[item.id] = true; });
-    var items = parsed && Array.isArray(parsed.entries) ? parsed.entries.slice(0, LOREBOOK_LIMITS.autoEntriesPerPass) : [];
+    var items = parsed.entries.slice(0, LOREBOOK_LIMITS.autoEntriesPerPass);
+    if (items.some(function(item) {
+      return !isPlainObject(item) || !toText(item.name).trim() || !toText(item.content).trim()
+        || !Array.isArray(item.sourceShortTermIds) || item.sourceShortTermIds.length === 0
+        || item.sourceShortTermIds.some(function(id) { return !allowedIds[id]; });
+    })) throw new Error('世界书整理条目或来源无效');
+    books.forEach(function(book) { evictStaleLorebookEntries(book); });
     var applied = 0;
     items.forEach(function(item) {
       if (!isPlainObject(item)) return;
@@ -7805,7 +8044,11 @@ async function consolidateLorebook(char) {
       if (result.ok) applied++;
     });
     // 本轮看过的摘要打标记，避免下一轮重复整理（后续新摘要会再次覆盖同类事实）
-    fresh.forEach(function(item) { item.lorebookScannedAt = new Date().toISOString(); });
+    fresh.forEach(function(item) {
+      item.lorebookScannedAt = new Date().toISOString();
+      item.lorebookScannedRevision = Number(item.revision) || 1;
+    });
+    trimCharacterMemory(char);
     return true;
   } catch (error) {
     console.error('consolidateLorebook failed:', error);
@@ -7814,6 +8057,7 @@ async function consolidateLorebook(char) {
 }
 
 async function checkMemoryTriggers(char) {
+  ensureMessageSequences(char);
   var counters = char.memory.counters;
   selfLearnMemoryImportance(char);
   var extractableMessages = getExtractableInstantMessages(char);
@@ -7823,9 +8067,10 @@ async function checkMemoryTriggers(char) {
     if (extracted) {
       resetMemoryRetry(counters, 'extraction');
       trimCharacterMemory(char);
-      return true;
-    } else {
+    } else if (extracted === false) {
       scheduleMemoryRetry(counters, 'extraction');
+    } else {
+      return false;
     }
   }
   var unanalyzedShortTermCount = char.memory.shortTerm.filter(function(item) { return !item.analyzedAt; }).length;
@@ -7834,14 +8079,18 @@ async function checkMemoryTriggers(char) {
     var analyzed = await analyzeShortToLongTerm(char);
     if (analyzed) {
       resetMemoryRetry(counters, 'analysis');
-    } else {
+    } else if (analyzed === false) {
       scheduleMemoryRetry(counters, 'analysis');
+    } else {
+      return false;
     }
   }
   if (!isPlainObject(char.memory.sceneState)) char.memory.sceneState = { key: '', startCount: 0, messageCount: 0 };
   var sceneState = char.memory.sceneState;
   var currentSceneKey = getSceneKey(char);
-  sceneState.messageCount = Math.max(0, char.memory.instant.length - (Number(sceneState.startCount) || 0));
+  sceneState.messageCount = char.memory.instant.filter(function(message) {
+    return !message.isLoading && message.sequence > sceneState.startSequence;
+  }).length;
   var sceneChanged = Boolean(sceneState.key) && sceneState.key !== currentSceneKey;
   var sceneLongEnough = sceneState.messageCount >= CONTEXT_BUDGET.sceneSpan;
   var sceneReady = (sceneChanged || sceneLongEnough) && sceneState.messageCount >= 6;
@@ -7850,23 +8099,31 @@ async function checkMemoryTriggers(char) {
     var summarized = await summarizeScene(char, sceneState.key || currentSceneKey);
     if (summarized) {
       resetMemoryRetry(counters, 'scene');
-      char.memory.sceneState = { key: currentSceneKey, startCount: char.memory.instant.length, messageCount: 0 };
-    } else {
+      char.memory.sceneState = { key: currentSceneKey, startCount: 0,
+        startSequence: counters.messageSequence, messageCount: 0 };
+    } else if (summarized === false) {
       scheduleMemoryRetry(counters, 'scene');
+    } else {
+      return false;
     }
   } else if (!sceneReady) {
     sceneState.key = currentSceneKey;
   }
-  // 世界书整理 + 自动淘汰：每积累若干条短期记忆就跑一次（没有新摘要时也会跑，用于淘汰计数）
-  var lorebookDue = (char.memory.shortTerm.length - (Number(counters.lorebookScannedCount) || 0)) >= LOREBOOK_LIMITS.consolidateSpan;
+  var lorebookPending = char.memory.shortTerm.filter(function(item) {
+    return !item.lorebookScannedAt || (Number(item.lorebookScannedRevision) || 1) !== (Number(item.revision) || 1);
+  });
+  var lorebookDue = lorebookPending.length >= LOREBOOK_LIMITS.consolidateSpan
+    || lorebookPending.some(function(item) { return item.analyzedAt; });
   if (lorebookDue && canRunMemoryTask(counters, 'lorebook')) {
     setActivity('正在整理世界书…');
     var lorebookConsolidated = await consolidateLorebook(char);
     if (lorebookConsolidated) {
       resetMemoryRetry(counters, 'lorebook');
-      counters.lorebookScannedCount = char.memory.shortTerm.length;
-    } else {
+      counters.lorebookScannedCount = (Number(counters.lorebookScannedCount) || 0) + Math.min(lorebookPending.length, MEMORY_LIMITS.analysisBatch);
+    } else if (lorebookConsolidated === false) {
       scheduleMemoryRetry(counters, 'lorebook');
+    } else {
+      return false;
     }
   }
   trimCharacterMemory(char);
@@ -7874,10 +8131,11 @@ async function checkMemoryTriggers(char) {
 }
 
 async function extractInstantToShortTerm(char, options) {
+  var guard = captureMemoryTask(char);
   options = options || {};
   var migration = options.migration === true;
   if (char.memory.instant.length <= 8) return false;
-  var sourceMessages = getExtractableInstantMessages(char);
+  var sourceMessages = getExtractableInstantMessages(char).slice(0, MEMORY_LIMITS.summarySources);
   var messagesToExtract = sourceMessages.map(function(message) {
     return { id: message.id, role: message.role, content: trimText(message.content, 600), timestamp: message.timestamp };
   });
@@ -7887,12 +8145,13 @@ async function extractInstantToShortTerm(char, options) {
   }).slice(0, 4).map(function(item) {
     return { eventTime: item.eventTime, participants: item.participants, location: item.location, content: trimText(item.content, 240) };
   });
-  var prompt = '分析以下带消息ID和时间戳的即时对话，压缩为事件流程摘要。事件按“日期+时段”划分：时段只有深夜、凌晨、清晨、早晨、上午、中午、下午、傍晚、晚上、夜里十种，且一天从02:00起算（00:00-02:00算前一天的深夜）；同一天同一时段的多个事情视为同一事件，按时间线集中叙述（如“2026-08-01 下午在家先…晚上…”）。eventTime、participants、location三要素中只要有一个相同就归入同一事件，不要强行拆开；同一事件内用时间线连接各阶段，保留仍然有效的关键细节、结果与未决事项。**只保留会影响后续剧情的内容**：谁做了什么、学到或决定了什么，地点/物品/伤势/关系的变化，新的发现或线索，以及仍未解决的目标、承诺、威胁与期限；一次性的寒暄、当下的情绪起伏、闲聊过程一律不记。**每条content不超过120字**，用平实的叙述句写成，禁止文学化描写、比喻、形容词铺陈与对白原文。eventTime写该事件的真实ISO时间，participants为参与人列表，location写地点（没有明确地点写“未说明”）。若内容是“最近短期事件”中某事件的延续，必须原样复用该事件的eventTime、participants和location，并把旧摘要与本批新进展重新组织成一段完整的更新后摘要；系统会用新content覆盖旧content，因此不能只返回新增片段：旧摘要中**仍然有效**的信息（未过期的约定、未解决的事、仍然成立的关系与状态）必须原样保留，只丢弃已经过时或已被推翻的部分。content按时间和因果顺序书写，不要逐字摘录。content必须写明是谁做的：涉及用户写“用户”，涉及角色写角色名（群组写具体成员名），双方共同的事写清各自做了什么，禁止使用“我、你、TA、他、她”这类指代不清的代词。content中禁止使用“今天、昨天、明天、今晚、今晚、刚刚、刚才、现在、最近、这几天”等相对时间词，一律使用具体日期（如“8月1日下午”）或事件本身描述。每条sourceMessageIds只能引用本批输入消息ID，旧摘要的来源由系统保留。必须覆盖全部输入消息：从第一条到最后一个已处理消息之间的每个消息ID都必须至少出现在一个事件的sourceMessageIds中，不能跳过中间消息，不得遗漏。' + (migration ? '不限事件数量，尽可能完整覆盖本批全部消息。' : '返回JSON数组，最多十五个元素。') + '返回JSON数组：[{"content":"一段完整的更新后事件流程摘要","eventTime":"ISO时间","participants":["用户","角色名"],"location":"地点或未说明","sourceMessageIds":["msg_id"]}]。\n最近短期事件:\n' + JSON.stringify(recentEventIdentities) + '\n对话内容:\n' + JSON.stringify(messagesToExtract);
+  var prompt = '分析以下带消息ID和时间戳的即时对话，压缩为事件流程摘要。事件按“日期+时段”划分：时段只有深夜、凌晨、清晨、早晨、上午、中午、下午、傍晚、晚上、夜里十种，且一天从02:00起算（00:00-02:00算前一天的深夜）；同一天同一时段的多个事情视为同一事件，按时间线集中叙述（如“2026-08-01 下午在家先…晚上…”）。同一时段也可能有不同事件，按事实或持续话题区分，不得把无关事件强行合并；同一事件内用时间线连接各阶段，保留仍然有效的关键细节、结果与未决事项。**只保留会影响后续剧情的内容**：谁做了什么、学到或决定了什么，地点/物品/伤势/关系的变化，新的发现或线索，以及仍未解决的目标、承诺、威胁与期限；一次性的寒暄、当下的情绪起伏、闲聊过程一律不记。**每条content不超过120字**，用平实的叙述句写成，禁止文学化描写、比喻、形容词铺陈与对白原文。eventTime写该事件的真实ISO时间，participants为参与人列表，location写地点（没有明确地点写“未说明”）。若内容是“最近短期事件”中某事件的延续，必须原样复用该事件的eventTime、participants和location，并把旧摘要与本批新进展重新组织成一段完整的更新后摘要；系统保留已有摘要并追加新事实，因此不能只返回新增片段：旧摘要中**仍然有效**的信息（未过期的约定、未解决的事、仍然成立的关系与状态）必须原样保留，只丢弃已经过时或已被推翻的部分。content按时间和因果顺序书写，不要逐字摘录。content必须写明是谁做的：涉及用户写“用户”，涉及角色写角色名（群组写具体成员名），双方共同的事写清各自做了什么，禁止使用“我、你、TA、他、她”这类指代不清的代词。content中禁止使用“今天、昨天、明天、今晚、今晚、刚刚、刚才、现在、最近、这几天”等相对时间词，一律使用具体日期（如“8月1日下午”）或事件本身描述。每条sourceMessageIds只能引用本批输入消息ID，旧摘要的来源由系统保留。必须覆盖全部输入消息：从第一条到最后一个已处理消息之间的每个消息ID都必须至少出现在一个事件的sourceMessageIds中，不能跳过中间消息，不得遗漏。' + (migration ? '不限事件数量，尽可能完整覆盖本批全部消息。' : '返回JSON数组，最多十五个元素。') + '返回JSON数组：[{"content":"一段完整的更新后事件流程摘要","eventTime":"ISO时间","participants":["用户","角色名"],"location":"地点或未说明","sourceMessageIds":["msg_id"]}]。\n最近短期事件:\n' + JSON.stringify(recentEventIdentities) + '\n对话内容:\n' + JSON.stringify(messagesToExtract);
   try {
     var response = await callAPI([
       { role: 'system', content: '你是一个信息提取助手。只返回JSON数组，不要其他文字。' },
       { role: 'user', content: prompt }
-    ]);
+    ], { char: char, taskType: 'extraction' });
+    if (!isMemoryTaskCurrent(guard)) return null;
     var content = response.choices[0].message.content;
     var points = parseJsonPayload(content);
     if (Array.isArray(points)) points = points.filter(isPlainObject);
@@ -7913,17 +8172,18 @@ async function extractInstantToShortTerm(char, options) {
       if (!validBatch || coveredSourceIds.size === 0) return false;
       var coveredPrefixLength = 0;
       while (coveredPrefixLength < sourceMessages.length && coveredSourceIds.has(sourceMessages[coveredPrefixLength].id)) coveredPrefixLength++;
-      var pointIndexes = Object.create(null);
+      var pointIndexes = new Map();
       points.forEach(function(point) {
         var firstIndex = Infinity;
         point.sourceMessageIds.forEach(function(id) { firstIndex = Math.min(firstIndex, sourceIndexes[id]); });
-        pointIndexes[point] = firstIndex;
+        pointIndexes.set(point, firstIndex);
       });
       if (coveredPrefixLength > 0) {
-        points = points.filter(function(point) { return pointIndexes[point] < coveredPrefixLength; });
+        points = points.filter(function(point) { return pointIndexes.get(point) < coveredPrefixLength; });
         if (points.length === 0) return false;
       }
       var accepted = 0;
+      var acceptedPoints = [];
       points.forEach(function(point) {
         var pointTime = normalizeTimestamp(point.eventTime, '');
         if (!pointTime) {
@@ -7936,12 +8196,13 @@ async function extractInstantToShortTerm(char, options) {
         }
         if (addShortTermMemory(char, point.content, pointTime || new Date().toISOString(), point)) {
           accepted++;
+          acceptedPoints.push(point);
         }
       });
       if (accepted === 0) return false;
       var extractedAt = new Date().toISOString();
       var markedIds = new Set();
-      points.forEach(function(point) {
+      acceptedPoints.forEach(function(point) {
         (point.sourceMessageIds || []).forEach(function(id) {
           markedIds.add(id);
         });
@@ -7960,15 +8221,17 @@ async function extractInstantToShortTerm(char, options) {
 }
 
 async function analyzeShortToLongTerm(char) {
+  var guard = captureMemoryTask(char);
   var analyzeLimit = Math.max(0, char.memory.shortTerm.length - MEMORY_LIMITS.shortTermTrimFloor);
   var itemsToAnalyze = char.memory.shortTerm.slice(0, analyzeLimit).filter(function(item) { return !item.analyzedAt; }).slice(0, MEMORY_LIMITS.analysisBatch);
   if (itemsToAnalyze.length === 0) return false;
-  var prompt = '分析以下带短期ID、来源消息ID、userEvidence及时间/人物/地点三要素的事件流程摘要，提取未来仍有价值的稳定事实。**价值判据**：只有能跨轮复用、会影响后续对话或关系、或用户明确表达过的信息才记（长期偏好、重要人物与关系、承诺与约定、反复出现的习惯、持续的情节线）；一次性的寒暄客套、当下的情绪起伏、可以随口重说的闲聊、纯场景描写一律不记。**证据不足宁可不记**，不要为了产出而脑补或推演。必须检查全部输入条目，并在analyzedShortTermIds中原样返回全部输入的短期ID；不得遗漏、增加或重复。合并重复或冲突条目；事件、承诺保留必要日期；普通寒暄不要进入长期记忆。每条长期记忆必须在sourceShortTermIds中列出它实际使用的短期条目id；每个列出的短期条目都必须至少贡献一个sourceMessageIds中的消息ID，否则不要列出该短期ID。sourceMessageIds只选择直接支持该事实的消息，不要复制短期条目的全部来源；userProfile和habits只能选择用户消息。evidence只能逐字引用被选择消息对应的userEvidence.text，不能引用摘要或改写。没有可引用的userEvidence时不要输出该条。events按“日期+时段”合并：同一天同一时段（深夜/凌晨/清晨/早晨/上午/中午/下午/傍晚/晚上/夜里，一天从02:00起算）的短期事件合并为一条长期事件，时段是最高优先级的事件标识；合并时eventTime取最早的ISO时间，participants取并集，location取最新（无明确地点写“未说明”）。剧情弧线：若若干短期事件属于同一持续情节或话题线（同一人物线、同一持续事件、同一反复出现的话题），除按时间合并外，还应在其中一条事件条目上标注arcOf（该情节的持续话题或人物线名称，稳定可复用）与arcStage（只能是起始/发展/转折/现状之一，按情节推进阶段标注），arcOf命名一旦确定就保持稳定——同一情节线不得每轮改名或另起新名，续写时沿用已有名称；并将value整合成按时间顺序、带情绪起伏的叙事摘要；同一arcOf只允许一条带弧线标注的条目，其余同线条目按普通事件输出。无论是否提取出长期记忆，成功完成分析都必须返回status:"ok"；没有长期价值时仍需返回完整analyzedShortTermIds和空longTerm。\n分类规则：userProfile/habits仅限用户事实，subject=user；relationship仅限双方关系，subject=relationship；events只记录用户陈述或共同事件；promises只记录用户明确承诺或双方明确约定。promises在此处只能新建为active；完成或取消由主对话的promiseUpdates按承诺ID处理。存在明确期限才填写dueAt。\n条目:\n' + JSON.stringify(itemsToAnalyze) + '\n\n返回JSON格式:\n{"status":"ok","analyzedShortTermIds":["全部输入的short_id"],"longTerm": [{"category": "...", "subject": "user|relationship|world", "key": "稳定且可复用的标识", "value": "...", "tags": [...], "importance": 1-10, "sourceShortTermIds":["short_id"], "sourceMessageIds": ["msg_id"], "evidence": "被选择用户消息中的逐字原话", "eventTime": "ISO时间", "participants":["参与者"],"location":"地点或未说明","status": "active", "dueAt": "ISO时间", "arcOf": "可选，持续情节线名称", "arcStage": "可选，起始/发展/转折/现状"}]}\ncategory可选: userProfile, relationship, events, promises, habits。value同样必须写明主体：涉及用户写“用户”，涉及角色写角色名（群组写具体成员名），禁止“我/你/TA”这类指代不清的代词。key与value中的时间一律写绝对日期（YYYY-MM-DD 或 YYYY-MM-DD 时段），禁止“明天/明晚/上周/上个月/三天后”这类相对时间词。这里只提取用户的约定（promises 的 promisor=user、promisor与promisee只能填 user 或 character）；角色单方承诺由主对话记录，不在此处提取。';
+  var prompt = '分析以下带短期ID、来源消息ID、userEvidence及时间/人物/地点三要素的事件流程摘要，提取未来仍有价值的稳定事实。**价值判据**：只有能跨轮复用、会影响后续对话或关系、或用户明确表达过的信息才记（长期偏好、重要人物与关系、承诺与约定、反复出现的习惯、持续的情节线）；一次性的寒暄客套、当下的情绪起伏、可以随口重说的闲聊、纯场景描写一律不记。**证据不足宁可不记**，不要为了产出而脑补或推演。必须检查全部输入条目，并在analyzedShortTermIds中原样返回全部输入的短期ID；不得遗漏、增加或重复。合并重复或冲突条目；事件、承诺保留必要日期；普通寒暄不要进入长期记忆。每条长期记忆必须在sourceShortTermIds中列出它实际使用的短期条目id；每个列出的短期条目都必须至少贡献一个sourceMessageIds中的消息ID，否则不要列出该短期ID。sourceMessageIds只选择直接支持该事实的消息，不要复制短期条目的全部来源；userProfile和habits只能选择用户消息。evidence只能逐字引用被选择消息对应的userEvidence.text，不能引用摘要或改写。没有可引用的userEvidence时不要输出该条。events按“日期+时段+事实主题”区分：同一天同一时段（深夜/凌晨/清晨/早晨/上午/中午/下午/傍晚/晚上/夜里，一天从02:00起算）的短期事件合并为一条长期事件，同一时段的独立事实不得互相覆盖，key须标明稳定事实主题；合并时eventTime取最早的ISO时间，participants取并集，location取最新（无明确地点写“未说明”）。剧情弧线：若若干短期事件属于同一持续情节或话题线（同一人物线、同一持续事件、同一反复出现的话题），除按时间合并外，还应在其中一条事件条目上标注arcOf（该情节的持续话题或人物线名称，稳定可复用）与arcStage（只能是起始/发展/转折/现状之一，按情节推进阶段标注），arcOf命名一旦确定就保持稳定——同一情节线不得每轮改名或另起新名，续写时沿用已有名称；并将value整合成按时间顺序、带情绪起伏的叙事摘要；同一arcOf只允许一条带弧线标注的条目，其余同线条目按普通事件输出。无论是否提取出长期记忆，成功完成分析都必须返回status:"ok"；没有长期价值时仍需返回完整analyzedShortTermIds和空longTerm。\n分类规则：userProfile/habits仅限用户事实，subject=user；relationship仅限双方关系，subject=relationship；events只记录用户陈述或共同事件；promises只记录用户明确承诺或双方明确约定。promises在此处只能新建为active；完成或取消由主对话的promiseUpdates按承诺ID处理。存在明确期限才填写dueAt。\n条目:\n' + JSON.stringify(itemsToAnalyze) + '\n\n返回JSON格式:\n{"status":"ok","analyzedShortTermIds":["全部输入的short_id"],"longTerm": [{"category": "...", "subject": "user|relationship|world", "key": "稳定且可复用的标识", "value": "...", "tags": [...], "importance": 1-10, "sourceShortTermIds":["short_id"], "sourceMessageIds": ["msg_id"], "evidence": "被选择用户消息中的逐字原话", "eventTime": "ISO时间", "participants":["参与者"],"location":"地点或未说明","status": "active", "dueAt": "ISO时间", "arcOf": "可选，持续情节线名称", "arcStage": "可选，起始/发展/转折/现状"}]}\ncategory可选: userProfile, relationship, events, promises, habits。value同样必须写明主体：涉及用户写“用户”，涉及角色写角色名（群组写具体成员名），禁止“我/你/TA”这类指代不清的代词。key与value中的时间一律写绝对日期（YYYY-MM-DD 或 YYYY-MM-DD 时段），禁止“明天/明晚/上周/上个月/三天后”这类相对时间词。这里只提取用户的约定（promises 的 promisor=user、promisor与promisee只能填 user 或 character）；角色单方承诺由主对话记录，不在此处提取。';
   try {
     var response = await callAPI([
       { role: 'system', content: '你是一个记忆分析助手。只返回JSON，不要其他文字。' },
       { role: 'user', content: prompt }
-    ]);
+    ], { char: char, taskType: 'analysis' });
+    if (!isMemoryTaskCurrent(guard)) return null;
     var content = response.choices[0].message.content;
     var update = parseJsonPayload(content);
     if (!isPlainObject(update)) throw new Error('记忆分析结果不是对象');
@@ -8021,8 +8284,10 @@ async function analyzeShortToLongTerm(char) {
       throw writeError;
     }
     var analyzedAt = new Date().toISOString();
-    char.memory.shortTerm = char.memory.shortTerm.filter(function(item, index) {
-      return !analyzableShortTermIds.has(item.id);
+    char.memory.shortTerm.forEach(function(item) {
+      if (!analyzableShortTermIds.has(item.id)) return;
+      item.analyzedAt = analyzedAt;
+      item.analyzedRevision = Number(item.revision) || 1;
     });
     trimCharacterMemory(char);
     return true;
@@ -8031,7 +8296,6 @@ async function analyzeShortToLongTerm(char) {
     return false;
   }
 }
-
 // ==================== One-Sentence Generation ====================
 async function quickGenerateCharacter() {
   var desc = document.getElementById('quickGenInput').value.trim();
@@ -9177,7 +9441,11 @@ function renderCacheStats() {
   }
   var total = stats.hitTokens + stats.missTokens;
   var rate = total ? Math.round(stats.hitTokens * 100 / total) : 0;
-  element.textContent = '缓存 ' + formatCompactNumber(stats.hitTokens) + '/' + formatCompactNumber(stats.missTokens) + ' · ' + rate + '%';
+  var recent = (state.config.requestMetrics || []).filter(function(item) { return item.taskType === 'chat' && item.hitRate != null; }).slice(-10);
+  var average = recent.length ? Math.round(recent.reduce(function(sum, item) { return sum + item.hitRate; }, 0) * 100 / recent.length) : rate;
+  element.textContent = '缓存命中 ' + rate + '% · 近' + recent.length + '轮均值 ' + average + '%';
+  element.title = '本轮 ' + formatCompactNumber(stats.hitTokens) + ' 命中 / ' + formatCompactNumber(stats.missTokens)
+    + ' 未命中 token；最近10次对话请求平均 ' + average + '%';
   element.classList.remove('hidden');
 }
 
@@ -9278,6 +9546,13 @@ function renderDebugInfo() {
     } catch (e) {
       parts.push('【最近一次回应】\n' + replyRaw);
     }
+  }
+  if (state.config && Array.isArray(state.config.requestMetrics) && state.config.requestMetrics.length) {
+    var metrics = state.config.requestMetrics.slice(-12).map(function(item) {
+      return { at: item.at, taskType: item.taskType, characterId: item.characterId,
+        inputTokens: item.inputTokens, hitTokens: item.hitTokens, missTokens: item.missTokens, hitRate: item.hitRate };
+    });
+    parts.push('【最近 API 用量与缓存统计】\n' + JSON.stringify(metrics, null, 2));
   }
   if (parts.length === 0) { wrap.classList.add('hidden'); pre.textContent = ''; return; }
   pre.textContent = parts.join('\n\n');
@@ -9449,7 +9724,6 @@ function saveSettings() {
   savePlatformFields(platform);
   scheduleSave();
 }
-
 // ==================== Viewport Height ====================
 function updateAppHeight() {
   var vh = window.visualViewport ? window.visualViewport.height : window.innerHeight;

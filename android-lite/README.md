@@ -1,6 +1,8 @@
 # DeepTalking Lite (android-lite)
 
-DeepTalking 的轻量 Android 封装：单个 WebView 直接加载 `assets/hub.html`（由仓库根目录 `hub.html` 同步而来）。
+DeepTalking 的轻量 Android 封装：原生 WebView 加载 `assets/hub.html`。开发源码位于根目录 `src/`，构建器将页面、样式与按职责拆分的 JavaScript 模块生成网页入口及 APK 资产。两份 `hub.html` 字节级一致。
+
+后续开发只修改 `src/` 的模块代码；单文件不再维护，两份 `hub.html` 仅由构建器生成。
 
 - 包名：`com.deeptalking.lite`
 - 显示名：DeepTalking
@@ -12,25 +14,31 @@ DeepTalking 的轻量 Android 封装：单个 WebView 直接加载 `assets/hub.h
 
 ## 构建
 
+需要 Node.js 22、JDK 17、Android SDK 和 Gradle。Gradle 的 `preBuild` 自动调用 `buildHubAssets`，从 `src/` 生成 WebView 资产后再打包；不需要手工准备 `hub.html`。源码、构建器或版本配置变化时会重新生成。
+
 ```bash
 cd android-lite
 gradle :app:assembleDebug
 # 产物: app/build/outputs/apk/debug/app-debug.apk
 ```
 
-CI：推送 `android-lite/**` 到 `main`/`cloud-main` 自动构建，产物上传到 GitHub Actions Artifacts（无 TTS 下载步骤）。
+CI：推送 `src/**`、`tools/**`、`hub.html`、`android-lite/**` 或构建工作流到 `main`/`cloud-main` 自动验证源码与产物、执行应用自检、构建固定签名的 release APK，并上传 Artifacts 和 Release。
 
 ## 更新资产（每次出包前）
 
-把仓库根目录的最新开发版 `hub.html` 同步为 APK 内副本：
+APK 打包会自动生成资产。网页预览及提交前验证时，修改 `src/` 中的模块后，从仓库根目录运行：
 
 ```bash
-Copy-Item hub.html android-lite/app/src/main/assets/hub.html
-# 同步后校验两份文件一致（SHA256）
+node tools/build-hub.mjs
+node tools/build-hub.mjs --check
 powershell -File tools/check-sync.ps1
-# katex/ 同步（引用了 katex/katex.min.css）
-Copy-Item katex android-lite/app/src/main/assets/katex -Recurse
+node tools/sync-version.mjs --check
+node tools/verify-hub.mjs
 ```
+
+版本号唯一来源仍为 `app/build.gradle.kts` 的 `versionName`。每次 APK 更新将补丁版本与 `versionCode` 各加一，再运行 `node tools/sync-version.mjs`，自动重建两份资产。模块职责与依赖规则见 `docs/FRONTEND_MODULES.md`。
+
+`katex/` 保持本地资源路径，两端已有资源需要一并保留。WebView 的 `file:///android_asset/hub.html`、包名、签名与 localStorage 主键保持稳定，模块拆分不触发数据迁移。
 
 ## 数据存储位置
 

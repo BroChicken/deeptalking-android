@@ -3,6 +3,23 @@
     id("org.jetbrains.kotlin.android")
 }
 
+val hubRoot = rootProject.projectDir.parentFile
+val buildHubAssets by tasks.registering(Exec::class) {
+    group = "build"
+    description = "Generate WebView assets from modular frontend sources"
+    workingDir(hubRoot)
+    commandLine("node", "tools/build-hub.mjs")
+    inputs.dir(hubRoot.resolve("src"))
+    inputs.file(hubRoot.resolve("tools/build-hub.mjs"))
+    inputs.file(project.file("build.gradle.kts"))
+    outputs.file(hubRoot.resolve("hub.html"))
+    outputs.file(project.file("src/main/assets/hub.html"))
+}
+
+tasks.named("preBuild") {
+    dependsOn(buildHubAssets)
+}
+
 android {
     namespace = "com.deeptalking.lite"
     compileSdk = 35
@@ -11,8 +28,8 @@ android {
         applicationId = "com.deeptalking.lite"
         minSdk = 26
         targetSdk = 35
-        versionCode = 29
-        versionName = "1.3.4"
+        versionCode = 30
+        versionName = "1.3.5"
     }
 
     compileOptions {

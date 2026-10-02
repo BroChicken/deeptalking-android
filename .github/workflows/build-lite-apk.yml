@@ -6,6 +6,10 @@ on:
     branches: [main, cloud-main]
     paths:
       - 'android-lite/**'
+      - 'src/**'
+      - 'tools/**'
+      - 'hub.html'
+      - '.github/workflows/build-lite-apk.yml'
 
 permissions:
   contents: write
@@ -15,6 +19,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Verify committed assets match module sources
+        run: node tools/build-hub.mjs --check
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -30,6 +39,12 @@ jobs:
           echo "Detected versionName=$VERSION"
       - name: Sync APP_VERSION into both hub.html copies
         run: node tools/sync-version.mjs
+      - name: Verify application contracts
+        run: node tools/verify-hub.mjs
+      - name: Verify build regression cases
+        run: node tools/test-build-hub.mjs
+      - name: Verify agent and memory regression cases
+        run: node --test tools/test-agent-regressions.mjs
       - name: Assert both hub.html copies are byte-identical
         run: |
           sha256sum hub.html android-lite/app/src/main/assets/hub.html
