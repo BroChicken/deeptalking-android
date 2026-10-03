@@ -259,6 +259,9 @@ async function executeToolCall(call, char, toolState) {
       });
       if (!lorebookResult.ok) return JSON.stringify({ ok: false, reason: lorebookResult.reason });
       var lorebookEntry = lorebookResult.entry;
+      if (lorebookResult.mergedIntoUser) {
+        return JSON.stringify({ ok: true, entryId: lorebookEntry.id, name: lorebookEntry.name, keywords: lorebookEntry.keywords, created: false, skipped: true, reason: '已有用户手写条目「' + toText(lorebookEntry.name) + '」覆盖同一设定，未新建重复条目；不要再重复写入' });
+      }
       if (toolState) {
         if (!Array.isArray(toolState.lorebookChanges)) toolState.lorebookChanges = [];
         toolState.lorebookChanges.push((lorebookResult.created ? '新增' : '更新') + '世界书「' + toText(lorebookEntry.name) + '」' + (lorebookEntry.alwaysActive ? '（常驻）' : ''));
@@ -300,35 +303,6 @@ async function executeToolCall(call, char, toolState) {
   } catch (e) {
     return JSON.stringify({ ok: false, reason: '工具执行异常: ' + (e && e.message ? e.message : String(e)) });
   }
-}
-
-async function executeAgentToolBatch(calls, char, toolState, reasoningItems, allowExecution) {
-  (reasoningItems || []).forEach(function(item) { toolState.items.push(item); });
-  if (!toolState.callResults) toolState.callResults = Object.create(null);
-  var failed = false;
-  for (var i = 0; i < calls.length; i++) {
-    var call = calls[i];
-    var callId = call.call_id || call.id || createMemoryId('call');
-    var signature = call.name + '\n' + toText(call.arguments);
-    var cached = toolState.callResults[callId];
-    if (cached && cached.signature === signature) {
-      if (typeof cached.output === 'string') try { if (JSON.parse(cached.output).ok === false) failed = true; } catch (error) { failed = true; }
-      continue;
-    }
-    if (cached) throw new Error('工具调用 ID 重复且参数不一致，停止重复执行');
-    var output;
-    if (allowExecution === false || (Number(toolState.executedCalls) || 0) >= MAX_TOOL_CALLS) {
-      output = JSON.stringify({ ok: false, reason: '工具调用已达上限，请基于已有结果收尾，不得声称未执行的修改已完成' });
-    } else {
-      toolState.executedCalls = (Number(toolState.executedCalls) || 0) + 1;
-      output = await executeToolCall(call, char, toolState);
-    }
-    toolState.callResults[callId] = { signature: signature, output: output };
-    toolState.items.push({ type: 'function_call', call_id: callId, name: call.name, arguments: toText(call.arguments) });
-    toolState.items.push({ type: 'function_call_output', call_id: callId, output: output });
-    if (typeof output === 'string') try { if (JSON.parse(output).ok === false) failed = true; } catch (error) { failed = true; }
-  }
-  return { failed: failed };
 }
 
 function extractFunctionCalls(fullResponse) {

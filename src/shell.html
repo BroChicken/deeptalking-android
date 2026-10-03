@@ -147,12 +147,12 @@
               </select>
             </div>
           </div>
-          <label class="flex items-center gap-2 text-xs text-muted-c"><input type="checkbox" id="proactiveToggle"> 角色主动开口（打开面板停留约 1 分钟未对话时，角色主动发起开场）</label>
-          <label class="flex items-center gap-2 text-xs text-muted-c"><input type="checkbox" id="styleCritiqueToggle"> 文风自动校对（回复命中语气/风格问题时，追加一次只改文风的修订请求）</label>
-          <label class="flex items-center gap-2 text-xs text-muted-c"><input type="checkbox" id="quickReplyRepairToggle"> 快速回应视角校正（快速回应不像用户会说的话时，后台用“用户本人”身份重写一次）</label>
+          <label class="flex items-center gap-2 text-xs text-muted-c" title="打开面板停留约 1 分钟未对话时，角色主动发起开场"><input type="checkbox" id="proactiveToggle"> 角色主动开口</label>
+          <label class="flex items-center gap-2 text-xs text-muted-c" title="回复命中语气/风格问题时，追加一次只改文风的修订请求"><input type="checkbox" id="styleCritiqueToggle"> 文风自动校对</label>
+          <label class="flex items-center gap-2 text-xs text-muted-c" title="快速回应不像用户会说的话时，后台用“用户本人”身份重写一次"><input type="checkbox" id="quickReplyRepairToggle"> 快速回应视角校正</label>
            <div id="debugInfoWrap" class="hidden mt-3">
              <div class="flex items-center justify-between mb-1">
-               <label class="block text-xs text-muted-c">调试信息（最近一次回应完整内容与活动时间线）</label>
+               <label class="block text-xs text-muted-c" title="最近一次回应完整内容与活动时间线">调试信息</label>
                <button onclick="copyDebugInfo()" class="text-[11px] px-2 py-0.5 rounded" style="background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text-color);">复制</button>
              </div>
              <pre id="debugInfo" class="text-[10px] leading-relaxed whitespace-pre-wrap break-all p-2 rounded-lg max-h-48 overflow-auto" style="background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text-color);"></pre>

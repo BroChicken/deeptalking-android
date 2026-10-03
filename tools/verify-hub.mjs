@@ -72,6 +72,15 @@ try {
     + '\n' + extractBraced(script, 'function collectLorebookEntries(')
     + '\n' + extractBraced(script, 'function resolveLorebookList(')
     + '\n' + extractBraced(script, 'function findLorebookEntry(')
+    + '\n' + extractBraced(script, 'function normalizeLorebookName(')
+    + '\n' + extractBraced(script, 'function lorebookBigrams(')
+    + '\n' + extractBraced(script, 'function bigramOverlapRatio(')
+    + '\n' + extractBraced(script, 'function normalizeKeywordList(')
+    + '\n' + extractBraced(script, 'function lorebookEntriesSimilar(')
+    + '\n' + extractBraced(script, 'function findSimilarLorebookEntry(')
+    + '\n' + extractBraced(script, 'function splitLorebookSentences(')
+    + '\n' + extractBraced(script, 'function mergeLorebookContent(')
+    + '\n' + extractBraced(script, 'function dedupeLorebook(')
     + '\n' + extractBraced(script, 'function lorebookEvidenceOverlaps(')
     + '\n' + extractBraced(script, 'function resolveLorebookSources(')
     + '\n' + extractBraced(script, 'function upsertLorebookEntry(')
@@ -114,7 +123,7 @@ try {
     + '\n' + script.match(/const QUICK_REPLY_ISSUE_LABELS = \{[\s\S]*?\n\};/)[0]
     + '\n' + script.match(/const QUICK_REPLY_PLACEHOLDERS = \[.*?\];/)[0]
     + '\n' + script.match(/const LOREBOOK_LIMITS = \{[\s\S]*?\n\};/)[0]
-    + '\nreturn { NARRATIVE_PATTERNS: NARRATIVE_PATTERNS, buildNarrativePatternDirective: buildNarrativePatternDirective, normalizeLorebook: normalizeLorebook, normalizeGeneratedLorebook: normalizeGeneratedLorebook, collectLorebookEntries: collectLorebookEntries, resolveLorebookList: resolveLorebookList, findLorebookEntry: findLorebookEntry, resolveLorebookSources: resolveLorebookSources, upsertLorebookEntry: upsertLorebookEntry, evictStaleLorebookEntries: evictStaleLorebookEntries, matchLorebookEntries: matchLorebookEntries, buildLorebookLines: buildLorebookLines, markLorebookMentions: markLorebookMentions, buildLorebookContext: buildLorebookContext, formatLorebookMention: formatLorebookMention, LOREBOOK_LIMITS: LOREBOOK_LIMITS, getSceneKey: getSceneKey, memoryTaskKeys: memoryTaskKeys, toolActivityHint: toolActivityHint, chatStageDecision: chatStageDecision, extractSpeakingSamples: extractSpeakingSamples, buildStyleAnchor: buildStyleAnchor, detectStyleViolations: detectStyleViolations, isSentenceLengthUniform: isSentenceLengthUniform, sharesDistinctivePhrase: sharesDistinctivePhrase, getLastStyleViolations: getLastStyleViolations, collectRecentStyleViolations: collectRecentStyleViolations, buildStyleReview: buildStyleReview, buildStyleCorrectionReminder: buildStyleCorrectionReminder, STYLE_GUARD: STYLE_GUARD, STYLE_VIOLATION_LABELS: STYLE_VIOLATION_LABELS, buildQuickReplyPerspectiveReminder: buildQuickReplyPerspectiveReminder, buildQuickReplyAsUserPrompt: buildQuickReplyAsUserPrompt, QUICK_REPLY_GUARD: QUICK_REPLY_GUARD, QUICK_REPLY_ISSUE_LABELS: QUICK_REPLY_ISSUE_LABELS, detectQuickReplyIssues: detectQuickReplyIssues, getLastQuickReplyIssues: getLastQuickReplyIssues };';
+    + '\nreturn { NARRATIVE_PATTERNS: NARRATIVE_PATTERNS, buildNarrativePatternDirective: buildNarrativePatternDirective, normalizeLorebook: normalizeLorebook, normalizeGeneratedLorebook: normalizeGeneratedLorebook, collectLorebookEntries: collectLorebookEntries, resolveLorebookList: resolveLorebookList, findLorebookEntry: findLorebookEntry, resolveLorebookSources: resolveLorebookSources, upsertLorebookEntry: upsertLorebookEntry, evictStaleLorebookEntries: evictStaleLorebookEntries, normalizeLorebookName: normalizeLorebookName, bigramOverlapRatio: bigramOverlapRatio, lorebookEntriesSimilar: lorebookEntriesSimilar, findSimilarLorebookEntry: findSimilarLorebookEntry, mergeLorebookContent: mergeLorebookContent, dedupeLorebook: dedupeLorebook, matchLorebookEntries: matchLorebookEntries, buildLorebookLines: buildLorebookLines, markLorebookMentions: markLorebookMentions, buildLorebookContext: buildLorebookContext, formatLorebookMention: formatLorebookMention, LOREBOOK_LIMITS: LOREBOOK_LIMITS, getSceneKey: getSceneKey, memoryTaskKeys: memoryTaskKeys, toolActivityHint: toolActivityHint, chatStageDecision: chatStageDecision, extractSpeakingSamples: extractSpeakingSamples, buildStyleAnchor: buildStyleAnchor, detectStyleViolations: detectStyleViolations, isSentenceLengthUniform: isSentenceLengthUniform, sharesDistinctivePhrase: sharesDistinctivePhrase, getLastStyleViolations: getLastStyleViolations, collectRecentStyleViolations: collectRecentStyleViolations, buildStyleReview: buildStyleReview, buildStyleCorrectionReminder: buildStyleCorrectionReminder, STYLE_GUARD: STYLE_GUARD, STYLE_VIOLATION_LABELS: STYLE_VIOLATION_LABELS, buildQuickReplyPerspectiveReminder: buildQuickReplyPerspectiveReminder, buildQuickReplyAsUserPrompt: buildQuickReplyAsUserPrompt, QUICK_REPLY_GUARD: QUICK_REPLY_GUARD, QUICK_REPLY_ISSUE_LABELS: QUICK_REPLY_ISSUE_LABELS, detectQuickReplyIssues: detectQuickReplyIssues, getLastQuickReplyIssues: getLastQuickReplyIssues };';
   unit = new Function(src)();
 } catch (error) {
   ok('可提取并求值目标函数', false, error.message);
@@ -242,17 +251,44 @@ if (unit) {
   ok('upsert: 新条目默认带 id 与零计数', /^lore_/.test(created.entry.id) && created.entry.mentions === 0 && created.entry.misses === 0 && created.entry.lastMentionedAt === null);
   const updated = upsertLorebookEntry(writeChar, { name: '赤月王国', content: '西侧王国（更新）' });
   ok('upsert: 同名条目更新而非新建', updated.ok && updated.created === false && writeChar.lorebook.length === 1 && writeChar.lorebook[0].content === '西侧王国（更新）');
-  ok('upsert: 无关键词自动按常驻处理', upsertLorebookEntry(writeChar, { name: '无关键词', content: '内容' }).entry.alwaysActive === true);
+  ok('upsert: 新条目必须有关键词或显式常驻', upsertLorebookEntry(writeChar, { name: '无关键词', content: '内容' }).ok === false);
+  ok('upsert: 显式常驻可无关键词新建', upsertLorebookEntry(writeChar, { name: '无关键词常驻', content: '内容', alwaysActive: true }).ok === true);
   const noContent = upsertLorebookEntry(writeChar, { name: '空内容', content: '   ' });
   ok('upsert: 空内容被拒绝', noContent.ok === false);
   const userEntry = normalizeLorebook([{ name: '用户条目', content: '不许改', origin: 'user' }])[0];
   const guarded = upsertLorebookEntry({ entityType: 'character', lorebook: [userEntry], memory: { instant: [] } }, { name: '用户条目', content: '试图覆盖' });
   ok('upsert: 拒绝覆盖用户手写条目', guarded.ok === false && userEntry.content === '不许改', guarded.reason);
-  const fullList = { entityType: 'character', lorebook: normalizeLorebook(Array.from({ length: L.entries }, (_, i) => ({ name: 'N' + i, content: 'c', origin: 'ai' }))), memory: { instant: [] } };
-  ok('upsert: 达上限后拒绝新建', upsertLorebookEntry(fullList, { name: '新增', content: 'c' }).ok === false);
+  const fullListChar = { entityType: 'character', lorebook: normalizeLorebook(Array.from({ length: L.entries }, (_, i) => ({ name: 'N' + i, content: 'c', origin: 'ai', keywords: ['k' + i] }))), memory: { instant: [] } };
+  ok('upsert: 达上限后拒绝新建', upsertLorebookEntry(fullListChar, { name: '全新条目', content: 'c', keywords: ['新词'] }).ok === false);
+
+  // 近似名称/共享关键词合并而非新建
+  const mergeChar = { entityType: 'character', lorebook: [], memory: { instant: [] } };
+  upsertLorebookEntry(mergeChar, { name: '银月商会', content: '西街的商会。', keywords: ['银月'] });
+  const mergedWrite = upsertLorebookEntry(mergeChar, { name: '银月商行', content: '经营药材。', keywords: ['银月'] });
+  ok('upsert: 近似条目合并而非新建', mergedWrite.ok && mergedWrite.created === false && mergeChar.lorebook.length === 1 && mergeChar.lorebook[0].content.includes('西街') && mergeChar.lorebook[0].content.includes('药材'));
+
+  // 近似命中用户条目时不新建、不改写
+  const userNear = normalizeLorebook([{ name: '银月商会', content: '用户写的商会。', origin: 'user' }])[0];
+  const userNearChar = { entityType: 'character', lorebook: [userNear], memory: { instant: [] } };
+  const skipped = upsertLorebookEntry(userNearChar, { name: '银月 商会', content: '试图新增。', keywords: ['银月'] });
+  ok('upsert: 近似命中用户条目时不新建', skipped.ok === true && skipped.mergedIntoUser === true && userNearChar.lorebook.length === 1 && userNear.content === '用户写的商会。');
+
+  // 本地去重：合并 AI 近重复、保留用户条目
+  const dedupeList = normalizeLorebook([
+    { name: '王都', content: '北方的都城。', origin: 'ai', keywords: ['王都'] },
+    { name: '王都', content: '都城有钟楼。', origin: 'ai', keywords: ['王都'] },
+    { name: '王都', content: '用户版本。', origin: 'user' }
+  ]);
+  const dedupedCount = unit.dedupeLorebook(dedupeList);
+  ok('dedupeLorebook: 合并 AI 近重复且不动用户条目', dedupedCount === 1 && dedupeList.length === 2 && dedupeList.filter((e) => e.origin === 'user').length === 1 && dedupeList[0].content.includes('钟楼'));
+
+  // 常驻条目上限
+  const manyActive = { entityType: 'character', lorebook: [], memory: { instant: [] } };
+  for (let i = 0; i < L.maxAlwaysActive; i++) upsertLorebookEntry(manyActive, { name: '常驻' + i, content: 'c' + i, alwaysActive: true });
+  ok('upsert: 常驻条目达上限后拒绝', upsertLorebookEntry(manyActive, { name: '常驻X', content: 'cc', alwaysActive: true }).ok === false);
   const groupChat = { entityType: 'group', lorebook: [], members: [{ basicInfo: { name: '张三' }, lorebook: [] }], memory: { instant: [] } };
-  ok('upsert: 可写入指定成员的私人世界书', upsertLorebookEntry(groupChat, { name: '密信', content: '内容', memberName: '张三' }).ok === true && groupChat.members[0].lorebook.length === 1);
-  ok('upsert: 成员不存在时报错', upsertLorebookEntry(groupChat, { name: 'x', content: 'y', memberName: '李四' }).ok === false);
+  ok('upsert: 可写入指定成员的私人世界书', upsertLorebookEntry(groupChat, { name: '密信', content: '内容', keywords: ['密信'], memberName: '张三' }).ok === true && groupChat.members[0].lorebook.length === 1);
+  ok('upsert: 成员不存在时报错', upsertLorebookEntry(groupChat, { name: 'x', content: 'y', keywords: ['x'], memberName: '李四' }).ok === false);
   ok('resolveLorebookList: 无 char 返回 null', resolveLorebookList(null, '') === null);
 
   // 隐藏自动淘汰
@@ -425,7 +461,9 @@ const mustHave = [
   ['世界书：模型维护工具', "name: 'upsert_lorebook_entry'"],
   ['世界书工具：保护用户手写条目', '用户手写条目（origin=user）受保护'],
   ['世界书工具：要求可回溯来源', '拿不出依据就不要写'],
-  ['世界书工具：常驻说明', '想让条目每轮都生效（如世界前提、规则）就把 alwaysActive 设为 true'],
+  ['世界书工具：常驻说明', '只有确实需要每轮生效的世界前提/规则才把 alwaysActive 设为 true'],
+  ['世界书工具：同一事物只一条', '同一件事物只能有一条'],
+  ['世界书整理：同一事物只一条', '同一件事物只能有一条'],
   ['世界书整理子任务', 'async function consolidateLorebook(char)'],
   ['世界书子任务计数器', "if (task === 'lorebook') return { failures: 'lorebookFailures', retryAt: 'lorebookRetryAt' };"],
   ['世界书子任务触发', "setActivity('正在整理世界书…')"],

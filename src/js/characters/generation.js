@@ -70,6 +70,7 @@ function createCharacter() {
     }
     if (isPlainObject(window._tempCharData) && Array.isArray(window._tempCharData.lorebook)) {
       group.lorebook = normalizeGeneratedLorebook(window._tempCharData.lorebook);
+      dedupeLorebook(group.lorebook);
     }
     window._tempCharData = null;
     addCharacter(group);
@@ -100,6 +101,7 @@ function createCharacter() {
     char.basicInfo.background = background;
     if (Array.isArray(window._tempCharData.lorebook)) {
       char.lorebook = normalizeGeneratedLorebook(window._tempCharData.lorebook);
+      dedupeLorebook(char.lorebook);
     }
     window._tempCharData = null;
   }
@@ -170,11 +172,12 @@ async function upgradeToGroup(id) {
     var upgradedBook = normalizeLorebook(char.lorebook).concat(Array.isArray(data.lorebook) ? normalizeGeneratedLorebook(data.lorebook) : []);
     var seenBookNames = Object.create(null);
     group.lorebook = upgradedBook.filter(function(entry) {
-      var bookKey = toText(entry.name).trim().toLowerCase() || entry.id;
+      var bookKey = normalizeLorebookName(entry.name) || entry.id;
       if (seenBookNames[bookKey]) return false;
       seenBookNames[bookKey] = true;
       return true;
     });
+    dedupeLorebook(group.lorebook);
     addCharacter(group);
   } catch (error) {
     alert('升级失败：' + error.message);

@@ -111,11 +111,11 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 
 `sendMessage(options)` 内的 `while(true)` — src/js/chat/conversation.js:163：
 
-- **工具调用（整批处理）**：模型返回 `function_call` 时，`executeAgentToolBatch()` 会**执行本轮全部信息类工具**（不再只执行第一个、丢弃其余），按 `call_id` 去重回传，`toolState.callResults` 保证同一 `call_id` 只执行一次；同名不同参数的重复 `call_id` 直接报错停止。每个结果都以 `function_call` + `function_call_output` 成对回传。**据此不再下发无关的 `web_search` 内置工具**：DeepSeek Responses 会静默忽略内置 `web_search`，把想要的查询发给不存在的工具，故本地改为注册同名 function 工具，经 `searchWebContent()` 实际检索 RSS 后回传结果。
+- **工具调用（每轮一个）**：DeepSeek thinking 模式**不支持并行 `function_call` 回传（会 400）**，因此模型一次返回多个 `function_call` 时，`conversation.js` 只执行并回传**第一个信息类工具**，其余调用丢弃、由模型在下一轮基于结果重发；`reasoning` 必须先于 `function_call`、再跟配对的 `function_call_output`。`toolState.executedCalls` 与 `MAX_TOOL_CALLS` 作为总量安全上限。若同一轮里既有信息类工具又有 `submit_response`，先执行该工具；只有工具失败时才丢弃这一轮的 `submit_response`，继续让模型修正。**`web_search` 是本地 function 工具**：DeepSeek Responses 会静默忽略内置 `web_search`，故本地注册同名工具，经 `searchWebContent()` 实际检索 RSS 后回传结果。
 - **上限**：`MAX_TOOL_ROUNDS = 5`（src/js/agent/tool-definitions.js:2）与 `MAX_TOOL_CALLS = 12`（:3）；达到任一上限后，未执行的调用回传 `ok:false` 的说明，并按 `chatStageDecision('auto-tool-limit', …)` 收尾。
 - **reasoning 回传**：thinking 模式的 `reasoning_text` 必须先回传，否则上下文断裂。
 - **ask_user 特判**：本轮只调 `ask_user` 且没有 `submit_response` 时，直接把问题包装成结构化回复输出，不进入工具循环。若同一轮既有改动工具又有 `submit_response`，先执行工具、再采用提交（避免"回复说设置已改、实际没改"）。
-- **工具改变可缓存 system 后重建请求**：`update_character_field` / `upsert_lorebook_entry` 修改的是静态设定或世界书，会影响 system 前缀；`sendMessage` 在工具批次后比较 `toolState.staticChanges` / `lorebookChanges`，若发生变化则用 `buildRequestPayload` 重建 `messages` 再进入下一轮，保证后续请求与最新设定一致。
+- **工具改变可缓存 system 后重建请求**：`update_character_field` / `upsert_lorebook_entry` 修改的是静态设定或世界书，会影响 system 前缀；`sendMessage` 在工具调用后比较 `toolState.staticChanges` / `lorebookChanges`，若发生变化则用 `buildRequestPayload` 重建 `messages` 再进入下一轮，保证后续请求与最新设定一致。
 - **一次提交 + 兜底**（不再每轮重发）：阶段一 `phase='auto'`（工具自由，含 `submit_response`）。只要拿到正文——`submit_response` 工具调用、合法 JSON 正文、或**散文**——就直接采用，**散文即终稿**，不再为了补 `quickReplies`/记忆而重发一轮（旧行为是几乎每轮都出现「正在整理回复…」甚至「正在重新整理回复…」）。阶段二 `phase='submit'` 只作为"阶段一连正文都没有"时的兜底，`quickReplies` 也**不再阻塞收尾**（缺失/非法直接接受，由后台换位生成补齐）。
 - **散文轮的记忆/状态后台补**：散文收尾时正文立即显示，`extractProseTurnMemory()` 在后台把这一轮整理成 shortTerm / longTerm / dynamicState 落盘（`queueBackgroundTask` 串行，不阻塞也不改写正文）。
 - **状态显示**：循环内所有右上角文案都来自纯函数 `chatStageDecision(stage, ctx)`（src/js/ui/status-settings.js:19），工具提示来自 `toolActivityHint(name)`（src/js/ui/status-settings.js:1），`setActivity()` 只负责写入 DOM。阶段事件计数由 `noteStageEvent(key)` 记入 `state.config.stageStats`，可在调试面板里核对「整理回复」是否真的不再出现。
@@ -215,12 +215,13 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 
 **定位：世界层设定的唯一去处**（时代与世界观、地点、组织、专有名词、历史、规则）。静态字段只承载"人/群组本人"的设定（群组 `description` = 群组前提、单角色 `basicInfo.background` = 个人背景），世界观一律不写进静态字段——这解决了旧版"世界观写描述还是写世界书"的两处重复。
 
-- **两种模式**：`alwaysActive: true`（常驻，每轮都注入，用于世界前提/规则）与关键词命中（被提到才注入，省 token）。无关键词的条目自动按常驻处理。
+- **两种模式**：`alwaysActive: true`（常驻，每轮都注入，用于世界前提/规则）与关键词命中（被提到才注入，省 token）。无关键词的条目**不再自动转常驻**：写入时若无 `keywords` 又未显式 `alwaysActive:true` 会被拒收，避免堆出永不淘汰的无效条目。
 - **来源与保护**：`origin: 'user' | 'ai'`。用户手写的条目（含老数据，默认按 `user` 处理）**不会被模型覆盖，也不参与自动淘汰**；用户一旦手改 AI 条目，该条目即转为 `user`。
 - **模型维护（三入口）**：
   1. 建卡/群组升级时由模型产出初始条目（`quickGenerateCharacter` / `upgradeToGroup` 的 `lorebook` 字段，2-4 条，`normalizeGeneratedLorebook()` 标记 `ai`）。
-  2. 主循环工具 `upsert_lorebook_entry`（`executeToolCall`）——按 `entryId`/`name` upsert，要求 `sourceMessageIds` + `evidence` 可回溯到已存在的消息，且**不得覆盖 `origin:user` 条目**。
-  3. 记忆子任务 `consolidateLorebook()` — src/js/memory/tasks.js:142：每积累 8 条短期记忆跑一次，从**已发生的摘要**里沉淀条目（`autoEntriesPerPass` 上限 3 条，按 `sourceShortTermIds` 校验），并顺带执行淘汰。
+  2. 主循环工具 `upsert_lorebook_entry`（`executeToolCall`）——先按 `entryId`/`name` 精确匹配，未命中再用 `findSimilarLorebookEntry()` 按名称 bigram 相似度（≥`nameSimilarity`）、共享关键词、内容 bigram 相似度（≥`contentSimilarity`）找**同一事物的近似条目**并**合并**（`mergeLorebookContent()` 逐句去重追加，关键词取并集），只有确实没有近似条目才新建；要求 `sourceMessageIds` + `evidence` 可回溯到已存在的消息，且**不得覆盖 `origin:user` 条目**（近似命中用户条目时返回 `mergedIntoUser`，不新建重复条目）。
+  3. 记忆子任务 `consolidateLorebook()` — src/js/memory/tasks.js:142：每积累 8 条短期记忆跑一次，把现有条目的**名称+关键词+内容**一起给模型，明确要求"同一事物只一条、近似就用原名合并、只沉淀会反复复用的设定"（`autoEntriesPerPass` 上限 3 条，按 `sourceShortTermIds` 校验），写完后本地再跑一次 `dedupeLorebook()` 兜底合并 AI 近重复条目，并顺带执行淘汰。
+  - **本地去重** `dedupeLorebook(list)` — src/js/memory/lorebook.js：只合并 `origin:'ai'` 的近重复条目（用户条目永不动）；建卡/群组升级时也会跑一次，避免一次性生成出重复条目。
 - **隐藏自动淘汰**（talemate 式）：`evictStaleLorebookEntries()` 每轮整理把未被注入的 `ai` 条目 `misses + 1`，达 `evictionMisses`（3）即退役；条目被注入时 `markLorebookMentions()` 把 `misses` 归零。`misses` 不展示给模型、也不由模型管理。
 - 归一化 `normalizeLorebook()` — src/js/memory/lorebook.js:1（上限见 `LOREBOOK_LIMITS` src/js/core/config.js:159）；角色卡弹窗第三个 tab 编辑（`renderLorebookEditor` src/js/ui/character-editor.js:96，展示来源徽标/常驻开关/最近提及）。
 - 命中 `matchLorebookEntries()` — src/js/memory/lorebook.js:179：**常驻条目无条件入围**，其余对**本轮用户输入 + 最近 6 条消息**做小写关键词包含匹配；排序 = 常驻 → `order` → `name`；最多 6 条。
@@ -384,7 +385,7 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 |---|---|---|
 | 一键建卡 `quickGenerateCharacter` | src/js/characters/generation.js:2 | 输出完整字段 JSON；**禁止套路名字与模板人设**；`personality` 写行为倾向；`background` 只写角色本人经历（世界观写 `lorebook`）；`speakingStyle` 必须是「调性描述；示例：<台词1> / <台词2> / <台词3>」（`CHARACTER_QUALITY_RULE` + `SPEAKING_STYLE_SAMPLES_RULE`）；群组分支要求成员说话方式显著不同，并输出 2-4 条初始 `lorebook` 条目 |
 | 群组升级 `upgradeToGroup` | src/js/characters/generation.js:117 | 与建卡同一套质量约束；`additionalMembers` 不得重复原角色与彼此姓名；可补 0-3 条 `lorebook`（只补近期已出现的世界层设定，没有就空数组）；原角色世界书并入群组 |
-| 世界书整理 `consolidateLorebook` | src/js/memory/tasks.js:142 | 只从**已发生的短期摘要**里沉淀世界层设定（`sourceShortTermIds` 必须可回溯）、禁止推测扩写；复用同名条目而非另起名字；≤`autoEntriesPerPass`(3) 条；顺带执行 `misses` 淘汰 |
+| 世界书整理 `consolidateLorebook` | src/js/memory/tasks.js:142 | 只从**已发生的短期摘要**里沉淀世界层设定（`sourceShortTermIds` 必须可回溯）、禁止推测扩写；把现有条目内容一并给模型并要求"同一事物只一条、近似就用原名合并、只写会复用的设定"；≤`autoEntriesPerPass`(3) 条；写后本地 `dedupeLorebook()` 兜底，并执行 `misses` 淘汰 |
 | 世界书一次性迁移 `migrateWorldLoreForEntity` | src/js/storage/lorebook-migration.js:44 | 把旧数据 `description`/`background` 里的世界观拆成条目（≤6 条，只整理已有信息）；用户手写条目不受影响；可选同时精简原文（仅在确实变短时替换） |
 | 成员补全 `fillGroupMemberFields` | src/js/ui/character-editor.js:236 | **已有字段是绝对权威，不得改写/润色/替换**；只填空字段；说话方式须与群内其他成员显著不同；无把握则省略 |
 | 空字段补全 `fillStaticFieldsForJob` | src/js/characters/profile-completion.js:33 | 只补 `job.missing` 中的字段，绝不覆盖已有设定；缺 `speakingStyle` 时套用示例台词约束；群组成员再叠加"彼此不同" |
@@ -401,8 +402,8 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 ## 八、健壮性
 
 - **API 请求级重试**：`performChatRequestWithRetry`（src/js/api/retry.js:14）对瞬时失败（网络错误 / 超时 Abort / HTTP 429 / 5xx）自动重试最多 `MAX_API_RETRIES = 3` 次（1s/2s/4s 指数退避）。
-- **工具失败可恢复**：`executeToolCall` 失败时回传可修正的提示（如 `delete_memory` 找不到 ID 时提示先 `list_memories`）。整批工具里只要有一步 `ok:false`，本轮不采用同一批的 `submit_response`，继续让模型修正，避免"回复说改了、实际没改"。
-- **工具批次幂等与上限**：`executeAgentToolBatch` 按 `call_id` 去重；重复但参数不一致的 `call_id` 直接报错停止；总数受 `MAX_TOOL_CALLS` 约束。
+- **工具失败可恢复**：`executeToolCall` 失败时回传可修正的提示（如 `delete_memory` 找不到 ID 时提示先 `list_memories`）。本轮工具 `ok:false` 时不采用同一轮的 `submit_response`，继续让模型修正，避免"回复说改了、实际没改"。
+- **每轮一个工具 + 上限**：DeepSeek thinking 模式不支持并行 `function_call` 回传，每轮只执行并回传第一个信息类工具；`MAX_TOOL_CALLS` 约束整轮总数；跨轮复用 `call_id` 时自动改用新 `call_id`，保证回传项内 `call_id` 唯一。
 - **记忆任务重试**：`memoryTaskKeys(task)` — src/js/memory/tasks.js:34 统一映射 `extraction` / `analysis` / `scene` / `lorebook` 四组计数器（`*Failures` / `*RetryAt`），`scheduleMemoryRetry` 指数退避（5→30 分钟封顶）。
 - **后台任务过期保护**：`captureMemoryTask(char)` 记录角色引用、`memory.revision` 与末条消息 ID；`isMemoryTaskCurrent()` 在后台调用返回后校验，过期（角色被删、轮次推进、分支被删）就直接丢弃。`extractProseTurnMemory` 在快照副本上运行 `convertProseToJson`，不修改真实 `lastInjectedRecallIds`；回写前要求 `revision` 未变、原 assistant 消息仍在，并只接受引用本轮用户消息或本轮回复的记忆。快速回应换位生成、空字段补全同样带 guard。
 - **摘要不被提前丢弃**：`trimShortTermList` 只在长期分析与世界书整理都消费了同一 `revision` 后才裁剪；世界书条目在写库前整批校验来源与字段，失败不推进 `lorebookScannedRevision`、也不累计 `misses`，避免一次坏输出造成误淘汰。
@@ -428,7 +429,7 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 | `API_LIMITS` | auxiliaryTimeoutMs 90000 / requestMetrics 60 / prefixSnapshots 12 | src/js/core/config.js:98 |
 | `PROMPT_LIMITS` | roleChars 8000 / memberChars 900 | src/js/core/config.js:113 |
 | `CONTEXT_BUDGET` | retrievedChars 1200 / summaryChars 1600 / sceneSummaries 2 / sceneInjectionChars 600 / sceneSpan 24 / volatileChars 6000 | src/js/core/config.js:173 |
-| `LOREBOOK_LIMITS` | entries 200 / keywordsPerEntry 20 / nameChars 60 / contentChars 2000 / injectEntries 6 / injectChars 1400 / scanMessages 6 / autoEntriesPerPass 3 / evictionMisses 3 / consolidateSpan 8 | src/js/core/config.js:159 |
+| `LOREBOOK_LIMITS` | entries 200 / keywordsPerEntry 20 / nameChars 60 / contentChars 2000 / injectEntries 6 / injectChars 1400 / scanMessages 6 / autoEntriesPerPass 3 / evictionMisses 3 / consolidateSpan 8 / maxAlwaysActive 6 / nameSimilarity 0.5 / contentSimilarity 0.45 / mergeSentenceSimilarity 0.6 | src/js/core/config.js:159 |
 | `NARRATIVE_PATTERNS` | 10 条节奏骨架 | src/js/core/config.js:144 |
 | `DYNAMIC_STATE_FIELDS` | 7 个动态字段 | src/js/core/config.js:119 |
 | `STATIC_PROFILE_FIELDS` | 12 个基础设定字段 | src/js/core/config.js:130 |

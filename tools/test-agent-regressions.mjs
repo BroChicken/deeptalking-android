@@ -201,6 +201,66 @@ test('tool batch executes changes before accepting a combined submit', async () 
   assert.equal(r.char.memory.instant.at(-1).content, 'Done.');
 });
 
+test('thinking mode returns exactly one function_call/output pair per round', async () => {
+  const r = runtime();
+  const roundOne = [
+    { type: 'function_call', name: 'search_memory', call_id: 'call_1', arguments: JSON.stringify({ query: 'mountains' }) },
+    { type: 'function_call', name: 'list_memories', call_id: 'call_2', arguments: '{}' },
+    { type: 'function_call', name: 'submit_response', call_id: 'call_3', arguments: JSON.stringify({ reply: 'Done.', quickReplies: ['Ok.', 'More.'] }) }
+  ];
+  r.evaluate(`
+    checkMemoryTriggers = async function(){ return true; };
+    scheduleProactiveCheck = function(){};
+    globalThis.__toolState = null;
+    performChatRequestWithRetry = async function(messages, text, loadingMsg, toolState) {
+      globalThis.__toolState = toolState;
+      return { fullText: '', fullResponse: { output: globalThis.__roundOne },
+        functionCalls: globalThis.__roundOne.filter(function(i){ return i.type === 'function_call'; }),
+        reasoningItems: [{ type: 'reasoning', id: 'r1', content: [{ type: 'reasoning_text', text: 'think' }] }], seenEventTypes: [] };
+    };
+  `, { __roundOne: roundOne });
+  await r.evaluate(`sendMessage({text:'remember mountains'})`);
+  const callItems = r.box.__toolState.items.filter(function(i) { return i.type === 'function_call'; });
+  const outputItems = r.box.__toolState.items.filter(function(i) { return i.type === 'function_call_output'; });
+  assert.equal(callItems.length, 1);
+  assert.equal(outputItems.length, 1);
+  assert.equal(callItems[0].name, 'search_memory');
+  assert.equal(callItems[0].call_id, outputItems[0].call_id);
+  assert.deepEqual(r.box.errors, []);
+  assert.equal(r.char.memory.instant.at(-1).content, 'Done.');
+});
+
+test('a call_id reused across rounds never duplicates returned items', async () => {
+  const r = runtime();
+  const tool = (name, id, args) => ({ type: 'function_call', name: name, call_id: id, arguments: JSON.stringify(args) });
+  const rounds = [
+    [tool('search_memory', 'call_1', { query: 'a' })],
+    [tool('search_memory', 'call_1', { query: 'b' })],
+    [{ type: 'function_call', name: 'submit_response', call_id: 'call_9', arguments: JSON.stringify({ reply: 'Final.', quickReplies: ['Ok.', 'More.'] }) }]
+  ];
+  r.evaluate(`
+    checkMemoryTriggers = async function(){ return true; };
+    scheduleProactiveCheck = function(){};
+    globalThis.__roundsData = ${JSON.stringify(rounds)};
+    globalThis.__dup = false;
+    globalThis.__round = 0;
+    performChatRequestWithRetry = async function(messages, text, loadingMsg, toolState) {
+      var ids = {};
+      toolState.items.forEach(function(item) {
+        if (item && item.type === 'function_call') { if (ids[item.call_id]) globalThis.__dup = true; ids[item.call_id] = true; }
+      });
+      var output = globalThis.__roundsData[globalThis.__round++];
+      return { fullText: '', fullResponse: { output: output },
+        functionCalls: output.filter(function(i){ return i.type === 'function_call'; }), reasoningItems: [], seenEventTypes: [] };
+    };
+  `);
+  await r.evaluate(`sendMessage({text:'go'})`);
+  assert.deepEqual(r.box.errors, []);
+  assert.equal(r.box.__dup, false);
+  assert.equal(r.box.__round, 3);
+  assert.equal(r.char.memory.instant.at(-1).content, 'Final.');
+});
+
 test('current user text has identical encoding when it becomes historical', () => {
   const r = runtime();
   r.char.memory.instant = [message('u1', 'user', 'long '.repeat(240))];

@@ -156,16 +156,17 @@ async function consolidateLorebook(char) {
   var existingLines = [];
   books.forEach(function(book) {
     (book || []).forEach(function(entry) {
-      existingLines.push('- ' + toText(entry.name) + '｜关键词: ' + (entry.keywords || []).join('、') + (entry.alwaysActive ? '｜常驻' : ''));
+      existingLines.push('- ' + toText(entry.name) + '｜关键词: ' + (entry.keywords || []).join('、') + (entry.alwaysActive ? '｜常驻' : '')
+        + '｜内容: ' + trimText(toText(entry.content), 160));
     });
   });
   var sourceEntries = fresh.map(function(item) {
     return { id: item.id, content: trimText(item.content, 600) };
   });
   var speakerName = toText(char.basicInfo && char.basicInfo.name) || '角色';
-  var prompt = '下面是一段角色扮演对话里已经发生的事件摘要，以及现有的世界书条目清单。\n'
+  var prompt = '下面是一段角色扮演对话里已经发生的事件摘要，以及现有的世界书条目清单（含内容）。\n'
     + '请找出其中**已经出现、值得日后复用**的世界层设定（时代/世界观、地点、组织、专有名词、历史、规则、背景事实），整理成世界书条目。\n'
-    + '要求：①只写已经出现或已被明确说出的内容，禁止推测、扩写或发明新设定；②已有条目能用就复用它的名字（同名会被更新），只有确实是一条新设定才起新名字；③每条 content 只写该条目本身的信息，不写理由、解释或出处；④keywords 写剧情里可能出现的称呼；若这条是世界前提/规则这类需要每轮生效的设定，把 alwaysActive 设为 true；⑤最多 3 条；没有值得沉淀的就返回空数组。\n'
+    + '要求：①只写已经出现或已被明确说出的内容，禁止推测、扩写或发明新设定；②**同一件事物只能有一条**：对照现有条目的名称、关键词与内容，凡与已有条目讲的是同一件事（名称相近、关键词相同、内容重叠），必须复用它的名字来更新合并，绝不新建近似条目；同理，本批不同摘要里指向同一件事的也只输出一条；③只沉淀会反复复用的世界层设定，一次性的小事、可从上下文直接看出的细节不要单独立条；④每条 content 只写该条目本身的信息，不写理由、解释或出处；⑤keywords 写剧情里可能出现的称呼；若这条是世界前提/规则这类需要每轮生效的设定，把 alwaysActive 设为 true；⑥最多 3 条；没有值得沉淀的就返回空数组。\n'
     + '只返回 JSON：{"entries":[{"name":"条目名","keywords":["触发词"],"content":"设定内容","alwaysActive":false,"sourceShortTermIds":["上面的摘要ID"]}]}。sourceShortTermIds 必须是上面出现过的摘要ID，至少要有一个；没有可引用ID的条目不要返回。\n\n'
     + '现有条目清单：\n' + (existingLines.join('\n') || '（空）')
     + '\n\n事件摘要（角色名：' + speakerName + '）：\n' + sourceEntries.map(function(item) { return '[' + item.id + '] ' + item.content; }).join('\n');
@@ -200,6 +201,8 @@ async function consolidateLorebook(char) {
       }, { sourceMessageIds: sourceIds, evidence: trimText(item.content, 300) });
       if (result.ok) applied++;
     });
+    // 本地再兜底合并一次近重复 AI 条目（用户手写条目不受影响）
+    books.forEach(function(book) { dedupeLorebook(book); });
     // 本轮看过的摘要打标记，避免下一轮重复整理（后续新摘要会再次覆盖同类事实）
     fresh.forEach(function(item) {
       item.lorebookScannedAt = new Date().toISOString();

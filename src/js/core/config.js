@@ -168,7 +168,11 @@ const LOREBOOK_LIMITS = {
   scanMessages: 6,
   autoEntriesPerPass: 3,
   evictionMisses: 3,
-  consolidateSpan: 8
+  consolidateSpan: 8,
+  maxAlwaysActive: 6,
+  nameSimilarity: 0.5,
+  contentSimilarity: 0.45,
+  mergeSentenceSimilarity: 0.6
 };
 
 // 记忆注入预算（字符）：检索记忆与摘要记忆共用一个池子，某一路没用完的额度让给另一路

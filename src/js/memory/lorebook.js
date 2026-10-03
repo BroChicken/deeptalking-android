@@ -79,6 +79,121 @@ function findLorebookEntry(list, entryId, name) {
   return list.find(function(entry) { return toText(entry.name).trim().toLowerCase() === wantedName; }) || null;
 }
 
+// ==================== 世界书去重 / 合并（同一事物只保留一条） ====================
+// 名字归一化：去空白与标点/引号书名号，便于"银月商会"与"银月商行"这类近义名命中同一条目
+function normalizeLorebookName(value) {
+  return toText(value).trim().toLowerCase()
+    .replace(/[\s\u3000]/g, '')
+    .replace(/[「」『』“”‘’"'《》〈〉（）()\[\]【】{}<>]/g, '')
+    .replace(/[，。！？、；：,.!?;:·—_\-]/g, '');
+}
+
+function lorebookBigrams(value) {
+  var normalized = normalizeLorebookName(value);
+  var pairs = new Set();
+  for (var i = 0; i + 2 <= normalized.length; i++) {
+    var pair = normalized.substr(i, 2);
+    if (/^[\u4e00-\u9fff\w]{2}$/.test(pair)) pairs.add(pair);
+  }
+  return pairs;
+}
+
+function bigramOverlapRatio(leftText, rightText) {
+  var left = lorebookBigrams(leftText);
+  var right = lorebookBigrams(rightText);
+  if (left.size === 0 || right.size === 0) return 0;
+  var inter = 0;
+  left.forEach(function(pair) { if (right.has(pair)) inter++; });
+  var union = left.size + right.size - inter;
+  return union === 0 ? 0 : inter / union;
+}
+
+function normalizeKeywordList(value) {
+  return (Array.isArray(value) ? value : []).map(function(keyword) { return normalizeLorebookName(keyword); }).filter(Boolean);
+}
+
+// 判定两条设定是否在讲同一件事：名称高度相似、或共享关键词、或内容高度重叠
+function lorebookEntriesSimilar(left, right) {
+  if (!left || !right) return false;
+  var leftName = normalizeLorebookName(left.name);
+  var rightName = normalizeLorebookName(right.name);
+  if (leftName && rightName) {
+    if (leftName === rightName) return true;
+    var nameScore = (leftName.indexOf(rightName) !== -1 || rightName.indexOf(leftName) !== -1)
+      ? 1 : bigramOverlapRatio(leftName, rightName);
+    if (nameScore >= LOREBOOK_LIMITS.nameSimilarity) return true;
+  }
+  var leftKeywords = normalizeKeywordList(left.keywords);
+  var rightKeywords = normalizeKeywordList(right.keywords);
+  if (leftKeywords.length > 0 && leftKeywords.some(function(keyword) { return rightKeywords.indexOf(keyword) !== -1; })) return true;
+  if (left.content && right.content && bigramOverlapRatio(left.content, right.content) >= LOREBOOK_LIMITS.contentSimilarity) return true;
+  return false;
+}
+
+function findSimilarLorebookEntry(list, payload) {
+  if (!Array.isArray(list) || list.length === 0) return null;
+  for (var i = 0; i < list.length; i++) {
+    if (list[i] && lorebookEntriesSimilar(payload, list[i])) return list[i];
+  }
+  return null;
+}
+
+// 按句切分（保留句末标点），用于内容合并时逐句去重
+function splitLorebookSentences(text) {
+  var parts = toText(text).split(/([。！？!?；;\n])/);
+  var out = [];
+  var buffer = '';
+  for (var i = 0; i < parts.length; i++) {
+    buffer += parts[i];
+    if (i % 2 === 1) {
+      var trimmed = buffer.trim();
+      if (trimmed) out.push(trimmed);
+      buffer = '';
+    }
+  }
+  if (buffer.trim()) out.push(buffer.trim());
+  return out;
+}
+
+// 合并内容：保留原有句子，只追加"没有近似说过"的新句子，避免整段覆盖丢信息或反复堆积
+function mergeLorebookContent(existingContent, incomingContent) {
+  var base = toText(existingContent).trim();
+  var known = splitLorebookSentences(base);
+  var added = [];
+  splitLorebookSentences(incomingContent).forEach(function(sentence) {
+    if (sentence.length < 2 || base.indexOf(sentence) !== -1) return;
+    var duplicate = known.concat(added).some(function(other) {
+      return bigramOverlapRatio(other, sentence) >= LOREBOOK_LIMITS.mergeSentenceSimilarity;
+    });
+    if (!duplicate) added.push(sentence);
+  });
+  return trimText(base + added.join(''), LOREBOOK_LIMITS.contentChars);
+}
+
+// 本地去重：把后出现的 AI 近重复条目并入先出现的 AI 条目；用户手写条目永不改动
+function dedupeLorebook(list) {
+  if (!Array.isArray(list) || list.length < 2) return 0;
+  var mergedCount = 0;
+  for (var i = 0; i < list.length; i++) {
+    var keep = list[i];
+    if (!keep || keep.origin !== 'ai') continue;
+    for (var j = list.length - 1; j > i; j--) {
+      var drop = list[j];
+      if (!drop || drop.origin !== 'ai') continue;
+      if (!lorebookEntriesSimilar(keep, drop)) continue;
+      keep.content = mergeLorebookContent(keep.content, drop.content);
+      keep.keywords = Array.from(new Set((keep.keywords || []).concat(drop.keywords || []))).slice(0, LOREBOOK_LIMITS.keywordsPerEntry);
+      keep.alwaysActive = keep.alwaysActive === true || drop.alwaysActive === true;
+      keep.enabled = true;
+      keep.misses = 0;
+      if (!keep.sourceMessageIds && drop.sourceMessageIds) keep.sourceMessageIds = drop.sourceMessageIds;
+      list.splice(j, 1);
+      mergedCount++;
+    }
+  }
+  return mergedCount;
+}
+
 // 宽松一档：允许归纳式短句，但必须与原文有 2 字以上的实词重叠
 // （不像 evidenceMatchesSummary 那样只凭长度就采信，防止世界书被凭空写满）
 function lorebookEvidenceOverlaps(source, evidence) {
@@ -120,23 +235,50 @@ function upsertLorebookEntry(char, payload, meta) {
   var rawKeywords = Array.isArray(payload.keywords) ? payload.keywords : toText(payload.keywords).split(/[,，、\n]/);
   var keywords = rawKeywords.map(function(keyword) { return toText(keyword).trim(); })
     .filter(Boolean).slice(0, LOREBOOK_LIMITS.keywordsPerEntry);
-  // 没有关键词的条目只能靠常驻生效，否则永远不会被注入
-  var alwaysActive = payload.alwaysActive === true || keywords.length === 0;
-  var existing = findLorebookEntry(list, payload.entryId, name);
-  if (existing && existing.origin !== 'ai') {
-    return { ok: false, reason: '「' + toText(existing.name) + '」是用户手写条目，不能覆盖或改写；请换一个条目名新增' };
+  var alwaysActive = payload.alwaysActive === true;
+  var exact = findLorebookEntry(list, payload.entryId, name);
+  if (exact && exact.origin !== 'ai') {
+    return { ok: false, reason: '「' + toText(exact.name) + '」是用户手写条目，不能覆盖或改写；请换一个条目名新增' };
   }
-  if (existing) {
-    existing.name = existing.name || name;
-    existing.content = content;
-    if (keywords.length > 0) existing.keywords = keywords;
-    existing.alwaysActive = alwaysActive;
-    existing.enabled = true;
-    existing.misses = 0;
-    existing.origin = 'ai';
-    if (meta && Array.isArray(meta.sourceMessageIds)) existing.sourceMessageIds = meta.sourceMessageIds.slice(0, 8);
-    if (meta && meta.evidence) existing.evidence = trimText(meta.evidence, 300);
-    return { ok: true, entry: existing, created: false };
+  if (exact) {
+    // 精确命中（同 id 或同名）：按"更新这一条"处理，内容替换
+    exact.name = exact.name || name;
+    exact.content = content;
+    if (keywords.length > 0) exact.keywords = keywords;
+    exact.alwaysActive = exact.alwaysActive === true || alwaysActive;
+    exact.enabled = true;
+    exact.misses = 0;
+    exact.origin = 'ai';
+    if (meta && Array.isArray(meta.sourceMessageIds)) exact.sourceMessageIds = meta.sourceMessageIds.slice(0, 8);
+    if (meta && meta.evidence) exact.evidence = trimText(meta.evidence, 300);
+    return { ok: true, entry: exact, created: false };
+  }
+  // 没有精确命中：找名称/关键词/内容近似的条目，视为同一事物并合并，避免重复条目
+  var similar = findSimilarLorebookEntry(list, { name: name, keywords: keywords, content: content });
+  if (similar) {
+    if (similar.origin !== 'ai') {
+      // 近似命中的是用户手写条目：不新建重复条目，也不改动用户内容
+      return { ok: true, entry: similar, created: false, mergedIntoUser: true };
+    }
+    similar.content = mergeLorebookContent(similar.content, content);
+    if (keywords.length > 0) similar.keywords = Array.from(new Set((similar.keywords || []).concat(keywords))).slice(0, LOREBOOK_LIMITS.keywordsPerEntry);
+    similar.alwaysActive = similar.alwaysActive === true || alwaysActive;
+    similar.enabled = true;
+    similar.misses = 0;
+    similar.origin = 'ai';
+    if (meta && Array.isArray(meta.sourceMessageIds)) similar.sourceMessageIds = meta.sourceMessageIds.slice(0, 8);
+    if (meta && meta.evidence) similar.evidence = trimText(meta.evidence, 300);
+    return { ok: true, entry: similar, created: false };
+  }
+  // 新建前校验：无关键词又不常驻的条目永远不会被注入，拒收并让模型补关键词或显式设常驻
+  if (keywords.length === 0 && !alwaysActive) {
+    return { ok: false, reason: '世界书条目需要 keywords（命中才注入）或显式 alwaysActive:true（常驻）；请补关键词，或确实属于世界前提时设为常驻' };
+  }
+  if (alwaysActive) {
+    var activeCount = list.filter(function(entry) { return entry && entry.origin === 'ai' && entry.alwaysActive === true; }).length;
+    if (activeCount >= LOREBOOK_LIMITS.maxAlwaysActive) {
+      return { ok: false, reason: '常驻世界书条目已达上限 ' + LOREBOOK_LIMITS.maxAlwaysActive + ' 条；这条请改为关键词条目（补 keywords），或先合并/删除已有常驻条目' };
+    }
   }
   if (list.length >= LOREBOOK_LIMITS.entries) {
     return { ok: false, reason: '世界书条目已达上限 ' + LOREBOOK_LIMITS.entries + ' 条' };

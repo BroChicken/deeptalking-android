@@ -183,8 +183,8 @@ async function sendMessage(options) {
         }
         if (phase === 'auto' && infoCalls.length) {
           if (toolState.rounds >= MAX_TOOL_ROUNDS || (Number(toolState.executedCalls) || 0) >= MAX_TOOL_CALLS) {
-            await executeAgentToolBatch(infoCalls, char, toolState, attempt.reasoningItems, false);
             var toolLimitDecision = chatStageDecision('auto-tool-limit', { hasText: !!(fullText && fullText.trim()) });
+            if (toolLimitDecision.action === 'accept-text') break;
             noteStageEvent('forcedSubmitAtToolLimit');
             setActivity(toolLimitDecision.activity);
             phase = 'submit';
@@ -193,11 +193,24 @@ async function sendMessage(options) {
             continue;
           }
           toolState.rounds++;
-          var batch = await executeAgentToolBatch(infoCalls, char, toolState, attempt.reasoningItems, true);
-          var toolDecision = chatStageDecision('auto-tool', { toolName: infoCalls[infoCalls.length - 1].name });
+          toolState.executedCalls = (Number(toolState.executedCalls) || 0) + 1;
+          // DeepSeek thinking 模式不支持并行 function_call 回传（会 400）：每轮只执行并回传第一个
+          // 信息类工具，其余调用丢弃、由模型在下一轮基于结果重发；reasoning 必须先于 function_call。
+          var primaryCall = infoCalls[0];
+          var usedCallIds = {};
+          toolState.items.forEach(function(item) { if (item && item.type === 'function_call') usedCallIds[item.call_id] = true; });
+          var primaryCallId = primaryCall.call_id || primaryCall.id || createMemoryId('call');
+          if (usedCallIds[primaryCallId]) primaryCallId = createMemoryId('call');
+          (attempt.reasoningItems || []).forEach(function(item) { toolState.items.push(item); });
+          toolState.items.push({ type: 'function_call', call_id: primaryCallId, name: primaryCall.name, arguments: toText(primaryCall.arguments) });
+          var primaryOutput = await executeToolCall(primaryCall, char, toolState);
+          toolState.items.push({ type: 'function_call_output', call_id: primaryCallId, output: primaryOutput });
+          var toolFailed = false;
+          if (typeof primaryOutput === 'string') { try { if (JSON.parse(primaryOutput).ok === false) toolFailed = true; } catch (error) { toolFailed = true; } }
+          var toolDecision = chatStageDecision('auto-tool', { toolName: primaryCall.name });
           setActivity(toolDecision.activity);
           updateMessageBubble(loadingMsg.id, getDisplayText(toolDecision.bubble));
-          if (!submitResult || batch.failed) continue;
+          if (!submitResult || toolFailed) continue;
         }
         if (submitResult && (submitResult.ok || submitResult.reason === 'missing_quick_replies')) {
           fullText = submitResult.rawArgs;

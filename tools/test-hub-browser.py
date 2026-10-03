@@ -98,7 +98,16 @@ def open_page(browser, html, viewport, fixture=None):
         mock["count"] += 1
         structured = {"reply": "The books are ready.", "quickReplies": ["Let's read.", "Tell me more."]}
         mode = mock["mode"]
-        if mode == "tool" and mock["count"] == 1:
+        if mode == "multi":
+            if mock["count"] <= 2:
+                payload = {"output": [
+                    {"type": "function_call", "name": "search_memory", "call_id": "call_1",
+                     "arguments": json.dumps({"query": "books"})},
+                    {"type": "function_call", "name": "list_memories", "call_id": "call_2", "arguments": "{}"}]}
+            else:
+                payload = {"output": [{"type": "function_call", "name": "submit_response",
+                                      "call_id": "call_3", "arguments": json.dumps(structured)}]}
+        elif mode == "tool" and mock["count"] == 1:
             payload = {"output": [{"type": "function_call", "name": "get_current_time",
                                   "call_id": "call-time", "arguments": "{}"}]}
         elif mode == "submit":
@@ -174,7 +183,8 @@ def exercise(browser, html, viewport, fixture, label, output):
                                                "buffer": json.dumps(backup).encode()})
     page.wait_for_function("state.characters['fixture-character'].basicInfo.name === 'Imported Character'")
     assert page.evaluate("state.config.apiKey") == "test-only-key", "Import must preserve the local API key"
-    for mode in ["json", "submit", "tool", "stream", "prose"]:
+    multi_tool_found = False
+    for mode in ["json", "submit", "tool", "stream", "prose", "multi"]:
         mock.update(mode=mode, count=0)
         page.evaluate("state.config.apiKey = 'test-only-key'; state.config.stream = false")
         page.locator("#messageInput").fill("A new question about books: " + mode)
@@ -185,7 +195,14 @@ def exercise(browser, html, viewport, fixture, label, output):
         if mode == "tool":
             assert mock["count"] == 2
             assert any(item.get("type") == "function_call_output" for item in requests[-1]["input"])
+        if mode == "multi":
+            assert mock["count"] == 3, mock["count"]
+            multi_tool_found = True
         page.evaluate("backgroundTaskChain")
+    assert multi_tool_found, "multi-tool scenario did not run"
+    for request in requests:
+        call_ids = [item.get("call_id") for item in request.get("input", []) if item.get("type") == "function_call"]
+        assert len(call_ids) == len(set(call_ids)), "duplicate call_id sent to the API: " + str(call_ids)
     page.evaluate("flushScheduledSave()")
     stored = page.evaluate("JSON.parse(localStorage.getItem(STORAGE_KEY))")
     page.reload(wait_until="networkidle")
