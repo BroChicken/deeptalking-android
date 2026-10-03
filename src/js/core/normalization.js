@@ -26,7 +26,7 @@ function normalizeTemperature(value) {
   return Number.isFinite(temperature) ? Math.max(0, Math.min(2, temperature)) : DEFAULT_CONFIG.temperature;
 }
 
-var REASONING_EFFORTS = ['none', 'low', 'medium', 'high', 'max'];
+const REASONING_EFFORTS = ['none', 'low', 'medium', 'high', 'max'];
 
 function normalizeReasoningEffort(value) {
   return REASONING_EFFORTS.indexOf(value) !== -1 ? value : DEFAULT_CONFIG.reasoningEffort;
@@ -60,6 +60,7 @@ function getActiveSessionId() {
 }
 
 function buildApiHeaders(config, sessionId) {
+  if (!config || !toText(config.apiKey).trim()) throw new Error('未配置API Key，请在设置中填写');
   var headers = { 'Content-Type': 'application/json', Authorization: 'Bearer ' + config.apiKey };
   if (config.stream !== false) {
     headers.Accept = 'text/event-stream';

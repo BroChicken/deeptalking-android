@@ -58,7 +58,10 @@ function buildVolatileContext(char, query, metadata) {
   if (corrections.length) add('【用户最新纠正（优先于旧记忆；未明确完成或取消时不得擅自结束约定）】\n' + corrections.join('\n'), 450);
   var stateLines = DYNAMIC_STATE_FIELDS.filter(function(field) {
     return char.entityType !== 'group' || GROUP_SHARED_DYNAMIC_FIELDS.indexOf(field.key) !== -1;
-  }).map(function(field) { return field.label + ': ' + trimText(char.dynamicState[field.key], 150); });
+  }).map(function(field) {
+    var value = trimText(char.dynamicState[field.key], 150) || '(未设置)';
+    return field.label + ': ' + maskUserWord(char, value);
+  });
   if (char.entityType === 'group') {
     (char.members || []).forEach(function(member) {
       stateLines.push('【' + toText(member.basicInfo.name) + '】' + trimText(buildDynamicStateContext(member), 220));

@@ -25,12 +25,18 @@ function normalizeLorebook(value) {
 
 // AI 生成/更新的条目统一标记来源（保护用户手写条目；自动淘汰只针对 ai 条目）
 function normalizeGeneratedLorebook(value) {
-  return normalizeLorebook(value).map(function(entry) {
-    entry.origin = 'ai';
-    // 没有关键词又不常驻的条目永远不会被注入，直接按常驻处理
-    if (entry.keywords.length === 0) entry.alwaysActive = true;
-    return entry;
+  var entries = normalizeLorebook(value);
+  entries.forEach(function(entry) { entry.origin = 'ai'; });
+  // 没有关键词又不常驻的条目永远不会被注入，按常驻处理；但常驻数量受 maxAlwaysActive 约束，
+  // 已显式 alwaysActive 的条目优先占位，超出的无名条目保持非常驻（依赖关键词）。
+  var activeCount = entries.filter(function(entry) { return entry.alwaysActive === true; }).length;
+  entries.forEach(function(entry) {
+    if (entry.alwaysActive || entry.keywords.length > 0) return;
+    if (activeCount >= LOREBOOK_LIMITS.maxAlwaysActive) return;
+    entry.alwaysActive = true;
+    activeCount++;
   });
+  return entries;
 }
 
 function collectLorebookEntries(char) {
@@ -170,17 +176,54 @@ function mergeLorebookContent(existingContent, incomingContent) {
   return trimText(base + added.join(''), LOREBOOK_LIMITS.contentChars);
 }
 
+// 预建条目的相似度指纹（名称/关键词/内容 bigram 集合），避免去重时对每对条目重复分词
+function lorebookFingerprint(entry) {
+  return {
+    name: normalizeLorebookName(entry && entry.name),
+    keywords: normalizeKeywordList(entry && entry.keywords),
+    contentBigrams: lorebookBigrams(entry && entry.content)
+  };
+}
+
+function bigramSetRatio(left, right) {
+  if (left.size === 0 || right.size === 0) return 0;
+  var inter = 0;
+  var smaller = left.size <= right.size ? left : right;
+  var larger = left.size <= right.size ? right : left;
+  smaller.forEach(function(pair) { if (larger.has(pair)) inter++; });
+  var union = left.size + right.size - inter;
+  return union === 0 ? 0 : inter / union;
+}
+
+// 用指纹判定是否同一事物（等价 lorebookEntriesSimilar，但复用预建集合）
+function lorebookFingerprintsSimilar(left, right) {
+  if (left.name && right.name) {
+    if (left.name === right.name) return true;
+    var nameScore = (left.name.indexOf(right.name) !== -1 || right.name.indexOf(left.name) !== -1)
+      ? 1 : bigramSetRatio(lorebookBigrams(left.name), lorebookBigrams(right.name));
+    if (nameScore >= LOREBOOK_LIMITS.nameSimilarity) return true;
+  }
+  if (left.keywords.length > 0 && left.keywords.some(function(keyword) { return right.keywords.indexOf(keyword) !== -1; })) return true;
+  if (left.contentBigrams.size > 0 && bigramSetRatio(left.contentBigrams, right.contentBigrams) >= LOREBOOK_LIMITS.contentSimilarity) return true;
+  return false;
+}
+
 // 本地去重：把后出现的 AI 近重复条目并入先出现的 AI 条目；用户手写条目永不改动
 function dedupeLorebook(list) {
   if (!Array.isArray(list) || list.length < 2) return 0;
   var mergedCount = 0;
+  var fingerprints = new Map();
+  function fp(entry) {
+    if (!fingerprints.has(entry)) fingerprints.set(entry, lorebookFingerprint(entry));
+    return fingerprints.get(entry);
+  }
   for (var i = 0; i < list.length; i++) {
     var keep = list[i];
     if (!keep || keep.origin !== 'ai') continue;
     for (var j = list.length - 1; j > i; j--) {
       var drop = list[j];
       if (!drop || drop.origin !== 'ai') continue;
-      if (!lorebookEntriesSimilar(keep, drop)) continue;
+      if (!lorebookFingerprintsSimilar(fp(keep), fp(drop))) continue;
       keep.content = mergeLorebookContent(keep.content, drop.content);
       keep.keywords = Array.from(new Set((keep.keywords || []).concat(drop.keywords || []))).slice(0, LOREBOOK_LIMITS.keywordsPerEntry);
       keep.alwaysActive = keep.alwaysActive === true || drop.alwaysActive === true;
@@ -188,8 +231,10 @@ function dedupeLorebook(list) {
       keep.misses = 0;
       if (!keep.sourceMessageIds && drop.sourceMessageIds) keep.sourceMessageIds = drop.sourceMessageIds;
       list.splice(j, 1);
+      fingerprints.delete(drop);
       mergedCount++;
     }
+    fingerprints.delete(keep);
   }
   return mergedCount;
 }

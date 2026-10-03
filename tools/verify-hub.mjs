@@ -77,6 +77,9 @@ try {
     + '\n' + extractBraced(script, 'function bigramOverlapRatio(')
     + '\n' + extractBraced(script, 'function normalizeKeywordList(')
     + '\n' + extractBraced(script, 'function lorebookEntriesSimilar(')
+    + '\n' + extractBraced(script, 'function lorebookFingerprint(')
+    + '\n' + extractBraced(script, 'function bigramSetRatio(')
+    + '\n' + extractBraced(script, 'function lorebookFingerprintsSimilar(')
     + '\n' + extractBraced(script, 'function findSimilarLorebookEntry(')
     + '\n' + extractBraced(script, 'function splitLorebookSentences(')
     + '\n' + extractBraced(script, 'function mergeLorebookContent(')
@@ -123,7 +126,7 @@ try {
     + '\n' + script.match(/const QUICK_REPLY_ISSUE_LABELS = \{[\s\S]*?\n\};/)[0]
     + '\n' + script.match(/const QUICK_REPLY_PLACEHOLDERS = \[.*?\];/)[0]
     + '\n' + script.match(/const LOREBOOK_LIMITS = \{[\s\S]*?\n\};/)[0]
-    + '\nreturn { NARRATIVE_PATTERNS: NARRATIVE_PATTERNS, buildNarrativePatternDirective: buildNarrativePatternDirective, normalizeLorebook: normalizeLorebook, normalizeGeneratedLorebook: normalizeGeneratedLorebook, collectLorebookEntries: collectLorebookEntries, resolveLorebookList: resolveLorebookList, findLorebookEntry: findLorebookEntry, resolveLorebookSources: resolveLorebookSources, upsertLorebookEntry: upsertLorebookEntry, evictStaleLorebookEntries: evictStaleLorebookEntries, normalizeLorebookName: normalizeLorebookName, bigramOverlapRatio: bigramOverlapRatio, lorebookEntriesSimilar: lorebookEntriesSimilar, findSimilarLorebookEntry: findSimilarLorebookEntry, mergeLorebookContent: mergeLorebookContent, dedupeLorebook: dedupeLorebook, matchLorebookEntries: matchLorebookEntries, buildLorebookLines: buildLorebookLines, markLorebookMentions: markLorebookMentions, buildLorebookContext: buildLorebookContext, formatLorebookMention: formatLorebookMention, LOREBOOK_LIMITS: LOREBOOK_LIMITS, getSceneKey: getSceneKey, memoryTaskKeys: memoryTaskKeys, toolActivityHint: toolActivityHint, chatStageDecision: chatStageDecision, extractSpeakingSamples: extractSpeakingSamples, buildStyleAnchor: buildStyleAnchor, detectStyleViolations: detectStyleViolations, isSentenceLengthUniform: isSentenceLengthUniform, sharesDistinctivePhrase: sharesDistinctivePhrase, getLastStyleViolations: getLastStyleViolations, collectRecentStyleViolations: collectRecentStyleViolations, buildStyleReview: buildStyleReview, buildStyleCorrectionReminder: buildStyleCorrectionReminder, STYLE_GUARD: STYLE_GUARD, STYLE_VIOLATION_LABELS: STYLE_VIOLATION_LABELS, buildQuickReplyPerspectiveReminder: buildQuickReplyPerspectiveReminder, buildQuickReplyAsUserPrompt: buildQuickReplyAsUserPrompt, QUICK_REPLY_GUARD: QUICK_REPLY_GUARD, QUICK_REPLY_ISSUE_LABELS: QUICK_REPLY_ISSUE_LABELS, detectQuickReplyIssues: detectQuickReplyIssues, getLastQuickReplyIssues: getLastQuickReplyIssues };';
+    + '\nreturn { NARRATIVE_PATTERNS: NARRATIVE_PATTERNS, buildNarrativePatternDirective: buildNarrativePatternDirective, normalizeLorebook: normalizeLorebook, normalizeGeneratedLorebook: normalizeGeneratedLorebook, collectLorebookEntries: collectLorebookEntries, resolveLorebookList: resolveLorebookList, findLorebookEntry: findLorebookEntry, resolveLorebookSources: resolveLorebookSources, upsertLorebookEntry: upsertLorebookEntry, evictStaleLorebookEntries: evictStaleLorebookEntries, normalizeLorebookName: normalizeLorebookName, bigramOverlapRatio: bigramOverlapRatio, lorebookEntriesSimilar: lorebookEntriesSimilar, lorebookFingerprint: lorebookFingerprint, bigramSetRatio: bigramSetRatio, lorebookFingerprintsSimilar: lorebookFingerprintsSimilar, findSimilarLorebookEntry: findSimilarLorebookEntry, mergeLorebookContent: mergeLorebookContent, dedupeLorebook: dedupeLorebook, matchLorebookEntries: matchLorebookEntries, buildLorebookLines: buildLorebookLines, markLorebookMentions: markLorebookMentions, buildLorebookContext: buildLorebookContext, formatLorebookMention: formatLorebookMention, LOREBOOK_LIMITS: LOREBOOK_LIMITS, getSceneKey: getSceneKey, memoryTaskKeys: memoryTaskKeys, toolActivityHint: toolActivityHint, chatStageDecision: chatStageDecision, extractSpeakingSamples: extractSpeakingSamples, buildStyleAnchor: buildStyleAnchor, detectStyleViolations: detectStyleViolations, isSentenceLengthUniform: isSentenceLengthUniform, sharesDistinctivePhrase: sharesDistinctivePhrase, getLastStyleViolations: getLastStyleViolations, collectRecentStyleViolations: collectRecentStyleViolations, buildStyleReview: buildStyleReview, buildStyleCorrectionReminder: buildStyleCorrectionReminder, STYLE_GUARD: STYLE_GUARD, STYLE_VIOLATION_LABELS: STYLE_VIOLATION_LABELS, buildQuickReplyPerspectiveReminder: buildQuickReplyPerspectiveReminder, buildQuickReplyAsUserPrompt: buildQuickReplyAsUserPrompt, QUICK_REPLY_GUARD: QUICK_REPLY_GUARD, QUICK_REPLY_ISSUE_LABELS: QUICK_REPLY_ISSUE_LABELS, detectQuickReplyIssues: detectQuickReplyIssues, getLastQuickReplyIssues: getLastQuickReplyIssues };';
   unit = new Function(src)();
 } catch (error) {
   ok('可提取并求值目标函数', false, error.message);
@@ -281,6 +284,20 @@ if (unit) {
   ]);
   const dedupedCount = unit.dedupeLorebook(dedupeList);
   ok('dedupeLorebook: 合并 AI 近重复且不动用户条目', dedupedCount === 1 && dedupeList.length === 2 && dedupeList.filter((e) => e.origin === 'user').length === 1 && dedupeList[0].content.includes('钟楼'));
+
+  // 指纹判定与字符版判定等价（去重重构不得改变语义）
+  const fpSamples = [
+    { name: '银月商会', keywords: ['商会'], content: '位于王都的商会。' },
+    { name: '银月商行', keywords: [], content: '王都的商会组织。' },
+    { name: '赤月王国', keywords: ['赤月'], content: '大陆西侧的王国。' },
+    { name: '完全无关', keywords: ['xyz'], content: '毫不相干的说明。' }
+  ];
+  let fpEquivalent = true;
+  for (const a of fpSamples) for (const b of fpSamples) {
+    if (a === b) continue;
+    if (unit.lorebookEntriesSimilar(a, b) !== unit.lorebookFingerprintsSimilar(unit.lorebookFingerprint(a), unit.lorebookFingerprint(b))) fpEquivalent = false;
+  }
+  ok('世界书指纹判定与 lorebookEntriesSimilar 等价', fpEquivalent);
 
   // 常驻条目上限
   const manyActive = { entityType: 'character', lorebook: [], memory: { instant: [] } };
@@ -623,6 +640,25 @@ console.log('\n[7] 语气遵从注入点与缓存安全');
   ok('critique 只在违规且开关打开时跑', script.includes('styleViolations.length > 0 && state.config.styleCritique !== false'));
   ok('critique 有长度异常回退', script.includes('STYLE_GUARD.critiqueMinRatio') && script.includes('STYLE_GUARD.critiqueMaxRatio') && script.includes('STYLE_GUARD.critiqueMaxChars'));
   ok('违规标签随消息持久化', script.includes('styleViolations: Array.isArray(message.styleViolations)'));
+}
+
+console.log('\n[8] 死代码清除与共享工具（防回退）');
+{
+  const deadSymbols = ['getProminentPromise', 'sanitizeRelativeTime', 'longAbsence'];
+  for (const name of deadSymbols) {
+    ok('已移除死代码 ' + name, !new RegExp('\\b' + name + '\\b').test(script));
+  }
+  ok('共享 HTML 实体解码存在且被两处复用',
+    /function decodeBasicHtmlEntities\b/.test(script)
+    && script.indexOf('htmlToReadableText') > 0
+    && script.indexOf('function stripHtmlTags') > 0);
+  ok('世界书去重指纹辅助函数在位',
+    /function lorebookFingerprint\b/.test(script) && /function bigramSetRatio\b/.test(script)
+    && /function lorebookFingerprintsSimilar\b/.test(script));
+  ok('volatile 角色/成员状态行已脱敏（绝不把“用户”发给模型）',
+    script.includes("return field.label + ': ' + maskUserWord(char, value);"));
+  ok('volatile 空动态字段与 buildDynamicStateContext 统一为 (未设置)',
+    script.includes("var value = trimText(char.dynamicState[field.key], 150) || '(未设置)';"));
 }
 
 console.log('\n结果: ' + pass + ' 通过, ' + failures.length + ' 失败');

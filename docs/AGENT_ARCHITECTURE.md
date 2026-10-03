@@ -218,10 +218,10 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 - **两种模式**：`alwaysActive: true`（常驻，每轮都注入，用于世界前提/规则）与关键词命中（被提到才注入，省 token）。无关键词的条目**不再自动转常驻**：写入时若无 `keywords` 又未显式 `alwaysActive:true` 会被拒收，避免堆出永不淘汰的无效条目。
 - **来源与保护**：`origin: 'user' | 'ai'`。用户手写的条目（含老数据，默认按 `user` 处理）**不会被模型覆盖，也不参与自动淘汰**；用户一旦手改 AI 条目，该条目即转为 `user`。
 - **模型维护（三入口）**：
-  1. 建卡/群组升级时由模型产出初始条目（`quickGenerateCharacter` / `upgradeToGroup` 的 `lorebook` 字段，2-4 条，`normalizeGeneratedLorebook()` 标记 `ai`）。
-  2. 主循环工具 `upsert_lorebook_entry`（`executeToolCall`）——先按 `entryId`/`name` 精确匹配，未命中再用 `findSimilarLorebookEntry()` 按名称 bigram 相似度（≥`nameSimilarity`）、共享关键词、内容 bigram 相似度（≥`contentSimilarity`）找**同一事物的近似条目**并**合并**（`mergeLorebookContent()` 逐句去重追加，关键词取并集），只有确实没有近似条目才新建；要求 `sourceMessageIds` + `evidence` 可回溯到已存在的消息，且**不得覆盖 `origin:user` 条目**（近似命中用户条目时返回 `mergedIntoUser`，不新建重复条目）。
+  1. 建卡/群组升级时由模型产出初始条目（`quickGenerateCharacter` / `upgradeToGroup` 的 `lorebook` 字段，2-4 条，`normalizeGeneratedLorebook()` 标记 `ai`）。无关键词条目按常驻处理，但常驻数量同样受 `maxAlwaysActive` 约束（显式 `alwaysActive` 的条目优先占位，超出的无名条目保持非常驻）。
+  2. 主循环工具 `upsert_lorebook_entry`（`executeToolCall`）——先按 `entryId`/`name` 精确匹配：**精确命中时用新 `content` 替换该条目原有内容**（模型点名即"更新这一条"，故须写全完整内容），未命中再用 `findSimilarLorebookEntry()` 按名称 bigram 相似度（≥`nameSimilarity`）、共享关键词、内容 bigram 相似度（≥`contentSimilarity`）找**同一事物的近似条目**并**合并**（`mergeLorebookContent()` 逐句去重追加，关键词取并集），只有确实没有近似条目才新建；要求 `sourceMessageIds` + `evidence` 可回溯到已存在的消息，且**不得覆盖 `origin:user` 条目**（精确/近似命中用户条目时返回 `mergedIntoUser`，不新建重复条目）。
   3. 记忆子任务 `consolidateLorebook()` — src/js/memory/tasks.js:142：每积累 8 条短期记忆跑一次，把现有条目的**名称+关键词+内容**一起给模型，明确要求"同一事物只一条、近似就用原名合并、只沉淀会反复复用的设定"（`autoEntriesPerPass` 上限 3 条，按 `sourceShortTermIds` 校验），写完后本地再跑一次 `dedupeLorebook()` 兜底合并 AI 近重复条目，并顺带执行淘汰。
-  - **本地去重** `dedupeLorebook(list)` — src/js/memory/lorebook.js：只合并 `origin:'ai'` 的近重复条目（用户条目永不动）；建卡/群组升级时也会跑一次，避免一次性生成出重复条目。
+   - **本地去重** `dedupeLorebook(list)` — src/js/memory/lorebook.js：只合并 `origin:'ai'` 的近重复条目（用户条目永不动）；判定用预建的 `lorebookFingerprint()`（名称/关键词/内容 bigram 集合）复用分词，避免每对条目重复切词；建卡/群组升级时也会跑一次，避免一次性生成出重复条目。
 - **隐藏自动淘汰**（talemate 式）：`evictStaleLorebookEntries()` 每轮整理把未被注入的 `ai` 条目 `misses + 1`，达 `evictionMisses`（3）即退役；条目被注入时 `markLorebookMentions()` 把 `misses` 归零。`misses` 不展示给模型、也不由模型管理。
 - 归一化 `normalizeLorebook()` — src/js/memory/lorebook.js:1（上限见 `LOREBOOK_LIMITS` src/js/core/config.js:159）；角色卡弹窗第三个 tab 编辑（`renderLorebookEditor` src/js/ui/character-editor.js:96，展示来源徽标/常驻开关/最近提及）。
 - 命中 `matchLorebookEntries()` — src/js/memory/lorebook.js:179：**常驻条目无条件入围**，其余对**本轮用户输入 + 最近 6 条消息**做小写关键词包含匹配；排序 = 常驻 → `order` → `name`；最多 6 条。
@@ -374,7 +374,7 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 ### 人格组装
 
 - `buildRoleContext(char, staticOnly)` — src/js/prompts/context.js:15：从 `char.basicInfo` 拼人格（主字段 + 次字段，共 12 项 `STATIC_PROFILE_FIELDS` src/js/core/config.js:130）；群组则拼群组信息 + 成员清单（`buildMemberContext` src/js/prompts/context.js:2）。
-- `buildDynamicStateContext()` — src/js/prompts/context.js:44：把 7 个动态字段渲染为"状态"文本（未设置的显示 `(未设置)`）。
+- `buildDynamicStateContext()` — src/js/prompts/context.js:44：把 7 个动态字段渲染为"状态"文本（未设置的显示 `(未设置)`；volatile 里的角色/成员状态块同样用 `(未设置)` 且经 `maskUserWord` 脱敏，与其它注入路径一致）。
 - `buildRequestPayload(char, query)` — src/js/prompts/request.js:1：装配 system + 历史 + 本轮 volatile。
 
 ### 子任务提示词（非主对话）
@@ -408,12 +408,14 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 - **后台任务过期保护**：`captureMemoryTask(char)` 记录角色引用、`memory.revision` 与末条消息 ID；`isMemoryTaskCurrent()` 在后台调用返回后校验，过期（角色被删、轮次推进、分支被删）就直接丢弃。`extractProseTurnMemory` 在快照副本上运行 `convertProseToJson`，不修改真实 `lastInjectedRecallIds`；回写前要求 `revision` 未变、原 assistant 消息仍在，并只接受引用本轮用户消息或本轮回复的记忆。快速回应换位生成、空字段补全同样带 guard。
 - **摘要不被提前丢弃**：`trimShortTermList` 只在长期分析与世界书整理都消费了同一 `revision` 后才裁剪；世界书条目在写库前整批校验来源与字段，失败不推进 `lorebookScannedRevision`、也不累计 `misses`，避免一次坏输出造成误淘汰。
 - **检索相关性下限**：`retrieveRelevantMemories` 只保留至少命中一个非停用词的候选，避免纯高重要性但无关的旧记忆挤占注入；`pendingRecall`（模型主动召回）优先占位，即使候选取满也一定注入；短指代查询经 `buildMemoryQuery` 补上下文。
-- **时间精度**：`resolveTimeRef` 保留带时区/时分的 explicit ISO，仅"日期或时段"表达才落整点/时段起点，避免把明确时刻改写成正午。
-- **请求失败也留痕**：`performChatRequest` / `callAI` 的 fetch 失败或非 2xx 也会写入 `requestMetrics`（`status: 'failed'`），并取消未读完的流式 reader，便于诊断网络与限流问题。
+- **时间精度**：`resolveTimeRef` 保留带时区/时分的 explicit ISO，仅"日期或时段"表达才落整点/时段起点，避免把明确时刻改写成正午。记忆衰减/排序的时间基准逐级回退（`Date.parse(lastRecalled) || Date.parse(updatedAt) || Date.parse(createdAt)`），`lastRecalled` 非空但不可解析时不会短路掉更新的时间戳、也不会被当成 1970 年。
+- **联网工具超时**：`fetchWithTimeout()`（src/js/api/web-content.js）给 B站 API、短链解析、Microlink、网页直连统一加超时，避免任意外部请求卡死工具循环（后台任务无重试兜底）。
+- **请求失败也留痕**：`performChatRequest` / `callAI` 的 fetch 失败或非 2xx 也会写入 `requestMetrics`（`status: 'failed'`），并取消未读完的流式 reader，便于诊断网络与限流问题。`buildApiHeaders` 在 apiKey 缺失时提前抛出明确错误，不发出 `Bearer undefined` 请求。
 - **文风校对可回退**：`critiqueReplyStyle` 在任何异常（解析失败、空结果、长度超出 `critiqueMinRatio`/`critiqueMaxRatio`/`critiqueMaxChars`）下都返回原文，绝不因校对失败影响回复。
 - **快速回应后台补齐可回退**：`repairQuickRepliesAsUser` 的换位生成失败（或生成结果仍不过校验）时退回 `['嗯','继续']`；回来太晚（`state.quickReplyMessageId` 已被下一轮覆盖）直接丢弃，不会覆盖新一轮的快速回应。
 - **后台任务串行**：`queueBackgroundTask`（src/js/prompts/style.js:208）把"散文轮记忆整理""快速回应补写"串成一条 Promise 链，避免交错写同一份角色状态；两者都不阻塞正文显示。
 - **散文即终稿不再重写**：阶段一拿到散文就直接采用，旧行为（`convertProseToJson` 阻塞在可见链路里、把用户已看到的正文换成"整理"后的版本）已移除；实机可用调试面板的 `stageStats` / `activityLog` 核对「正在整理回复…」是否真的不再出现。
+- **共享 HTML 工具**：`decodeBasicHtmlEntities()`（src/js/core/config.js）是 HTML 实体解码的唯一实现，`htmlToReadableText`（去 script/style 后可读文本）与 `stripHtmlTags`（B站标题清洗）都复用它，避免两处实现漂移。
 - **导入/导出归一化**：`normalizeAppData` → `normalizeCharacter`（src/js/storage/schema.js:40）逐字段校验，包含世界书、场景概要、场景状态与新增计数器。
 - **版本号单一来源**：右上角 `APP_VERSION`（src/js/core/config.js:73）由 `versionName` 派生，`tools/sync-version.mjs` 负责写入两份 `hub.html`；CI 在 `assembleRelease` 前执行该脚本并 `cmp` 校验两份文件一致，本地用 `node tools/sync-version.mjs --check` 复核。
 

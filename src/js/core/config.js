@@ -6,6 +6,16 @@ const STORAGE_RECOVERY_KEY = STORAGE_KEY + '_recovery';
 function escapeHtml(str) {
   return String(str == null ? '' : str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
+// 共享的 HTML 实体解码（供去标签/可读文本转换复用，避免多处实现漂移）
+function decodeBasicHtmlEntities(str) {
+  return toText(str)
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'");
+}
 function renderMathExpression(tex, display) {
   var tag = display ? 'div' : 'span';
   var className = display ? 'math-display' : 'math-inline';

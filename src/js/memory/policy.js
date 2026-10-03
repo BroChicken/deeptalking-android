@@ -3,7 +3,8 @@ function computeEffectiveImportance(item, now) {
   now = now || Date.now();
   var importance = Number(item.importance);
   if (!Number.isFinite(importance)) importance = 0;
-  var lastRef = Date.parse(item.lastRecalled || item.updatedAt || item.createdAt || '') || 0;
+  // 逐级回退：lastRecalled 非空但无法解析时不能短路掉 updatedAt/createdAt，否则会被当作 1970 年
+  var lastRef = Date.parse(item.lastRecalled) || Date.parse(item.updatedAt) || Date.parse(item.createdAt) || 0;
   var daysSince = lastRef ? Math.max(0, (now - lastRef) / 86400000) : 999;
   // 30 天内基本不衰减；30~180 天线性衰减至原始的一半；180 天后衰减至 10%
   var decay = 1;
@@ -195,8 +196,8 @@ function applyMemoryDecay(character, memoryStore) {
     var list = memoryStore.longTerm[category];
     if (!Array.isArray(list)) return;
     memoryStore.longTerm[category] = list.filter(function(item) {
-      var lastRef = Date.parse(item.lastRecalled || item.updatedAt || item.createdAt || '') || 0;
-      var daysSince = lastRef ? (now - lastRef) / DAY : 9999;
+      var lastRef = Date.parse(item.lastRecalled) || Date.parse(item.updatedAt) || Date.parse(item.createdAt) || 0;
+      var daysSince = lastRef ? Math.max(0, (now - lastRef) / DAY) : 9999;
       if (category === 'events') {
         var importance = Number(item.importance) || 0;
         var maxAge = 30 + importance * 15; // 低重要事件 ~45 天遗忘，高重要事件最长 ~180 天

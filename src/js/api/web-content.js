@@ -1,15 +1,19 @@
 // ==================== 联网内容获取：直连 → Microlink 摘要 / B站 API ====================
 function stripHtmlTags(value) {
-  return toText(value)
-    .replace(/<[^>]*>/g, '')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
-    .replace(/\s+/g, ' ')
-    .trim();
+  return decodeBasicHtmlEntities(toText(value).replace(/<[^>]*>/g, '')).replace(/\s+/g, ' ').trim();
+}
+
+// 统一超时抓取：避免任一外部请求卡死工具循环（后台任务无重试兜底）
+async function fetchWithTimeout(url, options, timeoutMs) {
+  var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  var timer = controller ? setTimeout(function() { controller.abort(); }, timeoutMs || 15000) : null;
+  try {
+    var opts = Object.assign({}, options || {});
+    if (controller) opts.signal = controller.signal;
+    return await fetch(url, opts);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function searchWebContent(query) {
@@ -63,7 +67,7 @@ async function fetchBiliJson(path, params) {
     return encodeURIComponent(k) + '=' + encodeURIComponent(params[k]);
   }).join('&');
   var url = 'https://api.bilibili.com' + path + (qs ? '?' + qs : '');
-  var res = await fetch(url, { method: 'GET', cache: 'no-store', referrer: 'https://www.bilibili.com/' });
+  var res = await fetchWithTimeout(url, { method: 'GET', cache: 'no-store', referrer: 'https://www.bilibili.com/' }, 15000);
   if (!res.ok) throw new Error('HTTP ' + res.status);
   var data = await res.json();
   if (!data || Number(data.code) !== 0) throw new Error(toText(data && data.message, '接口返回异常') + '（code ' + toText(data && data.code) + '）');
@@ -72,7 +76,7 @@ async function fetchBiliJson(path, params) {
 
 async function resolveBiliShortLink(url) {
   try {
-    var res = await fetch(url, { method: 'GET', redirect: 'follow', cache: 'no-store' });
+    var res = await fetchWithTimeout(url, { method: 'GET', redirect: 'follow', cache: 'no-store' }, 15000);
     var direct = extractBiliVideoId(res.url || '');
     if (direct) return direct;
     var html = await res.text().catch(function() { return ''; });
@@ -141,7 +145,7 @@ async function biliVideoDetail(id) {
 
 async function fetchViaMicrolink(url) {
   try {
-    var res = await fetch('https://api.microlink.io/?url=' + encodeURIComponent(url), { method: 'GET', cache: 'no-store' });
+    var res = await fetchWithTimeout('https://api.microlink.io/?url=' + encodeURIComponent(url), { method: 'GET', cache: 'no-store' }, 12000);
     if (!res.ok) throw new Error('HTTP ' + res.status);
     var json = await res.json();
     var d = (json && json.data) || null;
@@ -173,7 +177,7 @@ async function fetchViaMicrolink(url) {
 async function fetchWebContent(url) {
   var looksImage = /\.(png|jpe?g|gif|webp|bmp|svg)(\?|#|$)/i.test(url);
   try {
-    var res = await fetch(url, { method: 'GET', redirect: 'follow', cache: 'no-store' });
+    var res = await fetchWithTimeout(url, { method: 'GET', redirect: 'follow', cache: 'no-store' }, 20000);
     var contentType = (res.headers.get('content-type') || '').toLowerCase();
     if (res.ok && contentType.indexOf('image/') === 0) {
       // 由服务端下载该图片并作为图片内容交给模型查看

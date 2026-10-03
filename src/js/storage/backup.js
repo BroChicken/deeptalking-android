@@ -8,11 +8,15 @@ function isMobileDevice() {
   return /Mobi|Android|iPhone|iPad|iPod/.test(navigator.userAgent || '') || (navigator.maxTouchPoints && navigator.maxTouchPoints > 1 && /Touch/i.test(navigator.userAgent || ''));
 }
 
-// 中文 JSON 安全转 base64（btoa 只支持拉丁字符）
+// 中文 JSON 安全转 base64（btoa 只支持拉丁字符）。
+// 分块 String.fromCharCode.apply，避免逐字节字符串拼接在多 MB 备份时的 O(n²) 开销。
 function utf8ToBase64(str) {
   var bytes = new TextEncoder().encode(str);
+  var chunkSize = 0x8000;
   var bin = '';
-  for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  for (var i = 0; i < bytes.length; i += chunkSize) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + chunkSize, bytes.length)));
+  }
   return btoa(bin);
 }
 

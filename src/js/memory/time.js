@@ -208,10 +208,6 @@ function parseRelativeText(text, baseDate) {
   return result;
 }
 
-function sanitizeRelativeTime(text, baseDate) {
-  return parseRelativeText(text, baseDate || new Date());
-}
-
 // 动态状态字段写入时统一换算为绝对日期
 function sanitizeDynamicStateField(key, value, baseDate) {
   return parseRelativeText(value, baseDate || new Date());
@@ -268,12 +264,19 @@ function isExplanatorySentence(sentence) {
   return false;
 }
 
+// 字段名/标签查找表（模块级预建，避免每次清洗都重建）
+var FIELD_KEY_LOOKUP = (function() {
+  var keys = {};
+  var labels = [];
+  Object.keys(STATIC_PROFILE_FIELDS).forEach(function(k) { keys[k] = true; labels.push(STATIC_PROFILE_FIELDS[k].label); });
+  DYNAMIC_STATE_FIELDS.forEach(function(f) { keys[f.key] = true; labels.push(f.label); });
+  return { keys: keys, labels: labels };
+})();
+
 function cleanFieldValue(key, value) {
   var text = toText(value);
-  var fieldKeys = {};
-  var fieldLabels = [];
-  Object.keys(STATIC_PROFILE_FIELDS).forEach(function(k) { fieldKeys[k] = true; fieldLabels.push(STATIC_PROFILE_FIELDS[k].label); });
-  DYNAMIC_STATE_FIELDS.forEach(function(f) { fieldKeys[f.key] = true; fieldLabels.push(f.label); });
+  var fieldKeys = FIELD_KEY_LOOKUP.keys;
+  var fieldLabels = FIELD_KEY_LOOKUP.labels;
   // 剥离开头字段名前缀：如"职业：教师"、"当前目标: xxx"、"性格特征：冷静"
   var prefixMatch = text.match(/^\s*[^：:\n]{1,24}[：:]\s*/);
   if (prefixMatch) {

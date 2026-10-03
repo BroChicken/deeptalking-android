@@ -51,6 +51,39 @@ function message(id, role = 'user', content = 'Fact ' + id, index = 0) {
   return { id, role, content, timestamp: new Date(Date.parse('2026-10-01T18:00:00Z') + index * 1000).toISOString() };
 }
 
+test('invalid lastRecalled falls back to updatedAt/createdAt instead of epoch 0', () => {
+  const r = runtime();
+  const result = r.evaluate(`(() => {
+    const now = Date.now();
+    const recent = new Date(now - 3600000).toISOString();
+    // lastRecalled is a truthy but unparseable string; updatedAt is recent.
+    const item = { importance: 8, lastRecalled: 'not-a-date', updatedAt: recent, createdAt: recent };
+    const effective = computeEffectiveImportance(item, now);
+    // Also verify the decay filter keeps a recent event with a bad lastRecalled.
+    const store = { longTerm: { events: [Object.assign({}, item, { status: 'active' })] } };
+    applyMemoryDecay({ memory: store }, store);
+    return { effective: effective, kept: store.longTerm.events.length };
+  })()`);
+  // importance 8 with a recent timestamp: no decay (>=30 days) => 8.
+  assert.equal(result.effective, 8);
+  assert.equal(result.kept, 1);
+});
+
+test('generated lorebook promotes keyword-less entries but honors maxAlwaysActive', () => {
+  const r = runtime();
+  const result = r.evaluate(`(() => {
+    const make = (name) => ({ name: name, keywords: [], content: 'world fact ' + name });
+    const input = Array.from({ length: 10 }, (_, i) => make('E' + i));
+    const out = normalizeGeneratedLorebook(input);
+    return {
+      active: out.filter(e => e.alwaysActive).length,
+      nonActiveWithNoKeywords: out.filter(e => !e.alwaysActive && e.keywords.length === 0).length
+    };
+  })()`);
+  assert.equal(result.active, 6);
+  assert.equal(result.nonActiveWithNoKeywords, 4);
+});
+
 test('unrelated response evidence cannot alter dynamic or static fields', () => {
   const r = runtime();
   const result = r.evaluate(`(() => {

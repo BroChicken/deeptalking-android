@@ -31,7 +31,8 @@ window.addEventListener('DOMContentLoaded', function() {
   if (proactiveInputEl) proactiveInputEl.addEventListener('input', clearProactiveCheck);
 
   // Event delegation for character list
-  document.getElementById('characterList').addEventListener('click', function(e) {
+  var characterListEl = document.getElementById('characterList');
+  if (characterListEl) characterListEl.addEventListener('click', function(e) {
     var memberAction = e.target.closest('[data-member-action]');
     if (memberAction) {
       e.stopPropagation();
@@ -54,7 +55,8 @@ window.addEventListener('DOMContentLoaded', function() {
     }
   });
 
-  document.getElementById('messageContainer').addEventListener('click', function(e) {
+  var messageContainerEl = document.getElementById('messageContainer');
+  if (messageContainerEl) messageContainerEl.addEventListener('click', function(e) {
     var quickReplyButton = e.target.closest('[data-quick-reply-index]');
     if (quickReplyButton) {
       var quickReplyIndex = parseInt(quickReplyButton.dataset.quickReplyIndex, 10);
@@ -78,7 +80,8 @@ window.addEventListener('DOMContentLoaded', function() {
 
 window.addEventListener('resize', function() {
   if (window.innerWidth >= 768) {
-    document.getElementById('sidebarOverlay').classList.add('hidden');
+    var overlay = document.getElementById('sidebarOverlay');
+    if (overlay) overlay.classList.add('hidden');
   }
   updateAppHeight();
 });

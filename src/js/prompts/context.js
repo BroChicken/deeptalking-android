@@ -80,8 +80,7 @@ function getLastReplyGap(char) {
     return {
       milliseconds: milliseconds,
       text: formatElapsedTime(milliseconds),
-      reconnect: milliseconds >= 6 * 60 * 60 * 1000,
-      longAbsence: milliseconds >= 3 * 24 * 60 * 60 * 1000
+      reconnect: milliseconds >= 6 * 60 * 60 * 1000
     };
   }
   return null;
@@ -117,35 +116,10 @@ function getPromiseContext(char, query) {
   return lines.join('\n');
 }
 
-function getProminentPromise(char) {
-  var now = Date.now();
-  var promises = (char.memory.longTerm.promises || []).filter(function(item) {
-    return (item.status || 'active') === 'active';
-  }).map(function(item) {
-    var dueTime = item.dueAt ? Date.parse(item.dueAt) : 0;
-    return { item: item, dueTime: dueTime, overdue: dueTime > 0 && dueTime < now };
-  }).sort(function(a, b) {
-    if (a.overdue !== b.overdue) return a.overdue ? -1 : 1;
-    if (!a.dueTime) return 1;
-    if (!b.dueTime) return -1;
-    return a.dueTime - b.dueTime;
-  });
-  if (promises.length === 0) return null;
-  var first = promises[0];
-  return {
-    key: maskUserWord(char, trimText(first.item.key, 80)),
-    value: maskUserWord(char, trimText(first.item.value, 220)),
-    dueAt: first.dueAt ? formatContextTime(first.item.dueAt) : null,
-    overdue: first.overdue
-  };
-}
-
-// 从角色背景、动态状态与记忆中抽取候选话题素材，供角色自然引出新话题（避免冷场）。
-// 覆盖全部有效设定字段：静态基础设定 + 迁移后的动态可变字段 + 长期记忆。
 function buildTopicSuggestions(char) {
   var sources = [];
   var info = char.basicInfo || {};
-  ['gender', 'age', 'race', 'appearance', 'personality', 'values', 'fears', 'background', 'keyEvents', 'speakingStyle', 'language'].forEach(function(key) {
+  Object.keys(STATIC_PROFILE_FIELDS).forEach(function(key) {
     var value = trimText(info[key], 200);
     if (value) sources.push(value);
   });
