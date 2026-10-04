@@ -64,6 +64,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.isShiftPressed
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -111,14 +117,30 @@ fun ChatScreen(
     val listState = rememberLazyListState()
     val context = LocalContext.current
 
-    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri -> uri?.let(onAddImage) }
+    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
+        uris.forEach(onAddImage)
+    }
     val stickerPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri -> uri?.let(onAddSticker) }
+
+    val submit = {
+        val text = input.trim()
+        if (!isSending && (text.isNotEmpty() || pendingImages.isNotEmpty())) {
+            onSend(text)
+            input = ""
+        }
+    }
 
     val visibleMessages = messages.filterNot { it.internalOnly }
 
-    LaunchedEffect(visibleMessages.size) {
-        if (visibleMessages.isNotEmpty()) {
-            runCatching { listState.animateScrollToItem(visibleMessages.size - 1) }
+    var initialScrollDone by remember(character?.id) { mutableStateOf(false) }
+    LaunchedEffect(character?.id, visibleMessages.size) {
+        if (visibleMessages.isEmpty()) return@LaunchedEffect
+        val last = visibleMessages.size - 1
+        if (!initialScrollDone) {
+            runCatching { listState.scrollToItem(last) }
+            initialScrollDone = true
+        } else {
+            runCatching { listState.animateScrollToItem(last) }
         }
     }
     LaunchedEffect(visibleMessages.lastOrNull()?.content) {
@@ -142,6 +164,7 @@ fun ChatScreen(
                         MessageRow(
                             message = message,
                             character = character,
+                            isSending = isSending,
                             onCopy = { copyToClipboard(context, message.content) },
                             onEditResend = { editTarget = message },
                             onRegenerate = { onRegenerate(message.id) },
@@ -192,18 +215,28 @@ fun ChatScreen(
                     modifier = Modifier.fillMaxWidth().widthIn(max = 640.dp).align(Alignment.CenterHorizontally).padding(horizontal = 8.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.Bottom,
                 ) {
-                    IconButton(onClick = { imagePicker.launch("image/*") }, enabled = !isSending, modifier = Modifier.size(32.dp)) {
-                        Icon(Icons.Default.Image, contentDescription = "添加图片", tint = MaterialTheme.legacy.textSecondary, modifier = Modifier.size(18.dp))
-                    }
                     if (character != null) {
                         IconButton(onClick = { stickerPanelOpen = !stickerPanelOpen }, modifier = Modifier.size(32.dp)) {
                             Icon(Icons.Default.EmojiEmotions, contentDescription = "表情包", tint = MaterialTheme.legacy.textSecondary, modifier = Modifier.size(18.dp))
                         }
                     }
+                    IconButton(onClick = { imagePicker.launch("image/*") }, enabled = !isSending, modifier = Modifier.size(32.dp)) {
+                        Icon(Icons.Default.Image, contentDescription = "添加图片", tint = MaterialTheme.legacy.textSecondary, modifier = Modifier.size(18.dp))
+                    }
                     OutlinedTextField(
                         value = input,
                         onValueChange = { input = it; onUserActivity() },
-                        modifier = Modifier.weight(1f).heightIn(min = 46.dp, max = 140.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .heightIn(min = 46.dp, max = 140.dp)
+                            .onPreviewKeyEvent { event ->
+                                if (event.type == KeyEventType.KeyDown && event.key == Key.Enter && !event.isShiftPressed) {
+                                    submit()
+                                    true
+                                } else {
+                                    false
+                                }
+                            },
                         enabled = !isSending,
                         placeholder = { Text("输入消息", color = MaterialTheme.legacy.textMuted) },
                         maxLines = 6,
@@ -219,13 +252,7 @@ fun ChatScreen(
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text, imeAction = ImeAction.Default),
                     )
                     IconButton(
-                        onClick = {
-                            val text = input.trim()
-                            if (text.isNotEmpty() || pendingImages.isNotEmpty()) {
-                                onSend(text)
-                                input = ""
-                            }
-                        },
+                        onClick = { submit() },
                         enabled = !isSending && (input.isNotBlank() || pendingImages.isNotEmpty()),
                         modifier = Modifier
                             .size(48.dp)
@@ -310,6 +337,7 @@ private fun CharacterEmptyState(character: Character) {
 private fun MessageRow(
     message: ChatMessage,
     character: Character,
+    isSending: Boolean,
     onCopy: () -> Unit,
     onEditResend: () -> Unit,
     onRegenerate: () -> Unit,
@@ -357,7 +385,7 @@ private fun MessageRow(
                         }
                     }
                     if (!message.isLoading && message.content.isNotBlank()) {
-                        MessageMeta(message, isUser, onCopy, onEditResend, onRegenerate)
+                        MessageMeta(message, isUser, isSending, onCopy, onEditResend, onRegenerate)
                     }
                 }
             }
@@ -369,6 +397,7 @@ private fun MessageRow(
 private fun MessageMeta(
     message: ChatMessage,
     isUser: Boolean,
+    isSending: Boolean,
     onCopy: () -> Unit,
     onEditResend: () -> Unit,
     onRegenerate: () -> Unit,
@@ -384,16 +413,18 @@ private fun MessageMeta(
             color = if (isUser) legacy.onUserBubble.copy(alpha = 0.7f) else legacy.textMuted,
         )
         Spacer(Modifier.weight(1f))
-        IconButton(onClick = onCopy, modifier = Modifier.size(30.dp)) {
-            Icon(Icons.Default.ContentCopy, contentDescription = "复制消息", tint = legacy.textMuted, modifier = Modifier.size(15.dp))
-        }
-        if (isUser) {
-            IconButton(onClick = onEditResend, modifier = Modifier.size(30.dp)) {
-                Icon(Icons.Default.Edit, contentDescription = "编辑并重发", tint = legacy.textMuted, modifier = Modifier.size(15.dp))
+        if (!isSending) {
+            IconButton(onClick = onCopy, modifier = Modifier.size(30.dp)) {
+                Icon(Icons.Default.ContentCopy, contentDescription = "复制消息", tint = legacy.textMuted, modifier = Modifier.size(15.dp))
             }
-        } else {
-            IconButton(onClick = onRegenerate, modifier = Modifier.size(30.dp)) {
-                Icon(Icons.Default.Refresh, contentDescription = "重新生成", tint = legacy.textMuted, modifier = Modifier.size(15.dp))
+            if (isUser) {
+                IconButton(onClick = onEditResend, modifier = Modifier.size(30.dp)) {
+                    Icon(Icons.Default.Edit, contentDescription = "编辑并重发", tint = legacy.textMuted, modifier = Modifier.size(15.dp))
+                }
+            } else {
+                IconButton(onClick = onRegenerate, modifier = Modifier.size(30.dp)) {
+                    Icon(Icons.Default.Refresh, contentDescription = "重新生成", tint = legacy.textMuted, modifier = Modifier.size(15.dp))
+                }
             }
         }
     }

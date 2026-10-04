@@ -15,4 +15,5 @@ dependencies {
     implementation(libs.okhttp.sse)
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.serialization.json)
+    testImplementation(kotlin("test"))
 }

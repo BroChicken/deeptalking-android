@@ -11,6 +11,7 @@ import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.ShortTermMemory
 import com.deeptalking.domain.agent.ResponseParser
 import com.deeptalking.domain.agent.prompts.trimText
+import com.deeptalking.domain.agent.sessionIdFor
 import com.deeptalking.domain.memory.MemoryService
 import com.deeptalking.domain.memory.getTimeSlot
 import com.deeptalking.domain.memory.logicalDay
@@ -159,6 +160,7 @@ class BackgroundTasks(
     private val llm: LlmBackend,
     private val memory: MemoryService,
     private val model: String = "deepseek-flash",
+    private val apiPlatform: String? = null,
 ) {
 
     val queue: BackgroundTaskQueue = BackgroundTaskQueue()
@@ -212,7 +214,7 @@ class BackgroundTasks(
         val prompt = EXTRACTION_PROMPT_HEAD + countClause + EXTRACTION_PROMPT_TAIL +
             json.encodeToString(recentIdentities) + "\n对话内容:\n" + json.encodeToString(sources)
 
-        val raw = complete(EXTRACTION_SYSTEM, prompt, temperature = 0.2, maxOutputTokens = 4096)
+        val raw = complete(EXTRACTION_SYSTEM, prompt, temperature = 0.2, maxOutputTokens = 4096, sessionId = sessionIdFor(character))
         if (raw.isBlank()) return character
 
         val root = ResponseParser.parseJsonLenient(raw)
@@ -295,7 +297,7 @@ class BackgroundTasks(
             )
         }
         val prompt = ANALYSIS_PROMPT_HEAD + json.encodeToString(inputs) + ANALYSIS_PROMPT_TAIL
-        val raw = complete(ANALYSIS_SYSTEM, prompt, temperature = 0.2, maxOutputTokens = 4096)
+        val raw = complete(ANALYSIS_SYSTEM, prompt, temperature = 0.2, maxOutputTokens = 4096, sessionId = sessionIdFor(character))
         if (raw.isBlank()) return character
         val root = ResponseParser.parseJsonLenient(raw) as? JsonObject ?: return character
         if (root.string("status") != "ok") return character
@@ -327,7 +329,7 @@ class BackgroundTasks(
             "硬性要求：①只改文风，绝不改动情节、事实、对话含义与人物关系；②保持大体长度与段落数；③不要新增情节要素、不要加解释或旁白；④不得复述规则本身。\n" +
             "违反的规则：\n" + rules + "\n\n" +
             "只返回 JSON：{\"reply\":\"修订后的正文\"}，换行写 \\n，双引号写 \\\"。\n\n原文：\n" + original
-        val raw = complete(CRITIQUE_SYSTEM, prompt, temperature = 0.7, maxOutputTokens = 4096)
+        val raw = complete(CRITIQUE_SYSTEM, prompt, temperature = 0.7, maxOutputTokens = 4096, sessionId = sessionIdFor(character))
         if (raw.isBlank()) return original
         val data = ResponseParser.parseJsonLenient(raw) as? JsonObject ?: return original
         val revised = ResponseParser.unescapeLiteralNewlines(data.string("reply").orEmpty()).trim()
@@ -355,7 +357,7 @@ class BackgroundTasks(
         } else {
             prompt.second
         }
-        val raw = complete(prompt.first, userContent, temperature = 0.8, maxOutputTokens = 1024)
+        val raw = complete(prompt.first, userContent, temperature = 0.8, maxOutputTokens = 1024, sessionId = sessionIdFor(character))
         if (raw.isBlank()) return fallback
         val list = ResponseParser.parseQuickReplyList(ResponseParser.parseJsonLenient(raw))
         if (list.size < 2) return fallback
@@ -440,7 +442,13 @@ class BackgroundTasks(
         return system to user
     }
 
-    private suspend fun complete(system: String, user: String, temperature: Double, maxOutputTokens: Int): String {
+    private suspend fun complete(
+        system: String,
+        user: String,
+        temperature: Double,
+        maxOutputTokens: Int,
+        sessionId: String? = null,
+    ): String {
         val request = LlmRequest(
             model = model,
             instructions = system,
@@ -449,6 +457,8 @@ class BackgroundTasks(
             maxOutputTokens = maxOutputTokens,
             stream = false,
             reasoningEffort = "none",
+            apiPlatform = apiPlatform,
+            sessionId = sessionId ?: "deeptalking-general",
         )
         return try {
             llm.complete(request).text

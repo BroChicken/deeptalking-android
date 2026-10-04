@@ -22,6 +22,12 @@ data class AgentToolResult(
     val contentJson: String,
     val isError: Boolean = false,
     val updatedCharacter: com.deeptalking.core.model.Character? = null,
+    /**
+     * Set by `send_sticker` when the character chose a sticker to send as its
+     * next message (legacy `toolState.stickerToSend`); the orchestrator surfaces
+     * it so the UI can append the assistant sticker message.
+     */
+    val stickerFileRef: String? = null,
 )
 
 /**

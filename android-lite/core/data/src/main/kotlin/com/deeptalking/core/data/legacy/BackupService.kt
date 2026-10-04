@@ -62,12 +62,13 @@ class BackupService(
     suspend fun exportJson(): String {
         val all = characters.observeAll().first()
         val appConfig = config.observe().first()
+        val messagesByCharacter = all.associate { it.id to chat.getMessages(it.id) }
 
         val root = buildJsonObject {
             put("config", AppJson.encodeToJsonElement(appConfig))
             putJsonObject("characters") {
                 for (character in all) {
-                    put(character.id, characterToJson(character))
+                    put(character.id, characterToJson(character, messagesByCharacter[character.id].orEmpty()))
                 }
             }
             put("activeCharacterId", JsonNull)
@@ -84,12 +85,12 @@ class BackupService(
     private fun AppConfig.exportDateOrNow(): String =
         java.time.Instant.now().toString().substringBefore('.').ifBlank { java.time.Instant.now().toString() }
 
-    private fun characterToJson(character: Character): JsonObject = buildJsonObject {
+    private fun characterToJson(character: Character, messages: List<ChatMessage>): JsonObject = buildJsonObject {
         put("id", character.id)
         put("entityType", if (character.isGroup) "group" else "character")
         put("basicInfo", basicInfoToJson(character.name, character.emoji, character.staticProfile))
         put("dynamicState", dynamicStateToJson(character.dynamicState))
-        put("memory", memoryToJson(character.instant, character.shortTerm, character.longTerm))
+        put("memory", memoryToJson(messages.ifEmpty { character.instant }, character.shortTerm, character.longTerm))
         putJsonArray("lorebook") { character.lorebook.forEach { add(lorebookToJson(it)) } }
         putJsonArray("stickers") { character.stickers.forEach { add(stickerToJson(it)) } }
         if (character.fieldsMigrationVersion.isNotBlank()) {
@@ -225,8 +226,9 @@ class BackupService(
         put("enabled", entry.enabled)
         put("alwaysActive", entry.alwaysActive)
         put("origin", if (entry.origin == LorebookOrigin.Model) "ai" else "user")
+        put("mentions", entry.mentions)
         put("misses", entry.misses)
-        entry.updatedAt?.let { put("lastMentionedAt", it) }
+        entry.lastMentionedAt?.let { put("lastMentionedAt", it) }
         entry.createdAt?.let { put("createdAt", it) }
     }
 

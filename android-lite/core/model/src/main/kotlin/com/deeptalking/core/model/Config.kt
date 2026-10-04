@@ -19,6 +19,19 @@ data class AppConfig(
     val requestMetrics: List<RequestMetric> = emptyList(),
     /** Latest reply debug payload (legacy DEBUG_REPLY_STORAGE_KEY). */
     val lastReplyDebug: String = "",
+    /**
+     * Per-platform base URL / model slots (legacy `platformSettings`). Switching
+     * the platform must not overwrite another platform's configuration; the API
+     * key half lives in `:core:security` `SecretStore` (never in this payload).
+     */
+    val platformSettings: Map<String, PlatformSlot> = emptyMap(),
+)
+
+/** Non-secret half of a per-platform config slot (legacy `platformSettings[p]`). */
+@Serializable
+data class PlatformSlot(
+    val baseUrl: String = "",
+    val modelName: String = "",
 )
 
 /** One API request's usage/cache summary, mirroring the legacy metric shape. */

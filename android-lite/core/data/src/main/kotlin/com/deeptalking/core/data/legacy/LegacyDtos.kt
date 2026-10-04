@@ -226,6 +226,14 @@ data class LegacyConfig(
     @SerialName("proactiveEnabled") val proactiveEnabled: Boolean? = null,
     @SerialName("styleCritique") val styleCritique: Boolean? = null,
     @SerialName("quickReplyRepair") val quickReplyRepair: Boolean? = null,
+    @SerialName("platformSettings") val platformSettings: Map<String, LegacyPlatformSlot>? = null,
+)
+
+@Serializable
+data class LegacyPlatformSlot(
+    @SerialName("baseUrl") val baseUrl: String? = null,
+    @SerialName("modelName") val modelName: String? = null,
+    @SerialName("apiKey") val apiKey: String? = null,
 )
 
 @Serializable

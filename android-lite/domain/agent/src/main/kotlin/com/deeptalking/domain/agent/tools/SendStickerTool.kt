@@ -34,6 +34,9 @@ class SendStickerTool(private val stickersEnabled: Boolean = true) : AgentTool {
             return AgentToolResult(errorJson("没有该标签的表情包；可用标签：" + allTags.joinToString("、")))
         }
         val chosen = matches.last()
-        return AgentToolResult("""{"ok":true,"tag":${quote(chosen.tag)},"sent":true}""")
+        return AgentToolResult(
+            contentJson = """{"ok":true,"tag":${quote(chosen.tag)},"sent":true}""",
+            stickerFileRef = chosen.fileRef,
+        )
     }
 }

@@ -24,6 +24,7 @@ if (-not $gradleExe -or -not (Test-Path -LiteralPath $gradleExe)) {
 $modules = @(
   ':engine:ondevice:test',
   ':domain:agent:test',
+  ':core:network:test',
   ':domain:memory:test',
   ':core:data:testDebugUnitTest',
   ':feature:richtext:testDebugUnitTest'
@@ -43,8 +44,10 @@ while (-not $proc.HasExited) {
   }
   Start-Sleep -Seconds 3
 }
-$proc.Refresh()
-$exit = [int]$proc.ExitCode
+$text = Get-Content -LiteralPath $log -Raw -ErrorAction SilentlyContinue
+# Start-Process on gradle.bat yields an empty ExitCode on Windows PowerShell,
+# so derive success from Gradle's terminal status line instead.
+$exit = if ($text -match 'BUILD SUCCESSFUL') { 0 } else { 1 }
 if ($exit -ne 0) {
   Get-Content -LiteralPath $log -Tail 25 -ErrorAction SilentlyContinue | Write-Host
   Write-Host ('gradle test tasks failed (exit ' + $exit + ')') -ForegroundColor Red
@@ -52,7 +55,7 @@ if ($exit -ne 0) {
 }
 
 $total = 0; $fail = 0
-foreach ($m in @('engine\ondevice','domain\agent','domain\memory','core\data','feature\richtext')) {
+foreach ($m in @('engine\ondevice','domain\agent','core\network','domain\memory','core\data','feature\richtext')) {
   $dir = Join-Path $android ($m + '\build\test-results')
   if (-not (Test-Path -LiteralPath $dir)) { continue }
   Get-ChildItem -LiteralPath $dir -Recurse -Filter 'TEST-*.xml' | ForEach-Object {

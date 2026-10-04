@@ -29,6 +29,8 @@ data class LoopOutcome(
     val executedCalls: Int,
     /** Latest character returned by a tool's [AgentToolResult.updatedCharacter], if any. */
     val updatedCharacter: Character? = null,
+    /** File ref of a sticker the character chose to send this turn, if any. */
+    val stickerFileRef: String? = null,
     /** Token usage of the last model request, when the backend reported it. */
     val usage: com.deeptalking.engine.ondevice.TokenUsage? = null,
 )
@@ -66,6 +68,7 @@ class AgentLoop(
         var executedCalls = 0
         var lastText = ""
         var latestCharacter: Character? = null
+        var latestSticker: String? = null
         var lastUsage: com.deeptalking.engine.ondevice.TokenUsage? = null
         var phase = RequestPhase.AUTO
         var attempts = 0
@@ -73,13 +76,13 @@ class AgentLoop(
         while (attempts < 3) {
             attempts++
             val tools = if (phase == RequestPhase.AUTO) autoTools else listOf(submitTool)
-            val request = builder.build(phase, instructions, messages, tools, model)
-            val result = collectStream(request, onDelta)
+            val request = builder.build(phase, instructions, messages, tools, model, sessionIdFor(workingCharacter))
+            val result = collectStreamWithRetry(request, onDelta)
             if (result.text.isNotBlank()) lastText = result.text
             result.usage?.let { lastUsage = it }
 
             val submit = result.toolCalls.firstOrNull { it.name == "submit_response" }
-            if (submit != null) return LoopOutcome(result.text, submit, rounds, executedCalls, latestCharacter, lastUsage)
+            if (submit != null) return LoopOutcome(result.text, submit, rounds, executedCalls, latestCharacter, latestSticker, lastUsage)
 
             val infoCalls = result.toolCalls.filter { it.name != "submit_response" }
             if (phase == RequestPhase.AUTO) {
@@ -93,6 +96,7 @@ class AgentLoop(
                             rounds = rounds,
                             executedCalls = executedCalls,
                             updatedCharacter = latestCharacter,
+                            stickerFileRef = latestSticker,
                         )
                     }
                 }
@@ -104,6 +108,7 @@ class AgentLoop(
                     executedCalls++
                     val call = infoCalls.first()
                     val toolResult = registry.execute(call, context)
+                    toolResult.stickerFileRef?.let { latestSticker = it }
                     toolResult.updatedCharacter?.let { updated ->
                         latestCharacter = updated
                         workingCharacter = updated
@@ -124,7 +129,7 @@ class AgentLoop(
                     continue
                 }
                 if (lastText.isNotBlank()) {
-                    return LoopOutcome(lastText, null, rounds, executedCalls, latestCharacter, lastUsage)
+                    return LoopOutcome(lastText, null, rounds, executedCalls, latestCharacter, latestSticker, lastUsage)
                 }
                 phase = RequestPhase.SUBMIT
                 attempts = 0
@@ -132,10 +137,10 @@ class AgentLoop(
             }
 
             // Submit phase: no submit_response call came back.
-            if (lastText.isNotBlank()) return LoopOutcome(lastText, null, rounds, executedCalls, latestCharacter, lastUsage)
+            if (lastText.isNotBlank()) return LoopOutcome(lastText, null, rounds, executedCalls, latestCharacter, latestSticker, lastUsage)
             if (attempts >= 2) break
         }
-        return LoopOutcome(lastText, null, rounds, executedCalls, latestCharacter, lastUsage)
+        return LoopOutcome(lastText, null, rounds, executedCalls, latestCharacter, latestSticker, lastUsage)
     }
 
     /**
@@ -143,6 +148,30 @@ class AgentLoop(
      * reply text; partial `submit_response` arguments are salvaged when the
      * model answers through the terminal tool instead of plain text.
      */
+    /**
+     * Wraps [collectStream] with the legacy request-level retry policy
+     * (`src/js/api/retry.js`): transient transport failures are retried up to
+     * [ApiRetry.MAX_API_RETRIES] times with 1s/2s/4s backoff; non-transient
+     * errors propagate immediately.
+     */
+    private suspend fun collectStreamWithRetry(
+        request: com.deeptalking.engine.ondevice.LlmRequest,
+        onDelta: (String) -> Unit,
+    ): LlmResult {
+        var attempt = 0
+        while (true) {
+            try {
+                return collectStream(request, onDelta)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                if (attempt >= ApiRetry.MAX_API_RETRIES || !isTransientApiError(error)) throw error
+                attempt++
+                kotlinx.coroutines.delay(ApiRetry.delayFor(attempt))
+            }
+        }
+    }
+
     private suspend fun collectStream(
         request: com.deeptalking.engine.ondevice.LlmRequest,
         onDelta: (String) -> Unit,
@@ -150,6 +179,7 @@ class AgentLoop(
         val text = StringBuilder()
         var completed: LlmResult? = null
         val pending = LinkedHashMap<String, ToolCall>()
+        var failure: Throwable? = null
         try {
             llm.stream(request).collect { chunk ->
                 when (chunk) {
@@ -170,12 +200,18 @@ class AgentLoop(
             }
         } catch (cancelled: CancellationException) {
             throw cancelled
-        } catch (_: Throwable) {
-            // Fall through with whatever was accumulated before the failure.
+        } catch (error: Throwable) {
+            failure = error
         }
         val finished = completed
         if (finished != null && (finished.text.isNotBlank() || finished.toolCalls.isNotEmpty())) {
             return finished
+        }
+        // Nothing usable accumulated: surface transient transport failures so the
+        // caller can retry (legacy `performChatRequestWithRetry`). When partial
+        // content exists we keep it instead of throwing it away.
+        if (failure != null && text.isEmpty() && pending.isEmpty()) {
+            throw failure
         }
         return LlmResult(text = text.toString(), toolCalls = pending.values.toList())
     }

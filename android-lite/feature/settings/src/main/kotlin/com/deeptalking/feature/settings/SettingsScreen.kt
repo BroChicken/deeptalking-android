@@ -43,6 +43,7 @@ import androidx.compose.ui.unit.sp
 import com.deeptalking.core.designsystem.legacy
 import com.deeptalking.core.model.AppConfig
 import com.deeptalking.core.model.BuiltinPlatforms
+import com.deeptalking.core.model.PlatformSlot
 
 private val THINKING_LEVELS = listOf(
     "none" to "无",
@@ -51,6 +52,33 @@ private val THINKING_LEVELS = listOf(
     "high" to "高",
     "max" to "最高",
 )
+
+private val PLATFORM_LABELS = mapOf(
+    "deepseek" to "DeepSeek",
+    "opencode" to "OpenCode",
+    "custom" to "自定义",
+)
+
+/** Legacy `changePlatform`: persist the current platform's slot, then load the target's. */
+private fun switchPlatform(current: AppConfig, id: String): AppConfig {
+    if (id == current.apiPlatform) return current
+    val slot = PlatformSlot(baseUrl = current.apiBaseUrl, modelName = current.modelName)
+    val settings = current.platformSettings + (current.apiPlatform to slot)
+    val target = settings[id]
+    val preset = BuiltinPlatforms.firstOrNull { it.id == id }
+    val baseUrl = target?.baseUrl?.takeIf { it.isNotBlank() }
+        ?: preset?.baseUrl?.takeIf { it.isNotBlank() }
+        ?: current.apiBaseUrl
+    val model = target?.modelName?.takeIf { it.isNotBlank() }
+        ?: preset?.defaultModel?.takeIf { it.isNotBlank() }
+        ?: current.modelName
+    return current.copy(
+        apiPlatform = id,
+        apiBaseUrl = baseUrl,
+        modelName = model,
+        platformSettings = settings,
+    )
+}
 
 @Composable
 fun SettingsScreen(
@@ -66,7 +94,6 @@ fun SettingsScreen(
     var edited by remember(config) { mutableStateOf(config) }
     var apiKey by remember { mutableStateOf("") }
     var platformMenuOpen by remember { mutableStateOf(false) }
-    var modelMenuOpen by remember { mutableStateOf(false) }
     var thinkingMenuOpen by remember { mutableStateOf(false) }
 
     val models = BuiltinPlatforms.firstOrNull { it.id == edited.apiPlatform }?.models.orEmpty()
@@ -83,17 +110,14 @@ fun SettingsScreen(
 
         FieldLabel("API 平台")
         LegacyDropdown(
-            selected = edited.apiPlatform,
-            options = BuiltinPlatforms.map { it.id },
+            selected = PLATFORM_LABELS[edited.apiPlatform] ?: edited.apiPlatform,
+            options = BuiltinPlatforms.map { PLATFORM_LABELS[it.id] ?: it.id },
             expanded = platformMenuOpen,
             onExpandedChange = { platformMenuOpen = it },
-            onSelect = { id ->
-                val preset = BuiltinPlatforms.firstOrNull { it.id == id }
-                edited = edited.copy(
-                    apiPlatform = id,
-                    apiBaseUrl = preset?.baseUrl?.ifBlank { edited.apiBaseUrl } ?: edited.apiBaseUrl,
-                    modelName = preset?.defaultModel?.ifBlank { edited.modelName } ?: edited.modelName,
-                )
+            onSelect = { label ->
+                val id = PLATFORM_LABELS.entries.firstOrNull { it.value == label }?.key ?: label
+                edited = switchPlatform(edited, id)
+                apiKey = ""
                 platformMenuOpen = false
             },
         )
@@ -124,17 +148,11 @@ fun SettingsScreen(
         }
 
         FieldLabel("模型名称")
-        if (models.isEmpty()) {
-            LegacyField(value = edited.modelName, onValueChange = { edited = edited.copy(modelName = it) })
-        } else {
-            LegacyDropdown(
-                selected = edited.modelName.ifBlank { models.first() },
-                options = models,
-                expanded = modelMenuOpen,
-                onExpandedChange = { modelMenuOpen = it },
-                onSelect = { model -> edited = edited.copy(modelName = model); modelMenuOpen = false },
-            )
-        }
+        LegacyModelField(
+            value = edited.modelName,
+            suggestions = models,
+            onValueChange = { edited = edited.copy(modelName = it) },
+        )
 
         FieldLabel("Temperature")
         LegacyField(
@@ -158,9 +176,21 @@ fun SettingsScreen(
             },
         )
 
-        CheckRow("角色主动开口", edited.proactiveEnabled) { edited = edited.copy(proactiveEnabled = it) }
-        CheckRow("文风自动校对", edited.styleCritique) { edited = edited.copy(styleCritique = it) }
-        CheckRow("快速回应视角校正", edited.quickReplyRepair) { edited = edited.copy(quickReplyRepair = it) }
+        CheckRow(
+            "角色主动开口",
+            edited.proactiveEnabled,
+            hint = "打开面板停留约 1 分钟未对话时，角色主动发起开场",
+        ) { edited = edited.copy(proactiveEnabled = it) }
+        CheckRow(
+            "文风自动校对",
+            edited.styleCritique,
+            hint = "回复命中语气/风格问题时，追加一次只改文风的修订请求",
+        ) { edited = edited.copy(styleCritique = it) }
+        CheckRow(
+            "快速回应视角校正",
+            edited.quickReplyRepair,
+            hint = "快速回应不像用户会说的话时，后台用“用户本人”身份重写一次",
+        ) { edited = edited.copy(quickReplyRepair = it) }
 
         LegacyButton("测试提醒", modifier = Modifier.fillMaxWidth(), onClick = onTestReminder)
 
@@ -264,21 +294,71 @@ private fun LegacyButton(label: String, onClick: () -> Unit, modifier: Modifier 
 }
 
 @Composable
-private fun CheckRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier.fillMaxWidth().clickable { onChange(!checked) },
-    ) {
-        Checkbox(
-            checked = checked,
-            onCheckedChange = onChange,
-            colors = CheckboxDefaults.colors(
-                checkedColor = MaterialTheme.legacy.accent,
-                uncheckedColor = MaterialTheme.legacy.textMuted,
-                checkmarkColor = MaterialTheme.legacy.panel,
-            ),
-        )
-        Text(label, fontSize = 12.sp, color = MaterialTheme.legacy.textMuted)
+private fun CheckRow(label: String, checked: Boolean, hint: String? = null, onChange: (Boolean) -> Unit) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth().clickable { onChange(!checked) },
+        ) {
+            Checkbox(
+                checked = checked,
+                onCheckedChange = onChange,
+                colors = CheckboxDefaults.colors(
+                    checkedColor = MaterialTheme.legacy.accent,
+                    uncheckedColor = MaterialTheme.legacy.textMuted,
+                    checkmarkColor = MaterialTheme.legacy.panel,
+                ),
+            )
+            Text(label, fontSize = 12.sp, color = MaterialTheme.legacy.textMuted)
+        }
+        if (hint != null) {
+            Text(
+                hint,
+                fontSize = 11.sp,
+                color = MaterialTheme.legacy.textMuted.copy(alpha = 0.8f),
+                modifier = Modifier.padding(start = 40.dp, top = 1.dp),
+            )
+        }
+    }
+}
+
+/** Legacy `<input list>` model field: typable, with a dropdown of platform presets. */
+@Composable
+private fun LegacyModelField(value: String, suggestions: List<String>, onValueChange: (String) -> Unit) {
+    val legacy = MaterialTheme.legacy
+    var open by remember { mutableStateOf(false) }
+    Box(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(8.dp))
+                .background(legacy.input)
+                .border(1.dp, legacy.inputBorder, RoundedCornerShape(8.dp))
+                .padding(horizontal = 8.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            BasicTextField(
+                value = value,
+                onValueChange = onValueChange,
+                textStyle = TextStyle(fontSize = 13.sp, color = legacy.text),
+                cursorBrush = SolidColor(legacy.accent),
+                singleLine = true,
+                modifier = Modifier.weight(1f),
+            )
+            if (suggestions.isNotEmpty()) {
+                Text("▾", fontSize = 13.sp, color = legacy.textMuted, modifier = Modifier.clickable { open = true })
+            }
+        }
+        if (suggestions.isNotEmpty()) {
+            androidx.compose.material3.DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+                suggestions.forEach { suggestion ->
+                    androidx.compose.material3.DropdownMenuItem(
+                        text = { Text(suggestion, color = legacy.text) },
+                        onClick = { onValueChange(suggestion); open = false },
+                    )
+                }
+            }
+        }
     }
 }
 

@@ -38,6 +38,5 @@ include(":engine:ondevice")
 // Features
 include(":feature:chat")
 include(":feature:characters")
-include(":feature:memory")
 include(":feature:settings")
 include(":feature:richtext")

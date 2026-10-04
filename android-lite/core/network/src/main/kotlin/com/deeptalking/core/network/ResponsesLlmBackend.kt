@@ -1,5 +1,6 @@
 package com.deeptalking.core.network
 
+import com.deeptalking.core.model.BuiltinPlatforms
 import com.deeptalking.engine.ondevice.LlmBackend
 import com.deeptalking.engine.ondevice.LlmChunk
 import com.deeptalking.engine.ondevice.LlmRequest
@@ -43,8 +44,6 @@ class ResponsesLlmBackend(
     override val id: String = "responses",
 ) : LlmBackend {
 
-    private val endpoint: String = baseUrl.trimEnd('/') + "/responses"
-
     private val client: OkHttpClient = OkHttpClient.Builder()
         .readTimeout(90, TimeUnit.SECONDS)
         .build()
@@ -60,7 +59,7 @@ class ResponsesLlmBackend(
 
     override suspend fun complete(request: LlmRequest): LlmResult = withContext(Dispatchers.IO) {
         val payload = buildBody(request, stream = false)
-        client.newCall(newRequest(payload)).execute().use { response ->
+        client.newCall(newRequest(payload, request, stream = false)).execute().use { response ->
             val body = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
                 throw IllegalStateException("Responses API HTTP ${response.code}: ${body.take(500)}")
@@ -72,7 +71,7 @@ class ResponsesLlmBackend(
 
     override fun stream(request: LlmRequest): Flow<LlmChunk> = callbackFlow {
         val payload = buildBody(request, stream = true)
-        val httpRequest = newRequest(payload)
+        val httpRequest = newRequest(payload, request, stream = true)
         val factory = EventSources.createFactory(client)
 
         var pendingCallId: String? = null
@@ -166,13 +165,26 @@ class ResponsesLlmBackend(
         awaitClose { eventSource.cancel() }
     }
 
-    private fun newRequest(payload: String): Request {
+    private fun newRequest(payload: String, request: LlmRequest, stream: Boolean): Request {
         val builder = Request.Builder()
-            .url(endpoint)
+            .url(endpointFor(request.apiPlatform))
             .addHeader("Content-Type", "application/json")
+        if (stream) builder.addHeader("Accept", "text/event-stream")
         apiKeyProvider()?.let { builder.addHeader("Authorization", "Bearer $it") }
+        // OpenCode Go gateway mandates a stable per-session header; missing it
+        // returns 400 MissingSessionID (legacy `buildApiHeaders`).
+        opencodeSessionHeader(request.apiPlatform, request.sessionId)?.let { (name, value) ->
+            builder.addHeader(name, value)
+        }
         return builder.post(payload.toRequestBody(JSON_MEDIA_TYPE)).build()
     }
+
+    /**
+     * Mirrors the legacy `getResponsesEndpoint`: DeepSeek's `/responses` lives at
+     * the host root (strip a trailing `/v1`), while the OpenCode Go gateway keeps
+     * `/v1` as part of its path (`keepV1InResponses`).
+     */
+    private fun endpointFor(platform: String?): String = responsesEndpoint(baseUrl, platform)
 
     private fun buildBody(request: LlmRequest, stream: Boolean): String {
         val input = request.input.map { message ->
@@ -250,3 +262,25 @@ class ResponsesLlmBackend(
 private fun JsonElement?.str(): String? = (this as? JsonPrimitive)?.contentOrNull
 
 private fun JsonElement?.obj(): JsonObject? = this as? JsonObject
+
+/**
+ * Resolves the final Responses endpoint for a platform, mirroring the legacy
+ * `getResponsesEndpoint` (`src/js/prompts/request.js`): a trailing
+ * `/chat/completions` is dropped, then `/v1` is stripped unless the platform
+ * keeps it (`opencode` Go gateway), and `/responses` is appended.
+ */
+internal fun responsesEndpoint(baseUrl: String, platform: String?): String {
+    var base = baseUrl.trim().trimEnd('/')
+    base = base.replace(Regex("/chat/completions$", RegexOption.IGNORE_CASE), "").trimEnd('/')
+    val keepV1 = platform != null && BuiltinPlatforms.firstOrNull { it.id == platform }?.keepV1InResponses == true
+    if (!keepV1) base = base.replace(Regex("/v1$", RegexOption.IGNORE_CASE), "")
+    return base + "/responses"
+}
+
+/**
+ * The OpenCode Go gateway requires a stable `x-opencode-session` header; a
+ * missing value returns `400 MissingSessionID`. Returns null for other
+ * platforms (legacy `buildApiHeaders`).
+ */
+internal fun opencodeSessionHeader(platform: String?, sessionId: String?): Pair<String, String>? =
+    if (platform == "opencode") "x-opencode-session" to (sessionId ?: "deeptalking-general") else null

@@ -3,6 +3,7 @@ package com.deeptalking.domain.agent
 import com.deeptalking.core.model.AppConfig
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
+import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.StaticProfile
@@ -34,6 +35,8 @@ data class OrchestratorResult(
     val staticChanges: List<String> = emptyList(),
     /** Lorebook entry names created/updated this turn (legacy `lorebookChanges`). */
     val lorebookChanges: List<String> = emptyList(),
+    /** File ref of a sticker the character chose to send this turn, if any. */
+    val stickerFileRef: String? = null,
     /** Raw (pre-processing) model reply, for the settings debug panel. */
     val rawReply: String = "",
     /** Token usage of the last model request, when reported. */
@@ -123,7 +126,10 @@ class ChatOrchestrator(
         // Tool-driven edits win first; memory deltas fold onto that copy.
         // The pending recall surfaced in this turn's volatile context is consumed here;
         // applyMemory may set a fresh one from this turn's `recall`.
-        val base = (outcome.updatedCharacter ?: character).copy(pendingRecall = null)
+        val base = bumpLorebookMentions(
+            outcome.updatedCharacter ?: character,
+            memory.selectLorebook(character, userText),
+        ).copy(pendingRecall = null)
         val updated = applyMemory(base, parsed)
 
         // The visible reply may be replaced by the style critique before it is shown,
@@ -159,6 +165,7 @@ class ChatOrchestrator(
             proactive = proactive,
             staticChanges = diffStaticChanges(character, updated),
             lorebookChanges = diffLorebookChanges(character, updated),
+            stickerFileRef = outcome.stickerFileRef,
             rawReply = outcome.text,
             inputTokens = outcome.usage?.inputTokens ?: 0,
             outputTokens = outcome.usage?.outputTokens ?: 0,
@@ -184,6 +191,20 @@ class ChatOrchestrator(
             }
             .map { it.name.ifBlank { "未命名条目" } }
             .distinct()
+    }
+
+    /** Bumps `mentions`/`lastMentionedAt` on entries injected this turn (legacy lorebook hit tracking). */
+    private fun bumpLorebookMentions(character: Character, injected: List<LorebookEntry>): Character {
+        if (injected.isEmpty()) return character
+        val ids = injected.map { it.id }.toSet()
+        val now = java.time.Instant.now().toString()
+        fun bump(list: List<LorebookEntry>) = list.map {
+            if (it.id in ids) it.copy(mentions = it.mentions + 1, lastMentionedAt = now) else it
+        }
+        return character.copy(
+            lorebook = bump(character.lorebook),
+            members = character.members.map { it.copy(lorebook = bump(it.lorebook)) },
+        )
     }
 
     private fun staticValue(profile: StaticProfile, key: String): String = when (key) {

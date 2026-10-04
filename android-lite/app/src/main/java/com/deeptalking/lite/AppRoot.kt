@@ -21,7 +21,9 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Group
 import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -98,6 +100,7 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     var sidebarTab by remember { mutableIntStateOf(0) }
     var editingCharacter by remember { mutableStateOf<com.deeptalking.core.model.Character?>(null) }
+    var editingMemberIndex by remember { mutableStateOf<Int?>(null) }
     val snackbarHostState = remember { SnackbarHostState() }
 
     LaunchedEffect(Unit) {
@@ -156,8 +159,8 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
             ) {
                 // .tab-btn row (角色 | 设置)
                 Row(modifier = Modifier.fillMaxWidth().background(legacy.sidebar)) {
-                    SidebarTab("角色", selected = sidebarTab == 0, modifier = Modifier.weight(1f)) { sidebarTab = 0 }
-                    SidebarTab("设置", selected = sidebarTab == 1, modifier = Modifier.weight(1f)) { sidebarTab = 1 }
+                    SidebarTab("角色", Icons.Default.Group, selected = sidebarTab == 0, modifier = Modifier.weight(1f)) { sidebarTab = 0 }
+                    SidebarTab("设置", Icons.Default.Tune, selected = sidebarTab == 1, modifier = Modifier.weight(1f)) { sidebarTab = 1 }
                 }
                 Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(legacy.border))
                 if (sidebarTab == 0) {
@@ -172,11 +175,12 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                         onCreateCharacter = { name, emoji, personality, background ->
                             vm.createCharacter(name, emoji, personality, background)
                         },
-                        onCreateGroup = { name, emoji, description, scene, members ->
-                            vm.createGroup(name, emoji, description, scene, members)
+                        onCreateGroup = { name, emoji, description, scene, rules, members ->
+                            vm.createGroup(name, emoji, description, scene, rules, members)
                         },
                         onDelete = vm::deleteCharacter,
-                        onEdit = { editingCharacter = it },
+                        onEdit = { editingCharacter = it; editingMemberIndex = null },
+                        onEditMember = { char, index -> editingCharacter = char; editingMemberIndex = index },
                         onExport = export,
                         onImport = import,
                         onQuickGenerate = { prompt, cb -> vm.quickGenerate(prompt, cb) },
@@ -186,7 +190,7 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                 } else {
                     SettingsScreen(
                         config = config,
-                        hasApiKey = vm.hasApiKey(),
+                        hasApiKey = vm.hasApiKey(config.apiPlatform),
                         testResult = vm.testResult.collectAsState().value,
                         onSave = vm::saveSettings,
                         onTestReminder = vm::testReminder,
@@ -237,19 +241,26 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
     editingCharacter?.let { target ->
         com.deeptalking.feature.characters.CharacterEditorHost(
             character = characters.firstOrNull { it.id == target.id } ?: target,
-            onDismiss = { editingCharacter = null },
+            onDismiss = { editingCharacter = null; editingMemberIndex = null },
             onUpdate = vm::updateCharacter,
             onAddLorebook = vm::addLorebookEntry,
             onRemoveLorebook = vm::removeLorebookEntry,
             onUpdateLorebook = vm::updateLorebookEntry,
             onGenerateAvatar = { char, cb -> vm.generateEmojiAvatar(char, cb) },
             onFillMember = { char, index, hint -> vm.fillGroupMember(char, index, hint) },
+            initialMemberIndex = editingMemberIndex,
         )
     }
 }
 
 @Composable
-private fun SidebarTab(label: String, selected: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
+private fun SidebarTab(
+    label: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    selected: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
     val legacy = MaterialTheme.legacy
     Column(
         modifier = modifier
@@ -258,12 +269,21 @@ private fun SidebarTab(label: String, selected: Boolean, modifier: Modifier = Mo
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
-        Text(
-            label,
-            fontSize = 14.sp,
-            fontWeight = FontWeight.Medium,
-            color = if (selected) legacy.accent else legacy.textSecondary,
-        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                icon,
+                contentDescription = null,
+                tint = if (selected) legacy.accent else legacy.textSecondary,
+                modifier = Modifier.size(15.dp),
+            )
+            Spacer(Modifier.width(4.dp))
+            Text(
+                label,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium,
+                color = if (selected) legacy.accent else legacy.textSecondary,
+            )
+        }
         Box(
             modifier = Modifier
                 .padding(top = 6.dp)
@@ -354,8 +374,8 @@ private fun AppHeader(
 private fun CachePill(config: com.deeptalking.core.model.AppConfig) {
     val legacy = MaterialTheme.legacy
     val metrics = config.requestMetrics
+    if (metrics.isEmpty()) return
     val text = when {
-        metrics.isEmpty() -> "缓存 --"
         metrics.none { it.inputTokens > 0 } -> "缓存未返回命中数据"
         else -> {
             val recent = metrics.takeLast(12).filter { it.inputTokens > 0 }

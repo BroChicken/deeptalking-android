@@ -34,6 +34,14 @@ data class LlmRequest(
     val maxOutputTokens: Int? = null,
     val stream: Boolean = false,
     val reasoningEffort: String? = null,
+    /**
+     * Current API platform id (`deepseek` / `opencode` / `custom`). The OpenCode
+     * Go gateway requires a stable `x-opencode-session` header on every request
+     * (legacy `buildApiHeaders`, missing otherwise returns 400 MissingSessionID).
+     */
+    val apiPlatform: String? = null,
+    /** Stable session id (`deeptalking-<charId>` / `deeptalking-general`). */
+    val sessionId: String? = null,
 )
 
 data class ToolCall(

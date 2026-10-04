@@ -10,6 +10,7 @@ import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.LorebookOrigin
 import com.deeptalking.core.model.MemoryCategory
 import com.deeptalking.core.model.MemorySubject
+import com.deeptalking.core.model.PlatformSlot
 import com.deeptalking.core.model.MessageAttachment
 import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.Role
@@ -122,6 +123,8 @@ fun mapLorebook(dto: LegacyLorebookEntry): LorebookEntry = LorebookEntry(
     origin = if (dto.origin == "ai") LorebookOrigin.Model else LorebookOrigin.User,
     createdAt = null,
     updatedAt = dto.lastMentionedAt,
+    mentions = (dto.mentions ?: 0.0).toInt().coerceAtLeast(0),
+    lastMentionedAt = dto.lastMentionedAt,
     misses = (dto.misses ?: 0.0).toInt().coerceAtLeast(0),
 )
 
@@ -349,5 +352,11 @@ fun mapConfig(dto: LegacyConfig?): AppConfig {
         proactiveEnabled = dto.proactiveEnabled ?: true,
         styleCritique = dto.styleCritique ?: true,
         quickReplyRepair = dto.quickReplyRepair ?: true,
+        platformSettings = dto.platformSettings.orEmpty().mapValues { (_, slot) ->
+            PlatformSlot(
+                baseUrl = slot.baseUrl?.trim()?.trimEnd('/').orEmpty(),
+                modelName = slot.modelName?.trim().orEmpty(),
+            )
+        }.filterValues { it.baseUrl.isNotEmpty() || it.modelName.isNotEmpty() },
     )
 }

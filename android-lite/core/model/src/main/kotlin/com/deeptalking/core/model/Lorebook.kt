@@ -22,5 +22,10 @@ data class LorebookEntry(
     val memberName: String? = null,
     val createdAt: String? = null,
     val updatedAt: String? = null,
+    /** Times this entry was injected into context (legacy `mentions`). */
+    val mentions: Int = 0,
+    /** When the entry was last injected (legacy `lastMentionedAt`). */
+    val lastMentionedAt: String? = null,
+    /** Consecutive consolidation passes without a hit (legacy `misses`). */
     val misses: Int = 0,
 )

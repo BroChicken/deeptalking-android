@@ -21,9 +21,8 @@ DeepTalking 是原生 Android 应用（Kotlin + Jetpack Compose 多模块），�
 | `:domain:memory` | domain | `MemoryService` + `MemoryServiceImpl`、检索/世界书匹配/记忆策略/时间工具 |
 | `:engine:ondevice` | engine | 端侧推理接口：`LlmBackend/EmbeddingBackend/AsrBackend/TtsBackend` + `InferenceRegistry` |
 | `:feature:chat` | feature | 聊天界面：头像/气泡（尾角圆角）/流式打字/工具活动/快速回应/图片/表情包（含标签编辑）/消息操作（复制、编辑重发、重新生成）/⚡📖 状态改动提示/图片灯箱。**性能**：消息仅在有公式时才用 `RichTextWebView`，其余走纯 Compose `RichText`（`renderMarkdownAnnotated`），配合稳定 `key` 保证滚动顺滑 |
-| `:feature:characters` | feature | 角色/群组列表、创建弹窗（单角色/群组 + 一句话生成）、角色卡编辑器（基础/当前状态/世界书/**记忆** 四标签；世界书每条含 **启用** + **常驻** 两勾选、条目名、命中显示、来源标签；记忆以条目卡片列表展示）、AI emoji 头像、成员一句话补全、升级为群组、导出/导入、补全头像 |
-| `:feature:memory` | feature | （已并入角色卡「记忆」标签；本模块保留供扩展） |
-| `:feature:settings` | feature | 平台下拉、Base URL、模型预设下拉、Temperature、流式、思考强度、API Key、测试连接、测试提醒、调试信息（最近回应/用量/缓存）+ 复制 |
+| `:feature:characters` | feature | 角色/群组列表（群组展开成员子行，可直接编辑成员）、创建弹窗（单角色/群组 + 一句话生成）、角色卡编辑器（基础/当前状态/世界书 **三** 标签，不再有记忆可视化页；世界书每条含 **启用** + **常驻** 两勾选、条目名、命中次数/最近命中时间、来源标签）、AI emoji 头像、成员一句话补全、升级为群组、导出/导入、补全头像（含群组成员） |
+| `:feature:settings` | feature | 平台下拉（显示名；切换时按平台独立保存 Base URL/模型/API Key）、Base URL、模型（可输入 + 预设建议）、Temperature、流式、思考强度、API Key、测试连接、测试提醒、调试信息（最近回应/用量/缓存）+ 复制 |
 | `:feature:richtext` | feature | `MarkdownRenderer`（纯 Kotlin）+ `RichTextWebView`（KaTeX 早渲染） |
 
 依赖方向：`app → feature → domain → core/engine`。core/engine 不反依赖上层。
@@ -45,7 +44,8 @@ DeepTalking 是原生 Android 应用（Kotlin + Jetpack Compose 多模块），�
 ## 数据与迁移
 
 - 数据唯一入口：`:core:data` 仓库层（Room + DataStore）。禁止绕过仓库访问数据库。
-- 旧版 WebView 的 localStorage 数据通过 `legacy/LegacyImportService` 一次性导入；`legacy/BackupService` 保留旧 JSON 根结构（`{config, characters, activeCharacterId, activeTheme, version}`）的导入导出。UI 通过系统文件选择器（SAF）导出/导入备份，`activeTheme` 随备份往返。
+- 旧版 WebView 的 localStorage 数据通过 `legacy/LegacyImportService` 一次性导入；`legacy/BackupService` 保留旧 JSON 根结构（`{config, characters, activeCharacterId, activeTheme, version}`）的导入导出，导出时每个角色的会话从聊天表（`ChatRepository`）读入 `memory.instant`，不再依赖 `character.instant`。UI 通过系统文件选择器（SAF）导出/导入备份。
+- 每平台配置槽 `AppConfig.platformSettings` 保存非密的 Base URL/模型；API Key 走 `SecretStore` 的按平台键（切换平台互不覆盖）。
 - 媒体/表情以文件（`filesDir`）存放（`app/MediaStore`：图片压到 ≤1280px/2MB，表情 ≤384px/120KB），不再以 base64 进库。
 - API Key 存 `:core:security` 的 `SecretStore`（Keystore），UI 只见脱敏状态；导出时剔除。
 

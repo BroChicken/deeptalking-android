@@ -124,7 +124,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         }
     }
 
-    fun createGroup(name: String, emoji: String, description: String, scene: String, members: List<GroupMember>) {
+    fun createGroup(name: String, emoji: String, description: String, scene: String, rules: String, members: List<GroupMember>) {
         viewModelScope.launch {
             val group = Character(
                 id = UUID.randomUUID().toString(),
@@ -132,6 +132,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 emoji = emoji.ifBlank { "👥" },
                 description = description,
                 isGroup = true,
+                interactionRules = rules,
                 groupSharedDynamic = com.deeptalking.core.model.DynamicState(currentLocation = scene),
                 members = members,
                 createdAt = Instant.now().toString(),
@@ -280,14 +281,6 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         )
     }
 
-    fun deleteLongTerm(character: Character, memoryId: String) {
-        updateCharacter(character.copy(longTerm = character.longTerm.filterNot { it.id == memoryId }))
-    }
-
-    fun deleteShortTerm(character: Character, memoryId: String) {
-        updateCharacter(character.copy(shortTerm = character.shortTerm.filterNot { it.id == memoryId }))
-    }
-
     // ----------------------------------------------------------------- stickers
 
     fun addSticker(uri: Uri) {
@@ -359,34 +352,69 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         }
     }
 
-    /** Repairs default/damaged emoji avatars via the LLM. */
+    /** Repairs default/damaged emoji avatars (characters + group members) via the LLM. */
     fun repairAvatars() {
         viewModelScope.launch {
             val cfg = runCatching { core.currentConfig() }.getOrNull() ?: return@launch
-            if (core.secrets.getApiKey().isNullOrBlank()) {
+            if (core.secrets.getApiKey(cfg.apiPlatform).isNullOrBlank() && core.secrets.getApiKey().isNullOrBlank()) {
                 eventsState.tryEmit(UiEvent("请先在设置页配置 API Key，再补全头像"))
                 return@launch
             }
             val all = core.data.characters.observeAll().first()
-            val jobs = all.filter { needsRepair(it.emoji) }
-            if (jobs.isEmpty()) {
-                eventsState.tryEmit(UiEvent("所有角色都已使用 emoji 头像，无需补全"))
-                return@launch
-            }
             var done = 0
-            for (character in jobs) {
-                val emoji = runCatching { core.generateEmojiAvatar(cfg, character) }.getOrNull() ?: continue
-                if (emoji.isNotBlank()) {
-                    core.data.characters.upsert(character.copy(emoji = emoji))
-                    done++
+            for (character in all) {
+                var updated = character
+                var changed = false
+                if (needsRepair(character.emoji)) {
+                    val emoji = runCatching { core.generateEmojiAvatar(cfg, character) }.getOrNull()
+                    if (!emoji.isNullOrBlank()) {
+                        updated = updated.copy(emoji = emoji)
+                        changed = true
+                        done++
+                    }
                 }
+                if (character.members.isNotEmpty()) {
+                    val members = updated.members.toMutableList()
+                    var memberChanged = false
+                    members.forEachIndexed { index, member ->
+                        if (needsRepair(member.emoji)) {
+                            val probe = Character(
+                                id = member.id,
+                                name = member.name,
+                                emoji = member.emoji,
+                                staticProfile = member.staticProfile,
+                            )
+                            val emoji = runCatching { core.generateEmojiAvatar(cfg, probe) }.getOrNull()
+                            if (!emoji.isNullOrBlank()) {
+                                members[index] = member.copy(emoji = emoji)
+                                memberChanged = true
+                                done++
+                            }
+                        }
+                    }
+                    if (memberChanged) {
+                        updated = updated.copy(members = members)
+                        changed = true
+                    }
+                }
+                if (changed) core.data.characters.upsert(updated)
             }
-            eventsState.tryEmit(UiEvent("已生成 $done 个 emoji 头像"))
+            if (done == 0) {
+                eventsState.tryEmit(UiEvent("所有角色都已使用 emoji 头像，无需补全"))
+            } else {
+                eventsState.tryEmit(UiEvent("已生成 $done 个 emoji 头像"))
+            }
         }
     }
 
-    private fun needsRepair(emoji: String): Boolean =
-        emoji.isBlank() || emoji == "👤" || emoji == "👥" || emoji == "🙂" || emoji.all { it.code < 128 }
+    /** Legacy `isAvatarDamaged`: empty, placeholder, replacement char, or ASCII-only. */
+    private fun needsRepair(emoji: String): Boolean {
+        val v = emoji.trim()
+        if (v.isEmpty()) return true
+        if (v == "👤" || v == "👥") return true
+        if (v.contains('?') || v.contains('\uFFFD')) return true
+        return v.none { it.code > 127 }
+    }
 
     // ---------------------------------------------------------------- messaging
 
@@ -462,6 +490,18 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                         lorebookChanges = result.lorebookChanges,
                     ),
                 )
+                result.stickerFileRef?.let { ref ->
+                    core.data.chat.append(
+                        id,
+                        ChatMessage(
+                            id = UUID.randomUUID().toString(),
+                            role = Role.Assistant,
+                            content = "",
+                            timestamp = Instant.now().toString(),
+                            attachments = listOf(MessageAttachment(MessageAttachment.Kind.Sticker, ref)),
+                        ),
+                    )
+                }
                 core.data.characters.upsert(result.updatedCharacter)
                 quickRepliesState.value = result.quickReplies
                 statusState.value = ""
@@ -558,7 +598,10 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     fun saveSettings(newConfig: AppConfig, apiKey: String?) {
         viewModelScope.launch {
             core.data.config.update(newConfig)
-            if (!apiKey.isNullOrBlank()) core.secrets.setApiKey(apiKey)
+            if (!apiKey.isNullOrBlank()) {
+                core.secrets.setApiKey(newConfig.apiPlatform, apiKey)
+                core.secrets.setApiKey(apiKey)
+            }
         }
     }
 
@@ -568,7 +611,8 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
 
     fun testReminder() = core.scheduleTestReminder()
 
-    fun hasApiKey(): Boolean = !core.secrets.getApiKey().isNullOrBlank()
+    fun hasApiKey(platform: String = ""): Boolean =
+        !core.secrets.getApiKey(platform).isNullOrBlank() || !core.secrets.getApiKey().isNullOrBlank()
 
     private val testResultState = MutableStateFlow<String?>(null)
     val testResult: StateFlow<String?> = testResultState
@@ -576,7 +620,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     fun testApiConnection(config: AppConfig) {
         viewModelScope.launch {
             testResultState.value = "测试中…"
-            val key = core.secrets.getApiKey()
+            val key = core.secrets.getApiKey(config.apiPlatform) ?: core.secrets.getApiKey()
             testResultState.value = if (key.isNullOrBlank()) {
                 "未配置 API Key"
             } else {

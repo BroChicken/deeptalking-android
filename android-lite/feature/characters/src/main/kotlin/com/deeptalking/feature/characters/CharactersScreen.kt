@@ -6,8 +6,10 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -99,9 +101,10 @@ fun CharactersScreen(
     generating: Boolean,
     onSelect: (String) -> Unit,
     onCreateCharacter: (name: String, emoji: String, personality: String, background: String) -> Unit,
-    onCreateGroup: (name: String, emoji: String, description: String, scene: String, members: List<GroupMember>) -> Unit,
+    onCreateGroup: (name: String, emoji: String, description: String, scene: String, rules: String, members: List<GroupMember>) -> Unit,
     onDelete: (String) -> Unit,
     onEdit: (Character) -> Unit,
+    onEditMember: (Character, Int) -> Unit,
     onExport: () -> Unit,
     onImport: () -> Unit,
     onQuickGenerate: (String, (String?) -> Unit) -> Unit,
@@ -139,6 +142,7 @@ fun CharactersScreen(
                     active = character.id == activeId,
                     onSelect = { onSelect(character.id) },
                     onEdit = { onEdit(character) },
+                    onEditMember = { index -> onEditMember(character, index) },
                     onUpgrade = { onUpgradeToGroup(character) },
                     onDelete = { deleteTarget = character },
                 )
@@ -164,8 +168,8 @@ fun CharactersScreen(
                 onCreateCharacter(n, e, p, b)
                 createOpen = false
             },
-            onCreateGroup = { n, e, d, s, m ->
-                onCreateGroup(n, e, d, s, m)
+            onCreateGroup = { n, e, d, s, r, m ->
+                onCreateGroup(n, e, d, s, r, m)
                 createOpen = false
             },
         )
@@ -217,6 +221,7 @@ private fun CharacterCard(
     active: Boolean,
     onSelect: () -> Unit,
     onEdit: () -> Unit,
+    onEditMember: (Int) -> Unit,
     onUpgrade: () -> Unit,
     onDelete: () -> Unit,
 ) {
@@ -273,6 +278,47 @@ private fun CharacterCard(
             }
             CardAction(Icons.Default.Delete, "删除角色", androidx.compose.ui.graphics.Color(0xFFEF4444), onDelete)
         }
+        if (character.isGroup && character.members.isNotEmpty()) {
+            Spacer(Modifier.height(6.dp))
+            Row(modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min).padding(start = 20.dp)) {
+                Box(modifier = Modifier.width(1.dp).fillMaxHeight().background(legacy.border))
+                Column(
+                    modifier = Modifier.padding(start = 12.dp).weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    character.members.forEachIndexed { index, member ->
+                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                            Surface(shape = CircleShape, color = legacy.accentBg, modifier = Modifier.size(24.dp)) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    Text(member.emoji.ifEmpty { "👤" }, fontSize = 13.sp)
+                                }
+                            }
+                            Spacer(Modifier.width(8.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    member.name.ifEmpty { "未命名成员" },
+                                    fontSize = 12.sp,
+                                    color = legacy.text,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                val sub = member.roleInGroup.ifEmpty { member.staticProfile.personality }
+                                if (sub.isNotBlank()) {
+                                    Text(
+                                        sub,
+                                        fontSize = 11.sp,
+                                        color = legacy.textMuted,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                            }
+                            CardAction(Icons.Default.Edit, "编辑成员角色卡", legacy.textMuted) { onEditMember(index) }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -294,7 +340,7 @@ private fun CreateDialog(
     onQuickGenerate: (String, (String?) -> Unit) -> Unit,
     onDismiss: () -> Unit,
     onCreateCharacter: (String, String, String, String) -> Unit,
-    onCreateGroup: (String, String, String, String, List<GroupMember>) -> Unit,
+    onCreateGroup: (String, String, String, String, String, List<GroupMember>) -> Unit,
 ) {
     val legacy = MaterialTheme.legacy
     var isGroup by remember { mutableStateOf(false) }
@@ -375,6 +421,9 @@ private fun CreateDialog(
                     LegacyField(value = groupScene, onValueChange = { groupScene = it }, label = "共同场景", minLines = 2)
                     LegacyField(value = groupRules, onValueChange = { groupRules = it }, label = "成员互动规则", minLines = 2)
                     LegacyField(value = membersText, onValueChange = { membersText = it }, label = "群成员", placeholder = "每行：名称｜性格简述", minLines = 3)
+                    if (membersText.isNotBlank() && parseMembers(membersText).size < 2) {
+                        Text("群组至少需要两名成员", fontSize = 12.sp, color = legacy.warning)
+                    }
                 } else {
                     LegacyField(value = personality, onValueChange = { personality = it }, label = "性格简述", minLines = 2)
                     LegacyField(value = background, onValueChange = { background = it }, label = "背景故事", minLines = 3)
@@ -387,14 +436,14 @@ private fun CreateDialog(
                     if (isGroup) {
                         val members = parseMembers(membersText)
                         if (name.isNotBlank() && members.size >= 2) {
-                            onCreateGroup(name.trim(), emoji.trim(), groupDescription.trim(), groupScene.trim(), members)
+                            onCreateGroup(name.trim(), emoji.trim(), groupDescription.trim(), groupScene.trim(), groupRules.trim(), members)
                         }
                     } else if (name.isNotBlank()) {
                         onCreateCharacter(name.trim(), emoji.trim(), personality.trim(), background.trim())
                     }
                 },
                 enabled = name.isNotBlank(),
-            ) { Text(if (isGroup) "创建角色" else "创建角色") }
+            ) { Text("创建角色") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
     )
@@ -413,6 +462,7 @@ object CharacterEditorHost {
         onUpdateLorebook: (Character, LorebookEntry) -> Unit,
         onGenerateAvatar: (Character, (String?) -> Unit) -> Unit,
         onFillMember: (Character, Int, String) -> Unit,
+        initialMemberIndex: Int? = null,
     ) = CharacterEditorDialog(
         character = character,
         onDismiss = onDismiss,
@@ -422,6 +472,7 @@ object CharacterEditorHost {
         onUpdateLorebook = onUpdateLorebook,
         onGenerateAvatar = onGenerateAvatar,
         onFillMember = onFillMember,
+        initialMemberIndex = initialMemberIndex,
     )
 }
 
@@ -435,11 +486,12 @@ fun CharacterEditorDialog(
     onUpdateLorebook: (Character, LorebookEntry) -> Unit,
     onGenerateAvatar: (Character, (String?) -> Unit) -> Unit,
     onFillMember: (Character, Int, String) -> Unit,
+    initialMemberIndex: Int? = null,
 ) {
     val legacy = MaterialTheme.legacy
     var tab by remember { mutableIntStateOf(0) }
     var draft by remember(character.id) { mutableStateOf(character) }
-    var memberIndex by remember(character.id) { mutableStateOf<Int?>(null) }
+    var memberIndex by remember(character.id) { mutableStateOf(initialMemberIndex) }
     val editingMember = memberIndex?.let { draft.members.getOrNull(it) }
 
     val title = when {
@@ -464,7 +516,6 @@ fun CharacterEditorDialog(
                     ModalTab("基础设定", tab == 0, Modifier.weight(1f)) { tab = 0 }
                     ModalTab("当前状态", tab == 1, Modifier.weight(1f)) { tab = 1 }
                     ModalTab("世界书", tab == 2, Modifier.weight(1f)) { tab = 2 }
-                    ModalTab("记忆", tab == 3, Modifier.weight(1f)) { tab = 3 }
                 }
                 Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(legacy.border))
                 Spacer(Modifier.height(10.dp))
@@ -488,7 +539,6 @@ fun CharacterEditorDialog(
                             onRemoveLorebook = onRemoveLorebook,
                             onUpdateLorebook = onUpdateLorebook,
                         )
-                        else -> MemoryTab(draft = draft, editingMember = editingMember)
                     }
                 }
             }
@@ -640,11 +690,6 @@ private fun StateTab(draft: Character, memberIndex: Int?, onDraft: (Character) -
     }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(
-            "这些字段反映角色当前状态。你可以直接修改；AI 只会根据对话中明确的用户信息更新。",
-            fontSize = 12.sp,
-            color = MaterialTheme.legacy.textMuted,
-        )
         fields.forEach { (key, label) ->
             LegacyField(
                 value = dynamicValue(state, key),
@@ -666,11 +711,6 @@ private fun LorebookTab(
 ) {
     val legacy = MaterialTheme.legacy
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Text(
-            "世界书是世界层设定的唯一去处（时代与世界观、地点、组织、专有名词、历史、规则）。每条可选常驻（每轮都注入）或关键词命中（被提到才注入，更省 token）。条目由 AI 在剧情推进中自动维护，你可以随时修改、禁用或删除；你手改过的条目会被锁定，AI 不会再覆盖它。",
-            fontSize = 12.sp,
-            color = legacy.textMuted,
-        )
         if (draft.lorebook.isEmpty()) {
             Text("还没有条目。可以让 AI 在建卡时生成，或在对话中自动补充。", fontSize = 12.sp, color = legacy.textMuted)
         }
@@ -742,54 +782,6 @@ private fun LegacyCheck(label: String, checked: Boolean, onChange: (Boolean) -> 
             ),
         )
         Text(label, fontSize = 12.sp, color = MaterialTheme.legacy.textMuted)
-    }
-}
-
-@Composable
-private fun MemoryTab(draft: Character, editingMember: GroupMember?) {
-    val legacy = MaterialTheme.legacy
-    val longTerm = editingMember?.longTerm ?: draft.longTerm
-    val shortTerm = editingMember?.shortTerm ?: draft.shortTerm
-
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("长期记忆", fontSize = 14.sp, fontWeight = FontWeight.Medium, color = legacy.accent)
-        if (longTerm.isEmpty()) {
-            Text("暂无长期记忆", fontSize = 12.sp, color = legacy.textMuted)
-        } else {
-            longTerm.forEach { memory ->
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(legacy.input)
-                        .border(1.dp, legacy.inputBorder, RoundedCornerShape(8.dp))
-                        .padding(10.dp),
-                ) {
-                    if (memory.key.isNotEmpty()) {
-                        Text(memory.key, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = legacy.text)
-                    }
-                    Text(memory.value, fontSize = 13.sp, color = legacy.text)
-                }
-            }
-        }
-        Text("短期记忆", fontSize = 14.sp, fontWeight = FontWeight.Medium, color = legacy.accent)
-        if (shortTerm.isEmpty()) {
-            Text("暂无短期记忆", fontSize = 12.sp, color = legacy.textMuted)
-        } else {
-            shortTerm.forEach { memory ->
-                Text(
-                    memory.content,
-                    fontSize = 13.sp,
-                    color = legacy.text,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(legacy.input)
-                        .border(1.dp, legacy.inputBorder, RoundedCornerShape(8.dp))
-                        .padding(10.dp),
-                )
-            }
-        }
     }
 }
 
@@ -874,8 +866,21 @@ private fun Surface(shape: androidx.compose.ui.graphics.Shape, color: androidx.c
 // ==================== helpers ====================
 
 private fun lorebookMention(entry: LorebookEntry): String {
-    if (entry.misses <= 0) return "未命中过"
-    return "命中 ${entry.misses} 次"
+    if (entry.mentions <= 0) return "未命中过"
+    val whenText = relativeFrom(entry.lastMentionedAt) ?: return "命中 ${entry.mentions} 次"
+    return "命中 ${entry.mentions} 次 · $whenText"
+}
+
+private fun relativeFrom(iso: String?): String? {
+    if (iso.isNullOrBlank()) return null
+    val instant = runCatching { java.time.Instant.parse(iso) }.getOrNull() ?: return null
+    val minutes = java.time.Duration.between(instant, java.time.Instant.now()).toMinutes().coerceAtLeast(0)
+    return when {
+        minutes < 1 -> "刚刚"
+        minutes < 60 -> "$minutes 分钟前"
+        minutes < 1440 -> "${Math.round(minutes / 60.0)} 小时前"
+        else -> "${Math.round(minutes / 1440.0)} 天前"
+    }
 }
 
 private data class GeneratedDraft(

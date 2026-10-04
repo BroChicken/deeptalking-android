@@ -854,6 +854,7 @@ class RequestBuilder(private val config: AppConfig = AppConfig()) {
         input: List<ChatMessage>,
         tools: List<ToolDefinition>,
         model: String = config.modelName,
+        sessionId: String? = null,
     ): LlmRequest {
         val submitPhase = phase == RequestPhase.SUBMIT
         return LlmRequest(
@@ -866,6 +867,8 @@ class RequestBuilder(private val config: AppConfig = AppConfig()) {
             maxOutputTokens = 8192,
             stream = false,
             reasoningEffort = if (submitPhase) "none" else config.reasoningEffort,
+            apiPlatform = config.apiPlatform,
+            sessionId = sessionId,
         )
     }
 

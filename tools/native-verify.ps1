@@ -28,6 +28,7 @@ $env:ANDROID_HOME = $sdkRoot
 $testTasks = @(
   ':engine:ondevice:test',
   ':domain:agent:test',
+  ':core:network:test',
   ':domain:memory:test',
   ':core:data:testDebugUnitTest',
   ':feature:richtext:testDebugUnitTest'
@@ -51,8 +52,11 @@ function Invoke-Gradle {
     Start-Sleep -Seconds 3
   }
   Get-Content -LiteralPath $log -Tail 8 -ErrorAction SilentlyContinue | Write-Host
-  $proc.Refresh()
-  return [int]$proc.ExitCode
+  # Start-Process on gradle.bat yields an empty ExitCode on Windows PowerShell,
+  # so derive success from Gradle's terminal status line instead.
+  $text = Get-Content -LiteralPath $log -Raw -ErrorAction SilentlyContinue
+  if ($text -match 'BUILD SUCCESSFUL') { return 0 }
+  return 1
 }
 
 $compileExit = Invoke-Gradle -Tasks @(':app:assembleDebug') -Label '[1/2] Compile all modules (assembleDebug)'
@@ -61,7 +65,7 @@ $testExit = Invoke-Gradle -Tasks $testTasks -Label '[2/2] Unit tests'
 Write-Host ''
 Write-Host '== Summary ==' -ForegroundColor Cyan
 $total = 0; $bad = 0
-foreach ($m in @('engine\ondevice','domain\agent','domain\memory','core\data','feature\richtext')) {
+foreach ($m in @('engine\ondevice','domain\agent','core\network','domain\memory','core\data','feature\richtext')) {
   $dir = Join-Path $android ($m + '\build\test-results')
   if (-not (Test-Path -LiteralPath $dir)) { continue }
   $modTotal = 0; $modFail = 0

@@ -53,6 +53,10 @@ class NativeCore(context: Context) {
 
     suspend fun currentConfig(): AppConfig = data.config.current()
 
+    /** Resolves the active platform's key, falling back to the legacy global key. */
+    private fun apiKeyFor(platform: String): String? =
+        secrets.getApiKey(platform) ?: secrets.getApiKey()
+
     /**
      * Two-phase connectivity probe mirroring the legacy `testApiConnection`:
      * (1) site reachability, (2) a minimal Responses call. Returns a
@@ -86,6 +90,8 @@ class NativeCore(context: Context) {
                         input = listOf(ChatMessage(role = Role.User, content = "hi")),
                         maxOutputTokens = 32,
                         reasoningEffort = "none",
+                        apiPlatform = config.apiPlatform,
+                        sessionId = "deeptalking-general",
                     ),
                 )
                 "正常（返回 ${result.text.take(40).ifBlank { "空" }}）"
@@ -97,7 +103,7 @@ class NativeCore(context: Context) {
 
     /** One-line character/group generation; returns the raw JSON string from the model. */
     suspend fun quickGenerate(config: AppConfig, prompt: String): String? {
-        val backend = ResponsesLlmBackend(apiKeyProvider = { secrets.getApiKey() }, baseUrl = config.apiBaseUrl)
+        val backend = ResponsesLlmBackend(apiKeyProvider = { apiKeyFor(config.apiPlatform) }, baseUrl = config.apiBaseUrl)
         val result = backend.complete(
             LlmRequest(
                 model = config.modelName,
@@ -106,6 +112,8 @@ class NativeCore(context: Context) {
                 temperature = 1.0,
                 maxOutputTokens = 1200,
                 reasoningEffort = "none",
+                apiPlatform = config.apiPlatform,
+                sessionId = "deeptalking-general",
             ),
         )
         return result.text.takeIf { it.isNotBlank() }
@@ -113,7 +121,7 @@ class NativeCore(context: Context) {
 
     /** Generates a single emoji avatar from a character's description. */
     suspend fun generateEmojiAvatar(config: AppConfig, character: Character): String? {
-        val backend = ResponsesLlmBackend(apiKeyProvider = { secrets.getApiKey() }, baseUrl = config.apiBaseUrl)
+        val backend = ResponsesLlmBackend(apiKeyProvider = { apiKeyFor(config.apiPlatform) }, baseUrl = config.apiBaseUrl)
         val description = buildString {
             append(character.name).append(' ')
             append(character.staticProfile.appearance).append(' ')
@@ -128,6 +136,8 @@ class NativeCore(context: Context) {
                 temperature = 1.2,
                 maxOutputTokens = 16,
                 reasoningEffort = "none",
+                apiPlatform = config.apiPlatform,
+                sessionId = "deeptalking-general",
             ),
         )
         return result.text.trim().takeIf { it.isNotBlank() }?.take(4)
@@ -162,7 +172,7 @@ class NativeCore(context: Context) {
         member: GroupMember,
         hint: String,
     ): String? {
-        val backend = ResponsesLlmBackend(apiKeyProvider = { secrets.getApiKey() }, baseUrl = config.apiBaseUrl)
+        val backend = ResponsesLlmBackend(apiKeyProvider = { apiKeyFor(config.apiPlatform) }, baseUrl = config.apiBaseUrl)
         val otherMembers = group.members
             .filter { it.id != member.id }
             .map { mapOf("name" to it.name, "personality" to it.staticProfile.personality, "roleInGroup" to it.roleInGroup) }
@@ -180,6 +190,8 @@ class NativeCore(context: Context) {
                 temperature = 0.8,
                 maxOutputTokens = 800,
                 reasoningEffort = "none",
+                apiPlatform = config.apiPlatform,
+                sessionId = "deeptalking-general",
             ),
         )
         return result.text.takeIf { it.isNotBlank() }
@@ -233,10 +245,10 @@ class NativeCore(context: Context) {
         onCharacterUpdated: (Character) -> Unit = {},
     ): ChatOrchestrator {
         val llm = ResponsesLlmBackend(
-            apiKeyProvider = { secrets.getApiKey() },
+            apiKeyProvider = { apiKeyFor(config.apiPlatform) },
             baseUrl = config.apiBaseUrl,
         )
-        val background = BackgroundTasks(llm, memory, config.modelName)
+        val background = BackgroundTasks(llm, memory, config.modelName, config.apiPlatform)
         return ChatOrchestrator(
             llm = llm,
             tools = tools,

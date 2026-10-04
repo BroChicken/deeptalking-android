@@ -42,7 +42,11 @@ function Invoke-Gradle {
     Start-Sleep -Seconds 3
   }
   Get-Content -LiteralPath $log -Tail 8 -ErrorAction SilentlyContinue | Write-Host
-  return [int]$proc.ExitCode
+  # Start-Process on gradle.bat yields an empty ExitCode on Windows PowerShell,
+  # so derive success from Gradle's terminal status line instead.
+  $text = Get-Content -LiteralPath $log -Raw -ErrorAction SilentlyContinue
+  if ($text -match 'BUILD SUCCESSFUL') { return 0 }
+  return 1
 }
 
 if ($Clean) {

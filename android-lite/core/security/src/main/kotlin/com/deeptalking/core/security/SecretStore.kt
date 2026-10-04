@@ -22,6 +22,21 @@ class SecretStore(context: Context) {
         }.apply()
     }
 
+    /**
+     * Per-platform API key slot (legacy `platformSettings[platform].apiKey`).
+     * Switching platforms must not overwrite another platform's key.
+     */
+    fun getApiKey(platform: String): String? =
+        prefs.getString(platformKey(platform), null)
+
+    fun setApiKey(platform: String, value: String?) {
+        prefs.edit().apply {
+            if (value == null) remove(platformKey(platform)) else putString(platformKey(platform), value)
+        }.apply()
+    }
+
+    private fun platformKey(platform: String): String = KEY_API_KEY + "_" + platform
+
     fun clear() {
         prefs.edit().clear().apply()
     }
