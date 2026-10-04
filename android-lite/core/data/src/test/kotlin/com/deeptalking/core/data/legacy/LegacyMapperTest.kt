@@ -326,7 +326,8 @@ class LegacyMapperTest {
         val root = Json { ignoreUnknownKeys = true }.parseToJsonElement(exported) as JsonObject
         assertEquals("native", root["version"].toString().trim('"'))
         assertEquals(JsonNull, root["activeCharacterId"])
-        assertEquals("\"\"", root["activeTheme"].toString())
+        // The seed carried `activeTheme: theme-blue`; it now round-trips.
+        assertEquals("\"theme-blue\"", root["activeTheme"].toString())
         assertTrue(root["characters"] is JsonObject)
         val configJson = root["config"] as JsonObject
         assertNull(configJson["apiKey"])

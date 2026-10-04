@@ -7,6 +7,7 @@ import com.deeptalking.core.model.Character
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
 
 /** Result of one legacy import pass. */
 data class ImportSummary(
@@ -87,9 +88,14 @@ class LegacyImportService(
         val configDto = root["config"]?.let { element ->
             runCatching { codec.decodeFromJsonElement(LegacyConfig.serializer(), element) }.getOrNull()
         }
-        val configUpdated = configDto != null
+        val exportedTheme = (root["activeTheme"] as? kotlinx.serialization.json.JsonPrimitive)?.contentOrNull
+        val configUpdated = configDto != null || exportedTheme != null
         if (configUpdated) {
-            runCatching { config.update(mapConfig(configDto)) }
+            runCatching {
+                var mapped = configDto?.let(::mapConfig) ?: config.current()
+                if (exportedTheme != null) mapped = mapped.copy(activeTheme = exportedTheme)
+                config.update(mapped)
+            }
         }
 
         return ImportSummary(characterCount, messageCount, stickerCount, configUpdated)

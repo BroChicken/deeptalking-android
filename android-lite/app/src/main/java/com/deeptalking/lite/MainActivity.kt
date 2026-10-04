@@ -5,7 +5,6 @@ import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import com.deeptalking.core.designsystem.DeepTalkingTheme
 import com.deeptalking.core.notifications.NotificationChannels
 
 class MainActivity : ComponentActivity() {
@@ -17,9 +16,7 @@ class MainActivity : ComponentActivity() {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFICATIONS)
         }
         setContent {
-            DeepTalkingTheme {
-                AppRoot(DeepTalkingApp.core)
-            }
+            AppRoot(DeepTalkingApp.core)
         }
     }
 

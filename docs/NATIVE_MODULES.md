@@ -16,14 +16,14 @@ DeepTalking 是原生 Android 应用（Kotlin + Jetpack Compose 多模块），�
 | `:core:data` | core | 仓库层（`CharacterRepository/ChatRepository/ConfigRepository`）、`SettingsStore`（DataStore）、`CoreDataContainer`、`legacy`（旧数据迁移与备份） |
 | `:core:security` | core | `SecretStore`：API Key 存 Keystore/EncryptedSharedPreferences |
 | `:core:notifications` | core | 通知渠道、`ReminderWorker`、`Reminders`（WorkManager 调度） |
-| `:core:designsystem` | core | `DeepTalkingTheme`（Material3） |
+| `:core:designsystem` | core | `DeepTalkingTheme` + `AppTheme`（清浅/夜色/深海/旧灯 四套固定配色） |
 | `:domain:agent` | domain | `AgentTool/ToolRegistry`、`ChatOrchestrator`、`AgentLoop`、提示词装配（`prompts/`）、结构化解析（`ResponseParser`）、工具实现（`tools/`） |
 | `:domain:memory` | domain | `MemoryService` + `MemoryServiceImpl`、检索/世界书匹配/记忆策略/时间工具 |
 | `:engine:ondevice` | engine | 端侧推理接口：`LlmBackend/EmbeddingBackend/AsrBackend/TtsBackend` + `InferenceRegistry` |
-| `:feature:chat` | feature | 聊天界面 + `RichText`（渲染 WebView） |
-| `:feature:characters` | feature | 角色/群组列表与新建 |
-| `:feature:memory` | feature | 记忆/世界书浏览 |
-| `:feature:settings` | feature | 平台、模型、参数、API Key、测试提醒 |
+| `:feature:chat` | feature | 聊天界面（头像/气泡/流式/工具活动/快速回应/图片/表情包/消息操作）+ `RichText`（渲染 WebView） |
+| `:feature:characters` | feature | 角色/群组列表、创建弹窗（单角色/群组+一句话生成）、角色卡编辑器（基础/状态/世界书三标签）、导出/导入、补全头像 |
+| `:feature:memory` | feature | 记忆/世界书浏览 + 长期/短期记忆删除 |
+| `:feature:settings` | feature | 平台、Base URL、模型、参数、思考强度、API Key、测试连接、测试提醒 |
 | `:feature:richtext` | feature | `MarkdownRenderer`（纯 Kotlin）+ `RichTextWebView`（KaTeX 早渲染） |
 
 依赖方向：`app → feature → domain → core/engine`。core/engine 不反依赖上层。
@@ -37,9 +37,9 @@ DeepTalking 是原生 Android 应用（Kotlin + Jetpack Compose 多模块），�
 ## 数据与迁移
 
 - 数据唯一入口：`:core:data` 仓库层（Room + DataStore）。禁止绕过仓库访问数据库。
-- 旧版 WebView 的 localStorage 数据通过 `legacy/LegacyImportService` 一次性导入；`legacy/BackupService` 保留旧 JSON 根结构（`{config, characters, activeCharacterId, activeTheme, version}`）的导入导出。
-- 媒体/表情以文件（`filesDir`）存放，不再以 base64 进库。
-- API Key 存 `:core:security` 的 `SecretStore`（Keystore），UI 只见脱敏状态。
+- 旧版 WebView 的 localStorage 数据通过 `legacy/LegacyImportService` 一次性导入；`legacy/BackupService` 保留旧 JSON 根结构（`{config, characters, activeCharacterId, activeTheme, version}`）的导入导出。UI 通过系统文件选择器（SAF）导出/导入备份，`activeTheme` 随备份往返。
+- 媒体/表情以文件（`filesDir`）存放（`app/MediaStore`：图片压到 ≤1280px/2MB，表情 ≤384px/120KB），不再以 base64 进库。
+- API Key 存 `:core:security` 的 `SecretStore`（Keystore），UI 只见脱敏状态；导出时剔除。
 
 ## 构建与自检
 

@@ -13,6 +13,8 @@ data class AppConfig(
     val proactiveEnabled: Boolean = true,
     val styleCritique: Boolean = true,
     val quickReplyRepair: Boolean = true,
+    /** Empty = 清浅; otherwise `theme-black` / `theme-blue` / `theme-yellow`. */
+    val activeTheme: String = "",
 )
 
 @Serializable
@@ -25,6 +27,31 @@ data class PlatformPreset(
 )
 
 val BuiltinPlatforms: List<PlatformPreset> = listOf(
-    PlatformPreset("deepseek", "https://api.deepseek.com/v1", "deepseek-flash", listOf("deepseek-flash")),
-    PlatformPreset("opencode", "https://opencode.ai/zen/go/v1", "deepseek-flash", listOf("deepseek-flash"), keepV1InResponses = true),
+    PlatformPreset(
+        "deepseek",
+        "https://api.deepseek.com/v1",
+        "deepseek-flash",
+        listOf(
+            "deepseek-chat",
+            "deepseek-reasoner",
+            "deepseek-flash",
+        ),
+    ),
+    PlatformPreset(
+        "opencode",
+        "https://opencode.ai/zen/go/v1",
+        "deepseek-flash",
+        listOf(
+            "deepseek-flash",
+            "deepseek-v3.2",
+            "gpt-5.6",
+        ),
+        keepV1InResponses = true,
+    ),
+    PlatformPreset(
+        "custom",
+        "",
+        "",
+        emptyList(),
+    ),
 )

@@ -27,8 +27,8 @@ android {
         applicationId = "com.deeptalking.lite"
         minSdk = 26
         targetSdk = 35
-        versionCode = 32
-        versionName = "1.4.0"
+        versionCode = 33
+        versionName = "1.4.1"
     }
 
     compileOptions {
@@ -69,6 +69,8 @@ android {
 }
 
 dependencies {
+    implementation(project(":core:common"))
+    implementation(project(":core:model"))
     implementation(project(":core:data"))
     implementation(project(":core:network"))
     implementation(project(":core:security"))

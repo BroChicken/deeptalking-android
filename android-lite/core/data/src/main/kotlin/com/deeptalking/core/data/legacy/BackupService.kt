@@ -4,6 +4,7 @@ import com.deeptalking.core.data.AppJson
 import com.deeptalking.core.data.CharacterRepository
 import com.deeptalking.core.data.ChatRepository
 import com.deeptalking.core.data.ConfigRepository
+import com.deeptalking.core.model.AppConfig
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.DynamicState
@@ -51,6 +52,7 @@ class BackupService(
     private val characters: CharacterRepository,
     private val chat: ChatRepository,
     private val config: ConfigRepository,
+    private val stickerSink: StickerSink? = null,
 ) {
     private val codec = Json {
         prettyPrint = true
@@ -69,14 +71,18 @@ class BackupService(
                 }
             }
             put("activeCharacterId", JsonNull)
-            put("activeTheme", "")
+            put("activeTheme", appConfig.activeTheme)
+            put("exportDate", appConfig.exportDateOrNow())
             put("version", "native")
         }
         return codec.encodeToString(JsonElement.serializer(), root)
     }
 
     suspend fun importJson(json: String): ImportSummary =
-        LegacyImportService(characters, chat, config).importJson(json)
+        LegacyImportService(characters, chat, config, stickerSink).importJson(json)
+
+    private fun AppConfig.exportDateOrNow(): String =
+        java.time.Instant.now().toString().substringBefore('.').ifBlank { java.time.Instant.now().toString() }
 
     private fun characterToJson(character: Character): JsonObject = buildJsonObject {
         put("id", character.id)
