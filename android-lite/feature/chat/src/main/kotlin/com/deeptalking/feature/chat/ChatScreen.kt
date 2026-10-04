@@ -7,6 +7,7 @@ import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -19,6 +20,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -67,15 +69,18 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.em
+import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import com.deeptalking.core.designsystem.appColors
+import com.deeptalking.core.designsystem.legacy
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.MessageAttachment
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.Sticker
-import com.deeptalking.feature.richtext.renderMarkdownToHtml
 import java.io.File
 import java.util.Locale
 
@@ -111,24 +116,29 @@ fun ChatScreen(
 
     val visibleMessages = messages.filterNot { it.internalOnly }
 
-    LaunchedEffect(visibleMessages.size, visibleMessages.lastOrNull()?.content) {
+    LaunchedEffect(visibleMessages.size) {
         if (visibleMessages.isNotEmpty()) {
             runCatching { listState.animateScrollToItem(visibleMessages.size - 1) }
         }
     }
+    LaunchedEffect(visibleMessages.lastOrNull()?.content) {
+        if (isSending && visibleMessages.isNotEmpty()) {
+            runCatching { listState.scrollToItem(visibleMessages.size - 1) }
+        }
+    }
 
-    Column(modifier = Modifier.fillMaxSize()) {
+    Column(modifier = Modifier.fillMaxSize().imePadding()) {
         Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
             when {
                 character == null -> WelcomeHero()
                 visibleMessages.isEmpty() -> CharacterEmptyState(character)
                 else -> LazyColumn(
                     state = listState,
-                    modifier = Modifier.fillMaxSize().widthIn(max = 600.dp).align(Alignment.TopCenter),
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                    modifier = Modifier.fillMaxSize().widthIn(max = 896.dp).align(Alignment.TopCenter),
+                    verticalArrangement = Arrangement.spacedBy(16.dp),
                     contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 16.dp, vertical = 14.dp),
                 ) {
-                    items(visibleMessages) { message ->
+                    items(visibleMessages, key = { it.id }) { message ->
                         MessageRow(
                             message = message,
                             character = character,
@@ -166,8 +176,9 @@ fun ChatScreen(
             }
         }
 
-        Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 2.dp) {
-            Column {
+        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(MaterialTheme.legacy.border))
+        Surface(color = MaterialTheme.legacy.header, tonalElevation = 0.dp) {
+            Column(modifier = Modifier.fillMaxWidth()) {
                 if (stickerPanelOpen && character != null) {
                     StickerPanel(
                         stickers = character.stickers,
@@ -181,12 +192,12 @@ fun ChatScreen(
                     modifier = Modifier.fillMaxWidth().widthIn(max = 640.dp).align(Alignment.CenterHorizontally).padding(horizontal = 8.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.Bottom,
                 ) {
-                    IconButton(onClick = { imagePicker.launch("image/*") }, enabled = !isSending) {
-                        Icon(Icons.Default.Image, contentDescription = "添加图片")
+                    IconButton(onClick = { imagePicker.launch("image/*") }, enabled = !isSending, modifier = Modifier.size(32.dp)) {
+                        Icon(Icons.Default.Image, contentDescription = "添加图片", tint = MaterialTheme.legacy.textSecondary, modifier = Modifier.size(18.dp))
                     }
                     if (character != null) {
-                        IconButton(onClick = { stickerPanelOpen = !stickerPanelOpen }) {
-                            Icon(Icons.Default.EmojiEmotions, contentDescription = "表情包")
+                        IconButton(onClick = { stickerPanelOpen = !stickerPanelOpen }, modifier = Modifier.size(32.dp)) {
+                            Icon(Icons.Default.EmojiEmotions, contentDescription = "表情包", tint = MaterialTheme.legacy.textSecondary, modifier = Modifier.size(18.dp))
                         }
                     }
                     OutlinedTextField(
@@ -194,8 +205,17 @@ fun ChatScreen(
                         onValueChange = { input = it; onUserActivity() },
                         modifier = Modifier.weight(1f).heightIn(min = 46.dp, max = 140.dp),
                         enabled = !isSending,
-                        placeholder = { Text("输入消息") },
+                        placeholder = { Text("输入消息", color = MaterialTheme.legacy.textMuted) },
                         maxLines = 6,
+                        shape = RoundedCornerShape(12.dp),
+                        colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
+                            focusedContainerColor = MaterialTheme.legacy.input,
+                            unfocusedContainerColor = MaterialTheme.legacy.input,
+                            focusedBorderColor = MaterialTheme.legacy.inputBorder,
+                            unfocusedBorderColor = MaterialTheme.legacy.inputBorder,
+                            focusedTextColor = MaterialTheme.legacy.text,
+                            unfocusedTextColor = MaterialTheme.legacy.text,
+                        ),
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text, imeAction = ImeAction.Default),
                     )
                     IconButton(
@@ -207,8 +227,12 @@ fun ChatScreen(
                             }
                         },
                         enabled = !isSending && (input.isNotBlank() || pendingImages.isNotEmpty()),
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(MaterialTheme.legacy.btnPrimary),
                     ) {
-                        Icon(Icons.Default.Send, contentDescription = "发送", tint = MaterialTheme.colorScheme.primary)
+                        Icon(Icons.Default.Send, contentDescription = "发送", tint = MaterialTheme.legacy.onUserBubble)
                     }
                 }
             }
@@ -240,20 +264,22 @@ fun ChatScreen(
 
 @Composable
 private fun WelcomeHero() {
+    val legacy = MaterialTheme.legacy
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) {
-            Surface(shape = CircleShape, color = MaterialTheme.colorScheme.primaryContainer, modifier = Modifier.size(96.dp)) {
+            Surface(shape = CircleShape, color = legacy.accentBg, modifier = Modifier.size(96.dp)) {
                 Box(contentAlignment = Alignment.Center) {
-                    Icon(Icons.Default.SmartToy, contentDescription = null, modifier = Modifier.size(48.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Icon(Icons.Default.SmartToy, contentDescription = null, modifier = Modifier.size(48.dp), tint = legacy.textMuted)
                 }
             }
             Spacer(Modifier.height(16.dp))
-            Text("欢迎使用 DeepTalking", style = MaterialTheme.typography.headlineSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("欢迎使用 DeepTalking", fontSize = 20.sp, fontWeight = FontWeight.Medium, color = legacy.textSecondary)
             Spacer(Modifier.height(8.dp))
             Text(
                 "一个具有三级记忆系统的深度对话应用。点击左上角菜单按钮，创建或选择角色，开始一段有记忆的对话。",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 14.sp,
+                color = legacy.textMuted,
+                textAlign = TextAlign.Center,
             )
         }
     }
@@ -261,18 +287,20 @@ private fun WelcomeHero() {
 
 @Composable
 private fun CharacterEmptyState(character: Character) {
+    val legacy = MaterialTheme.legacy
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) {
-            Surface(shape = CircleShape, color = MaterialTheme.colorScheme.primaryContainer, modifier = Modifier.size(80.dp)) {
-                Box(contentAlignment = Alignment.Center) { Text(character.emoji.ifEmpty { "👤" }, style = MaterialTheme.typography.displayMedium) }
+            Surface(shape = CircleShape, color = legacy.accentBg, modifier = Modifier.size(80.dp)) {
+                Box(contentAlignment = Alignment.Center) { Text(character.emoji.ifEmpty { "👤" }, fontSize = 40.sp) }
             }
             Spacer(Modifier.height(12.dp))
-            Text("与 ${character.name} 开始对话", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("与 ${character.name} 开始对话", fontSize = 18.sp, color = legacy.textSecondary)
             Spacer(Modifier.height(6.dp))
             Text(
                 character.staticProfile.personality.ifEmpty { "点击下方输入框开始聊天" },
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 14.sp,
+                color = legacy.textMuted,
+                textAlign = TextAlign.Center,
             )
         }
     }
@@ -311,49 +339,71 @@ private fun MessageRow(
                 color = bubbleColor,
                 contentColor = contentColor,
                 shape = shape,
-                modifier = Modifier.widthIn(max = if (isUser) 320.dp else 400.dp),
+                modifier = Modifier.widthIn(max = 560.dp).fillMaxWidth(0.84f),
             ) {
                 Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
                     if (message.isLoading && message.content.isEmpty()) {
-                        TypingIndicator(MaterialTheme.colorScheme.onSurfaceVariant)
+                        TypingIndicator(colors.onAiBubble.copy(alpha = 0.6f))
                     } else {
                         if (isUser) {
                             if (message.content.isNotBlank()) {
-                                SelectionContainer { Text(message.content, style = MaterialTheme.typography.bodyLarge) }
+                                SelectionContainer {
+                                    Text(
+                                        message.content,
+                                        fontSize = 15.sp,
+                                        lineHeight = 1.68.em,
+                                    )
+                                }
                             }
                         } else if (message.content.isNotBlank()) {
-                            RichText(html = renderMarkdownToHtml(message.content), modifier = Modifier.fillMaxWidth())
+                            RichText(source = message.content, modifier = Modifier.fillMaxWidth())
                         }
                         MessageImages(message, onImageClick)
                         message.staticChanges.takeIf { !isUser && it.isNotEmpty() }?.let {
-                            Text("⚡ ${it.joinToString(" · ")}已修改", style = MaterialTheme.typography.labelSmall, color = colors.warning, modifier = Modifier.padding(top = 4.dp))
+                            Text("⚡ ${it.joinToString(" · ")}已修改", fontSize = 11.sp, color = colors.warning, modifier = Modifier.padding(top = 4.dp))
                         }
                         message.lorebookChanges.takeIf { !isUser && it.isNotEmpty() }?.let {
-                            Text("📖 ${it.joinToString(" · ")}", style = MaterialTheme.typography.labelSmall, color = colors.warning, modifier = Modifier.padding(top = 4.dp))
+                            Text("📖 ${it.joinToString(" · ")}", fontSize = 11.sp, color = colors.warning, modifier = Modifier.padding(top = 4.dp))
                         }
+                    }
+                    if (!message.isLoading && message.content.isNotBlank()) {
+                        MessageMeta(message, isUser, onCopy, onEditResend, onRegenerate)
                     }
                 }
             }
-            if (!message.isLoading && message.content.isNotBlank()) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = formatTime(message.timestamp),
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    IconButton(onClick = onCopy, modifier = Modifier.size(30.dp)) {
-                        Icon(Icons.Default.ContentCopy, contentDescription = "复制消息", modifier = Modifier.size(15.dp))
-                    }
-                    if (isUser) {
-                        IconButton(onClick = onEditResend, modifier = Modifier.size(30.dp)) {
-                            Icon(Icons.Default.Edit, contentDescription = "编辑并重发", modifier = Modifier.size(15.dp))
-                        }
-                    } else {
-                        IconButton(onClick = onRegenerate, modifier = Modifier.size(30.dp)) {
-                            Icon(Icons.Default.Refresh, contentDescription = "重新生成", modifier = Modifier.size(15.dp))
-                        }
-                    }
-                }
+        }
+    }
+}
+
+@Composable
+private fun MessageMeta(
+    message: ChatMessage,
+    isUser: Boolean,
+    onCopy: () -> Unit,
+    onEditResend: () -> Unit,
+    onRegenerate: () -> Unit,
+) {
+    val legacy = MaterialTheme.legacy
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = formatTime(message.timestamp),
+            fontSize = 11.sp,
+            color = if (isUser) legacy.onUserBubble.copy(alpha = 0.7f) else legacy.textMuted,
+        )
+        Spacer(Modifier.weight(1f))
+        IconButton(onClick = onCopy, modifier = Modifier.size(30.dp)) {
+            Icon(Icons.Default.ContentCopy, contentDescription = "复制消息", tint = legacy.textMuted, modifier = Modifier.size(15.dp))
+        }
+        if (isUser) {
+            IconButton(onClick = onEditResend, modifier = Modifier.size(30.dp)) {
+                Icon(Icons.Default.Edit, contentDescription = "编辑并重发", tint = legacy.textMuted, modifier = Modifier.size(15.dp))
+            }
+        } else {
+            IconButton(onClick = onRegenerate, modifier = Modifier.size(30.dp)) {
+                Icon(Icons.Default.Refresh, contentDescription = "重新生成", tint = legacy.textMuted, modifier = Modifier.size(15.dp))
             }
         }
     }
@@ -361,16 +411,30 @@ private fun MessageRow(
 
 @Composable
 private fun QuickReplyRow(replies: List<String>, isSending: Boolean, onQuickReply: (String) -> Unit) {
-    Column(modifier = Modifier.fillMaxWidth().padding(start = 38.dp)) {
-        Text("快速回应 · 以用户身份直接回复", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Spacer(Modifier.height(4.dp))
-        replies.forEach { reply ->
-            Surface(
-                color = MaterialTheme.colorScheme.surfaceVariant,
-                shape = RoundedCornerShape(10.dp),
-                modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp).clickable(enabled = !isSending) { onQuickReply(reply) },
-            ) {
-                Text(reply, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp))
+    val legacy = MaterialTheme.legacy
+    Row(modifier = Modifier.fillMaxWidth()) {
+        Spacer(Modifier.width(38.dp))
+        Column(modifier = Modifier.widthIn(max = 560.dp).fillMaxWidth(0.84f)) {
+            Text("快速回应 · 以用户身份直接回复", fontSize = 11.sp, color = legacy.textMuted)
+            Spacer(Modifier.height(6.dp))
+            replies.forEach { reply ->
+                Surface(
+                    color = legacy.input,
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 3.dp)
+                        .border(1.dp, legacy.inputBorder, RoundedCornerShape(10.dp))
+                        .clickable(enabled = !isSending) { onQuickReply(reply) },
+                ) {
+                    Text(
+                        reply,
+                        fontSize = 12.sp,
+                        lineHeight = 1.45.em,
+                        color = legacy.text,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                    )
+                }
             }
         }
     }
@@ -378,12 +442,13 @@ private fun QuickReplyRow(replies: List<String>, isSending: Boolean, onQuickRepl
 
 @Composable
 private fun Avatar(emoji: String) {
+    val legacy = MaterialTheme.legacy
     Surface(
         shape = RoundedCornerShape(9.dp),
-        color = MaterialTheme.colorScheme.primaryContainer,
+        color = legacy.accentBg,
         modifier = Modifier.size(30.dp),
     ) {
-        Box(contentAlignment = Alignment.Center) { Text(emoji, style = MaterialTheme.typography.bodyMedium) }
+        Box(contentAlignment = Alignment.Center) { Text(emoji, fontSize = 15.sp, color = legacy.text) }
     }
 }
 
@@ -428,16 +493,16 @@ private fun StickerPanel(
         modifier = Modifier
             .fillMaxWidth()
             .heightIn(max = 240.dp)
-            .background(MaterialTheme.colorScheme.surfaceVariant)
-            .padding(8.dp),
+            .background(MaterialTheme.legacy.input)
+            .padding(10.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-            TextButton(onClick = onUpload) { Text("+ 上传表情") }
+            TextButton(onClick = onUpload) { Text("+ 上传表情", fontSize = 12.sp, color = MaterialTheme.legacy.text) }
             Spacer(Modifier.weight(1f))
-            Text("${stickers.size} 张", style = MaterialTheme.typography.labelSmall)
+            Text("${stickers.size} 张", fontSize = 11.sp, color = MaterialTheme.legacy.textMuted)
         }
         if (stickers.isEmpty()) {
-            Text("还没有表情包。点上方「上传表情」加入。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(8.dp))
+            Text("还没有表情包。点上方「上传表情」加入。", fontSize = 12.sp, color = MaterialTheme.legacy.textMuted, modifier = Modifier.padding(12.dp))
         } else {
             LazyVerticalGrid(
                 columns = GridCells.Adaptive(72.dp),
@@ -461,8 +526,8 @@ private fun StickerPanel(
                         }
                         Text(
                             sticker.tag.ifEmpty { "未分类" },
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            fontSize = 10.sp,
+                            color = MaterialTheme.legacy.textMuted,
                             maxLines = 1,
                             modifier = Modifier.clickable { tagEdit = sticker },
                         )

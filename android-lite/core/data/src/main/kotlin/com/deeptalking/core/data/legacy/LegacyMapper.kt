@@ -116,6 +116,7 @@ fun mapLorebook(dto: LegacyLorebookEntry): LorebookEntry = LorebookEntry(
     name = dto.name ?: "",
     content = dto.content ?: "",
     keywords = extractKeywords(dto.keywords),
+    enabled = dto.enabled != false,
     alwaysActive = dto.alwaysActive == true,
     // `normalizeLorebook` treats anything that is not exactly "ai" as a user entry.
     origin = if (dto.origin == "ai") LorebookOrigin.Model else LorebookOrigin.User,

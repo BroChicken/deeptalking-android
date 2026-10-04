@@ -167,12 +167,14 @@ fun select(
 ): List<LorebookEntry> {
     val haystack = recentText.lowercase()
     val hits = entries.filter { entry ->
-        entry.alwaysActive || (
-            haystack.isNotBlank() &&
-                entry.keywords.any { keyword ->
-                    val needle = keyword.trim().lowercase()
-                    needle.isNotEmpty() && haystack.contains(needle)
-                }
+        entry.enabled && (
+            entry.alwaysActive || (
+                haystack.isNotBlank() &&
+                    entry.keywords.any { keyword ->
+                        val needle = keyword.trim().lowercase()
+                        needle.isNotEmpty() && haystack.contains(needle)
+                    }
+                )
             )
     }.sortedWith(
         compareByDescending<LorebookEntry> { it.alwaysActive }.thenBy { it.name },

@@ -1,6 +1,7 @@
 package com.deeptalking.feature.characters
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -14,10 +15,13 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
@@ -28,31 +32,29 @@ import androidx.compose.material.icons.filled.FileDownload
 import androidx.compose.material.icons.filled.FileUpload
 import androidx.compose.material.icons.filled.Groups
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
+import androidx.compose.material3.CheckboxDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.ScrollableTabRow
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.deeptalking.core.designsystem.legacy
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.GroupMember
 import com.deeptalking.core.model.LorebookEntry
@@ -106,32 +108,32 @@ fun CharactersScreen(
     onRepairAvatars: () -> Unit,
     onUpgradeToGroup: (Character) -> Unit,
 ) {
+    val legacy = MaterialTheme.legacy
     var createOpen by remember { mutableStateOf(false) }
     var deleteTarget by remember { mutableStateOf<Character?>(null) }
 
-    Column(modifier = Modifier.fillMaxSize()) {
-        Column(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = { createOpen = true }, modifier = Modifier.fillMaxWidth()) {
-                Icon(Icons.Default.Add, contentDescription = null)
-                Spacer(Modifier.width(4.dp))
-                Text("新建角色或群组")
-            }
-            OutlinedButton(onClick = onRepairAvatars, modifier = Modifier.fillMaxWidth()) {
-                Icon(Icons.Default.AutoFixHigh, contentDescription = null)
-                Spacer(Modifier.width(4.dp))
-                Text("补全头像")
-            }
+    Column(modifier = Modifier.fillMaxSize().background(legacy.sidebar)) {
+        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            LegacyButton("+  新建角色或群组", primary = true, onClick = { createOpen = true })
+            LegacyButton("⟳  补全头像", primary = false, onClick = onRepairAvatars)
         }
 
         LazyColumn(
             modifier = Modifier.weight(1f).fillMaxWidth(),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 4.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             if (characters.isEmpty()) {
-                item { Text("暂无角色\n点击上方按钮创建", color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                item {
+                    Text(
+                        "暂无角色\n点击上方按钮创建",
+                        fontSize = 14.sp,
+                        color = legacy.textMuted,
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 32.dp),
+                    )
+                }
             }
-            items(characters) { character ->
+            items(characters, key = { it.id }) { character ->
                 CharacterCard(
                     character = character,
                     active = character.id == activeId,
@@ -143,20 +145,13 @@ fun CharactersScreen(
             }
         }
 
+        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(legacy.border))
         Row(
             modifier = Modifier.fillMaxWidth().padding(12.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            OutlinedButton(onClick = onExport, modifier = Modifier.weight(1f)) {
-                Icon(Icons.Default.FileDownload, contentDescription = null)
-                Spacer(Modifier.width(4.dp))
-                Text("导出")
-            }
-            OutlinedButton(onClick = onImport, modifier = Modifier.weight(1f)) {
-                Icon(Icons.Default.FileUpload, contentDescription = null)
-                Spacer(Modifier.width(4.dp))
-                Text("导入")
-            }
+            LegacyButton("导出", primary = false, modifier = Modifier.weight(1f), onClick = onExport)
+            LegacyButton("导入", primary = false, modifier = Modifier.weight(1f), onClick = onImport)
         }
     }
 
@@ -193,6 +188,30 @@ fun CharactersScreen(
 }
 
 @Composable
+private fun LegacyButton(
+    label: String,
+    primary: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val legacy = MaterialTheme.legacy
+    val bg = if (primary) legacy.btnPrimary else legacy.input
+    val fg = if (primary) legacy.onUserBubble else legacy.textSecondary
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(38.dp)
+            .clip(RoundedCornerShape(if (primary) 12.dp else 8.dp))
+            .background(bg)
+            .then(if (primary) Modifier else Modifier.border(1.dp, legacy.inputBorder, RoundedCornerShape(8.dp)))
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(label, fontSize = 12.sp, color = fg, fontWeight = if (primary) FontWeight.Medium else FontWeight.Normal)
+    }
+}
+
+@Composable
 private fun CharacterCard(
     character: Character,
     active: Boolean,
@@ -201,73 +220,71 @@ private fun CharacterCard(
     onUpgrade: () -> Unit,
     onDelete: () -> Unit,
 ) {
-    Card(
-        colors = CardDefaults.cardColors(
-            containerColor = if (active) {
-                MaterialTheme.colorScheme.primaryContainer
-            } else {
-                MaterialTheme.colorScheme.surfaceVariant
-            },
-        ),
-        modifier = Modifier.fillMaxWidth().clickable(onClick = onSelect),
+    val legacy = MaterialTheme.legacy
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(9.dp))
+            .background(if (active) legacy.accentBg else androidx.compose.ui.graphics.Color.Transparent)
+            .clickable(onClick = onSelect)
+            .padding(10.dp),
     ) {
-        Column(modifier = Modifier.fillMaxWidth().padding(10.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Surface(
-                    shape = CircleShape,
-                    color = MaterialTheme.colorScheme.primaryContainer,
-                    modifier = Modifier.size(40.dp),
-                ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Text(character.emoji.ifEmpty { if (character.isGroup) "👥" else "👤" }, style = MaterialTheme.typography.titleLarge)
-                    }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Surface(
+                shape = CircleShape,
+                color = legacy.accentBg,
+                modifier = Modifier.size(40.dp),
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Text(character.emoji.ifEmpty { if (character.isGroup) "👥" else "👤" }, fontSize = 20.sp)
                 }
-                Spacer(Modifier.width(10.dp))
-                Column(modifier = Modifier.weight(1f)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(character.name.ifEmpty { "未命名" }, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        if (character.isGroup) {
-                            Spacer(Modifier.width(6.dp))
-                            Text("群组", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                    }
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        text = if (character.isGroup) {
-                            "${character.members.size} 位成员 · ${character.description.ifEmpty { "群组对话" }}"
-                        } else {
-                            character.staticProfile.personality.ifEmpty { "暂无描述" }
-                        },
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 2,
+                        character.name.ifEmpty { "未命名" },
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = legacy.text,
+                        maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
-                }
-                IconButton(onClick = onEdit) { Icon(Icons.Default.Edit, contentDescription = "编辑角色卡") }
-                if (!character.isGroup) {
-                    IconButton(onClick = onUpgrade) { Icon(Icons.Default.Groups, contentDescription = "升级为群组") }
-                }
-                IconButton(onClick = onDelete) { Icon(Icons.Default.Delete, contentDescription = "删除角色") }
-            }
-            if (character.isGroup && character.members.isNotEmpty()) {
-                Spacer(Modifier.height(6.dp))
-                Column(modifier = Modifier.padding(start = 24.dp)) {
-                    character.members.forEach { member ->
-                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 2.dp)) {
-                            Text(member.emoji.ifEmpty { "👤" }, style = MaterialTheme.typography.bodyMedium)
-                            Spacer(Modifier.width(6.dp))
-                            Text(
-                                member.name + (if (member.roleInGroup.isNotBlank()) " · ${member.roleInGroup}" else if (member.staticProfile.personality.isNotBlank()) " · ${member.staticProfile.personality}" else ""),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        }
+                    if (character.isGroup) {
+                        Spacer(Modifier.width(6.dp))
+                        Text("群组", fontSize = 12.sp, color = legacy.textMuted)
                     }
                 }
+                Text(
+                    text = if (character.isGroup) {
+                        "${character.members.size} 位成员 · ${character.description.ifEmpty { "群组对话" }}"
+                    } else {
+                        character.staticProfile.personality.ifEmpty { "暂无描述" }
+                    },
+                    fontSize = 12.sp,
+                    color = legacy.textMuted,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
             }
+            CardAction(Icons.Default.Edit, "编辑角色卡", legacy.textMuted, onEdit)
+            if (!character.isGroup) {
+                CardAction(Icons.Default.Groups, "升级为群组", legacy.textMuted, onUpgrade)
+            }
+            CardAction(Icons.Default.Delete, "删除角色", androidx.compose.ui.graphics.Color(0xFFEF4444), onDelete)
         }
+    }
+}
+
+@Composable
+private fun CardAction(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    description: String,
+    tint: androidx.compose.ui.graphics.Color,
+    onClick: () -> Unit,
+) {
+    IconButton(onClick = onClick, modifier = Modifier.size(40.dp)) {
+        Icon(icon, contentDescription = description, tint = tint, modifier = Modifier.size(18.dp))
     }
 }
 
@@ -279,6 +296,7 @@ private fun CreateDialog(
     onCreateCharacter: (String, String, String, String) -> Unit,
     onCreateGroup: (String, String, String, String, List<GroupMember>) -> Unit,
 ) {
+    val legacy = MaterialTheme.legacy
     var isGroup by remember { mutableStateOf(false) }
     var name by remember { mutableStateOf("") }
     var emoji by remember { mutableStateOf("") }
@@ -286,30 +304,35 @@ private fun CreateDialog(
     var background by remember { mutableStateOf("") }
     var groupDescription by remember { mutableStateOf("") }
     var groupScene by remember { mutableStateOf("") }
+    var groupRules by remember { mutableStateOf("") }
     var membersText by remember { mutableStateOf("") }
     var quickGenInput by remember { mutableStateOf("") }
+    var createTypeExpanded by remember { mutableStateOf(false) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(if (isGroup) "创建新群组" else "创建新角色") },
+        containerColor = legacy.panel,
+        title = { Text(if (isGroup) "创建新群组" else "创建新角色", color = legacy.text) },
         text = {
             Column(
-                modifier = Modifier.verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.heightIn(max = 460.dp).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                Text("一句话生成 (可选)", style = MaterialTheme.typography.labelMedium)
+                Text("一句话生成 (可选)", fontSize = 14.sp, color = legacy.textSecondary)
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    OutlinedTextField(
+                    LegacyField(
                         value = quickGenInput,
                         onValueChange = { quickGenInput = it },
-                        placeholder = { Text(if (isGroup) "描述你想要的群组和成员..." else "描述你想要的角色...") },
-                        singleLine = true,
+                        placeholder = if (isGroup) "描述你想要的群组和成员..." else "描述你想要的角色...",
                         modifier = Modifier.weight(1f),
                     )
                     Spacer(Modifier.width(6.dp))
-                    Button(
+                    LegacyButton(
+                        label = if (generating) "生成中…" else "生成",
+                        primary = false,
+                        modifier = Modifier.width(72.dp),
                         onClick = {
-                            if (quickGenInput.isBlank() || generating) return@Button
+                            if (quickGenInput.isBlank() || generating) return@LegacyButton
                             onQuickGenerate(quickGenInput) { raw ->
                                 if (raw != null) {
                                     parseGenerated(raw)?.let { parsed ->
@@ -327,64 +350,34 @@ private fun CreateDialog(
                                 }
                             }
                         },
-                        enabled = quickGenInput.isNotBlank() && !generating,
-                    ) { Text(if (generating) "生成中…" else "生成") }
+                    )
                 }
-                Text("AI将根据描述自动填充下方字段", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(selected = !isGroup, onClick = { isGroup = false }, label = { Text("单角色") })
-                    FilterChip(selected = isGroup, onClick = { isGroup = true }, label = { Text("群组") })
-                }
-                OutlinedTextField(
+                Text("AI将根据描述自动填充下方字段", fontSize = 12.sp, color = legacy.textMuted)
+
+                Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(legacy.border))
+
+                Text("创建类型", fontSize = 14.sp, color = legacy.textSecondary)
+                LegacyDropdown(
+                    selected = if (isGroup) "群组" else "单角色",
+                    options = listOf("单角色" to false, "群组" to true),
+                    expanded = createTypeExpanded,
+                    onExpandedChange = { createTypeExpanded = it },
+                    onSelect = { isGroup = it; createTypeExpanded = false },
+                )
+                LegacyField(
                     value = name,
                     onValueChange = { name = it },
-                    label = { Text(if (isGroup) "群组名称 *" else "角色名称 *") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
+                    label = if (isGroup) "群组名称 *" else "角色名称 *",
                 )
-                OutlinedTextField(
-                    value = emoji,
-                    onValueChange = { emoji = it },
-                    label = { Text("头像") },
-                    placeholder = { Text("🌸") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                )
+                LegacyField(value = emoji, onValueChange = { emoji = it }, label = "头像", placeholder = "🌸")
                 if (isGroup) {
-                    OutlinedTextField(
-                        value = groupDescription,
-                        onValueChange = { groupDescription = it },
-                        label = { Text("群组前提") },
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                    OutlinedTextField(
-                        value = groupScene,
-                        onValueChange = { groupScene = it },
-                        label = { Text("共同场景") },
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                    OutlinedTextField(
-                        value = membersText,
-                        onValueChange = { membersText = it },
-                        label = { Text("群成员") },
-                        placeholder = { Text("每行：名称｜性格简述") },
-                        minLines = 3,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
+                    LegacyField(value = groupDescription, onValueChange = { groupDescription = it }, label = "群组前提", minLines = 2)
+                    LegacyField(value = groupScene, onValueChange = { groupScene = it }, label = "共同场景", minLines = 2)
+                    LegacyField(value = groupRules, onValueChange = { groupRules = it }, label = "成员互动规则", minLines = 2)
+                    LegacyField(value = membersText, onValueChange = { membersText = it }, label = "群成员", placeholder = "每行：名称｜性格简述", minLines = 3)
                 } else {
-                    OutlinedTextField(
-                        value = personality,
-                        onValueChange = { personality = it },
-                        label = { Text("性格简述") },
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                    OutlinedTextField(
-                        value = background,
-                        onValueChange = { background = it },
-                        label = { Text("背景故事") },
-                        minLines = 3,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
+                    LegacyField(value = personality, onValueChange = { personality = it }, label = "性格简述", minLines = 2)
+                    LegacyField(value = background, onValueChange = { background = it }, label = "背景故事", minLines = 3)
                 }
             }
         },
@@ -401,7 +394,7 @@ private fun CreateDialog(
                     }
                 },
                 enabled = name.isNotBlank(),
-            ) { Text(if (isGroup) "创建群组" else "创建角色") }
+            ) { Text(if (isGroup) "创建角色" else "创建角色") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
     )
@@ -409,7 +402,6 @@ private fun CreateDialog(
 
 // ==================== Character card editor ====================
 
-/** Host wrapper so AppRoot can show the editor for any character (incl. members). */
 object CharacterEditorHost {
     @Composable
     operator fun invoke(
@@ -433,7 +425,6 @@ object CharacterEditorHost {
     )
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun CharacterEditorDialog(
     character: Character,
@@ -445,7 +436,8 @@ fun CharacterEditorDialog(
     onGenerateAvatar: (Character, (String?) -> Unit) -> Unit,
     onFillMember: (Character, Int, String) -> Unit,
 ) {
-    var tab by remember { mutableStateOf(0) }
+    val legacy = MaterialTheme.legacy
+    var tab by remember { mutableIntStateOf(0) }
     var draft by remember(character.id) { mutableStateOf(character) }
     var memberIndex by remember(character.id) { mutableStateOf<Int?>(null) }
     val editingMember = memberIndex?.let { draft.members.getOrNull(it) }
@@ -457,23 +449,25 @@ fun CharacterEditorDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
+        containerColor = legacy.panel,
         title = {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 if (editingMember != null) {
-                    IconButton(onClick = { memberIndex = null }) { Text("←") }
+                    IconButton(onClick = { memberIndex = null }) { Text("←", color = legacy.textSecondary) }
                 }
-                Text(title)
+                Text(title, color = legacy.text)
             }
         },
         text = {
-            Column(modifier = Modifier.fillMaxWidth().heightIn(max = 460.dp)) {
-                ScrollableTabRow(selectedTabIndex = tab, edgePadding = 0.dp) {
-                    Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("基础设定") })
-                    Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("当前状态") })
-                    Tab(selected = tab == 2, onClick = { tab = 2 }, text = { Text("世界书") })
-                    Tab(selected = tab == 3, onClick = { tab = 3 }, text = { Text("记忆") })
+            Column(modifier = Modifier.fillMaxWidth().heightIn(max = 480.dp)) {
+                Row(modifier = Modifier.fillMaxWidth()) {
+                    ModalTab("基础设定", tab == 0, Modifier.weight(1f)) { tab = 0 }
+                    ModalTab("当前状态", tab == 1, Modifier.weight(1f)) { tab = 1 }
+                    ModalTab("世界书", tab == 2, Modifier.weight(1f)) { tab = 2 }
+                    ModalTab("记忆", tab == 3, Modifier.weight(1f)) { tab = 3 }
                 }
-                Spacer(Modifier.height(8.dp))
+                Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(legacy.border))
+                Spacer(Modifier.height(10.dp))
                 Column(
                     modifier = Modifier.verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -516,6 +510,27 @@ fun CharacterEditorDialog(
 }
 
 @Composable
+private fun ModalTab(label: String, selected: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    val legacy = MaterialTheme.legacy
+    Box(
+        modifier = modifier.height(40.dp).clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            label,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.Medium,
+            color = if (selected) legacy.accent else legacy.textSecondary,
+        )
+        if (selected) {
+            Box(
+                modifier = Modifier.align(Alignment.BottomCenter).width(40.dp).height(2.dp).background(legacy.accent),
+            )
+        }
+    }
+}
+
+@Composable
 private fun BasicTab(
     draft: Character,
     memberIndex: Int?,
@@ -543,106 +558,72 @@ private fun BasicTab(
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (member != null) {
-            Text("一句话补全空字段", style = MaterialTheme.typography.labelMedium)
+            Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(MaterialTheme.legacy.border))
+            Text("一句话补全空字段", fontSize = 14.sp, color = MaterialTheme.legacy.textSecondary)
             Row(verticalAlignment = Alignment.CenterVertically) {
-                OutlinedTextField(
+                LegacyField(
                     value = fillHint,
                     onValueChange = { fillHint = it },
-                    placeholder = { Text("例如：她是负责医疗支持的沉稳护士") },
-                    singleLine = true,
+                    placeholder = "例如：她是负责医疗支持的沉稳护士",
                     modifier = Modifier.weight(1f),
                 )
                 Spacer(Modifier.width(6.dp))
-                Button(
-                    onClick = { onFillMember(draft, memberIndex, fillHint) },
-                    enabled = fillHint.isNotBlank(),
-                ) { Text("补全") }
+                LegacyButton("补全", primary = false, modifier = Modifier.width(64.dp), onClick = { onFillMember(draft, memberIndex, fillHint) })
             }
-            Text("只填充当前为空的字段，不覆盖已编辑内容。", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("只填充当前为空的字段，不覆盖已编辑内容。", fontSize = 12.sp, color = MaterialTheme.legacy.textMuted)
+            Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(MaterialTheme.legacy.border))
         }
 
-        OutlinedTextField(
-            value = member?.name ?: draft.name,
-            onValueChange = { updateName(it) },
-            label = { Text(if (member != null) "名称" else if (draft.isGroup) "群组名称" else "名称") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
-        OutlinedTextField(
-            value = member?.emoji ?: draft.emoji,
-            onValueChange = { updateEmoji(it) },
-            label = { Text("头像") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
+        LegacyField(value = member?.name ?: draft.name, onValueChange = { updateName(it) }, label = if (draft.isGroup && member == null) "群组名称" else "名称")
+        LegacyField(value = member?.emoji ?: draft.emoji, onValueChange = { updateEmoji(it) }, label = "头像")
 
         if (draft.isGroup && member == null) {
-            OutlinedTextField(
-                value = draft.description,
-                onValueChange = { onDraft(draft.copy(description = it)) },
-                label = { Text("群组前提") },
-                modifier = Modifier.fillMaxWidth(),
-            )
-            OutlinedTextField(
+            LegacyField(value = draft.description, onValueChange = { onDraft(draft.copy(description = it)) }, label = "群组前提", minLines = 2)
+            LegacyField(
                 value = draft.groupSharedDynamic.currentLocation,
                 onValueChange = { onDraft(draft.copy(groupSharedDynamic = draft.groupSharedDynamic.copy(currentLocation = it))) },
-                label = { Text("共同场景") },
-                modifier = Modifier.fillMaxWidth(),
-            )
-            OutlinedTextField(
-                value = draft.interactionRules,
-                onValueChange = { onDraft(draft.copy(interactionRules = it)) },
-                label = { Text("成员互动规则") },
+                label = "共同场景",
                 minLines = 2,
-                modifier = Modifier.fillMaxWidth(),
             )
-            Text(
-                "成员：" + draft.members.joinToString("、") { it.name },
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            LegacyField(value = draft.interactionRules, onValueChange = { onDraft(draft.copy(interactionRules = it)) }, label = "成员互动规则", minLines = 3)
+            Text("成员：" + draft.members.joinToString("、") { it.name }, fontSize = 12.sp, color = MaterialTheme.legacy.textMuted)
         } else {
             val profile = member?.staticProfile ?: draft.staticProfile
             STATIC_FIELDS.forEach { (key, label) ->
-                OutlinedTextField(
+                LegacyField(
                     value = staticValue(profile, key),
                     onValueChange = { updateProfile(withStatic(profile, key, it)) },
-                    label = { Text(label) },
-                    minLines = if (key == "background") 3 else 1,
-                    modifier = Modifier.fillMaxWidth(),
+                    label = label,
+                    minLines = if (key == "background") 2 else 1,
                 )
             }
             if (member != null) {
-                OutlinedTextField(
+                LegacyField(
                     value = member.roleInGroup,
                     onValueChange = { role ->
                         onDraft(draft.copy(members = draft.members.toMutableList().also { list -> list[memberIndex] = member.copy(roleInGroup = role) }))
                     },
-                    label = { Text("群内定位") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
+                    label = "群内定位",
                 )
             }
         }
 
-        // Avatar section with AI emoji generation.
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Surface(shape = CircleShape, color = MaterialTheme.colorScheme.primaryContainer, modifier = Modifier.size(40.dp)) {
+            Surface(shape = CircleShape, color = MaterialTheme.legacy.accentBg, modifier = Modifier.size(40.dp)) {
                 Box(contentAlignment = Alignment.Center) {
-                    Text(member?.emoji?.ifEmpty { "👤" } ?: draft.emoji.ifEmpty { if (draft.isGroup) "👥" else "👤" })
+                    Text(member?.emoji?.ifEmpty { "👤" } ?: draft.emoji.ifEmpty { if (draft.isGroup) "👥" else "👤" }, fontSize = 20.sp)
                 }
             }
             Spacer(Modifier.width(8.dp))
-            OutlinedButton(onClick = {
+            LegacyButton("AI 生成 emoji 头像", primary = false, modifier = Modifier.width(160.dp), onClick = {
                 onGenerateAvatar(draft) { emoji ->
                     if (!emoji.isNullOrBlank()) updateEmoji(emoji)
                 }
-            }) { Text("AI 生成 emoji 头像") }
+            })
         }
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun StateTab(draft: Character, memberIndex: Int?, onDraft: (Character) -> Unit) {
     val member = memberIndex?.let { draft.members.getOrNull(it) }
@@ -661,16 +642,15 @@ private fun StateTab(draft: Character, memberIndex: Int?, onDraft: (Character) -
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text(
             "这些字段反映角色当前状态。你可以直接修改；AI 只会根据对话中明确的用户信息更新。",
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            fontSize = 12.sp,
+            color = MaterialTheme.legacy.textMuted,
         )
         fields.forEach { (key, label) ->
-            OutlinedTextField(
+            LegacyField(
                 value = dynamicValue(state, key),
                 onValueChange = { update(withDynamic(state, key, it)) },
-                label = { Text(label) },
+                label = label,
                 minLines = if (key == "currentSituation") 3 else 1,
-                modifier = Modifier.fillMaxWidth(),
             )
         }
     }
@@ -684,119 +664,216 @@ private fun LorebookTab(
     onRemoveLorebook: (Character, String) -> Unit,
     onUpdateLorebook: (Character, LorebookEntry) -> Unit,
 ) {
+    val legacy = MaterialTheme.legacy
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Text(
             "世界书是世界层设定的唯一去处（时代与世界观、地点、组织、专有名词、历史、规则）。每条可选常驻（每轮都注入）或关键词命中（被提到才注入，更省 token）。条目由 AI 在剧情推进中自动维护，你可以随时修改、禁用或删除；你手改过的条目会被锁定，AI 不会再覆盖它。",
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            fontSize = 12.sp,
+            color = legacy.textMuted,
         )
         if (draft.lorebook.isEmpty()) {
-            Text("还没有条目。可以让 AI 在建卡时生成，或在对话中自动补充。", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("还没有条目。可以让 AI 在建卡时生成，或在对话中自动补充。", fontSize = 12.sp, color = legacy.textMuted)
         }
         draft.lorebook.forEach { entry ->
-            Card(
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(legacy.input)
+                    .border(1.dp, legacy.inputBorder, RoundedCornerShape(8.dp))
+                    .padding(10.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                Column(modifier = Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        OutlinedTextField(
-                            value = entry.name,
-                            onValueChange = { name ->
-                                onUpdateLorebook(draft, entry.copy(name = name, origin = LorebookOrigin.User))
-                            },
-                            placeholder = { Text("条目名（如：赤月王国）") },
-                            singleLine = true,
-                            modifier = Modifier.weight(1f),
-                        )
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            if (entry.origin == LorebookOrigin.User) "手写" else "AI 写入",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = if (entry.origin == LorebookOrigin.User) {
-                                MaterialTheme.colorScheme.primary
-                            } else {
-                                MaterialTheme.colorScheme.onSurfaceVariant
-                            },
-                        )
-                        TextButton(onClick = { onRemoveLorebook(draft, entry.id) }) { Text("删除") }
-                    }
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Checkbox(
-                                checked = true,
-                                onCheckedChange = { checked ->
-                                    onUpdateLorebook(draft, entry.copy(alwaysActive = checked))
-                                },
-                            )
-                            Text("常驻", style = MaterialTheme.typography.labelSmall)
-                        }
-                        Text(
-                            lorebookMention(draft, entry),
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                    OutlinedTextField(
-                        value = entry.keywords.joinToString("、"),
-                        onValueChange = { raw ->
-                            val keywords = raw.split(',', '，', '、', '\n').map { it.trim() }.filter { it.isNotEmpty() }.take(20)
-                            val alwaysActive = if (keywords.isEmpty()) true else entry.alwaysActive
-                            onUpdateLorebook(draft, entry.copy(keywords = keywords, alwaysActive = alwaysActive, origin = LorebookOrigin.User))
-                        },
-                        placeholder = { Text("触发关键词（用、或逗号分隔；常驻条目可留空）") },
-                        modifier = Modifier.fillMaxWidth(),
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    LegacyField(
+                        value = entry.name,
+                        onValueChange = { name -> onUpdateLorebook(draft, entry.copy(name = name, origin = LorebookOrigin.User)) },
+                        placeholder = "条目名（如：赤月王国）",
+                        modifier = Modifier.weight(1f),
                     )
-                    OutlinedTextField(
-                        value = entry.content,
-                        onValueChange = { content ->
-                            onUpdateLorebook(draft, entry.copy(content = content, origin = LorebookOrigin.User))
-                        },
-                        placeholder = { Text("命中后注入的设定内容") },
-                        minLines = 2,
-                        modifier = Modifier.fillMaxWidth(),
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        if (entry.origin == LorebookOrigin.User) "手写" else "AI 写入",
+                        fontSize = 12.sp,
+                        color = if (entry.origin == LorebookOrigin.User) legacy.warning else legacy.textMuted,
                     )
+                    TextButton(onClick = { onRemoveLorebook(draft, entry.id) }) { Text("删除", fontSize = 12.sp, color = legacy.textSecondary) }
                 }
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    LegacyCheck("启用", entry.enabled) { checked ->
+                        onUpdateLorebook(draft, entry.copy(enabled = checked))
+                    }
+                    LegacyCheck("常驻", entry.alwaysActive) { checked ->
+                        onUpdateLorebook(draft, entry.copy(alwaysActive = checked))
+                    }
+                    Text(lorebookMention(entry), fontSize = 12.sp, color = legacy.textMuted)
+                }
+                LegacyField(
+                    value = entry.keywords.joinToString("、"),
+                    onValueChange = { raw ->
+                        val keywords = raw.split(',', '，', '、', '\n').map { it.trim() }.filter { it.isNotEmpty() }.take(20)
+                        val alwaysActive = if (keywords.isEmpty()) true else entry.alwaysActive
+                        onUpdateLorebook(draft, entry.copy(keywords = keywords, alwaysActive = alwaysActive, origin = LorebookOrigin.User))
+                    },
+                    placeholder = "触发关键词（用、或逗号分隔；常驻条目可留空）",
+                )
+                LegacyField(
+                    value = entry.content,
+                    onValueChange = { content -> onUpdateLorebook(draft, entry.copy(content = content, origin = LorebookOrigin.User)) },
+                    placeholder = "命中后注入的设定内容",
+                    minLines = 2,
+                )
             }
         }
-        OutlinedButton(onClick = { onAddLorebook(draft) }, modifier = Modifier.fillMaxWidth()) {
-            Text("+ 添加条目")
-        }
+        LegacyButton("+ 添加条目", primary = false, onClick = { onAddLorebook(draft) })
+    }
+}
+
+@Composable
+private fun LegacyCheck(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { onChange(!checked) }) {
+        Checkbox(
+            checked = checked,
+            onCheckedChange = onChange,
+            colors = CheckboxDefaults.colors(
+                checkedColor = MaterialTheme.legacy.accent,
+                uncheckedColor = MaterialTheme.legacy.textMuted,
+                checkmarkColor = MaterialTheme.legacy.panel,
+            ),
+        )
+        Text(label, fontSize = 12.sp, color = MaterialTheme.legacy.textMuted)
     }
 }
 
 @Composable
 private fun MemoryTab(draft: Character, editingMember: GroupMember?) {
-    val character = if (editingMember != null) {
-        draft.copy(shortTerm = editingMember.shortTerm, longTerm = editingMember.longTerm)
-    } else {
-        draft
-    }
+    val legacy = MaterialTheme.legacy
+    val longTerm = editingMember?.longTerm ?: draft.longTerm
+    val shortTerm = editingMember?.shortTerm ?: draft.shortTerm
+
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("长期记忆", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
-        if (character.longTerm.isEmpty()) {
-            Text("暂无长期记忆", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text("长期记忆", fontSize = 14.sp, fontWeight = FontWeight.Medium, color = legacy.accent)
+        if (longTerm.isEmpty()) {
+            Text("暂无长期记忆", fontSize = 12.sp, color = legacy.textMuted)
         } else {
-            character.longTerm.forEach { memory ->
-                Text(
-                    if (memory.key.isNotEmpty()) "${memory.key} — ${memory.value}" else memory.value,
-                    style = MaterialTheme.typography.bodyMedium,
-                )
+            longTerm.forEach { memory ->
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(legacy.input)
+                        .border(1.dp, legacy.inputBorder, RoundedCornerShape(8.dp))
+                        .padding(10.dp),
+                ) {
+                    if (memory.key.isNotEmpty()) {
+                        Text(memory.key, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = legacy.text)
+                    }
+                    Text(memory.value, fontSize = 13.sp, color = legacy.text)
+                }
             }
         }
-        Text("短期记忆", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
-        if (character.shortTerm.isEmpty()) {
-            Text("暂无短期记忆", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text("短期记忆", fontSize = 14.sp, fontWeight = FontWeight.Medium, color = legacy.accent)
+        if (shortTerm.isEmpty()) {
+            Text("暂无短期记忆", fontSize = 12.sp, color = legacy.textMuted)
         } else {
-            character.shortTerm.forEach { memory ->
-                Text(memory.content, style = MaterialTheme.typography.bodyMedium)
+            shortTerm.forEach { memory ->
+                Text(
+                    memory.content,
+                    fontSize = 13.sp,
+                    color = legacy.text,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(legacy.input)
+                        .border(1.dp, legacy.inputBorder, RoundedCornerShape(8.dp))
+                        .padding(10.dp),
+                )
             }
         }
     }
 }
 
+// ==================== legacy-styled input primitives ====================
+
+@Composable
+private fun LegacyField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    modifier: Modifier = Modifier,
+    label: String? = null,
+    placeholder: String? = null,
+    minLines: Int = 1,
+) {
+    val legacy = MaterialTheme.legacy
+    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(3.dp)) {
+        if (label != null) {
+            Text(label, fontSize = 12.sp, color = legacy.textMuted)
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(8.dp))
+                .background(legacy.input)
+                .border(1.dp, legacy.inputBorder, RoundedCornerShape(8.dp))
+                .padding(horizontal = 8.dp, vertical = 6.dp),
+        ) {
+            if (value.isEmpty() && placeholder != null) {
+                Text(placeholder, fontSize = 13.sp, color = legacy.textMuted)
+            }
+            BasicTextField(
+                value = value,
+                onValueChange = onValueChange,
+                textStyle = TextStyle(fontSize = 13.sp, color = legacy.text),
+                cursorBrush = SolidColor(legacy.accent),
+                minLines = minLines,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+    }
+}
+
+@Composable
+private fun <T> LegacyDropdown(
+    selected: String,
+    options: List<Pair<String, T>>,
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
+    onSelect: (T) -> Unit,
+) {
+    val legacy = MaterialTheme.legacy
+    Box(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(8.dp))
+                .background(legacy.input)
+                .border(1.dp, legacy.inputBorder, RoundedCornerShape(8.dp))
+                .clickable { onExpandedChange(true) }
+                .padding(horizontal = 8.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(selected, fontSize = 13.sp, color = legacy.text, modifier = Modifier.weight(1f))
+            Text("▾", fontSize = 13.sp, color = legacy.textMuted)
+        }
+        androidx.compose.material3.DropdownMenu(expanded = expanded, onDismissRequest = { onExpandedChange(false) }) {
+            options.forEach { (label, value) ->
+                androidx.compose.material3.DropdownMenuItem(
+                    text = { Text(label, color = legacy.text) },
+                    onClick = { onSelect(value) },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun Surface(shape: androidx.compose.ui.graphics.Shape, color: androidx.compose.ui.graphics.Color, modifier: Modifier, content: @Composable () -> Unit) {
+    Box(modifier = modifier.clip(shape).background(color), contentAlignment = Alignment.Center) { content() }
+}
+
 // ==================== helpers ====================
 
-private fun lorebookMention(draft: Character, entry: LorebookEntry): String {
+private fun lorebookMention(entry: LorebookEntry): String {
     if (entry.misses <= 0) return "未命中过"
     return "命中 ${entry.misses} 次"
 }

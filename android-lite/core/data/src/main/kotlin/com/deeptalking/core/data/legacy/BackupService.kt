@@ -222,6 +222,7 @@ class BackupService(
         put("name", entry.name)
         putJsonArray("keywords") { entry.keywords.forEach { add(it) } }
         put("content", entry.content)
+        put("enabled", entry.enabled)
         put("alwaysActive", entry.alwaysActive)
         put("origin", if (entry.origin == LorebookOrigin.Model) "ai" else "user")
         put("misses", entry.misses)

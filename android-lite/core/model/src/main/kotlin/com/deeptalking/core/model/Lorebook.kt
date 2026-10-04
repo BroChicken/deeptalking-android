@@ -16,6 +16,7 @@ data class LorebookEntry(
     val name: String = "",
     val content: String = "",
     val keywords: List<String> = emptyList(),
+    val enabled: Boolean = true,
     val alwaysActive: Boolean = false,
     val origin: LorebookOrigin = LorebookOrigin.Model,
     val memberName: String? = null,

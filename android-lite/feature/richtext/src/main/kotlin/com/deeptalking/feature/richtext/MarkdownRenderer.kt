@@ -92,6 +92,25 @@ private fun escapeHtml(value: String): String = value
     .replace("'", "&#39;")
 
 /**
+ * True when [text] contains math delimiters (`$...$`, `$$...$$`, `\(...\)`,
+ * `\[...\]`). Used to decide whether a message needs the KaTeX WebView or can
+ * be rendered with a cheap pure-Compose [androidx.compose.ui.text.Text].
+ */
+fun containsMath(text: String): Boolean =
+    text.contains('$') ||
+        text.contains("\\(") ||
+        text.contains("\\[") ||
+        text.contains("\\]")
+
+/**
+ * Builds a [androidx.compose.ui.text.AnnotatedString]-friendly plain-text
+ * version of the markdown subset for messages without math. Rendering markdown
+ * structure (headings/lists/code) is left to the WebView path; this fast path
+ * only strips inline markers so the common case needs no WebView at all.
+ */
+fun plainTextForNonMath(text: String): String = text
+
+/**
  * Renders a markdown subset to HTML. Math delimiters survive untouched so the
  * WebView's KaTeX auto-render pass can typeset them.
  */

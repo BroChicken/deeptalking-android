@@ -20,10 +20,10 @@ DeepTalking 是原生 Android 应用（Kotlin + Jetpack Compose 多模块），�
 | `:domain:agent` | domain | `AgentTool/ToolRegistry`、`ChatOrchestrator`、`AgentLoop`、提示词装配（`prompts/`）、结构化解析（`ResponseParser`）、工具实现（`tools/`） |
 | `:domain:memory` | domain | `MemoryService` + `MemoryServiceImpl`、检索/世界书匹配/记忆策略/时间工具 |
 | `:engine:ondevice` | engine | 端侧推理接口：`LlmBackend/EmbeddingBackend/AsrBackend/TtsBackend` + `InferenceRegistry` |
-| `:feature:chat` | feature | 聊天界面：头像/气泡（尾角圆角）/流式打字/工具活动/快速回应/图片/表情包（含标签编辑）/消息操作（复制、编辑重发、重新生成）/⚡📖 状态改动提示/图片灯箱 + `RichText`（渲染 WebView） |
-| `:feature:characters` | feature | 角色/群组列表、创建弹窗（单角色/群组 + 一句话生成）、角色卡编辑器（基础/当前状态/世界书/**记忆** 四标签，世界书含 常驻/启用、AI emoji 头像、成员一句话补全）、升级为群组、导出/导入、补全头像 |
+| `:feature:chat` | feature | 聊天界面：头像/气泡（尾角圆角）/流式打字/工具活动/快速回应/图片/表情包（含标签编辑）/消息操作（复制、编辑重发、重新生成）/⚡📖 状态改动提示/图片灯箱。**性能**：消息仅在有公式时才用 `RichTextWebView`，其余走纯 Compose `RichText`（`renderMarkdownAnnotated`），配合稳定 `key` 保证滚动顺滑 |
+| `:feature:characters` | feature | 角色/群组列表、创建弹窗（单角色/群组 + 一句话生成）、角色卡编辑器（基础/当前状态/世界书/**记忆** 四标签；世界书每条含 **启用** + **常驻** 两勾选、条目名、命中显示、来源标签；记忆以条目卡片列表展示）、AI emoji 头像、成员一句话补全、升级为群组、导出/导入、补全头像 |
 | `:feature:memory` | feature | （已并入角色卡「记忆」标签；本模块保留供扩展） |
-| `:feature:settings` | feature | 平台下拉、Base URL、模型、Temperature、流式、思考强度、API Key、测试连接、测试提醒、调试信息（最近回应/用量/缓存）+ 复制 |
+| `:feature:settings` | feature | 平台下拉、Base URL、模型预设下拉、Temperature、流式、思考强度、API Key、测试连接、测试提醒、调试信息（最近回应/用量/缓存）+ 复制 |
 | `:feature:richtext` | feature | `MarkdownRenderer`（纯 Kotlin）+ `RichTextWebView`（KaTeX 早渲染） |
 
 依赖方向：`app → feature → domain → core/engine`。core/engine 不反依赖上层。
@@ -36,11 +36,11 @@ DeepTalking 是原生 Android 应用（Kotlin + Jetpack Compose 多模块），�
 
 ## 界面与交互（对齐旧版 WebView）
 
-- 应用骨架对齐旧版 `shell.html`：顶部 header（头像 + 名称 + 身份 + 版本徽标）+ 左侧抽屉侧栏（**角色 / 设置** 两标签）+ 主聊天区。无独立「记忆」页（记忆并入角色卡第 4 标签）。
-- 四套主题（清浅/夜色/深海/旧灯）由 `AppConfig.activeTheme` 驱动，顶栏色块菜单切换。
-- 气泡：`max-width min(84%,560)`、圆角 12dp + 尾角 4dp、无阴影；头像 30dp 圆角方块；typing 三点；消息操作与 ⚡/📖 提示对齐旧版。
+- 配色**逐值对齐** `src/styles/app.css`：`core:designsystem` 暴露 `LegacyColors`（`--bg/--text/--bubble-*/--sidebar/--input-*` 等全部 CSS 变量，四主题各一套），UI 直接用原值，不再依赖 Material 语义色派生，从根上避免"文字与气泡颜色相近看不清"。
+- 应用骨架对齐旧版 `shell.html`：顶部 header（hamburger 42dp + 头像 32 + 名称/身份 + 主题菜单 + 版本徽标，高 64dp，随状态栏 inset）+ 左侧抽屉侧栏 **258dp**（**角色 / 设置** 两标签）+ 主聊天区。缓存条 / 活动状态为 header 右下角小胶囊（对齐 `#cacheStatsBar` / `#activityStatusBar`）。
+- 消息区：`max-width 56rem` 居中；气泡 `max-width min(84%,560)`、内距 `12px 14px`、圆角 12 + 尾角 4、无阴影、字号 15、行高 1.68；AI 头像 30dp 圆角方块（用户消息无头像）；typing 三点；消息 meta 行（时间 + 30dp 圆形操作按钮）。
 - 交互回退回旧版：角色**主动开口**为面板空闲 **60s** 自动触发（随应用可见性暂停/重置），非手动按钮；编辑重发/重新生成会**丢弃后续分支及相关记忆**。
-- 设置区含调试信息面板；头部缓存命中条由 `AppConfig.requestMetrics` 提供（无命中数据显示「缓存未返回命中数据」）。
+- 世界书条目受 `enabled` 控制：禁用的条目不参与注入（`LorebookMatcher.select` 过滤），与「常驻」互不影响。
 
 ## 数据与迁移
 

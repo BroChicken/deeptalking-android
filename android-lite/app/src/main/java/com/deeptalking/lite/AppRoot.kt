@@ -3,18 +3,23 @@ package com.deeptalking.lite
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material3.DrawerValue
@@ -27,11 +32,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Tab
-import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -45,17 +46,21 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
+import com.deeptalking.core.designsystem.AppTheme
 import com.deeptalking.core.designsystem.DeepTalkingTheme
+import com.deeptalking.core.designsystem.legacy
 import com.deeptalking.feature.characters.CharactersScreen
 import com.deeptalking.feature.chat.ChatScreen
 import com.deeptalking.feature.settings.SettingsScreen
@@ -72,11 +77,11 @@ fun AppRoot(core: NativeCore) {
     }
 }
 
-@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
 private fun AppContent(core: NativeCore, vm: AppViewModel) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val scope = rememberCoroutineScope()
+    val legacy = MaterialTheme.legacy
 
     val characters by vm.characters.collectAsState()
     val activeId by vm.activeId.collectAsState()
@@ -145,11 +150,16 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
     ModalNavigationDrawer(
         drawerState = drawerState,
         drawerContent = {
-            ModalDrawerSheet(modifier = Modifier.width(320.dp)) {
-                TabRow(selectedTabIndex = sidebarTab) {
-                    Tab(selected = sidebarTab == 0, onClick = { sidebarTab = 0 }, text = { Text("角色") })
-                    Tab(selected = sidebarTab == 1, onClick = { sidebarTab = 1 }, text = { Text("设置") })
+            ModalDrawerSheet(
+                modifier = Modifier.width(258.dp),
+                drawerContainerColor = legacy.sidebar,
+            ) {
+                // .tab-btn row (角色 | 设置)
+                Row(modifier = Modifier.fillMaxWidth().background(legacy.sidebar)) {
+                    SidebarTab("角色", selected = sidebarTab == 0, modifier = Modifier.weight(1f)) { sidebarTab = 0 }
+                    SidebarTab("设置", selected = sidebarTab == 1, modifier = Modifier.weight(1f)) { sidebarTab = 1 }
                 }
+                Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(legacy.border))
                 if (sidebarTab == 0) {
                     CharactersScreen(
                         characters = characters,
@@ -187,71 +197,19 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
         },
     ) {
         Scaffold(
+            containerColor = legacy.bg,
             snackbarHost = { SnackbarHost(snackbarHostState) },
-            topBar = {
-                TopAppBar(
-                    colors = TopAppBarDefaults.topAppBarColors(
-                        containerColor = MaterialTheme.colorScheme.surface,
-                    ),
-                    navigationIcon = {
-                        IconButton(onClick = { scope.launch { drawerState.open() } }) {
-                            Icon(Icons.Default.Menu, contentDescription = "角色列表")
-                        }
-                    },
-                    title = {
-                        if (activeCharacter == null) {
-                            Text(
-                                "选择一个角色开始对话",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        } else {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Surface(
-                                    shape = CircleShape,
-                                    color = MaterialTheme.colorScheme.primaryContainer,
-                                    modifier = Modifier.size(32.dp),
-                                ) {
-                                    Box(contentAlignment = Alignment.Center) {
-                                        Text(activeCharacter!!.emoji.ifEmpty { "👤" })
-                                    }
-                                }
-                                Spacer(Modifier.width(8.dp))
-                                Column {
-                                    Text(
-                                        activeCharacter!!.name,
-                                        style = MaterialTheme.typography.titleSmall,
-                                        fontWeight = FontWeight.Bold,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                    )
-                                    val occupation = activeCharacter!!.dynamicState.currentOccupation
-                                        .ifBlank { "未知身份" }
-                                    Text(
-                                        occupation,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                    )
-                                }
-                            }
-                        }
-                    },
-                    actions = {
-                        ThemeMenu(currentThemeId = config.activeTheme, onSelect = vm::setTheme)
-                        Text(
-                            "v" + BuildConfig.VERSION_NAME,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(end = 8.dp),
-                        )
-                    },
-                )
-            },
         ) { padding ->
             Column(modifier = Modifier.fillMaxSize().padding(padding)) {
-                CacheStatsBar(config)
+                AppHeader(
+                    activeCharacter = activeCharacter,
+                    currentThemeId = config.activeTheme,
+                    version = BuildConfig.VERSION_NAME,
+                    status = status,
+                    config = config,
+                    onOpenDrawer = { scope.launch { drawerState.open() } },
+                    onSelectTheme = vm::setTheme,
+                )
                 ChatScreen(
                     character = activeCharacter,
                     messages = messages,
@@ -290,9 +248,106 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
 }
 
 @Composable
-private fun CacheStatsBar(config: com.deeptalking.core.model.AppConfig) {
+private fun SidebarTab(label: String, selected: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    val legacy = MaterialTheme.legacy
+    Column(
+        modifier = modifier
+            .height(44.dp)
+            .clickable(onClick = onClick),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Text(
+            label,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.Medium,
+            color = if (selected) legacy.accent else legacy.textSecondary,
+        )
+        Box(
+            modifier = Modifier
+                .padding(top = 6.dp)
+                .width(48.dp)
+                .height(2.dp)
+                .background(if (selected) legacy.accent else androidx.compose.ui.graphics.Color.Transparent),
+        )
+    }
+}
+
+@Composable
+private fun AppHeader(
+    activeCharacter: com.deeptalking.core.model.Character?,
+    currentThemeId: String,
+    version: String,
+    status: String,
+    config: com.deeptalking.core.model.AppConfig,
+    onOpenDrawer: () -> Unit,
+    onSelectTheme: (String) -> Unit,
+) {
+    val legacy = MaterialTheme.legacy
+    Box(modifier = Modifier.fillMaxWidth().background(legacy.header).statusBarsPadding()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().height(64.dp).padding(horizontal = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            IconButton(onClick = onOpenDrawer, modifier = Modifier.size(42.dp)) {
+                Icon(Icons.Default.Menu, contentDescription = "角色列表", tint = legacy.textSecondary)
+            }
+            Spacer(Modifier.width(10.dp))
+            if (activeCharacter == null) {
+                Text("选择一个角色开始对话", fontSize = 14.sp, color = legacy.textMuted)
+            } else {
+                Surface(
+                    shape = CircleShape,
+                    color = legacy.accentBg,
+                    modifier = Modifier.size(32.dp),
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Text(activeCharacter.emoji.ifEmpty { "👤" }, textAlign = TextAlign.Center)
+                    }
+                }
+                Spacer(Modifier.width(8.dp))
+                Column {
+                    Text(
+                        activeCharacter.name,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = legacy.text,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        activeCharacter.dynamicState.currentOccupation.ifBlank { "未知身份" },
+                        fontSize = 12.sp,
+                        color = legacy.textMuted,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            Spacer(Modifier.weight(1f))
+            ThemeMenu(currentThemeId = currentThemeId, onSelect = onSelectTheme)
+            Text(
+                "v" + version,
+                fontSize = 10.sp,
+                color = legacy.textMuted,
+                modifier = Modifier.padding(start = 4.dp),
+            )
+        }
+        // #activityStatusBar (bottom-left) and #cacheStatsBar (bottom-right) pills
+        StatusPills(status = status, config = config, modifier = Modifier.align(Alignment.BottomEnd))
+        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(legacy.border).align(Alignment.BottomStart))
+    }
+}
+
+@Composable
+private fun StatusPills(
+    status: String,
+    config: com.deeptalking.core.model.AppConfig,
+    modifier: Modifier = Modifier,
+) {
+    val legacy = MaterialTheme.legacy
     val metrics = config.requestMetrics
-    val text = when {
+    val cacheText = when {
         metrics.isEmpty() -> "缓存 --"
         metrics.none { it.inputTokens > 0 } -> "缓存未返回命中数据"
         else -> {
@@ -302,30 +357,54 @@ private fun CacheStatsBar(config: com.deeptalking.core.model.AppConfig) {
             "缓存命中 ${(last * 100).toInt()}% · 近${recent.size}轮均值 ${(avg * 100).toInt()}%"
         }
     }
-    Text(
-        text,
-        style = MaterialTheme.typography.labelSmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp),
-    )
+    Row(modifier = modifier.padding(end = 8.dp, bottom = 3.dp), verticalAlignment = Alignment.CenterVertically) {
+        if (status.isNotBlank()) {
+            Text(
+                status,
+                fontSize = 11.sp,
+                color = legacy.accent,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(end = 6.dp),
+            )
+        }
+        Text(
+            cacheText,
+            fontSize = 10.sp,
+            color = legacy.textMuted,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier
+                .clip(RoundedCornerShape(4.dp))
+                .background(legacy.header)
+                .border(1.dp, legacy.border, RoundedCornerShape(4.dp))
+                .padding(horizontal = 6.dp, vertical = 1.dp),
+        )
+    }
 }
 
 @Composable
 private fun ThemeMenu(currentThemeId: String, onSelect: (String) -> Unit) {
     var open by remember { mutableStateOf(false) }
+    val legacy = MaterialTheme.legacy
     Box {
-        IconButton(onClick = { open = true }) {
-            Text("◐", style = MaterialTheme.typography.titleMedium)
+        IconButton(onClick = { open = true }, modifier = Modifier.size(42.dp)) {
+            Text("◐", fontSize = 18.sp, color = legacy.textSecondary)
         }
         androidx.compose.material3.DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
-            com.deeptalking.core.designsystem.AppTheme.entries.forEach { theme ->
+            AppTheme.entries.forEach { theme ->
                 androidx.compose.material3.DropdownMenuItem(
-                    text = { Text(theme.label) },
+                    text = {
+                        Text(
+                            theme.label,
+                            color = if (theme.id == currentThemeId) legacy.accent else legacy.textSecondary,
+                        )
+                    },
                     leadingIcon = {
                         Surface(
                             shape = CircleShape,
-                            color = swatchColor(theme.id),
-                            modifier = Modifier.size(20.dp),
+                            color = theme.swatch,
+                            modifier = Modifier.size(20.dp).border(1.dp, legacy.textMuted, CircleShape),
                         ) {}
                     },
                     onClick = {
@@ -336,13 +415,4 @@ private fun ThemeMenu(currentThemeId: String, onSelect: (String) -> Unit) {
             }
         }
     }
-    @Suppress("UNUSED_EXPRESSION")
-    currentThemeId
-}
-
-private fun swatchColor(id: String) = when (id) {
-    "theme-black" -> androidx.compose.ui.graphics.Color(0xFF0F151C)
-    "theme-blue" -> androidx.compose.ui.graphics.Color(0xFF0F202C)
-    "theme-yellow" -> androidx.compose.ui.graphics.Color(0xFF2A271B)
-    else -> androidx.compose.ui.graphics.Color(0xFFEDF0F4)
 }
