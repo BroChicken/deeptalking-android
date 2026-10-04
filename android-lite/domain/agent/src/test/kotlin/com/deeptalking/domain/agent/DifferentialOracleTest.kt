@@ -36,6 +36,13 @@ import java.time.Instant
  */
 class DifferentialOracleTest {
 
+    init {
+        // The volatile context embeds a local-time string; pin the JVM default
+        // timezone and locale so results are identical on macOS/Windows/Linux CI.
+        java.util.TimeZone.setDefault(java.util.TimeZone.getTimeZone("Asia/Shanghai"))
+        java.util.Locale.setDefault(java.util.Locale.CHINA)
+    }
+
     private val json = Json { ignoreUnknownKeys = true }
 
     private fun readResource(name: String): String =
@@ -73,11 +80,6 @@ class DifferentialOracleTest {
 
     private fun oracle(): JsonObject =
         json.parseToJsonElement(readResource("js-oracle.json")).jsonObject
-
-    @Test
-    fun `fixed clock and timezone for determinism`() {
-        java.util.TimeZone.setDefault(java.util.TimeZone.getTimeZone("Asia/Shanghai"))
-    }
 
     @Test
     fun `tool contract matches the legacy JS oracle`() = runBlocking {

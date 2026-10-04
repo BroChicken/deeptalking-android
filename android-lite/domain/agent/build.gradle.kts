@@ -19,3 +19,10 @@ dependencies {
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
 }
+
+// The differential oracle compares a local-time string byte-for-byte, so the
+// test JVM must use a fixed timezone regardless of the CI runner's default.
+tasks.withType<Test>().configureEach {
+    systemProperty("user.timezone", "Asia/Shanghai")
+    jvmArgs("-Duser.language=zh", "-Duser.country=CN")
+}
