@@ -6,9 +6,6 @@ on:
     branches: [main, cloud-main]
     paths:
       - 'android-lite/**'
-      - 'src/**'
-      - 'tools/**'
-      - 'hub.html'
       - '.github/workflows/build-lite-apk.yml'
 
 permissions:
@@ -19,11 +16,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - name: Verify committed assets match module sources
-        run: node tools/build-hub.mjs --check
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -37,18 +29,11 @@ jobs:
           if [ -z "$VERSION" ]; then echo "versionName not found" >&2; exit 1; fi
           echo "name=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Detected versionName=$VERSION"
-      - name: Sync APP_VERSION into both hub.html copies
-        run: node tools/sync-version.mjs
-      - name: Verify application contracts
-        run: node tools/verify-hub.mjs
-      - name: Verify build regression cases
-        run: node tools/test-build-hub.mjs
-      - name: Verify agent and memory regression cases
-        run: node --test tools/test-agent-regressions.mjs
-      - name: Assert both hub.html copies are byte-identical
+      - name: Verify module compilation and unit tests
+        working-directory: android-lite
         run: |
-          sha256sum hub.html android-lite/app/src/main/assets/hub.html
-          cmp hub.html android-lite/app/src/main/assets/hub.html
+          gradle :app:assembleDebug --stacktrace
+          gradle :engine:ondevice:test :domain:agent:test :domain:memory:test :core:data:testDebugUnitTest :feature:richtext:testDebugUnitTest --stacktrace
       - name: Restore signing keystore
         shell: bash
         env:

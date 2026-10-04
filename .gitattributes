@@ -1,4 +1,4 @@
 # Keep deterministic frontend build inputs and outputs identical across platforms.
 src/** text eol=lf
-hub.html text eol=lf
+src/vendor/katex/fonts/** binary
 android-lite/app/src/main/assets/hub.html text eol=lf

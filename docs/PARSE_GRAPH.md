@@ -8,7 +8,7 @@
 - **INV-1 单点解析**：所有"模型输出 → 结构化对象"都经 `parseJsonPayload`。改它=改全系统。
 - **INV-2 顶层类型契约**：主回复解析必须返回**对象**（`isPlainObject`）。返回数组=快速回应/记忆全丢（静默失败）。
 - **INV-3 不改字段名集合**（`DYNAMIC_STATE_FIELDS` / `STATIC_PROFILE_FIELDS`）而不检查下游：schema、清洗、迁移、UI、提示词全部由这两个常量驱动。
-- **INV-4 两文件字节一致**：`hub.html` 与 `android-lite/.../hub.html` 必须同步（`tools/check-sync.ps1`）。
+- **INV-4 产物与源码一致**：`android-lite/.../assets/hub.html` 与 `assets/katex/` 由 `src/`（含 `src/vendor/`）构建，不得手改（`tools/check-sync.ps1` / `build-hub.mjs --check`）。
 - **INV-5 前缀缓存稳定**：system 固定在前、历史原样递增、volatile 只挂当前用户消息；任何"每轮变化的文本塞进 system 前缀"都会击穿缓存。
 - **INV-6 阶段二只用于兜底**：阶段一（含 `submit_response` 工具）拿到正文就直接收尾；只有"连正文都没有"才进阶段二锁定 `submit_response`。
 - **INV-7 待办必须用户原话证据**（promises 准入）。
@@ -148,7 +148,7 @@ STATIC_PROFILE_FIELDS ─┬─► submit_response schema (staticFieldProperties
 - [ ] 是否碰到 `parseJsonPayload` / `repairFreetextFields`？→ 跑"自测样例"（含未转义引号、真实换行、嵌套对象）。
 - [ ] 是否改 `DYNAMIC_STATE_FIELDS` / `STATIC_PROFILE_FIELDS`？→ 逐一核对第 3 节所有下游 + 迁移 + 提示词。
 - [ ] 是否改 system prompt 文本？→ 检查前缀缓存（INV-5）。
-- [ ] 是否改 `hub.html`？→ 同步 APK 副本 + `check-sync.ps1`。
+- [ ] 是否改 `src/`？→ 重建生成资产 + `check-sync.ps1`。
 - [ ] 是否改 `versionName`？→ 同步 `APP_VERSION` + `versionCode`，跑 workflow。
 - [ ] 是否新增 `parseJsonPayload` 调用？→ 检查返回类型守卫。
 - [ ] 是否改请求体阶段（`buildResponsesRequestBody`）？→ 核对阶段二 tools/tool_choice（INV-6）。

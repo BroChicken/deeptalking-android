@@ -1,6 +1,7 @@
-﻿plugins {
-    id("com.android.application")
-    id("org.jetbrains.kotlin.android")
+plugins {
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.kotlin.compose)
 }
 
 val hubRoot = rootProject.projectDir.parentFile
@@ -12,8 +13,8 @@ val buildHubAssets by tasks.registering(Exec::class) {
     inputs.dir(hubRoot.resolve("src"))
     inputs.file(hubRoot.resolve("tools/build-hub.mjs"))
     inputs.file(project.file("build.gradle.kts"))
-    outputs.file(hubRoot.resolve("hub.html"))
     outputs.file(project.file("src/main/assets/hub.html"))
+    outputs.dir(project.file("src/main/assets/katex"))
 }
 
 tasks.named("preBuild") {
@@ -28,8 +29,8 @@ android {
         applicationId = "com.deeptalking.lite"
         minSdk = 26
         targetSdk = 35
-        versionCode = 31
-        versionName = "1.3.6"
+        versionCode = 32
+        versionName = "1.4.0"
     }
 
     compileOptions {
@@ -39,6 +40,10 @@ android {
 
     kotlinOptions {
         jvmTarget = "17"
+    }
+
+    buildFeatures {
+        compose = true
     }
 
     signingConfigs {
@@ -66,4 +71,27 @@ android {
 }
 
 dependencies {
+    implementation(project(":core:data"))
+    implementation(project(":core:network"))
+    implementation(project(":core:security"))
+    implementation(project(":core:notifications"))
+    implementation(project(":core:designsystem"))
+    implementation(project(":engine:ondevice"))
+    implementation(project(":domain:agent"))
+    implementation(project(":domain:memory"))
+    implementation(project(":feature:chat"))
+    implementation(project(":feature:characters"))
+    implementation(project(":feature:memory"))
+    implementation(project(":feature:settings"))
+
+    implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.activity.compose)
+    implementation(libs.lifecycle.runtime.ktx)
+    implementation(libs.lifecycle.viewmodel.compose)
+    implementation(libs.navigation.compose)
+    implementation(platform(libs.compose.bom))
+    implementation(libs.compose.ui)
+    implementation(libs.compose.material3)
+    implementation(libs.compose.material.icons.extended)
+    implementation(libs.compose.ui.tooling.preview)
 }

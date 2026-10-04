@@ -7,9 +7,12 @@ android-lite/keystore/*.jks
 
 # 构建产物
 android-lite/build/
-android-lite/app/build/
+android-lite/**/build/
 android-lite/local.properties
 
 # 本地数据
 save/
 apk/
+
+# 校验脚本工作区（可复用的临时产物，不进仓库）
+tools/.work/

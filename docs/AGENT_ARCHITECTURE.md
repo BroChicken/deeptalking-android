@@ -1,10 +1,10 @@
 ﻿# Agent 架构文档（DeepTalking / 模块化前端）
 
-> 本文档记录 `src/js/` 中 Agent 功能的定义与构造（只描述**当前最新状态**，历史变更看 git）。源码按职责拆分，网页与 APK 的 `hub.html` 均为构建产物。行号随源码调整会偏移，**以模块路径与函数名检索为准**；改动 Agent 循环、工具、提示词、记忆、字段或常量时，必须同步更新本文档。
+> 本文档记录 `src/js/` 中 Agent 功能的定义与构造（只描述**当前最新状态**，历史变更看 git）。源码按职责拆分，APK 的 `hub.html` 为构建产物。行号随源码调整会偏移，**以模块路径与函数名检索为准**；改动 Agent 循环、工具、提示词、记忆、字段或常量时，必须同步更新本文档。
 
 ## 源码与运行边界
 
-后续开发以拆开的 `src/` 模块为唯一源码，单文件不再维护。模块顺序由 `src/manifest.json` 声明，`node tools/build-hub.mjs` 将 `src/shell.html`、样式和 JavaScript 构建为两份字节级一致的 `hub.html`；两份文件仅为生成产物。脚本保留原有经典脚本全局作用域和执行顺序，跨模块函数调用、DOM 事件、提示词、Agent 循环和存储格式均维持原有契约。Android 仍从固定 `file:///android_asset/hub.html` 加载，localStorage 主键仍为 `deeptalking_data_v1`。
+后续开发以拆开的 `src/` 模块为唯一源码，单文件不再维护。模块顺序由 `src/manifest.json` 声明，`node tools/build-hub.mjs` 将 `src/shell.html`、样式和 JavaScript 构建为 APK 资产 `android-lite/app/src/main/assets/hub.html`，并把 `src/vendor/katex/` 复制到 `assets/katex/`；这些资产仅为生成产物。脚本保留原有经典脚本全局作用域和执行顺序，跨模块函数调用、DOM 事件、提示词、Agent 循环和存储格式均维持原有契约。Android 仍从固定 `file:///android_asset/hub.html` 加载，localStorage 主键仍为 `deeptalking_data_v1`。
 
 | 模块 | 关键锚点 |
 |---|---|
@@ -22,9 +22,9 @@
 | `src/js/core/config.js` | 字段与记忆/世界书/提示词预算常量 |
 | `src/js/ui/status-settings.js` | `toolActivityHint`、`chatStageDecision`、设置 |
 
-完整模块职责和开发/构建流程见 [FRONTEND_MODULES.md](FRONTEND_MODULES.md)。`APP_VERSION` 在源码中使用占位符，构建器从 Android 的 `versionName` 注入；`sync-version.mjs` 也调用同一构建器。`build-hub.mjs --check` 和 `verify-hub.mjs` 验证源码与网页、APK 资产三方一致，并检查独立模块语法边界。
+完整模块职责和开发/构建流程见 [FRONTEND_MODULES.md](FRONTEND_MODULES.md)。`APP_VERSION` 在源码中使用占位符，构建器从 Android 的 `versionName` 注入；`sync-version.mjs` 也调用同一构建器。`build-hub.mjs --check` 和 `verify-hub.mjs` 验证源码与 APK 生成资产一致，并检查独立模块语法边界。
 
-Android 打包的 `preBuild` 自动执行 `buildHubAssets`，直接从 `src/` 生成运行资源，再由 Gradle 打包 APK。`hub.html` 是这一流程的中间产物，不是打包时需要手工维护的输入源码。
+Android 打包的 `preBuild` 自动执行 `buildHubAssets`，直接从 `src/`（含 `src/vendor/`）生成运行资源 `assets/hub.html` 与 `assets/katex/`，再由 Gradle 打包 APK。这些资产是这一流程的产物，不是打包时需要手工维护的输入源码。
 
 ## 一、Agent 是什么
 
@@ -417,7 +417,7 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 - **散文即终稿不再重写**：阶段一拿到散文就直接采用，旧行为（`convertProseToJson` 阻塞在可见链路里、把用户已看到的正文换成"整理"后的版本）已移除；实机可用调试面板的 `stageStats` / `activityLog` 核对「正在整理回复…」是否真的不再出现。
 - **共享 HTML 工具**：`decodeBasicHtmlEntities()`（src/js/core/config.js）是 HTML 实体解码的唯一实现，`htmlToReadableText`（去 script/style 后可读文本）与 `stripHtmlTags`（B站标题清洗）都复用它，避免两处实现漂移。
 - **导入/导出归一化**：`normalizeAppData` → `normalizeCharacter`（src/js/storage/schema.js:40）逐字段校验，包含世界书、场景概要、场景状态与新增计数器。
-- **版本号单一来源**：右上角 `APP_VERSION`（src/js/core/config.js:73）由 `versionName` 派生，`tools/sync-version.mjs` 负责写入两份 `hub.html`；CI 在 `assembleRelease` 前执行该脚本并 `cmp` 校验两份文件一致，本地用 `node tools/sync-version.mjs --check` 复核。
+- **版本号单一来源**：右上角 `APP_VERSION`（src/js/core/config.js:73）由 `versionName` 派生，`tools/sync-version.mjs` 负责写入生成资产 `hub.html`；CI 在 `assembleRelease` 前执行该脚本并校验产物与源码一致，本地用 `node tools/sync-version.mjs --check` 复核。
 
 ## 九、关键常量速查
 
