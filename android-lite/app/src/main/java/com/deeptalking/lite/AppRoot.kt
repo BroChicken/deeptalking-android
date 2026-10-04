@@ -199,6 +199,7 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
         Scaffold(
             containerColor = legacy.bg,
             snackbarHost = { SnackbarHost(snackbarHostState) },
+            contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0),
         ) { padding ->
             Column(modifier = Modifier.fillMaxSize().padding(padding)) {
                 AppHeader(
@@ -325,6 +326,18 @@ private fun AppHeader(
                 }
             }
             Spacer(Modifier.weight(1f))
+            if (status.isNotBlank()) {
+                Text(
+                    status,
+                    fontSize = 11.sp,
+                    color = legacy.accent,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(end = 6.dp),
+                )
+            }
+            CachePill(config)
+            Spacer(Modifier.width(4.dp))
             ThemeMenu(currentThemeId = currentThemeId, onSelect = onSelectTheme)
             Text(
                 "v" + version,
@@ -333,21 +346,15 @@ private fun AppHeader(
                 modifier = Modifier.padding(start = 4.dp),
             )
         }
-        // #activityStatusBar (bottom-left) and #cacheStatsBar (bottom-right) pills
-        StatusPills(status = status, config = config, modifier = Modifier.align(Alignment.BottomEnd))
         Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(legacy.border).align(Alignment.BottomStart))
     }
 }
 
 @Composable
-private fun StatusPills(
-    status: String,
-    config: com.deeptalking.core.model.AppConfig,
-    modifier: Modifier = Modifier,
-) {
+private fun CachePill(config: com.deeptalking.core.model.AppConfig) {
     val legacy = MaterialTheme.legacy
     val metrics = config.requestMetrics
-    val cacheText = when {
+    val text = when {
         metrics.isEmpty() -> "缓存 --"
         metrics.none { it.inputTokens > 0 } -> "缓存未返回命中数据"
         else -> {
@@ -357,30 +364,18 @@ private fun StatusPills(
             "缓存命中 ${(last * 100).toInt()}% · 近${recent.size}轮均值 ${(avg * 100).toInt()}%"
         }
     }
-    Row(modifier = modifier.padding(end = 8.dp, bottom = 3.dp), verticalAlignment = Alignment.CenterVertically) {
-        if (status.isNotBlank()) {
-            Text(
-                status,
-                fontSize = 11.sp,
-                color = legacy.accent,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.padding(end = 6.dp),
-            )
-        }
-        Text(
-            cacheText,
-            fontSize = 10.sp,
-            color = legacy.textMuted,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier
-                .clip(RoundedCornerShape(4.dp))
-                .background(legacy.header)
-                .border(1.dp, legacy.border, RoundedCornerShape(4.dp))
-                .padding(horizontal = 6.dp, vertical = 1.dp),
-        )
-    }
+    Text(
+        text,
+        fontSize = 10.sp,
+        color = legacy.textMuted,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+        modifier = Modifier
+            .clip(RoundedCornerShape(4.dp))
+            .background(legacy.bg)
+            .border(1.dp, legacy.border, RoundedCornerShape(4.dp))
+            .padding(horizontal = 6.dp, vertical = 2.dp),
+    )
 }
 
 @Composable

@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -35,7 +36,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Edit
@@ -127,7 +127,7 @@ fun ChatScreen(
         }
     }
 
-    Column(modifier = Modifier.fillMaxSize().imePadding()) {
+    Column(modifier = Modifier.fillMaxSize().imePadding().navigationBarsPadding()) {
         Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
             when {
                 character == null -> WelcomeHero()
@@ -345,18 +345,8 @@ private fun MessageRow(
                     if (message.isLoading && message.content.isEmpty()) {
                         TypingIndicator(colors.onAiBubble.copy(alpha = 0.6f))
                     } else {
-                        if (isUser) {
-                            if (message.content.isNotBlank()) {
-                                SelectionContainer {
-                                    Text(
-                                        message.content,
-                                        fontSize = 15.sp,
-                                        lineHeight = 1.68.em,
-                                    )
-                                }
-                            }
-                        } else if (message.content.isNotBlank()) {
-                            RichText(source = message.content, modifier = Modifier.fillMaxWidth())
+                        if (message.content.isNotBlank()) {
+                            RichText(source = message.content, isUser = isUser, modifier = Modifier.fillMaxWidth())
                         }
                         MessageImages(message, onImageClick)
                         message.staticChanges.takeIf { !isUser && it.isNotEmpty() }?.let {

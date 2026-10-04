@@ -1,28 +1,40 @@
 package com.deeptalking.feature.chat
 
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.withStyle
 
 /**
  * Minimal markdown-subset renderer producing an [AnnotatedString] for the
  * no-math fast path. Mirrors the inline rules in `renderMarkdownToHtml`
- * (bold / italic / strikethrough / inline code / action text) closely enough
- * that the common prose case needs no WebView. Math messages still go through
- * the KaTeX WebView.
+ * (bold / italic / strikethrough / inline code / action text). Action text
+ * — parenthesised stage directions — is italicised and tinted with
+ * [actionColor] to match the legacy `.action-text` CSS rule. Math messages
+ * still go through the KaTeX WebView.
  */
-fun renderMarkdownAnnotated(text: String): AnnotatedString {
-    val codeStyle = SpanStyle(fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace)
-    val actionStyle = SpanStyle(fontStyle = FontStyle.Italic)
+fun renderMarkdownAnnotated(
+    text: String,
+    actionColor: Color = Color.Unspecified,
+    textColor: Color = Color.Unspecified,
+): AnnotatedString {
+    val codeStyle = SpanStyle(fontFamily = FontFamily.Monospace)
+    val actionStyle = SpanStyle(
+        fontStyle = FontStyle.Italic,
+        color = if (actionColor == Color.Unspecified) Color.Unspecified else actionColor,
+    )
+    val italicStyle = SpanStyle(fontStyle = FontStyle.Italic)
     return buildAnnotatedString {
         var i = 0
         val sb = StringBuilder()
         fun flush() {
             if (sb.isNotEmpty()) {
-                append(sb.toString())
+                if (textColor == Color.Unspecified) append(sb.toString()) else withStyle(SpanStyle(color = textColor)) { append(sb.toString()) }
                 sb.clear()
             }
         }
@@ -35,7 +47,7 @@ fun renderMarkdownAnnotated(text: String): AnnotatedString {
                     if (end > i + 2) {
                         flush()
                         withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
-                            append(renderMarkdownAnnotated(text.substring(i + 2, end)))
+                            append(renderMarkdownAnnotated(text.substring(i + 2, end), actionColor, textColor))
                         }
                         i = end + 2
                     } else {
@@ -46,7 +58,7 @@ fun renderMarkdownAnnotated(text: String): AnnotatedString {
                     val end = text.indexOf("~~", i + 2)
                     if (end > i + 2) {
                         flush()
-                        withStyle(SpanStyle(textDecoration = androidx.compose.ui.text.style.TextDecoration.LineThrough)) {
+                        withStyle(SpanStyle(textDecoration = TextDecoration.LineThrough)) {
                             append(text.substring(i + 2, end))
                         }
                         i = end + 2
@@ -64,25 +76,23 @@ fun renderMarkdownAnnotated(text: String): AnnotatedString {
                         sb.append(ch); i++
                     }
                 }
-                ch == '*' || ch == '_' -> {
-                    val next = text.indexOf(ch, i + 1)
-                    if (next > i + 1) {
+                ch == '(' || ch == '（' -> {
+                    val close = if (ch == '(') ')' else '）'
+                    val end = text.indexOf(close, i + 1)
+                    if (end > i + 1 && end - i <= 80 && !text.substring(i, end).contains('\n')) {
                         flush()
-                        withStyle(SpanStyle(fontStyle = FontStyle.Italic)) {
-                            append(text.substring(i + 1, next))
-                        }
-                        i = next + 1
+                        withStyle(actionStyle) { append(text.substring(i, end + 1)) }
+                        i = end + 1
                     } else {
                         sb.append(ch); i++
                     }
                 }
-                ch == '(' || ch == '（' -> {
-                    val close = if (ch == '(') ')' else '）'
-                    val end = text.indexOf(close, i + 1)
-                    if (end > i + 1 && end - i <= 80) {
+                ch == '*' || ch == '_' -> {
+                    val next = text.indexOf(ch, i + 1)
+                    if (next > i + 1) {
                         flush()
-                        withStyle(actionStyle) { append(text.substring(i, end + 1)) }
-                        i = end + 1
+                        withStyle(italicStyle) { append(text.substring(i + 1, next)) }
+                        i = next + 1
                     } else {
                         sb.append(ch); i++
                     }
