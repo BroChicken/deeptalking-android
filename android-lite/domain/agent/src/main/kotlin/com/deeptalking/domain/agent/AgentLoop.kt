@@ -29,6 +29,8 @@ data class LoopOutcome(
     val executedCalls: Int,
     /** Latest character returned by a tool's [AgentToolResult.updatedCharacter], if any. */
     val updatedCharacter: Character? = null,
+    /** Token usage of the last model request, when the backend reported it. */
+    val usage: com.deeptalking.engine.ondevice.TokenUsage? = null,
 )
 
 /**
@@ -64,6 +66,7 @@ class AgentLoop(
         var executedCalls = 0
         var lastText = ""
         var latestCharacter: Character? = null
+        var lastUsage: com.deeptalking.engine.ondevice.TokenUsage? = null
         var phase = RequestPhase.AUTO
         var attempts = 0
 
@@ -73,9 +76,10 @@ class AgentLoop(
             val request = builder.build(phase, instructions, messages, tools, model)
             val result = collectStream(request, onDelta)
             if (result.text.isNotBlank()) lastText = result.text
+            result.usage?.let { lastUsage = it }
 
             val submit = result.toolCalls.firstOrNull { it.name == "submit_response" }
-            if (submit != null) return LoopOutcome(result.text, submit, rounds, executedCalls, latestCharacter)
+            if (submit != null) return LoopOutcome(result.text, submit, rounds, executedCalls, latestCharacter, lastUsage)
 
             val infoCalls = result.toolCalls.filter { it.name != "submit_response" }
             if (phase == RequestPhase.AUTO) {
@@ -120,7 +124,7 @@ class AgentLoop(
                     continue
                 }
                 if (lastText.isNotBlank()) {
-                    return LoopOutcome(lastText, null, rounds, executedCalls, latestCharacter)
+                    return LoopOutcome(lastText, null, rounds, executedCalls, latestCharacter, lastUsage)
                 }
                 phase = RequestPhase.SUBMIT
                 attempts = 0
@@ -128,10 +132,10 @@ class AgentLoop(
             }
 
             // Submit phase: no submit_response call came back.
-            if (lastText.isNotBlank()) return LoopOutcome(lastText, null, rounds, executedCalls, latestCharacter)
+            if (lastText.isNotBlank()) return LoopOutcome(lastText, null, rounds, executedCalls, latestCharacter, lastUsage)
             if (attempts >= 2) break
         }
-        return LoopOutcome(lastText, null, rounds, executedCalls, latestCharacter)
+        return LoopOutcome(lastText, null, rounds, executedCalls, latestCharacter, lastUsage)
     }
 
     /**
@@ -217,7 +221,7 @@ class AgentLoop(
                 "quickReplies",
                 buildJsonArray {
                     add("嗯，我明白")
-                    add("稍等，我想一下")
+                    add("稍等，我想一想")
                 },
             )
         }

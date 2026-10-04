@@ -101,6 +101,7 @@ class BackupService(
                 put("avatar", character.emoji)
                 put("description", character.description)
                 put("scene", character.groupSharedDynamic.currentLocation)
+                put("interactionRules", character.interactionRules)
             }
             putJsonArray("members") { character.members.forEach { add(memberToJson(it)) } }
         }
@@ -110,6 +111,7 @@ class BackupService(
         put("id", member.id)
         put("basicInfo", basicInfoToJson(member.name, member.emoji, member.staticProfile))
         put("dynamicState", dynamicStateToJson(member.dynamicState))
+        put("roleInGroup", member.roleInGroup)
         put("memory", memoryToJson(emptyList(), member.shortTerm, member.longTerm))
         putJsonArray("lorebook") { member.lorebook.forEach { add(lorebookToJson(it)) } }
     }
@@ -165,11 +167,18 @@ class BackupService(
         put("role", roleKey(message.role))
         put("content", message.content)
         message.timestamp?.let { put("timestamp", it) }
+        if (message.internalOnly) put("internalOnly", true)
         val images = message.attachments
             .filter { it.kind == MessageAttachment.Kind.Image }
             .map { it.uri }
         if (images.isNotEmpty()) {
             putJsonArray("images") { images.forEach { add(it) } }
+        }
+        if (message.staticChanges.isNotEmpty()) {
+            putJsonArray("staticChanges") { message.staticChanges.forEach { add(it) } }
+        }
+        if (message.lorebookChanges.isNotEmpty()) {
+            putJsonArray("lorebookChanges") { message.lorebookChanges.forEach { add(it) } }
         }
     }
 

@@ -1,26 +1,29 @@
 package com.deeptalking.feature.settings
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Slider
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -28,6 +31,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
@@ -52,9 +56,10 @@ fun SettingsScreen(
     onTestReminder: () -> Unit,
     onTestConnection: (AppConfig) -> Unit,
 ) {
+    val context = LocalContext.current
     var edited by remember(config) { mutableStateOf(config) }
     var apiKey by remember { mutableStateOf("") }
-    var modelMenuOpen by remember { mutableStateOf(false) }
+    var platformMenuOpen by remember { mutableStateOf(false) }
 
     Column(
         modifier = Modifier
@@ -63,22 +68,32 @@ fun SettingsScreen(
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text("API 配置", style = MaterialTheme.typography.titleSmall)
+        Text("API 配置", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
 
         Text("API 平台", style = MaterialTheme.typography.labelMedium)
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            BuiltinPlatforms.forEach { preset ->
-                FilterChip(
-                    selected = edited.apiPlatform == preset.id,
-                    onClick = {
-                        edited = edited.copy(
-                            apiPlatform = preset.id,
-                            apiBaseUrl = preset.baseUrl.ifBlank { edited.apiBaseUrl },
-                            modelName = preset.defaultModel.ifBlank { edited.modelName },
-                        )
-                    },
-                    label = { Text(preset.id) },
-                )
+        ExposedDropdownMenuBox(expanded = platformMenuOpen, onExpandedChange = { platformMenuOpen = !platformMenuOpen }) {
+            OutlinedTextField(
+                value = edited.apiPlatform,
+                onValueChange = {},
+                readOnly = true,
+                label = { Text("API 平台") },
+                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = platformMenuOpen) },
+                modifier = Modifier.fillMaxWidth().menuAnchor(),
+            )
+            ExposedDropdownMenu(expanded = platformMenuOpen, onDismissRequest = { platformMenuOpen = false }) {
+                BuiltinPlatforms.forEach { preset ->
+                    DropdownMenuItem(
+                        text = { Text(preset.id) },
+                        onClick = {
+                            edited = edited.copy(
+                                apiPlatform = preset.id,
+                                apiBaseUrl = preset.baseUrl.ifBlank { edited.apiBaseUrl },
+                                modelName = preset.defaultModel.ifBlank { edited.modelName },
+                            )
+                            platformMenuOpen = false
+                        },
+                    )
+                }
             }
         }
 
@@ -103,68 +118,42 @@ fun SettingsScreen(
         )
 
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            OutlinedButton(
-                onClick = { onTestConnection(edited) },
-                modifier = Modifier.weight(1f),
-            ) { Text("测试连接") }
-            Button(
-                onClick = { onSave(edited, apiKey.ifBlank { null }) },
-                modifier = Modifier.weight(1f),
-            ) { Text("保存设置") }
+            OutlinedButton(onClick = { onTestConnection(edited) }, modifier = Modifier.weight(1f)) { Text("测试连接") }
+            Button(onClick = { onSave(edited, apiKey.ifBlank { null }) }, modifier = Modifier.weight(1f)) { Text("保存设置") }
         }
 
         if (!testResult.isNullOrBlank()) {
-            Text(
-                testResult,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            Text(testResult, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
 
-        ExposedDropdownMenuBox(
-            expanded = modelMenuOpen,
-            onExpandedChange = { modelMenuOpen = !modelMenuOpen },
-        ) {
-            OutlinedTextField(
-                value = edited.modelName,
-                onValueChange = { edited = edited.copy(modelName = it) },
-                label = { Text("模型名称") },
-                singleLine = true,
-                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = modelMenuOpen) },
-                modifier = Modifier.fillMaxWidth().menuAnchor(),
-            )
-            ExposedDropdownMenu(expanded = modelMenuOpen, onDismissRequest = { modelMenuOpen = false }) {
-                val preset = BuiltinPlatforms.firstOrNull { it.id == edited.apiPlatform }
-                val presets = preset?.models.orEmpty()
-                if (presets.isEmpty()) {
-                    DropdownMenuItem(text = { Text("（无预设，请手动输入）") }, onClick = { modelMenuOpen = false })
-                } else {
-                    presets.forEach { model ->
-                        DropdownMenuItem(
-                            text = { Text(model) },
-                            onClick = {
-                                edited = edited.copy(modelName = model)
-                                modelMenuOpen = false
-                            },
-                        )
-                    }
-                }
-            }
-        }
+        OutlinedTextField(
+            value = edited.modelName,
+            onValueChange = { edited = edited.copy(modelName = it) },
+            label = { Text("模型名称") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
 
-        Column {
-            Text("Temperature: ${"%.2f".format(edited.temperature)}", style = MaterialTheme.typography.titleSmall)
-            Slider(
-                value = edited.temperature.toFloat(),
-                onValueChange = { edited = edited.copy(temperature = it.toDouble()) },
-                valueRange = 0f..2f,
-            )
+        OutlinedTextField(
+            value = edited.temperature.toString(),
+            onValueChange = { raw ->
+                raw.toDoubleOrNull()?.let { edited = edited.copy(temperature = it.coerceIn(0.0, 2.0)) }
+            },
+            label = { Text("Temperature") },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+            modifier = Modifier.fillMaxWidth(),
+        )
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(checked = edited.stream, onCheckedChange = { edited = edited.copy(stream = it) })
+            Text("流式回复", style = MaterialTheme.typography.bodyMedium)
         }
 
         Text("思考强度（DeepSeek）", style = MaterialTheme.typography.labelMedium)
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             THINKING_LEVELS.forEach { (value, label) ->
-                FilterChip(
+                androidx.compose.material3.FilterChip(
                     selected = edited.reasoningEffort == value,
                     onClick = { edited = edited.copy(reasoningEffort = value) },
                     label = { Text(label) },
@@ -172,24 +161,47 @@ fun SettingsScreen(
             }
         }
 
-        SwitchRow("流式输出", edited.stream) { edited = edited.copy(stream = it) }
-        SwitchRow("角色主动开口", edited.proactiveEnabled) { edited = edited.copy(proactiveEnabled = it) }
-        SwitchRow("文风自动校对", edited.styleCritique) { edited = edited.copy(styleCritique = it) }
-        SwitchRow("快速回应视角校正", edited.quickReplyRepair) { edited = edited.copy(quickReplyRepair = it) }
+        CheckRow("角色主动开口", edited.proactiveEnabled) { edited = edited.copy(proactiveEnabled = it) }
+        CheckRow("文风自动校对", edited.styleCritique) { edited = edited.copy(styleCritique = it) }
+        CheckRow("快速回应视角校正", edited.quickReplyRepair) { edited = edited.copy(quickReplyRepair = it) }
 
-        OutlinedButton(onClick = onTestReminder, modifier = Modifier.fillMaxWidth()) {
-            Text("测试提醒")
-        }
+        OutlinedButton(onClick = onTestReminder, modifier = Modifier.fillMaxWidth()) { Text("测试提醒") }
+
+        DebugInfoPanel(config, context)
     }
 }
 
 @Composable
-private fun SwitchRow(label: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text(label, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
-        Switch(checked = checked, onCheckedChange = onCheckedChange)
+private fun CheckRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Checkbox(checked = checked, onCheckedChange = onChange)
+        Text(label, style = MaterialTheme.typography.bodyMedium)
     }
+}
+
+@Composable
+private fun DebugInfoPanel(config: AppConfig, context: Context) {
+    val parts = buildList {
+        if (config.lastReplyDebug.isNotBlank()) add("【最近一次回应】\n" + config.lastReplyDebug)
+        if (config.requestMetrics.isNotEmpty()) {
+            val recent = config.requestMetrics.takeLast(12).joinToString("\n") {
+                "输入 ${it.inputTokens} · 命中 ${it.hitTokens} · 命中率 ${"%.0f".format(it.hitRate * 100)}%"
+            }
+            add("【最近 API 用量与缓存统计】\n$recent")
+        }
+    }
+    if (parts.isEmpty()) return
+    Text("调试信息", style = MaterialTheme.typography.labelMedium)
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        TextButton(onClick = {
+            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            clipboard.setPrimaryClip(ClipData.newPlainText("debug", parts.joinToString("\n\n")))
+        }) { Text("复制") }
+    }
+    Text(
+        parts.joinToString("\n\n"),
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.fillMaxWidth().heightIn(max = 240.dp).verticalScroll(rememberScrollState()),
+    )
 }

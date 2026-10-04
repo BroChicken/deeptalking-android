@@ -20,10 +20,10 @@ DeepTalking 是原生 Android 应用（Kotlin + Jetpack Compose 多模块），�
 | `:domain:agent` | domain | `AgentTool/ToolRegistry`、`ChatOrchestrator`、`AgentLoop`、提示词装配（`prompts/`）、结构化解析（`ResponseParser`）、工具实现（`tools/`） |
 | `:domain:memory` | domain | `MemoryService` + `MemoryServiceImpl`、检索/世界书匹配/记忆策略/时间工具 |
 | `:engine:ondevice` | engine | 端侧推理接口：`LlmBackend/EmbeddingBackend/AsrBackend/TtsBackend` + `InferenceRegistry` |
-| `:feature:chat` | feature | 聊天界面（头像/气泡/流式/工具活动/快速回应/图片/表情包/消息操作）+ `RichText`（渲染 WebView） |
-| `:feature:characters` | feature | 角色/群组列表、创建弹窗（单角色/群组+一句话生成）、角色卡编辑器（基础/状态/世界书三标签）、导出/导入、补全头像 |
-| `:feature:memory` | feature | 记忆/世界书浏览 + 长期/短期记忆删除 |
-| `:feature:settings` | feature | 平台、Base URL、模型、参数、思考强度、API Key、测试连接、测试提醒 |
+| `:feature:chat` | feature | 聊天界面：头像/气泡（尾角圆角）/流式打字/工具活动/快速回应/图片/表情包（含标签编辑）/消息操作（复制、编辑重发、重新生成）/⚡📖 状态改动提示/图片灯箱 + `RichText`（渲染 WebView） |
+| `:feature:characters` | feature | 角色/群组列表、创建弹窗（单角色/群组 + 一句话生成）、角色卡编辑器（基础/当前状态/世界书/**记忆** 四标签，世界书含 常驻/启用、AI emoji 头像、成员一句话补全）、升级为群组、导出/导入、补全头像 |
+| `:feature:memory` | feature | （已并入角色卡「记忆」标签；本模块保留供扩展） |
+| `:feature:settings` | feature | 平台下拉、Base URL、模型、Temperature、流式、思考强度、API Key、测试连接、测试提醒、调试信息（最近回应/用量/缓存）+ 复制 |
 | `:feature:richtext` | feature | `MarkdownRenderer`（纯 Kotlin）+ `RichTextWebView`（KaTeX 早渲染） |
 
 依赖方向：`app → feature → domain → core/engine`。core/engine 不反依赖上层。
@@ -33,6 +33,14 @@ DeepTalking 是原生 Android 应用（Kotlin + Jetpack Compose 多模块），�
 - 端侧推理（`:engine:ondevice`）：调用方只依赖接口，新增模型 = 新增实现 + 在 `NativeCore` 注册。当前仅 `LlmBackend` 有实现；`EmbeddingBackend/AsrBackend/TtsBackend` 暂为 `null`（TTS 已解禁，但只保留接口，实现另行评审）。
 - Agent 工具（`:domain:agent`）：实现 `AgentTool` 接口并在 `defaultTools()` 注册即可，`AgentLoop` 不变。
 - 记忆（`:domain:memory`）：上层依赖 `MemoryService` 接口。
+
+## 界面与交互（对齐旧版 WebView）
+
+- 应用骨架对齐旧版 `shell.html`：顶部 header（头像 + 名称 + 身份 + 版本徽标）+ 左侧抽屉侧栏（**角色 / 设置** 两标签）+ 主聊天区。无独立「记忆」页（记忆并入角色卡第 4 标签）。
+- 四套主题（清浅/夜色/深海/旧灯）由 `AppConfig.activeTheme` 驱动，顶栏色块菜单切换。
+- 气泡：`max-width min(84%,560)`、圆角 12dp + 尾角 4dp、无阴影；头像 30dp 圆角方块；typing 三点；消息操作与 ⚡/📖 提示对齐旧版。
+- 交互回退回旧版：角色**主动开口**为面板空闲 **60s** 自动触发（随应用可见性暂停/重置），非手动按钮；编辑重发/重新生成会**丢弃后续分支及相关记忆**。
+- 设置区含调试信息面板；头部缓存命中条由 `AppConfig.requestMetrics` 提供（无命中数据显示「缓存未返回命中数据」）。
 
 ## 数据与迁移
 

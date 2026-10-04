@@ -10,8 +10,10 @@ import com.deeptalking.core.model.GroupMember
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.LorebookOrigin
 import com.deeptalking.core.model.MessageAttachment
+import com.deeptalking.core.model.RequestMetric
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.StaticProfile
+import com.deeptalking.domain.agent.OrchestratorResult
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -102,7 +104,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             activeIdState.value = id
             quickRepliesState.value = emptyList()
             streamingState.value = null
-            explicitIdle.value = System.currentTimeMillis()
+            lastUserActivityAt.value = System.currentTimeMillis()
         }
     }
 
@@ -157,6 +159,97 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         viewModelScope.launch {
             val current = core.data.characters.get(id) ?: return@launch
             core.data.characters.upsert(transform(current))
+        }
+    }
+
+    /** Replaces a group member (by index) on [character]. */
+    fun updateMember(character: Character, index: Int, member: GroupMember) {
+        if (index !in character.members.indices) return
+        val members = character.members.toMutableList().also { it[index] = member }
+        updateCharacter(character.copy(members = members))
+    }
+
+    /**
+     * Legacy "升级为群组": expands a single character into a group using the
+     * current conversation as seed material (AI-generated members).
+     */
+    fun upgradeToGroup(character: Character, onDone: (Boolean) -> Unit = {}) {
+        if (character.isGroup) { onDone(false); return }
+        viewModelScope.launch {
+            val cfg = runCatching { core.currentConfig() }.getOrNull()
+            if (cfg == null || core.secrets.getApiKey().isNullOrBlank()) {
+                eventsState.tryEmit(UiEvent("请先在设置页配置 API Key"))
+                onDone(false)
+                return@launch
+            }
+            val history = core.data.chat.getMessages(character.id)
+            val prompt = buildString {
+                append("把以下角色升级为一个群组，保留其身份作为群主，并新增 2-3 名与当前剧情相符的成员。")
+                append("\n角色：").append(character.name)
+                if (character.staticProfile.personality.isNotBlank()) {
+                    append("（").append(character.staticProfile.personality).append("）")
+                }
+                val context = history.takeLast(6).joinToString("\n") { "${it.role}: ${it.content.take(200)}" }
+                if (context.isNotBlank()) append("\n近期对话：\n").append(context)
+            }
+            val raw = runCatching { core.quickGenerate(cfg, prompt) }.getOrNull()
+            val members = raw?.let { core.parseGroupMembers(it) }.orEmpty()
+            if (members.isEmpty()) {
+                eventsState.tryEmit(UiEvent("升级失败，请重试"))
+                onDone(false)
+                return@launch
+            }
+            val group = character.copy(
+                isGroup = true,
+                emoji = character.emoji.ifBlank { "👥" },
+                description = character.staticProfile.personality.ifBlank { character.description },
+                interactionRules = character.interactionRules,
+                groupSharedDynamic = com.deeptalking.core.model.DynamicState(
+                    currentSituation = character.dynamicState.currentSituation,
+                    currentLocation = character.dynamicState.currentLocation,
+                ),
+                members = members,
+            )
+            core.data.characters.upsert(group)
+            onDone(true)
+        }
+    }
+
+    /** Legacy "一句话补全空字段" for a group member: fills only empty fields. */
+    fun fillGroupMember(character: Character, index: Int, hint: String) {
+        val member = character.members.getOrNull(index) ?: return
+        if (hint.isBlank()) {
+            eventsState.tryEmit(UiEvent("请输入一句话描述"))
+            return
+        }
+        viewModelScope.launch {
+            val cfg = runCatching { core.currentConfig() }.getOrNull()
+            if (cfg == null || core.secrets.getApiKey().isNullOrBlank()) {
+                eventsState.tryEmit(UiEvent("请先在设置页配置 API Key"))
+                return@launch
+            }
+            val raw = runCatching { core.fillMemberFields(cfg, character, member, hint) }.getOrNull()
+            if (raw == null) {
+                eventsState.tryEmit(UiEvent("补全失败，请重试"))
+                return@launch
+            }
+            val filled = core.applyMemberFill(member, raw)
+            updateMember(character, index, filled)
+        }
+    }
+
+    /** Legacy "AI 生成 emoji 头像" for the draft character. */
+    fun generateEmojiAvatar(character: Character, onResult: (String?) -> Unit) {
+        viewModelScope.launch {
+            val cfg = runCatching { core.currentConfig() }.getOrNull()
+            if (cfg == null || core.secrets.getApiKey().isNullOrBlank()) {
+                eventsState.tryEmit(UiEvent("请先在设置页配置 API Key"))
+                onResult(null)
+                return@launch
+            }
+            val emoji = runCatching { core.generateEmojiAvatar(cfg, character) }.getOrNull()
+            if (emoji.isNullOrBlank()) eventsState.tryEmit(UiEvent("emoji 头像生成失败"))
+            onResult(emoji)
         }
     }
 
@@ -317,19 +410,19 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         pendingImagesState.value = emptyList()
     }
 
-    private fun submitTurn(text: String, proactive: Boolean) {
+    private fun submitTurn(text: String, proactive: Boolean, skipUserAppend: Boolean = false) {
         val id = activeIdState.value ?: return
         val images = pendingImagesState.value
         if ((!proactive && text.isBlank() && images.isEmpty()) || sendingState.value) return
         viewModelScope.launch {
             sendingState.value = true
             statusState.value = "思考中…"
-            explicitIdle.value = System.currentTimeMillis()
+            lastUserActivityAt.value = System.currentTimeMillis()
             try {
                 val character = core.data.characters.get(id) ?: return@launch
                 val savedImages = images.mapNotNull { uri -> media.saveImage(uri) }
                 pendingImagesState.value = emptyList()
-                if (!proactive) {
+                if (!proactive && !skipUserAppend) {
                     core.data.chat.append(
                         id,
                         ChatMessage(
@@ -365,11 +458,14 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                         content = result.reply,
                         timestamp = Instant.now().toString(),
                         internalOnly = result.proactive,
+                        staticChanges = result.staticChanges,
+                        lorebookChanges = result.lorebookChanges,
                     ),
                 )
                 core.data.characters.upsert(result.updatedCharacter)
                 quickRepliesState.value = result.quickReplies
                 statusState.value = ""
+                recordMetrics(cfg, id, result)
             } catch (error: Exception) {
                 streamingState.value = null
                 statusState.value = ""
@@ -380,31 +476,81 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         }
     }
 
+    /** Stores the last reply debug payload and appends a rolling usage/cache metric. */
+    private suspend fun recordMetrics(cfg: AppConfig, characterId: String, result: OrchestratorResult) {
+        val hitTokens = result.cachedTokens
+        val missTokens = (result.inputTokens - hitTokens).coerceAtLeast(0)
+        val hitRate = if (result.inputTokens > 0) hitTokens.toDouble() / result.inputTokens else 0.0
+        val metric = RequestMetric(
+            at = Instant.now().toString(),
+            taskType = "chat",
+            characterId = characterId,
+            inputTokens = result.inputTokens,
+            hitTokens = hitTokens,
+            missTokens = missTokens,
+            hitRate = hitRate,
+        )
+        val metrics = (cfg.requestMetrics + metric).takeLast(60)
+        val debug = buildString {
+            append("reply: ").append(result.reply.take(500))
+            if (result.rawReply.isNotBlank() && result.rawReply != result.reply) {
+                append("\n\n原始回应（未处理）:\n").append(result.rawReply.take(1500))
+            }
+        }
+        runCatching { core.data.config.update(cfg.copy(requestMetrics = metrics, lastReplyDebug = debug)) }
+    }
+
     /** Removes [message] and everything after it, then re-sends [message]'s text. */
     fun editAndResend(messageId: String, newText: String) {
         val id = activeIdState.value ?: return
+        if (sendingState.value) return
         viewModelScope.launch {
             val history = core.data.chat.getMessages(id)
-            val index = history.indexOfFirst { it.id == messageId }
-            if (index < 0) return@launch
-            core.data.chat.replace(id, history.take(index))
+            val userIndex = history.indexOfFirst { it.id == messageId && it.role == Role.User }
+            if (userIndex < 0) return@launch
+            discardBranch(id, userIndex)
             send(newText)
         }
     }
 
-    /** Removes the assistant [messageId] and after, then regenerates. */
+    /** Removes the assistant [messageId] and everything after, then regenerates. */
     fun regenerate(messageId: String) {
         val id = activeIdState.value ?: return
+        if (sendingState.value) return
         viewModelScope.launch {
             val history = core.data.chat.getMessages(id)
-            val index = history.indexOfFirst { it.id == messageId }
-            if (index < 0) return@launch
-            val kept = history.take(index)
-            core.data.chat.replace(id, kept)
-            val lastUser = kept.lastOrNull { it.role == Role.User } ?: return@launch
-            core.data.chat.replace(id, kept.dropLast(1))
-            send(lastUser.content)
+            val replyIndex = history.indexOfFirst { it.id == messageId && it.role == Role.Assistant }
+            if (replyIndex < 0) return@launch
+            var userIndex = replyIndex - 1
+            while (userIndex >= 0 && history[userIndex].role != Role.User) userIndex--
+            if (userIndex < 0) return@launch
+            val userText = history[userIndex].content
+            discardBranch(id, userIndex + 1)
+            submitTurn(userText, proactive = false, skipUserAppend = true)
         }
+    }
+
+    /**
+     * Legacy `discardConversationBranch`: truncates the persisted history from
+     * [fromIndex] and prunes short-term / long-term / pendingRecall memories whose
+     * source messages were removed.
+     */
+    private suspend fun discardBranch(characterId: String, fromIndex: Int) {
+        val history = core.data.chat.getMessages(characterId)
+        if (fromIndex !in 0..history.size) return
+        val removedIds = history.drop(fromIndex).mapNotNull { it.id.ifBlank { null } }.toSet()
+        core.data.chat.replace(characterId, history.take(fromIndex))
+        val character = core.data.characters.get(characterId) ?: return
+        fun hasRemovedSource(ids: List<String>) = ids.any { it in removedIds }
+        core.data.characters.upsert(
+            character.copy(
+                shortTerm = character.shortTerm.filterNot { hasRemovedSource(it.sourceMessageIds) },
+                longTerm = character.longTerm.filterNot { hasRemovedSource(it.sourceMessageIds) },
+                pendingRecall = character.pendingRecall?.takeIf {
+                    removedIds.isEmpty()
+                },
+            ),
+        )
     }
 
     // ---------------------------------------------------------------- settings
@@ -467,29 +613,50 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
 
     // -------------------------------------------------------------- proactive
 
-    private val explicitIdle = MutableStateFlow(System.currentTimeMillis())
+    /**
+     * Legacy proactive opening: after [PROACTIVE_IDLE_MS] of no user activity
+     * (and only when the app is visible, a key is set, and a character is
+     * active), the character opens unprompted. Any user input or send resets the
+     * timer. No cooldown, not restricted to empty conversations.
+     */
+    private val lastUserActivityAt = MutableStateFlow(System.currentTimeMillis())
 
     private suspend fun proactiveLoop() {
         while (true) {
-            delay(15_000)
+            delay(5_000)
             val cfg = runCatching { core.currentConfig() }.getOrNull() ?: continue
-            if (!cfg.proactiveEnabled) continue
+            if (!cfg.proactiveEnabled) {
+                lastUserActivityAt.value = System.currentTimeMillis()
+                continue
+            }
             if (sendingState.value) continue
             if (core.secrets.getApiKey().isNullOrBlank()) continue
-            val id = activeIdState.value ?: continue
-            if (System.currentTimeMillis() - explicitIdle.value < 60_000) continue
-            val character = core.data.characters.get(id) ?: continue
-            val messages = core.data.chat.getMessages(id)
-            if (messages.isEmpty()) {
-                submitTurn("", proactive = true)
-                explicitIdle.value = System.currentTimeMillis()
+            if (activeIdState.value == null) continue
+            if (!appVisible.value) {
+                lastUserActivityAt.value = System.currentTimeMillis()
+                continue
             }
+            if (System.currentTimeMillis() - lastUserActivityAt.value < PROACTIVE_IDLE_MS) continue
+            submitTurn("", proactive = true)
+            lastUserActivityAt.value = System.currentTimeMillis()
         }
     }
 
-    /** Keeps [explicitIdle] fresh when the user interacts with the composer. */
+    /** Keeps the proactive idle timer fresh on any user interaction / send. */
     fun noteUserActivity() {
-        explicitIdle.value = System.currentTimeMillis()
+        lastUserActivityAt.value = System.currentTimeMillis()
+    }
+
+    /** Called by the Activity on visibility changes so proactive pauses when hidden. */
+    fun setAppVisible(visible: Boolean) {
+        appVisible.value = visible
+        if (visible) lastUserActivityAt.value = System.currentTimeMillis()
+    }
+
+    private val appVisible = MutableStateFlow(true)
+
+    private companion object {
+        const val PROACTIVE_IDLE_MS = 60_000L
     }
 
     // ------------------------------------------------------------------- theme

@@ -34,6 +34,8 @@ data class GroupMember(
     val id: String = "",
     val name: String = "",
     val emoji: String = "",
+    /** Member-only "群内定位" (legacy `member.roleInGroup`). */
+    val roleInGroup: String = "",
     val staticProfile: StaticProfile = StaticProfile(),
     val dynamicState: DynamicState = DynamicState(),
     val shortTerm: List<ShortTermMemory> = emptyList(),
@@ -49,6 +51,8 @@ data class Character(
     val emoji: String = "",
     val description: String = "",
     val isGroup: Boolean = false,
+    /** Group-only "成员互动规则" (legacy `groupInfo.interactionRules`). */
+    val interactionRules: String = "",
     val staticProfile: StaticProfile = StaticProfile(),
     val dynamicState: DynamicState = DynamicState(),
     val shortTerm: List<ShortTermMemory> = emptyList(),

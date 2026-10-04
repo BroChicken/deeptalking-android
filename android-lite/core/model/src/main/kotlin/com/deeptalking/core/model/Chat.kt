@@ -31,6 +31,10 @@ data class ChatMessage(
     val styleViolations: List<String> = emptyList(),
     /** Quick-reply issues detected on this assistant turn. */
     val quickReplyIssues: List<String> = emptyList(),
+    /** Static profile field labels auto-adjusted after this assistant turn (legacy `staticChanges`). */
+    val staticChanges: List<String> = emptyList(),
+    /** Lorebook entry names created/updated after this assistant turn (legacy `lorebookChanges`). */
+    val lorebookChanges: List<String> = emptyList(),
 )
 
 @Serializable

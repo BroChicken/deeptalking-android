@@ -143,6 +143,8 @@ data class LegacyInstantMessage(
     @SerialName("images") val images: List<String>? = null,
     @SerialName("internalOnly") val internalOnly: Boolean? = null,
     @SerialName("isLoading") val isLoading: Boolean? = null,
+    @SerialName("staticChanges") val staticChanges: List<String>? = null,
+    @SerialName("lorebookChanges") val lorebookChanges: List<String>? = null,
 )
 
 @Serializable

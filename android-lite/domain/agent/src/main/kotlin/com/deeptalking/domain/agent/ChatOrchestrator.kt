@@ -5,6 +5,7 @@ import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.Role
+import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.domain.agent.prompts.DYNAMIC_STATE_FIELDS
 import com.deeptalking.domain.agent.prompts.PersonaInputs
 import com.deeptalking.domain.agent.prompts.RequestBuilder
@@ -29,6 +30,16 @@ data class OrchestratorResult(
     val updatedCharacter: Character,
     /** True when this turn was a proactive (unprompted) opening. */
     val proactive: Boolean = false,
+    /** Static profile field labels auto-adjusted this turn (legacy `staticChanges`). */
+    val staticChanges: List<String> = emptyList(),
+    /** Lorebook entry names created/updated this turn (legacy `lorebookChanges`). */
+    val lorebookChanges: List<String> = emptyList(),
+    /** Raw (pre-processing) model reply, for the settings debug panel. */
+    val rawReply: String = "",
+    /** Token usage of the last model request, when reported. */
+    val inputTokens: Int = 0,
+    val outputTokens: Int = 0,
+    val cachedTokens: Int = 0,
 )
 
 /**
@@ -146,7 +157,49 @@ class ChatOrchestrator(
             quickReplies = quickReplies,
             updatedCharacter = updated,
             proactive = proactive,
+            staticChanges = diffStaticChanges(character, updated),
+            lorebookChanges = diffLorebookChanges(character, updated),
+            rawReply = outcome.text,
+            inputTokens = outcome.usage?.inputTokens ?: 0,
+            outputTokens = outcome.usage?.outputTokens ?: 0,
+            cachedTokens = outcome.usage?.cachedTokens ?: 0,
         )
+    }
+
+    /** Labels of static profile fields whose value changed during the turn. */
+    private fun diffStaticChanges(before: Character, after: Character): List<String> {
+        if (after.isGroup) return emptyList()
+        return STATIC_PROFILE_FIELDS.filter { (key, _) ->
+            staticValue(before.staticProfile, key) != staticValue(after.staticProfile, key)
+        }.map { it.second }
+    }
+
+    /** Names of lorebook entries added or whose content/keywords changed. */
+    private fun diffLorebookChanges(before: Character, after: Character): List<String> {
+        val beforeById = before.lorebook.associateBy { it.id }
+        return after.lorebook
+            .filter { entry ->
+                val old = beforeById[entry.id]
+                old == null || old.content != entry.content || old.keywords != entry.keywords || old.name != entry.name
+            }
+            .map { it.name.ifBlank { "未命名条目" } }
+            .distinct()
+    }
+
+    private fun staticValue(profile: StaticProfile, key: String): String = when (key) {
+        "gender" -> profile.gender
+        "age" -> profile.age
+        "race" -> profile.race
+        "appearance" -> profile.appearance
+        "personality" -> profile.personality
+        "values" -> profile.values
+        "fears" -> profile.fears
+        "background" -> profile.background
+        "keyEvents" -> profile.keyEvents
+        "speakingStyle" -> profile.speakingStyle
+        "language" -> profile.language
+        "userAddress" -> profile.userAddress
+        else -> ""
     }
 
     private fun applyMemory(character: Character, parsed: ParsedTurn): Character {

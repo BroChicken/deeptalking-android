@@ -142,6 +142,9 @@ private fun mapInstant(dto: LegacyInstantMessage): ChatMessage = ChatMessage(
         .filter { it.isNotBlank() }
         .take(4)
         .map { uri -> MessageAttachment(kind = MessageAttachment.Kind.Image, uri = uri) },
+    internalOnly = dto.internalOnly == true,
+    staticChanges = dto.staticChanges ?: emptyList(),
+    lorebookChanges = dto.lorebookChanges ?: emptyList(),
 )
 
 /** Maps a legacy sticker. Returns null when there is no image payload at all. */
@@ -248,6 +251,7 @@ private fun mapMembers(dto: LegacyCharacter): List<GroupMember> =
             id = member.id ?: "",
             name = member.basicInfo?.name ?: "",
             emoji = member.basicInfo?.avatar ?: "👤",
+            roleInGroup = member.roleInGroup ?: "",
             staticProfile = mapStaticProfile(member.basicInfo, member.basicInfo?.fields, null),
             dynamicState = mapDynamicState(
                 LegacyCharacter(
@@ -311,6 +315,7 @@ fun mapCharacter(dto: LegacyCharacter, stickerSink: StickerSink?): Character {
         emoji = if (isGroup) pick(groupInfo?.avatar, basic?.avatar, "👥") else pick(basic?.avatar, "👤"),
         description = description,
         isGroup = isGroup,
+        interactionRules = groupInfo?.interactionRules ?: "",
         staticProfile = staticProfile,
         dynamicState = effectiveDynamic,
         shortTerm = (memory?.shortTerm ?: emptyList()).map { mapShortTerm(it) },

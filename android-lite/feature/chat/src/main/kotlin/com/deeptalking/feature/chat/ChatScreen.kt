@@ -24,16 +24,17 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.EmojiEmotions
@@ -43,7 +44,7 @@ import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.SmartToy
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.AssistChip
+import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -73,6 +74,7 @@ import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.MessageAttachment
 import com.deeptalking.core.model.Role
+import com.deeptalking.core.model.Sticker
 import com.deeptalking.feature.richtext.renderMarkdownToHtml
 import java.io.File
 import java.util.Locale
@@ -87,7 +89,6 @@ fun ChatScreen(
     pendingImages: List<Uri>,
     onSend: (String) -> Unit,
     onQuickReply: (String) -> Unit,
-    onProactive: () -> Unit,
     onAddImage: (Uri) -> Unit,
     onRemoveImage: (Uri) -> Unit,
     onEditResend: (String, String) -> Unit,
@@ -96,7 +97,7 @@ fun ChatScreen(
     onAddSticker: (Uri) -> Unit = {},
     onDeleteSticker: (String) -> Unit = {},
     onSetStickerTag: (String, String) -> Unit = { _, _ -> },
-    onSendSticker: (com.deeptalking.core.model.Sticker) -> Unit = {},
+    onSendSticker: (Sticker) -> Unit = {},
 ) {
     var input by remember { mutableStateOf("") }
     var imagePreview by remember { mutableStateOf<String?>(null) }
@@ -105,13 +106,8 @@ fun ChatScreen(
     val listState = rememberLazyListState()
     val context = LocalContext.current
 
-    val imagePicker = rememberLauncherForActivityResult(
-        ActivityResultContracts.GetContent(),
-    ) { uri -> uri?.let(onAddImage) }
-
-    val stickerPicker = rememberLauncherForActivityResult(
-        ActivityResultContracts.GetContent(),
-    ) { uri -> uri?.let(onAddSticker) }
+    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri -> uri?.let(onAddImage) }
+    val stickerPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri -> uri?.let(onAddSticker) }
 
     val visibleMessages = messages.filterNot { it.internalOnly }
 
@@ -122,56 +118,36 @@ fun ChatScreen(
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
-        if (character == null) {
-            WelcomeHero()
-        } else if (visibleMessages.isEmpty()) {
-            CharacterEmptyState(character)
-        } else {
-            LazyColumn(
-                state = listState,
-                modifier = Modifier.weight(1f).fillMaxWidth(),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp),
-            ) {
-                items(visibleMessages) { message ->
-                    MessageRow(
-                        message = message,
-                        character = character,
-                        onCopy = { copyToClipboard(context, message.content) },
-                        onEditResend = { editTarget = message },
-                        onRegenerate = { onRegenerate(message.id) },
-                        onImageClick = { imagePreview = it },
-                    )
-                }
-            }
-        }
-
-        if (quickReplies.isNotEmpty() && !isSending) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState())
-                    .padding(horizontal = 12.dp, vertical = 4.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    "快速回应 · 以用户身份直接回复",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                quickReplies.forEach { reply ->
-                    AssistChip(onClick = { onQuickReply(reply) }, label = { Text(reply) })
+        Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+            when {
+                character == null -> WelcomeHero()
+                visibleMessages.isEmpty() -> CharacterEmptyState(character)
+                else -> LazyColumn(
+                    state = listState,
+                    modifier = Modifier.fillMaxSize().widthIn(max = 600.dp).align(Alignment.TopCenter),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+                ) {
+                    items(visibleMessages) { message ->
+                        MessageRow(
+                            message = message,
+                            character = character,
+                            onCopy = { copyToClipboard(context, message.content) },
+                            onEditResend = { editTarget = message },
+                            onRegenerate = { onRegenerate(message.id) },
+                            onImageClick = { imagePreview = it },
+                        )
+                    }
+                    if (quickReplies.isNotEmpty() && !isSending) {
+                        item { QuickReplyRow(quickReplies, isSending, onQuickReply) }
+                    }
                 }
             }
         }
 
         if (pendingImages.isNotEmpty()) {
             Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState())
-                    .padding(horizontal = 12.dp, vertical = 4.dp),
+                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 4.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 pendingImages.forEach { uri ->
@@ -182,10 +158,7 @@ fun ChatScreen(
                             contentScale = ContentScale.Crop,
                             modifier = Modifier.size(64.dp).clip(RoundedCornerShape(8.dp)),
                         )
-                        IconButton(
-                            onClick = { onRemoveImage(uri) },
-                            modifier = Modifier.align(Alignment.TopEnd).size(20.dp),
-                        ) {
+                        IconButton(onClick = { onRemoveImage(uri) }, modifier = Modifier.align(Alignment.TopEnd).size(20.dp)) {
                             Icon(Icons.Outlined.Close, contentDescription = "移除", modifier = Modifier.size(14.dp))
                         }
                     }
@@ -199,16 +172,13 @@ fun ChatScreen(
                     StickerPanel(
                         stickers = character.stickers,
                         onUpload = { stickerPicker.launch("image/*") },
-                        onSend = { sticker ->
-                            onSendSticker(sticker)
-                            stickerPanelOpen = false
-                        },
-                        onDelete = { onDeleteSticker(it) },
-                        onSetTag = { id, tag -> onSetStickerTag(id, tag) },
+                        onSend = { onSendSticker(it); stickerPanelOpen = false },
+                        onDelete = onDeleteSticker,
+                        onSetTag = onSetStickerTag,
                     )
                 }
                 Row(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
+                    modifier = Modifier.fillMaxWidth().widthIn(max = 640.dp).align(Alignment.CenterHorizontally).padding(horizontal = 8.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.Bottom,
                 ) {
                     IconButton(onClick = { imagePicker.launch("image/*") }, enabled = !isSending) {
@@ -219,18 +189,10 @@ fun ChatScreen(
                             Icon(Icons.Default.EmojiEmotions, contentDescription = "表情包")
                         }
                     }
-                    if (character != null) {
-                        IconButton(onClick = onProactive, enabled = !isSending) {
-                            Icon(Icons.Default.AutoAwesome, contentDescription = "角色主动开口")
-                        }
-                    }
                     OutlinedTextField(
                         value = input,
-                        onValueChange = {
-                            input = it
-                            onUserActivity()
-                        },
-                        modifier = Modifier.weight(1f).heightIn(min = 44.dp, max = 140.dp),
+                        onValueChange = { input = it; onUserActivity() },
+                        modifier = Modifier.weight(1f).heightIn(min = 46.dp, max = 140.dp),
                         enabled = !isSending,
                         placeholder = { Text("输入消息") },
                         maxLines = 6,
@@ -254,37 +216,22 @@ fun ChatScreen(
     }
 
     imagePreview?.let { path ->
-        AlertDialog(
-            onDismissRequest = { imagePreview = null },
-            confirmButton = { TextButton(onClick = { imagePreview = null }) { Text("关闭") } },
-            text = {
-                AsyncImage(
-                    model = File(path),
-                    contentDescription = "图片",
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            },
-        )
+        Box(
+            modifier = Modifier.fillMaxSize().background(Color(0xD9000000)).clickable { imagePreview = null },
+            contentAlignment = Alignment.Center,
+        ) {
+            AsyncImage(model = File(path), contentDescription = "图片", contentScale = ContentScale.Fit, modifier = Modifier.fillMaxWidth().padding(24.dp))
+        }
     }
 
     editTarget?.let { target ->
         var draft by remember(target.id) { mutableStateOf(target.content) }
         AlertDialog(
             onDismissRequest = { editTarget = null },
-            title = { Text("编辑并重新发送") },
-            text = {
-                OutlinedTextField(
-                    value = draft,
-                    onValueChange = { draft = it },
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            },
+            title = { Text("编辑并重新发送消息：") },
+            text = { OutlinedTextField(value = draft, onValueChange = { draft = it }, modifier = Modifier.fillMaxWidth()) },
             confirmButton = {
-                TextButton(onClick = {
-                    onEditResend(target.id, draft)
-                    editTarget = null
-                }) { Text("重发") }
+                TextButton(onClick = { onEditResend(target.id, draft); editTarget = null }) { Text("重发") }
             },
             dismissButton = { TextButton(onClick = { editTarget = null }) { Text("取消") } },
         )
@@ -292,25 +239,16 @@ fun ChatScreen(
 }
 
 @Composable
-private fun ColumnScope.WelcomeHero() {
-    Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+private fun WelcomeHero() {
+    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) {
-            Surface(
-                shape = CircleShape,
-                color = MaterialTheme.colorScheme.primaryContainer,
-                modifier = Modifier.size(96.dp),
-            ) {
+            Surface(shape = CircleShape, color = MaterialTheme.colorScheme.primaryContainer, modifier = Modifier.size(96.dp)) {
                 Box(contentAlignment = Alignment.Center) {
-                    Icon(
-                        Icons.Default.SmartToy,
-                        contentDescription = null,
-                        modifier = Modifier.size(48.dp),
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+                    Icon(Icons.Default.SmartToy, contentDescription = null, modifier = Modifier.size(48.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
             Spacer(Modifier.height(16.dp))
-            Text("欢迎使用 DeepTalking", style = MaterialTheme.typography.headlineSmall)
+            Text("欢迎使用 DeepTalking", style = MaterialTheme.typography.headlineSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.height(8.dp))
             Text(
                 "一个具有三级记忆系统的深度对话应用。点击左上角菜单按钮，创建或选择角色，开始一段有记忆的对话。",
@@ -322,12 +260,14 @@ private fun ColumnScope.WelcomeHero() {
 }
 
 @Composable
-private fun ColumnScope.CharacterEmptyState(character: Character) {
-    Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+private fun CharacterEmptyState(character: Character) {
+    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) {
-            Text(character.emoji.ifEmpty { "👤" }, style = MaterialTheme.typography.displayMedium)
+            Surface(shape = CircleShape, color = MaterialTheme.colorScheme.primaryContainer, modifier = Modifier.size(80.dp)) {
+                Box(contentAlignment = Alignment.Center) { Text(character.emoji.ifEmpty { "👤" }, style = MaterialTheme.typography.displayMedium) }
+            }
             Spacer(Modifier.height(12.dp))
-            Text("与 ${character.name} 开始对话", style = MaterialTheme.typography.titleLarge)
+            Text("与 ${character.name} 开始对话", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.height(6.dp))
             Text(
                 character.staticProfile.personality.ifEmpty { "点击下方输入框开始聊天" },
@@ -351,6 +291,11 @@ private fun MessageRow(
     val colors = MaterialTheme.appColors
     val bubbleColor = if (isUser) colors.userBubble else colors.aiBubble
     val contentColor = if (isUser) colors.onUserBubble else colors.onAiBubble
+    val shape = if (isUser) {
+        RoundedCornerShape(topStart = 12.dp, topEnd = 12.dp, bottomStart = 12.dp, bottomEnd = 4.dp)
+    } else {
+        RoundedCornerShape(topStart = 12.dp, topEnd = 12.dp, bottomStart = 4.dp, bottomEnd = 12.dp)
+    }
 
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -358,35 +303,34 @@ private fun MessageRow(
         verticalAlignment = Alignment.Top,
     ) {
         if (!isUser) {
-            Avatar(emoji = character.emoji.ifEmpty { "👤" })
+            Avatar(character.emoji.ifEmpty { "👤" })
             Spacer(Modifier.width(8.dp))
         }
         Column(horizontalAlignment = if (isUser) Alignment.End else Alignment.Start) {
             Surface(
                 color = bubbleColor,
                 contentColor = contentColor,
-                shape = RoundedCornerShape(14.dp),
-                border = androidx.compose.foundation.BorderStroke(1.dp, colors.bubbleBorder),
-                modifier = Modifier.widthIn(max = 320.dp),
+                shape = shape,
+                modifier = Modifier.widthIn(max = if (isUser) 320.dp else 400.dp),
             ) {
-                Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
                     if (message.isLoading && message.content.isEmpty()) {
-                        TypingIndicator(contentColor)
-                    } else if (isUser) {
-                        if (message.content.isNotBlank()) {
-                            SelectionContainer {
-                                Text(message.content, style = MaterialTheme.typography.bodyMedium)
-                            }
-                        }
-                        MessageImages(message, onImageClick)
+                        TypingIndicator(MaterialTheme.colorScheme.onSurfaceVariant)
                     } else {
-                        if (validText(message.content)) {
-                            RichText(
-                                html = renderMarkdownToHtml(message.content),
-                                modifier = Modifier.fillMaxWidth(),
-                            )
+                        if (isUser) {
+                            if (message.content.isNotBlank()) {
+                                SelectionContainer { Text(message.content, style = MaterialTheme.typography.bodyLarge) }
+                            }
+                        } else if (message.content.isNotBlank()) {
+                            RichText(html = renderMarkdownToHtml(message.content), modifier = Modifier.fillMaxWidth())
                         }
                         MessageImages(message, onImageClick)
+                        message.staticChanges.takeIf { !isUser && it.isNotEmpty() }?.let {
+                            Text("⚡ ${it.joinToString(" · ")}已修改", style = MaterialTheme.typography.labelSmall, color = colors.warning, modifier = Modifier.padding(top = 4.dp))
+                        }
+                        message.lorebookChanges.takeIf { !isUser && it.isNotEmpty() }?.let {
+                            Text("📖 ${it.joinToString(" · ")}", style = MaterialTheme.typography.labelSmall, color = colors.warning, modifier = Modifier.padding(top = 4.dp))
+                        }
                     }
                 }
             }
@@ -397,16 +341,16 @@ private fun MessageRow(
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    IconButton(onClick = onCopy, modifier = Modifier.size(28.dp)) {
-                        Icon(Icons.Default.ContentCopy, contentDescription = "复制消息", modifier = Modifier.size(14.dp))
+                    IconButton(onClick = onCopy, modifier = Modifier.size(30.dp)) {
+                        Icon(Icons.Default.ContentCopy, contentDescription = "复制消息", modifier = Modifier.size(15.dp))
                     }
                     if (isUser) {
-                        IconButton(onClick = onEditResend, modifier = Modifier.size(28.dp)) {
-                            Icon(Icons.Default.Edit, contentDescription = "编辑并重发", modifier = Modifier.size(14.dp))
+                        IconButton(onClick = onEditResend, modifier = Modifier.size(30.dp)) {
+                            Icon(Icons.Default.Edit, contentDescription = "编辑并重发", modifier = Modifier.size(15.dp))
                         }
                     } else {
-                        IconButton(onClick = onRegenerate, modifier = Modifier.size(28.dp)) {
-                            Icon(Icons.Default.Refresh, contentDescription = "重新生成", modifier = Modifier.size(14.dp))
+                        IconButton(onClick = onRegenerate, modifier = Modifier.size(30.dp)) {
+                            Icon(Icons.Default.Refresh, contentDescription = "重新生成", modifier = Modifier.size(15.dp))
                         }
                     }
                 }
@@ -416,45 +360,131 @@ private fun MessageRow(
 }
 
 @Composable
-private fun Avatar(emoji: String) {
-    Surface(
-        shape = CircleShape,
-        color = MaterialTheme.colorScheme.primaryContainer,
-        modifier = Modifier.size(34.dp),
-    ) {
-        Box(contentAlignment = Alignment.Center) {
-            Text(emoji, style = MaterialTheme.typography.titleMedium)
+private fun QuickReplyRow(replies: List<String>, isSending: Boolean, onQuickReply: (String) -> Unit) {
+    Column(modifier = Modifier.fillMaxWidth().padding(start = 38.dp)) {
+        Text("快速回应 · 以用户身份直接回复", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.height(4.dp))
+        replies.forEach { reply ->
+            Surface(
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp).clickable(enabled = !isSending) { onQuickReply(reply) },
+            ) {
+                Text(reply, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp))
+            }
         }
     }
 }
 
 @Composable
+private fun Avatar(emoji: String) {
+    Surface(
+        shape = RoundedCornerShape(9.dp),
+        color = MaterialTheme.colorScheme.primaryContainer,
+        modifier = Modifier.size(30.dp),
+    ) {
+        Box(contentAlignment = Alignment.Center) { Text(emoji, style = MaterialTheme.typography.bodyMedium) }
+    }
+}
+
+@Composable
 private fun TypingIndicator(color: Color) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text("● ● ●", color = color, fontWeight = FontWeight.Bold)
+    Row(horizontalArrangement = Arrangement.spacedBy(5.dp), verticalAlignment = Alignment.CenterVertically) {
+        repeat(3) {
+            Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(color.copy(alpha = 0.5f)))
+        }
     }
 }
 
 @Composable
 private fun MessageImages(message: ChatMessage, onImageClick: (String) -> Unit) {
-    val media = message.attachments.filter {
-        it.kind == MessageAttachment.Kind.Image || it.kind == MessageAttachment.Kind.Sticker
-    }
-    media.forEach { attachment ->
-        AsyncImage(
-            model = File(attachment.uri),
-            contentDescription = "图片",
-            contentScale = ContentScale.Fit,
-            modifier = Modifier
-                .padding(top = 6.dp)
-                .widthIn(max = if (attachment.kind == MessageAttachment.Kind.Sticker) 160.dp else 280.dp)
-                .clip(RoundedCornerShape(8.dp))
-                .clickable { onImageClick(attachment.uri) },
-        )
+    val media = message.attachments.filter { it.kind == MessageAttachment.Kind.Image || it.kind == MessageAttachment.Kind.Sticker }
+    if (media.isEmpty()) return
+    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(top = 6.dp)) {
+        media.forEach { attachment ->
+            AsyncImage(
+                model = File(attachment.uri),
+                contentDescription = "图片",
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .size(if (attachment.kind == MessageAttachment.Kind.Sticker) 96.dp else 160.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .clickable { onImageClick(attachment.uri) },
+            )
+        }
     }
 }
 
-private fun validText(text: String): Boolean = text.isNotBlank()
+@Composable
+private fun StickerPanel(
+    stickers: List<Sticker>,
+    onUpload: () -> Unit,
+    onSend: (Sticker) -> Unit,
+    onDelete: (String) -> Unit,
+    onSetTag: (String, String) -> Unit,
+) {
+    var tagEdit by remember { mutableStateOf<Sticker?>(null) }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(max = 240.dp)
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .padding(8.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+            TextButton(onClick = onUpload) { Text("+ 上传表情") }
+            Spacer(Modifier.weight(1f))
+            Text("${stickers.size} 张", style = MaterialTheme.typography.labelSmall)
+        }
+        if (stickers.isEmpty()) {
+            Text("还没有表情包。点上方「上传表情」加入。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(8.dp))
+        } else {
+            LazyVerticalGrid(
+                columns = GridCells.Adaptive(72.dp),
+                modifier = Modifier.fillMaxWidth().heightIn(max = 180.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                items(stickers.size) { index ->
+                    val sticker = stickers[index]
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Box {
+                            AsyncImage(
+                                model = File(sticker.fileRef),
+                                contentDescription = sticker.tag,
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.size(72.dp).clip(RoundedCornerShape(8.dp)).clickable { onSend(sticker) },
+                            )
+                            IconButton(onClick = { onDelete(sticker.id) }, modifier = Modifier.align(Alignment.TopEnd).size(18.dp)) {
+                                Icon(Icons.Outlined.Close, contentDescription = "删除表情", modifier = Modifier.size(12.dp))
+                            }
+                        }
+                        Text(
+                            sticker.tag.ifEmpty { "未分类" },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            modifier = Modifier.clickable { tagEdit = sticker },
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    tagEdit?.let { sticker ->
+        var tag by remember(sticker.id) { mutableStateOf(sticker.tag) }
+        AlertDialog(
+            onDismissRequest = { tagEdit = null },
+            title = { Text("编辑标签") },
+            text = { OutlinedTextField(value = tag, onValueChange = { tag = it }, singleLine = true) },
+            confirmButton = {
+                TextButton(onClick = { onSetTag(sticker.id, tag); tagEdit = null }) { Text("保存") }
+            },
+            dismissButton = { TextButton(onClick = { tagEdit = null }) { Text("取消") } },
+        )
+    }
+}
 
 private fun formatTime(timestamp: String?): String {
     if (timestamp.isNullOrBlank()) return ""
@@ -468,63 +498,4 @@ private fun formatTime(timestamp: String?): String {
 private fun copyToClipboard(context: Context, text: String) {
     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
     clipboard.setPrimaryClip(ClipData.newPlainText("message", text))
-}
-
-@Composable
-private fun StickerPanel(
-    stickers: List<com.deeptalking.core.model.Sticker>,
-    onUpload: () -> Unit,
-    onSend: (com.deeptalking.core.model.Sticker) -> Unit,
-    onDelete: (String) -> Unit,
-    onSetTag: (String, String) -> Unit,
-) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .heightIn(max = 220.dp)
-            .background(MaterialTheme.colorScheme.surfaceVariant)
-            .padding(8.dp),
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-            TextButton(onClick = onUpload) { Text("+ 上传表情") }
-            Spacer(Modifier.weight(1f))
-            Text("${stickers.size} 张", style = MaterialTheme.typography.labelSmall)
-        }
-        if (stickers.isEmpty()) {
-            Text(
-                "还没有表情包。点上方「上传表情」加入。",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(8.dp),
-            )
-        } else {
-            LazyVerticalGrid(
-                columns = androidx.compose.foundation.lazy.grid.GridCells.Adaptive(64.dp),
-                modifier = Modifier.fillMaxWidth().heightIn(max = 160.dp),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                items(stickers.size) { index ->
-                    val sticker = stickers[index]
-                    Box {
-                        AsyncImage(
-                            model = File(sticker.fileRef),
-                            contentDescription = sticker.tag,
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier
-                                .size(64.dp)
-                                .clip(RoundedCornerShape(8.dp))
-                                .clickable { onSend(sticker) },
-                        )
-                        IconButton(
-                            onClick = { onDelete(sticker.id) },
-                            modifier = Modifier.align(Alignment.TopEnd).size(18.dp),
-                        ) {
-                            Icon(Icons.Outlined.Close, contentDescription = "删除表情", modifier = Modifier.size(12.dp))
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
