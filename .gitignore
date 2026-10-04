@@ -3,12 +3,16 @@ archive/
 
 # 敏感文件
 android-lite/keystore/*.jks
+android-lite/keystore/CREDENTIALS.txt
 **/signing.properties
 
 # 构建产物
 android-lite/build/
 android-lite/**/build/
 android-lite/local.properties
+
+# 生成的 WebView 资源（KaTeX 由 src/vendor/katex 在构建时复制）
+android-lite/app/src/main/assets/
 
 # 本地数据
 save/

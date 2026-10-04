@@ -4,21 +4,19 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
-val hubRoot = rootProject.projectDir.parentFile
-val buildHubAssets by tasks.registering(Exec::class) {
+// KaTeX is the only runtime WebView asset (formula rendering). It lives in the
+// repo at src/vendor/katex and is copied into the APK assets at build time so
+// RichTextWebView can load it from file:///android_asset/katex/.
+val vendorRoot = rootProject.projectDir.parentFile.resolve("src/vendor/katex")
+val syncKatexAssets by tasks.registering(Copy::class) {
     group = "build"
-    description = "Generate WebView assets from modular frontend sources"
-    workingDir(hubRoot)
-    commandLine("node", "tools/build-hub.mjs")
-    inputs.dir(hubRoot.resolve("src"))
-    inputs.file(hubRoot.resolve("tools/build-hub.mjs"))
-    inputs.file(project.file("build.gradle.kts"))
-    outputs.file(project.file("src/main/assets/hub.html"))
-    outputs.dir(project.file("src/main/assets/katex"))
+    description = "Copy vendored KaTeX into app assets for the rich-text WebView"
+    from(vendorRoot)
+    into(project.file("src/main/assets/katex"))
 }
 
 tasks.named("preBuild") {
-    dependsOn(buildHubAssets)
+    dependsOn(syncKatexAssets)
 }
 
 android {
