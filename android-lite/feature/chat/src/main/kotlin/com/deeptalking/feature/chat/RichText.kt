@@ -8,9 +8,12 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.unit.em
 import androidx.compose.ui.viewinterop.AndroidView
 import com.deeptalking.core.designsystem.legacy
 import com.deeptalking.feature.richtext.RichTextWebView
+import com.deeptalking.feature.richtext.containsImageMarkdown
 import com.deeptalking.feature.richtext.containsMath
 import com.deeptalking.feature.richtext.renderMarkdownToHtml
 
@@ -28,8 +31,20 @@ import com.deeptalking.feature.richtext.renderMarkdownToHtml
  */
 @Composable
 fun RichText(source: String, isUser: Boolean, modifier: Modifier = Modifier) {
-    if (containsMath(source)) {
+    val legacy = MaterialTheme.legacy
+    val contentColor = if (isUser) legacy.onUserBubble else legacy.onAiBubble
+    if (containsMath(source) || containsImageMarkdown(source)) {
         val html = remember(source) { renderMarkdownToHtml(source) }
+        val extraCss = remember(isUser, legacy) {
+            val action = if (isUser) legacy.onUserBubble.copy(alpha = 0.75f) else legacy.actionText
+            // The WebView has no theme by default, so its body text would render
+            // pure black; force the bubble's real content colour instead.
+            "body{color:${contentColor.toHex()}}" +
+                "h1,h2,h3{color:${contentColor.toHex()}}" +
+                ".action-text{color:${action.toHex()};font-style:italic}" +
+                "a{color:${legacy.accent.toHex()};text-decoration:none}" +
+                "code,pre{background:${legacy.input.toHex()}}"
+        }
         AndroidView(
             modifier = modifier.fillMaxWidth(),
             factory = { context ->
@@ -42,21 +57,34 @@ fun RichText(source: String, isUser: Boolean, modifier: Modifier = Modifier) {
                 }
             },
             update = { webView ->
-                if (webView.tag != html) {
-                    webView.tag = html
-                    webView.renderHtml(html)
+                val stamp = html + "\u0000" + extraCss
+                if (webView.tag != stamp) {
+                    webView.tag = stamp
+                    webView.renderHtml(html, extraCss)
                 }
             },
         )
     } else {
-        val legacy = MaterialTheme.legacy
         val actionColor = if (isUser) legacy.onUserBubble.copy(alpha = 0.75f) else legacy.actionText
         Text(
-            text = remember(source, isUser, actionColor) {
-                renderMarkdownAnnotated(source, actionColor = actionColor)
+            text = remember(source, isUser, actionColor, legacy) {
+                renderMarkdownAnnotated(
+                    source,
+                    actionColor = actionColor,
+                    linkColor = legacy.accent,
+                    codeBackground = legacy.input,
+                    quoteColor = legacy.textMuted,
+                )
             },
             color = LocalContentColor.current,
-            modifier = modifier.fillMaxWidth(),
+            lineHeight = 1.55.em,
+            modifier = modifier,
         )
     }
 }
+
+private fun Color.toHex(): String = "#%02X%02X%02X".format(
+    (red * 255).toInt().coerceIn(0, 255),
+    (green * 255).toInt().coerceIn(0, 255),
+    (blue * 255).toInt().coerceIn(0, 255),
+)

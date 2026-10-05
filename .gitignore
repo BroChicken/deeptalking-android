@@ -20,3 +20,6 @@ apk/
 
 # 校验脚本工作区（可复用的临时产物，不进仓库）
 tools/.work/
+
+# 本地代码索引（CodeGraph）
+.codegraph/

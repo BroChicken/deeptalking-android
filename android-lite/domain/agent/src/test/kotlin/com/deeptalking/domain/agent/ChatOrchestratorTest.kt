@@ -76,7 +76,6 @@ class ChatOrchestratorTest {
 
     @Test
     fun `streams deltas through the callback`() = runBlocking {
-        val args = """{"reply":"流式回复正文","quickReplies":["一","二"]}"""
         val streamingLlm = object : LlmBackend {
             override val id = "streaming"
             override fun stream(request: LlmRequest): Flow<LlmChunk> = flow {
@@ -95,5 +94,52 @@ class ChatOrchestratorTest {
         val deltas = StringBuilder()
         orchestrator.run(character(), emptyList(), "hi", onDelta = { deltas.append(it) })
         assertTrue("onDelta should receive streamed text", deltas.isNotEmpty())
+    }
+
+    @Test
+    fun `mirrors the turn into character instant`() = runBlocking {
+        val args = """{"reply":"记住了","quickReplies":["好","嗯"]}"""
+        val orchestrator = ChatOrchestrator(
+            llm = ScriptedLlm(args),
+            tools = ToolRegistry(listOf(NoTools())),
+            memory = MemoryServiceImpl(),
+            config = AppConfig(),
+        )
+        val history = listOf(ChatMessage(id = "m1", role = Role.User, content = "在吗"))
+        val result = orchestrator.run(character(), history, "在吗")
+        assertTrue(
+            "user message should be mirrored into instant",
+            result.updatedCharacter.instant.any { it.role == Role.User && it.id == "m1" },
+        )
+        assertTrue(
+            "assistant reply should be mirrored into instant",
+            result.updatedCharacter.instant.any { it.role == Role.Assistant && it.content == "记住了" },
+        )
+    }
+
+    @Test
+    fun `non-stream config drives complete instead of stream`() = runBlocking {
+        val args = """{"reply":"非流式","quickReplies":["一","二"]}"""
+        var completeCalled = false
+        val llm = object : LlmBackend {
+            override val id = "nonstream"
+            override fun stream(request: LlmRequest): Flow<LlmChunk> = flow {
+                throw AssertionError("stream() must not be used when config.stream=false")
+            }
+            override suspend fun complete(request: LlmRequest): LlmResult {
+                completeCalled = true
+                val call = ToolCall(id = "c1", name = "submit_response", arguments = args)
+                return LlmResult(toolCalls = listOf(call))
+            }
+        }
+        val orchestrator = ChatOrchestrator(
+            llm = llm,
+            tools = ToolRegistry(listOf(NoTools())),
+            memory = MemoryServiceImpl(),
+            config = AppConfig(stream = false),
+        )
+        val result = orchestrator.run(character(), emptyList(), "hi")
+        assertTrue("complete() should be used for non-stream config", completeCalled)
+        assertEquals("非流式", result.reply)
     }
 }

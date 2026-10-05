@@ -46,6 +46,14 @@ data class ShortTermMemory(
     val timeRef: String? = null,
     val eventTime: String? = null,
     val createdAt: String? = null,
+    /** When this item was folded into long-term memory (legacy `analyzedAt`). */
+    val analyzedAt: String? = null,
+    /** Participants of the event (legacy `participants`). */
+    val participants: List<String> = emptyList(),
+    /** Event location (legacy `location`). */
+    val location: String = "",
+    /** When this item was last handed to the lorebook consolidation pass. */
+    val lorebookScannedAt: String? = null,
 )
 
 @Serializable
@@ -69,4 +77,22 @@ data class LongTermMemory(
     val updatedAt: String? = null,
     val lastRecalled: String? = null,
     val recallCount: Int = 0,
+    /** When a due-reminder notification was posted for this promise (native `set_reminder` firing). */
+    val notifiedAt: String? = null,
+    /** Event participants, for identity/merge (legacy `participants`). */
+    val participants: List<String> = emptyList(),
+    /** Event location, for identity/merge (legacy `location`). */
+    val location: String = "",
+    /** Self-learned importance delta in [-3, 3] (legacy `learnedBonus`). */
+    val learnedBonus: Int = 0,
+    /** Times this memory was used (recall or retrieval hit), legacy `usageCount`. */
+    val usageCount: Int = 0,
+    /** Last time this memory was used, ISO (legacy `lastUsageAt`). */
+    val lastUsageAt: String? = null,
+    /** Story-arc label (legacy `arcOf`). */
+    val arcOf: String? = null,
+    /** Story-arc stage 起始/发展/转折/现状 (legacy `arcStage`). */
+    val arcStage: String? = null,
+    /** Recorded-at timestamp (legacy `recordedAt`). */
+    val recordedAt: String? = null,
 )

@@ -64,23 +64,36 @@ class SetReminderTool(private val memory: MemoryService) : AgentTool {
         }
         val now = Instant.now().toString()
         val dueAt = ToolArgs.string(args, "dueAt").trim().ifEmpty { null }
+        val memberName = ToolArgs.string(args, "memberName").trim().ifEmpty { null }
+        // Update an existing active promise with the same key rather than inserting a
+        // duplicate (legacy set_reminder merges by key).
+        val existing = context.character.longTerm.firstOrNull {
+            it.category == MemoryCategory.Promises &&
+                it.status == PromiseStatus.Active &&
+                it.key.equals(key, ignoreCase = true) &&
+                (memberName == null || it.memberName.equals(memberName, ignoreCase = true))
+        }
         val reminder = LongTermMemory(
+            id = existing?.id ?: java.util.UUID.randomUUID().toString(),
             category = MemoryCategory.Promises,
             subject = MemorySubject.User,
             key = key,
             value = value,
-            importance = 6,
+            tags = existing?.tags ?: emptyList(),
+            importance = existing?.importance ?: 6,
             sourceMessageIds = validSources,
             evidence = evidence,
-            eventTime = now,
+            eventTime = existing?.eventTime ?: now,
             dueAt = dueAt,
             promisor = "user",
             promisee = "character",
             status = PromiseStatus.Active,
-            createdAt = now,
+            createdAt = existing?.createdAt ?: now,
             updatedAt = now,
+            lastRecalled = existing?.lastRecalled,
+            recallCount = existing?.recallCount ?: 0,
+            notifiedAt = null,
         )
-        val memberName = ToolArgs.string(args, "memberName").trim().ifEmpty { null }
         val memberLongTerm = if (memberName != null) mapOf(memberName to listOf(reminder)) else emptyMap()
         val shared = if (memberName != null) emptyList() else listOf(reminder)
         memory.applyTurn(context.character, shortTerm = emptyList(), longTerm = shared, memberLongTerm = memberLongTerm)

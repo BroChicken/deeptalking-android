@@ -7,14 +7,15 @@ import kotlinx.serialization.json.JsonElement
 /**
  * DTOs for the OpenAI-compatible "Responses" API used by DeepSeek / OpenCode Go.
  *
- * [InputItem.content] stays a raw [JsonElement] because callers may send either a
- * plain string or an array of content parts. Decoding is configured with
- * `ignoreUnknownKeys = true` by [ResponsesLlmBackend].
+ * [ResponsesRequest.input] stays a list of raw [JsonElement] because the payload is
+ * heterogeneous: plain `{role, content}` messages plus structured
+ * `function_call` / `function_call_output` / `reasoning` items (legacy
+ * `toolState.items`, `src/js/api/responses.js:72-74`).
  */
 @Serializable
 data class ResponsesRequest(
     val model: String,
-    val input: List<InputItem> = emptyList(),
+    val input: List<JsonElement> = emptyList(),
     val instructions: String? = null,
     val tools: List<ToolDto>? = null,
     @SerialName("tool_choice") val toolChoice: JsonElement? = null,
@@ -22,12 +23,6 @@ data class ResponsesRequest(
     @SerialName("max_output_tokens") val maxOutputTokens: Int? = null,
     val stream: Boolean = false,
     val reasoning: ReasoningDto? = null,
-)
-
-@Serializable
-data class InputItem(
-    val role: String,
-    val content: JsonElement,
 )
 
 @Serializable

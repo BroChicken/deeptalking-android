@@ -1,5 +1,6 @@
 package com.deeptalking.domain.agent
 
+import com.deeptalking.core.common.AppLimits
 import com.deeptalking.core.model.AppConfig
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
@@ -70,6 +71,8 @@ class ChatOrchestrator(
         history: List<ChatMessage>,
         userText: String,
         onDelta: (String) -> Unit = {},
+        onToolActivity: (String) -> Unit = {},
+        onQuickRepliesRepaired: (List<String>) -> Unit = {},
         proactive: Boolean = false,
     ): OrchestratorResult {
         val builder = RequestBuilder(config)
@@ -107,6 +110,7 @@ class ChatOrchestrator(
             builder = builder,
             model = config.modelName,
             onDelta = onDelta,
+            onToolActivity = onToolActivity,
         )
 
         val parsed = when {
@@ -140,31 +144,40 @@ class ChatOrchestrator(
             parsed.reply
         }
 
+        // Mirror the live conversation window into `character.instant` (legacy
+        // `memory.instant`): tools (set_reminder), the volatile context and the
+        // background tasks all read user/reply IDs and recent replies from here.
+        val assistantMessage = ChatMessage(
+            id = "assistant_" + character.id,
+            role = Role.Assistant,
+            content = displayReply,
+        )
+        val instantWindow = (history.filter { !it.rejected } + assistantMessage).let {
+            if (it.size > AppLimits.Memory.INSTANT) it.takeLast(AppLimits.Memory.INSTANT) else it
+        }
+        val characterWithInstant = updated.copy(instant = instantWindow)
+
         if (backgroundTasks != null && runBackgroundTasks) {
-            val assistant = ChatMessage(
-                id = "assistant_" + character.id,
-                role = Role.Assistant,
-                content = displayReply,
-            )
             backgroundTasks.scheduleTurn(
-                character = updated,
+                character = characterWithInstant,
                 reply = displayReply,
                 userText = userText,
                 currentQuickReplies = quickReplies,
-                messages = history.filter { !it.isLoading } + assistant,
+                messages = history.filter { !it.isLoading } + assistantMessage,
                 critiqueEnabled = config.styleCritique,
                 quickReplyRepairEnabled = config.quickReplyRepair,
                 onCharacterUpdated = onCharacterUpdated,
+                onQuickRepliesRepaired = onQuickRepliesRepaired,
             )
         }
 
         return OrchestratorResult(
             reply = displayReply,
             quickReplies = quickReplies,
-            updatedCharacter = updated,
+            updatedCharacter = characterWithInstant,
             proactive = proactive,
-            staticChanges = diffStaticChanges(character, updated),
-            lorebookChanges = diffLorebookChanges(character, updated),
+            staticChanges = diffStaticChanges(character, characterWithInstant),
+            lorebookChanges = diffLorebookChanges(character, characterWithInstant),
             stickerFileRef = outcome.stickerFileRef,
             rawReply = outcome.text,
             inputTokens = outcome.usage?.inputTokens ?: 0,

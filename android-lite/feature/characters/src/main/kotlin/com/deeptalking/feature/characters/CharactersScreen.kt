@@ -46,6 +46,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -112,7 +113,7 @@ fun CharactersScreen(
     onUpgradeToGroup: (Character) -> Unit,
 ) {
     val legacy = MaterialTheme.legacy
-    var createOpen by remember { mutableStateOf(false) }
+    var createOpen by rememberSaveable { mutableStateOf(false) }
     var deleteTarget by remember { mutableStateOf<Character?>(null) }
 
     Column(modifier = Modifier.fillMaxSize().background(legacy.sidebar)) {
@@ -343,17 +344,17 @@ private fun CreateDialog(
     onCreateGroup: (String, String, String, String, String, List<GroupMember>) -> Unit,
 ) {
     val legacy = MaterialTheme.legacy
-    var isGroup by remember { mutableStateOf(false) }
-    var name by remember { mutableStateOf("") }
-    var emoji by remember { mutableStateOf("") }
-    var personality by remember { mutableStateOf("") }
-    var background by remember { mutableStateOf("") }
-    var groupDescription by remember { mutableStateOf("") }
-    var groupScene by remember { mutableStateOf("") }
-    var groupRules by remember { mutableStateOf("") }
-    var membersText by remember { mutableStateOf("") }
-    var quickGenInput by remember { mutableStateOf("") }
-    var createTypeExpanded by remember { mutableStateOf(false) }
+    var isGroup by rememberSaveable { mutableStateOf(false) }
+    var name by rememberSaveable { mutableStateOf("") }
+    var emoji by rememberSaveable { mutableStateOf("") }
+    var personality by rememberSaveable { mutableStateOf("") }
+    var background by rememberSaveable { mutableStateOf("") }
+    var groupDescription by rememberSaveable { mutableStateOf("") }
+    var groupScene by rememberSaveable { mutableStateOf("") }
+    var groupRules by rememberSaveable { mutableStateOf("") }
+    var membersText by rememberSaveable { mutableStateOf("") }
+    var quickGenInput by rememberSaveable { mutableStateOf("") }
+    var createTypeExpanded by rememberSaveable { mutableStateOf(false) }
 
     AlertDialog(
         onDismissRequest = onDismiss,

@@ -5,6 +5,7 @@ import com.deeptalking.domain.agent.AgentContext
 import com.deeptalking.domain.agent.AgentTool
 import com.deeptalking.domain.agent.AgentToolResult
 import com.deeptalking.domain.memory.MemoryService
+import com.deeptalking.domain.memory.hasValidUserEvidence
 import com.deeptalking.engine.ondevice.ToolCall
 import com.deeptalking.engine.ondevice.ToolDefinition
 import kotlinx.serialization.json.add
@@ -52,6 +53,14 @@ class UpdateMemoryTool(private val memory: MemoryService) : AgentTool {
         val id = ToolArgs.string(args, "id").trim()
         if (id.isEmpty()) {
             return AgentToolResult(errorJson("缺少记忆ID id，请先调用 search_memory 或 list_memories 获取目标ID"))
+        }
+        val sourceIds = ToolArgs.strings(args, "sourceMessageIds").map { it.trim() }.filter { it.isNotEmpty() }
+        val evidence = ToolArgs.string(args, "evidence").trim()
+        if (sourceIds.isEmpty() || evidence.isEmpty()) {
+            return AgentToolResult(errorJson("必须给出 sourceMessageIds 与 evidence（逐字摘录用户纠正的原话）"))
+        }
+        if (hasValidUserEvidence(context.character, sourceIds, evidence) == null) {
+            return AgentToolResult(errorJson("evidence 必须是 sourceMessageIds 指定用户消息中的逐字原话；对不上时不修改"))
         }
         val memberName = ToolArgs.string(args, "memberName").trim().ifEmpty { null }
         val subjectRaw = ToolArgs.string(args, "subject").trim()

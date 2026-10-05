@@ -1,6 +1,8 @@
 package com.deeptalking.core.network
 
 import com.deeptalking.core.model.BuiltinPlatforms
+import com.deeptalking.core.model.ChatMessage
+import com.deeptalking.core.model.Role
 import com.deeptalking.engine.ondevice.LlmBackend
 import com.deeptalking.engine.ondevice.LlmChunk
 import com.deeptalking.engine.ondevice.LlmRequest
@@ -14,9 +16,11 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.put
@@ -42,6 +46,8 @@ class ResponsesLlmBackend(
     private val apiKeyProvider: () -> String?,
     private val baseUrl: String = "https://api.deepseek.com/v1",
     override val id: String = "responses",
+    /** Identifies this client (OpenCode Go rejects generic SDK/HTTP-library UAs). */
+    private val userAgent: String = "DeepTalking-Lite",
 ) : LlmBackend {
 
     private val client: OkHttpClient = OkHttpClient.Builder()
@@ -65,7 +71,7 @@ class ResponsesLlmBackend(
                 throw IllegalStateException("Responses API HTTP ${response.code}: ${body.take(500)}")
             }
             val parsed = json.decodeFromString(ResponsesResponse.serializer(), body)
-            toResult(parsed, body)
+            toResult(parsed, body, extractReasoningFromBody(body))
         }
     }
 
@@ -77,6 +83,7 @@ class ResponsesLlmBackend(
         var pendingCallId: String? = null
         var pendingName: String? = null
         val pendingArgs = StringBuilder()
+        val reasoningItems = mutableListOf<String>()
 
         fun emitToolStart(callId: String?, name: String?, args: String) {
             if (name.isNullOrEmpty() && args.isEmpty()) return
@@ -119,11 +126,17 @@ class ResponsesLlmBackend(
 
                     "response.output_item.done" -> {
                         val item = root["item"].obj()
-                        if (item != null && item["type"].str() == "function_call") {
-                            val callId = item["call_id"].str() ?: item["id"].str() ?: pendingCallId
-                            val name = item["name"].str() ?: pendingName
-                            val args = item["arguments"].str() ?: pendingArgs.toString()
-                            emitToolStart(callId, name, args)
+                        if (item != null) {
+                            when (item["type"].str()) {
+                                "function_call" -> {
+                                    val callId = item["call_id"].str() ?: item["id"].str() ?: pendingCallId
+                                    val name = item["name"].str() ?: pendingName
+                                    val args = item["arguments"].str() ?: pendingArgs.toString()
+                                    emitToolStart(callId, name, args)
+                                }
+                                "reasoning" -> normalizeReasoningItem(item)?.let { reasoningItems += it }
+                                else -> Unit
+                            }
                         }
                     }
 
@@ -134,7 +147,9 @@ class ResponsesLlmBackend(
                                 json.decodeFromJsonElement(ResponsesResponse.serializer(), responseElement)
                             }.getOrNull()
                             if (parsed != null) {
-                                this@callbackFlow.trySend(LlmChunk.Completed(toResult(parsed, data)))
+                                this@callbackFlow.trySend(
+                                    LlmChunk.Completed(toResult(parsed, data, reasoningItems.toList())),
+                                )
                             }
                         }
                         this@callbackFlow.close()
@@ -169,8 +184,10 @@ class ResponsesLlmBackend(
         val builder = Request.Builder()
             .url(endpointFor(request.apiPlatform))
             .addHeader("Content-Type", "application/json")
+            .addHeader("User-Agent", userAgent)
         if (stream) builder.addHeader("Accept", "text/event-stream")
-        apiKeyProvider()?.let { builder.addHeader("Authorization", "Bearer $it") }
+        apiKeyProvider()?.trim()?.takeIf { it.isNotEmpty() }
+            ?.let { builder.addHeader("Authorization", "Bearer $it") }
         // OpenCode Go gateway mandates a stable per-session header; missing it
         // returns 400 MissingSessionID (legacy `buildApiHeaders`).
         opencodeSessionHeader(request.apiPlatform, request.sessionId)?.let { (name, value) ->
@@ -187,12 +204,7 @@ class ResponsesLlmBackend(
     private fun endpointFor(platform: String?): String = responsesEndpoint(baseUrl, platform)
 
     private fun buildBody(request: LlmRequest, stream: Boolean): String {
-        val input = request.input.map { message ->
-            InputItem(
-                role = message.role.name.lowercase(),
-                content = JsonPrimitive(message.content),
-            )
-        }
+        val input = buildResponsesInput(request.input)
 
         val tools = if (request.tools.isNotEmpty()) {
             request.tools.map { definition ->
@@ -230,7 +242,11 @@ class ResponsesLlmBackend(
         return json.encodeToString(ResponsesRequest.serializer(), dto)
     }
 
-    private fun toResult(response: ResponsesResponse, raw: String?): LlmResult {
+    private fun toResult(
+        response: ResponsesResponse,
+        raw: String?,
+        reasoning: List<String> = emptyList(),
+    ): LlmResult {
         val text = response.output
             .filter { it.type == "message" }
             .flatMap { it.content.orEmpty() }
@@ -255,7 +271,50 @@ class ResponsesLlmBackend(
             )
         }
 
-        return LlmResult(text = text, toolCalls = toolCalls, usage = usage, raw = raw)
+        return LlmResult(text = text, toolCalls = toolCalls, usage = usage, raw = raw, reasoning = reasoning)
+    }
+
+    /** Non-streaming reasoning items from the raw body's `output[]` (type `reasoning`). */
+    private fun extractReasoningFromBody(body: String): List<String> {
+        val root = runCatching { json.parseToJsonElement(body) as? JsonObject }.getOrNull()
+            ?: return emptyList()
+        val output = root["output"] as? JsonArray ?: return emptyList()
+        return output.mapNotNull { element ->
+            (element as? JsonObject)?.takeIf { it["type"].str() == "reasoning" }
+                ?.let { normalizeReasoningItem(it) }
+        }
+    }
+
+    /**
+     * Rebuilds a minimal Responses `reasoning` item (`{type,id,status,content,summary}`)
+     * from a streamed/done item, dropping transport-only fields (legacy keeps the same
+     * shape when replaying reasoning before `function_call`).
+     */
+    private fun normalizeReasoningItem(item: JsonObject): String? {
+        val id = item["id"].str() ?: return null
+        val status = item["status"].str() ?: "completed"
+        val content = (item["content"] as? JsonArray).orEmpty().mapNotNull { part ->
+            val text = (part as? JsonObject)?.get("text").str().orEmpty()
+            if (text.isEmpty()) null else buildJsonObject {
+                put("type", "reasoning_text")
+                put("text", text)
+            }
+        }
+        val summary = (item["summary"] as? JsonArray).orEmpty().mapNotNull { part ->
+            val text = (part as? JsonObject)?.get("text").str().orEmpty()
+            if (text.isEmpty()) null else buildJsonObject {
+                put("type", "reasoning_summary")
+                put("text", text)
+            }
+        }
+        if (content.isEmpty() && summary.isEmpty()) return null
+        return buildJsonObject {
+            put("type", "reasoning")
+            put("id", id)
+            put("status", status)
+            put("content", buildJsonArray { content.forEach { add(it) } })
+            put("summary", buildJsonArray { summary.forEach { add(it) } })
+        }.toString()
     }
 }
 
@@ -284,3 +343,47 @@ internal fun responsesEndpoint(baseUrl: String, platform: String?): String {
  */
 internal fun opencodeSessionHeader(platform: String?, sessionId: String?): Pair<String, String>? =
     if (platform == "opencode") "x-opencode-session" to (sessionId ?: "deeptalking-general") else null
+
+/**
+ * Builds the heterogeneous Responses `input` array from chat messages: plain
+ * `{role, content}` items plus structured `function_call` / `function_call_output`
+ * items and replayed `reasoning` items, mirroring the legacy `toolState.items`
+ * push order (`src/js/chat/conversation.js:204-207`, `src/js/api/responses.js:72-74`).
+ * `Role.Tool` must never be emitted as a plain `{role:"tool"}` message.
+ */
+internal fun buildResponsesInput(messages: List<ChatMessage>): List<JsonElement> {
+    val json = Json { isLenient = true; ignoreUnknownKeys = true }
+    val input = mutableListOf<JsonElement>()
+    messages.forEach { message ->
+        val reasoning = message.reasoningJson
+            ?.let { runCatching { json.parseToJsonElement(it) as? JsonArray }.getOrNull() }
+        when {
+            message.role == Role.Tool -> input += buildJsonObject {
+                put("type", "function_call_output")
+                put("call_id", message.toolCallId.orEmpty())
+                put("output", message.content)
+            }
+
+            message.role == Role.Assistant && !message.toolName.isNullOrBlank() -> {
+                reasoning?.forEach { input += it }
+                input += buildJsonObject {
+                    put("type", "function_call")
+                    put("call_id", message.toolCallId.orEmpty())
+                    put("name", message.toolName)
+                    put("arguments", message.toolArguments.orEmpty())
+                }
+            }
+
+            else -> {
+                reasoning?.forEach { input += it }
+                if (message.content.isNotEmpty() || message.role != Role.Assistant) {
+                    input += buildJsonObject {
+                        put("role", message.role.name.lowercase())
+                        put("content", message.content)
+                    }
+                }
+            }
+        }
+    }
+    return input
+}

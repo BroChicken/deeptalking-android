@@ -102,6 +102,10 @@ fun containsMath(text: String): Boolean =
         text.contains("\\[") ||
         text.contains("\\]")
 
+/** True when [text] embeds a markdown image, which only the WebView path can render. */
+fun containsImageMarkdown(text: String): Boolean =
+    Regex("""!\[[^\]]*\]\(https?://[^\s)]+\)""").containsMatchIn(text)
+
 /**
  * Builds a [androidx.compose.ui.text.AnnotatedString]-friendly plain-text
  * version of the markdown subset for messages without math. Rendering markdown
@@ -161,8 +165,7 @@ fun renderMarkdownToHtml(text: String): String {
             val alt = match.groupValues[1]
             val url = match.groupValues[2]
             token(
-                "<img class=\"message-image\" src=\"$url\" alt=\"$alt\" loading=\"lazy\" " +
-                    "onerror=\"this.remove()\" onclick=\"openImagePreview(this.src)\">"
+                "<img class=\"message-image\" src=\"$url\" alt=\"$alt\" loading=\"lazy\" onerror=\"this.remove()\">"
             )
         }
         result = LINK.replace(result) { match ->

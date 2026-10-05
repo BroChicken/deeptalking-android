@@ -1,5 +1,7 @@
 ﻿# Agent 架构文档（DeepTalking / 模块化前端）
 
+> **原生现状**：应用已迁移为原生 Android（`android-lite/`，Kotlin + Compose 多模块）。Agent 循环、工具、记忆/世界书、场景概要、后台任务（文风校对、快速回应换位、记忆抽取/分析、世界书整理、空字段补全、一次性迁移）均已按本文档描述的语义在 `:domain:agent` / `:domain:memory` 重新实现；`src/js/` 与 `hub.html` 仅作行为/数据参照，不再是运行入口。原生模块与记忆维护任务的实现说明见 [NATIVE_MODULES.md](NATIVE_MODULES.md)；下方行号仍指向旧 WebView 源码，用于对照语义。
+
 > 本文档记录 `src/js/` 中 Agent 功能的定义与构造（只描述**当前最新状态**，历史变更看 git）。源码按职责拆分，APK 的 `hub.html` 为构建产物。行号随源码调整会偏移，**以模块路径与函数名检索为准**；改动 Agent 循环、工具、提示词、记忆、字段或常量时，必须同步更新本文档。
 
 ## 源码与运行边界

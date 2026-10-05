@@ -22,12 +22,15 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonPrimitive
 
 /**
- * Turns a legacy base64/data-URI sticker into a stable reference (normally a
- * local file path). Tests inject an in-memory fake; the app uses
- * [FileStickerSink].
+ * Turns a legacy base64/data-URI media payload into a stable local reference
+ * (normally a relative file key like `images/<sha>.jpg`). Tests inject an
+ * in-memory fake; the app uses [FileStickerSink].
  */
 fun interface StickerSink {
     fun refFor(dataUri: String): String
+
+    /** Stores a message-image data URI; defaults to [refFor]. */
+    fun imageRefFor(dataUri: String): String = refFor(dataUri)
 }
 
 private fun pick(vararg values: String?): String =
@@ -137,7 +140,7 @@ private fun mapShortTerm(dto: LegacyShortTerm): ShortTermMemory = ShortTermMemor
     createdAt = dto.timestamp,
 )
 
-private fun mapInstant(dto: LegacyInstantMessage): ChatMessage = ChatMessage(
+private fun mapInstant(dto: LegacyInstantMessage, imageSink: StickerSink?): ChatMessage = ChatMessage(
     id = dto.id ?: "",
     role = mapRole(dto.role),
     content = dto.content ?: "",
@@ -145,7 +148,14 @@ private fun mapInstant(dto: LegacyInstantMessage): ChatMessage = ChatMessage(
     attachments = (dto.images ?: emptyList())
         .filter { it.isNotBlank() }
         .take(4)
-        .map { uri -> MessageAttachment(kind = MessageAttachment.Kind.Image, uri = uri) },
+        .map { uri ->
+            val ref = if (uri.startsWith("data:", ignoreCase = true)) {
+                imageSink?.imageRefFor(uri) ?: uri
+            } else {
+                uri
+            }
+            MessageAttachment(kind = MessageAttachment.Kind.Image, uri = ref)
+        },
     internalOnly = dto.internalOnly == true,
     staticChanges = dto.staticChanges ?: emptyList(),
     lorebookChanges = dto.lorebookChanges ?: emptyList(),
@@ -330,7 +340,7 @@ fun mapCharacter(dto: LegacyCharacter, stickerSink: StickerSink?): Character {
         stickers = (dto.stickers ?: emptyList()).mapNotNull { mapSticker(it, stickerSink) },
         instant = (memory?.instant ?: emptyList())
             .filter { it.isLoading != true }
-            .map { mapInstant(it) },
+            .map { mapInstant(it, stickerSink) },
         groupSharedDynamic = if (isGroup) sharedDynamic else DynamicState(),
         members = if (isGroup) mapMembers(dto) else emptyList(),
         fieldsMigrationVersion = dto.fieldsMigrationVersion ?: "",

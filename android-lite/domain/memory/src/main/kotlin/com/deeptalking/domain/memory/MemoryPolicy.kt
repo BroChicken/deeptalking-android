@@ -37,11 +37,11 @@ internal fun parseTimestampMillis(value: String?): Long? {
 internal fun clamp(value: Int, min: Int, max: Int): Int = value.coerceIn(min, max)
 
 /**
- * Effective importance after time decay. Ported from `computeEffectiveImportance`.
- * The JS `learnedBonus` field is not on the native model, so it is treated as 0.
+ * Effective importance after time decay. Ported from `computeEffectiveImportance`,
+ * including the self-learned `learnedBonus` delta.
  */
 fun computeEffectiveImportance(memory: LongTermMemory, now: Long = System.currentTimeMillis()): Double {
-    val importance = clamp(memory.importance, 0, 10)
+    val importance = clamp(memory.importance + memory.learnedBonus, 0, 10)
     val lastRef = parseTimestampMillis(memory.lastRecalled)
         ?: parseTimestampMillis(memory.updatedAt)
         ?: parseTimestampMillis(memory.createdAt)
@@ -192,22 +192,34 @@ fun mergeLongTerm(
         merged = merged.copy(
             value = mergeTimelineValue(existing, incoming),
             eventTime = earlierTimestamp(existing.eventTime, incoming.eventTime),
+            participants = (existing.participants + incoming.participants).distinct().take(8),
+            location = mergeLocations(existing.location, incoming.location),
         )
     } else if (incomingTime >= existingTime) {
+        // Never silently overwrite a semantically different value: keep the
+        // existing text and fold in only the complementary fields.
+        val conflict = memoriesSemanticallyDiffer(incoming.value, existing.value)
         merged = merged.copy(
-            value = incoming.value.ifEmpty { existing.value },
-            subject = incoming.subject,
-            sourceMessageIds = incoming.sourceMessageIds.ifEmpty { existing.sourceMessageIds },
-            evidence = incoming.evidence.ifEmpty { existing.evidence },
-            status = incoming.status,
+            value = if (conflict) existing.value else incoming.value.ifEmpty { existing.value },
+            subject = if (conflict) existing.subject else incoming.subject,
+            sourceMessageIds = (existing.sourceMessageIds + incoming.sourceMessageIds).distinct().take(8),
+            evidence = if (conflict) existing.evidence else incoming.evidence.ifEmpty { existing.evidence },
+            status = if (conflict) existing.status else incoming.status,
             dueAt = incoming.dueAt ?: existing.dueAt,
             updatedAt = incoming.updatedAt ?: incoming.createdAt ?: existing.updatedAt,
+            arcOf = incoming.arcOf ?: existing.arcOf,
+            arcStage = incoming.arcStage ?: existing.arcStage,
         )
     }
     return merged.copy(
         tags = (existing.tags + incoming.tags).distinct().take(8),
         importance = maxOf(existing.importance, incoming.importance),
     )
+}
+
+private fun mergeLocations(a: String, b: String): String {
+    val set = listOf(a.trim().take(160), b.trim().take(160)).filter { it.isNotEmpty() }.distinct()
+    return set.joinToString("、").ifEmpty { "未说明" }
 }
 
 /**

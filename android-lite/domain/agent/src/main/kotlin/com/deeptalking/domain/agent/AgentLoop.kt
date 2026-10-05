@@ -13,6 +13,7 @@ import com.deeptalking.engine.ondevice.ToolCall
 import com.deeptalking.engine.ondevice.ToolDefinition
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.collect
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
@@ -40,11 +41,12 @@ data class LoopOutcome(
  * `chat/conversation.js`.
  *
  * The model is consumed through [LlmBackend.stream]; growing assistant text is
- * reported through `onDelta` and the final [LlmResult] is taken from
- * `LlmChunk.Completed` (falling back to the accumulated deltas when a stream
- * ends without one). Tool results are fed back as [Role.Tool] messages (the
- * transport in :core:network maps them to plain `tool` input items, which is
- * the closest available representation).
+ * reported through `onDelta` (already sanitized for display) and the final
+ * [LlmResult] is taken from `LlmChunk.Completed` (falling back to the accumulated
+ * deltas when a stream ends without one). Tool interactions are fed back as a
+ * structured Responses `function_call` + `function_call_output` pair (with the
+ * round's `reasoning` items replayed before the call), matching the legacy
+ * `toolState.items` push order.
  */
 class AgentLoop(
     private val llm: LlmBackend,
@@ -60,6 +62,7 @@ class AgentLoop(
         builder: RequestBuilder,
         model: String,
         onDelta: (String) -> Unit = {},
+        onToolActivity: (String) -> Unit = {},
     ): LoopOutcome {
         var workingCharacter = character
         var context = AgentContext(character = workingCharacter, activeCharacterId = workingCharacter.id)
@@ -70,6 +73,7 @@ class AgentLoop(
         var latestCharacter: Character? = null
         var latestSticker: String? = null
         var lastUsage: com.deeptalking.engine.ondevice.TokenUsage? = null
+        var lastReasoning: List<String> = emptyList()
         var phase = RequestPhase.AUTO
         var attempts = 0
 
@@ -77,9 +81,10 @@ class AgentLoop(
             attempts++
             val tools = if (phase == RequestPhase.AUTO) autoTools else listOf(submitTool)
             val request = builder.build(phase, instructions, messages, tools, model, sessionIdFor(workingCharacter))
-            val result = collectStreamWithRetry(request, onDelta)
+            val result = collectResultWithRetry(request, onDelta)
             if (result.text.isNotBlank()) lastText = result.text
             result.usage?.let { lastUsage = it }
+            lastReasoning = result.reasoning
 
             val submit = result.toolCalls.firstOrNull { it.name == "submit_response" }
             if (submit != null) return LoopOutcome(result.text, submit, rounds, executedCalls, latestCharacter, latestSticker, lastUsage)
@@ -107,6 +112,8 @@ class AgentLoop(
                     rounds++
                     executedCalls++
                     val call = infoCalls.first()
+                    val callId = call.id.ifBlank { "call_$rounds" }
+                    onToolActivity(toolActivityHint(call.name))
                     val toolResult = registry.execute(call, context)
                     toolResult.stickerFileRef?.let { latestSticker = it }
                     toolResult.updatedCharacter?.let { updated ->
@@ -118,18 +125,32 @@ class AgentLoop(
                         id = "assistant_${rounds}",
                         role = Role.Assistant,
                         content = "",
+                        toolCallId = callId,
+                        toolName = call.name,
+                        toolArguments = call.arguments,
+                        reasoningJson = reasoningArray(lastReasoning),
                         internalOnly = false,
                         isLoading = false,
                     )
                     messages += ChatMessage(
-                        id = call.id.ifBlank { "tool_${rounds}" },
+                        id = callId,
                         role = Role.Tool,
                         content = toolResult.contentJson,
+                        toolCallId = callId,
                     )
+                    onToolActivity("正在继续推理…")
                     continue
                 }
                 if (lastText.isNotBlank()) {
                     return LoopOutcome(lastText, null, rounds, executedCalls, latestCharacter, latestSticker, lastUsage)
+                }
+                reasoningArray(lastReasoning)?.let { reasoning ->
+                    messages += ChatMessage(
+                        id = "reasoning_${rounds}",
+                        role = Role.Assistant,
+                        content = "",
+                        reasoningJson = reasoning,
+                    )
                 }
                 phase = RequestPhase.SUBMIT
                 attempts = 0
@@ -149,19 +170,21 @@ class AgentLoop(
      * model answers through the terminal tool instead of plain text.
      */
     /**
-     * Wraps [collectStream] with the legacy request-level retry policy
+     * Wraps the model request with the legacy request-level retry policy
      * (`src/js/api/retry.js`): transient transport failures are retried up to
      * [ApiRetry.MAX_API_RETRIES] times with 1s/2s/4s backoff; non-transient
-     * errors propagate immediately.
+     * errors propagate immediately. Honors [LlmRequest.stream]: streaming uses
+     * [collectStream] (progressive `onDelta`), non-streaming uses
+     * [LlmBackend.complete] in one shot.
      */
-    private suspend fun collectStreamWithRetry(
+    private suspend fun collectResultWithRetry(
         request: com.deeptalking.engine.ondevice.LlmRequest,
         onDelta: (String) -> Unit,
     ): LlmResult {
         var attempt = 0
         while (true) {
             try {
-                return collectStream(request, onDelta)
+                return if (request.stream) collectStream(request, onDelta) else llm.complete(request)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Throwable) {
@@ -180,18 +203,22 @@ class AgentLoop(
         var completed: LlmResult? = null
         val pending = LinkedHashMap<String, ToolCall>()
         var failure: Throwable? = null
+        var salvaged: String? = null
         try {
             llm.stream(request).collect { chunk ->
                 when (chunk) {
                     is LlmChunk.TextDelta -> {
                         text.append(chunk.text)
-                        onDelta(text.toString())
+                        StreamText.displayFor(text.toString(), salvaged)?.let(onDelta)
                     }
                     is LlmChunk.ToolCallStart -> {
                         val call = chunk.call
                         pending[call.id.ifBlank { call.name }] = call
                         if (call.name == "submit_response" && text.isEmpty()) {
-                            salvagePartialReply(call.arguments)?.let(onDelta)
+                            StreamText.extractReplyFromJson(call.arguments)?.let { reply ->
+                                salvaged = reply
+                                StreamText.displayFor(text.toString(), reply)?.let(onDelta)
+                            }
                         }
                     }
                     is LlmChunk.Completed -> completed = chunk.result
@@ -216,38 +243,12 @@ class AgentLoop(
         return LlmResult(text = text.toString(), toolCalls = pending.values.toList())
     }
 
-    /** Best-effort partial extraction of the `reply` string from a streamed tool call. */
-    private fun salvagePartialReply(arguments: String): String? {
-        val keyIdx = arguments.indexOf("\"reply\"")
-        if (keyIdx < 0) return null
-        var i = arguments.indexOf(':', keyIdx)
-        if (i < 0) return null
-        i++
-        while (i < arguments.length && arguments[i].isWhitespace()) i++
-        if (i >= arguments.length || arguments[i] != '"') return null
-        val start = i
-        var j = i + 1
-        var escaped = false
-        while (j < arguments.length) {
-            val c = arguments[j]
-            if (escaped) {
-                escaped = false
-                j++
-                continue
-            }
-            if (c == '\\') {
-                escaped = true
-                j++
-                continue
-            }
-            if (c == '"') break
-            j++
-        }
-        val token = if (j < arguments.length) arguments.substring(start, j + 1) else arguments.substring(start) + "\""
-        val wrapped = "{\"reply\":$token}"
-        return (ResponseParser.parseJsonLenient(wrapped) as? JsonObject)
-            ?.let { (it["reply"] as? JsonPrimitive)?.contentOrNull }
-            ?.takeIf { it.isNotBlank() }
+    /** Serializes captured reasoning items into a JSON array for [ChatMessage.reasoningJson]. */
+    private fun reasoningArray(items: List<String>): String? {
+        if (items.isEmpty()) return null
+        return buildJsonArray {
+            items.forEach { item -> runCatching { add(Json.parseToJsonElement(item)) } }
+        }.toString()
     }
 
     private fun syntheticSubmitReply(question: String): ToolCall {
@@ -271,4 +272,19 @@ private object ToolJson {
             ?.let { (it["question"] as? JsonPrimitive)?.contentOrNull }
             .orEmpty()
             .trim()
+}
+
+/** Top-right activity hint per tool, mirroring legacy `toolActivityHint` (`status-settings.js:1-15`). */
+internal fun toolActivityHint(name: String): String = when (name) {
+    "get_current_time" -> "正在确认时间…"
+    "search_memory" -> "正在回忆…"
+    "list_memories" -> "正在整理记忆…"
+    "delete_memory" -> "正在清理记忆…"
+    "set_reminder" -> "已记下，正在回应…"
+    "update_character_field" -> "已按你的要求调整设定…"
+    "upsert_lorebook_entry" -> "已更新世界书…"
+    "web_search" -> "正在搜索…"
+    "web_fetch" -> "正在读取网页…"
+    "send_sticker" -> "正在挑表情…"
+    else -> "正在处理…"
 }

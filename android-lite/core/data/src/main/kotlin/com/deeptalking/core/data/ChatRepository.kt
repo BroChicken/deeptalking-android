@@ -23,8 +23,7 @@ class ChatRepository(private val dao: MessageDao) {
     }
 
     suspend fun replace(characterId: String, messages: List<ChatMessage>) {
-        dao.deleteForCharacter(characterId)
-        dao.upsertAll(messages.map { toEntity(characterId, it) })
+        dao.replaceForCharacter(characterId, messages.map { toEntity(characterId, it) })
     }
 
     suspend fun clear(characterId: String) = dao.deleteForCharacter(characterId)

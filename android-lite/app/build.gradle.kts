@@ -27,8 +27,8 @@ android {
         applicationId = "com.deeptalking.lite"
         minSdk = 26
         targetSdk = 35
-        versionCode = 37
-        versionName = "1.4.5"
+        versionCode = 39
+        versionName = "1.4.7"
     }
 
     compileOptions {

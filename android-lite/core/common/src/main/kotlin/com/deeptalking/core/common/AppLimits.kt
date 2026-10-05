@@ -34,6 +34,19 @@ object AppLimits {
         const val INJECT_ENTRIES = 6
         const val INJECT_CHARS = 1_400
         const val MAX_ALWAYS_ACTIVE = 6
+        /** Max entries a single consolidation pass may add/update. */
+        const val AUTO_ENTRIES_PER_PASS = 3
+        /** Fresh short-term items that trigger a consolidation pass. */
+        const val CONSOLIDATE_SPAN = 8
+    }
+
+    object Scene {
+        /** Max scene summaries retained (legacy CONTEXT_BUDGET.sceneSummaries). */
+        const val SUMMARIES = 2
+        /** Messages after the scene cursor needed to summarize. */
+        const val SPAN = 24
+        /** Minimum messages before a scene may be summarized. */
+        const val MIN_MESSAGES = 6
     }
 
     object Agent {

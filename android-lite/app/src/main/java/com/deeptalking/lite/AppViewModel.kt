@@ -3,18 +3,22 @@ package com.deeptalking.lite
 import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.deeptalking.core.common.AppLimits
 import com.deeptalking.core.model.AppConfig
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.GroupMember
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.LorebookOrigin
+import com.deeptalking.core.model.MemoryCategory
 import com.deeptalking.core.model.MessageAttachment
+import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.RequestMetric
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.domain.agent.OrchestratorResult
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -83,6 +87,14 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     private val eventsState = MutableSharedFlow<UiEvent>(extraBufferCapacity = 8)
     val events: SharedFlow<UiEvent> = eventsState.asSharedFlow()
 
+    /** Non-null when the one-time field-structure migration dialog should show (target count). */
+    private val fieldMigrationState = MutableStateFlow<Int?>(null)
+    val fieldMigrationPrompt: StateFlow<Int?> = fieldMigrationState
+
+    /** Non-null when the one-time world-book migration dialog should show (target count). */
+    private val lorebookMigrationState = MutableStateFlow<Int?>(null)
+    val lorebookMigrationPrompt: StateFlow<Int?> = lorebookMigrationState
+
     private val media = MediaStore(DeepTalkingApp.core.appContext)
 
     init {
@@ -95,6 +107,84 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         }
         viewModelScope.launch { proactiveLoop() }
         viewModelScope.launch { themeLoop() }
+        // Legacy on-load silent static-field completion (only with an API key).
+        viewModelScope.launch {
+            runCatching {
+                val cfg = core.data.config.observe().first()
+                core.runStartupMaintenance(cfg)
+            }.onFailure { DeepTalkingApp.recordError(it) }
+        }
+        // Legacy one-time migration prompts (field schema, then world book).
+        viewModelScope.launch {
+            runCatching { checkMigrationPrompts() }.onFailure { DeepTalkingApp.recordError(it) }
+        }
+    }
+
+    // --------------------------------------------------------- migrations
+
+    private suspend fun checkMigrationPrompts() {
+        val cfg = core.data.config.observe().first()
+        if (!core.hasApiKey(cfg.apiPlatform)) return
+        val settings = core.data.settings
+        if (!settings.getBoolean(FIELD_MIGRATION_SKIP_KEY)) {
+            val count = core.fieldMigrationTargetCount()
+            if (count > 0) fieldMigrationState.value = count
+        }
+        if (!settings.getBoolean(LOREBOOK_MIGRATION_SKIP_KEY)) {
+            val count = core.lorebookMigrationTargetCount()
+            if (count > 0) lorebookMigrationState.value = count
+        }
+    }
+
+    fun runFieldMigration() {
+        fieldMigrationState.value = null
+        viewModelScope.launch {
+            val count = core.remapCharacterFields(core.currentConfig())
+            eventsState.tryEmit(UiEvent("字段结构迁移完成（$count 个角色）"))
+        }
+    }
+
+    fun skipFieldMigrationForever() {
+        fieldMigrationState.value = null
+        viewModelScope.launch {
+            core.data.settings.putBoolean(FIELD_MIGRATION_SKIP_KEY, true)
+            val characters = core.data.characters.all()
+            characters.forEach { character ->
+                if (character.fieldsMigrationVersion != "1.2.0") {
+                    core.data.characters.upsert(character.copy(fieldsMigrationVersion = "1.2.0"))
+                }
+            }
+        }
+    }
+
+    /** Dismiss without marking, so it is asked again on the next launch (legacy "跳过"). */
+    fun dismissFieldMigration() {
+        fieldMigrationState.value = null
+    }
+
+    fun runLorebookMigration(trimSource: Boolean) {
+        lorebookMigrationState.value = null
+        viewModelScope.launch {
+            val count = core.runWorldLoreMigration(core.currentConfig(), trimSource)
+            eventsState.tryEmit(UiEvent("世界书整理完成（$count 个角色）"))
+        }
+    }
+
+    fun skipLorebookMigrationForever() {
+        lorebookMigrationState.value = null
+        viewModelScope.launch {
+            core.data.settings.putBoolean(LOREBOOK_MIGRATION_SKIP_KEY, true)
+            val now = Instant.now().toString()
+            core.data.characters.all().forEach { character ->
+                if (character.lorebookMigratedAt == null) {
+                    core.data.characters.upsert(character.copy(lorebookMigratedAt = now))
+                }
+            }
+        }
+    }
+
+    fun dismissLorebookMigration() {
+        lorebookMigrationState.value = null
     }
 
     // ---------------------------------------------------------------- selection
@@ -291,6 +381,8 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 return@launch
             }
             val character = core.data.characters.get(id) ?: return@launch
+            // Skip duplicates (same compressed payload → same file key).
+            if (character.stickers.any { it.fileRef == path }) return@launch
             val sticker = com.deeptalking.core.model.Sticker(
                 id = UUID.randomUUID().toString(),
                 tag = "未分类",
@@ -313,10 +405,17 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         )
     }
 
-    /** Sends a sticker as a user image attachment. */
-    fun sendSticker(sticker: com.deeptalking.core.model.Sticker) {
+    /**
+     * Sends a sticker as the user. Mirrors legacy `sendStickerAsUser`: any typed
+     * text is sent first as its own message, then the sticker becomes a separate
+     * user bubble and triggers its own reply (two turns, not a shared bubble).
+     */
+    fun sendSticker(sticker: com.deeptalking.core.model.Sticker, text: String = "") {
         val id = activeIdState.value ?: return
+        if (sendingState.value) return
         viewModelScope.launch {
+            if (text.isNotBlank()) submitTurn(text.trim(), proactive = false).join()
+            if (sendingState.value || activeIdState.value != id) return@launch
             core.data.chat.append(
                 id,
                 ChatMessage(
@@ -327,6 +426,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                     attachments = listOf(MessageAttachment(MessageAttachment.Kind.Sticker, sticker.fileRef)),
                 ),
             )
+            submitTurn("", proactive = false, skipUserAppend = true).join()
         }
     }
 
@@ -418,9 +518,13 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
 
     // ---------------------------------------------------------------- messaging
 
-    fun send(text: String) = submitTurn(text, proactive = false)
+    fun send(text: String) {
+        submitTurn(text, proactive = false)
+    }
 
-    fun promptProactive() = submitTurn("", proactive = true)
+    fun promptProactive() {
+        submitTurn("", proactive = true)
+    }
 
     fun addPendingImage(uri: Uri) {
         if (pendingImagesState.value.size >= 4) {
@@ -438,16 +542,22 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         pendingImagesState.value = emptyList()
     }
 
-    private fun submitTurn(text: String, proactive: Boolean, skipUserAppend: Boolean = false) {
-        val id = activeIdState.value ?: return
+    private fun submitTurn(text: String, proactive: Boolean, skipUserAppend: Boolean = false): Job {
+        val id = activeIdState.value ?: return completedJob()
         val images = pendingImagesState.value
-        if ((!proactive && text.isBlank() && images.isEmpty()) || sendingState.value) return
-        viewModelScope.launch {
+        if (sendingState.value) return completedJob()
+        if (!proactive && !skipUserAppend && text.isBlank() && images.isEmpty()) return completedJob()
+        return viewModelScope.launch {
             sendingState.value = true
             statusState.value = "思考中…"
             lastUserActivityAt.value = System.currentTimeMillis()
             try {
-                val character = core.data.characters.get(id) ?: return@launch
+                // Legacy blocks before mutating the conversation when no key is set.
+                val cfg = core.currentConfig()
+                if (!core.hasApiKey(cfg.apiPlatform)) {
+                    eventsState.tryEmit(UiEvent("未配置 API Key，请在设置中填写"))
+                    return@launch
+                }
                 val savedImages = images.mapNotNull { uri -> media.saveImage(uri) }
                 pendingImagesState.value = emptyList()
                 if (!proactive && !skipUserAppend) {
@@ -463,18 +573,23 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                     )
                 }
                 val history = core.data.chat.getMessages(id)
-                val cfg = core.currentConfig()
+                // Mirror the live chat into `character.instant` (incl. the just-appended
+                // user message) so set_reminder validation + volatile context see it.
+                val character = (core.data.characters.get(id) ?: return@launch)
+                    .copy(instant = windowInstant(history))
                 statusState.value = "生成中…"
                 streamingState.value = ""
 
                 val orchestrator = core.createOrchestrator(cfg) { updated ->
-                    viewModelScope.launch { core.data.characters.upsert(updated) }
+                    core.appScope.launch { core.data.characters.upsert(updated) }
                 }
                 val result = orchestrator.run(
                     character = character,
                     history = history,
                     userText = text.trim(),
                     onDelta = { streamingState.value = it },
+                    onToolActivity = { statusState.value = it },
+                    onQuickRepliesRepaired = { quickRepliesState.value = it },
                     proactive = proactive,
                 )
                 streamingState.value = null
@@ -485,7 +600,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                         role = Role.Assistant,
                         content = result.reply,
                         timestamp = Instant.now().toString(),
-                        internalOnly = result.proactive,
+                        internalOnly = false,
                         staticChanges = result.staticChanges,
                         lorebookChanges = result.lorebookChanges,
                     ),
@@ -502,7 +617,8 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                         ),
                     )
                 }
-                core.data.characters.upsert(result.updatedCharacter)
+                val withReminders = scheduleDueReminders(result.updatedCharacter)
+                core.data.characters.upsert(withReminders)
                 quickRepliesState.value = result.quickReplies
                 statusState.value = ""
                 recordMetrics(cfg, id, result)
@@ -515,6 +631,57 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             }
         }
     }
+
+    /** Trims a message list to the persisted `character.instant` window (legacy `memory.instant`). */
+    private fun windowInstant(messages: List<ChatMessage>): List<ChatMessage> =
+        if (messages.size > AppLimits.Memory.INSTANT) messages.takeLast(AppLimits.Memory.INSTANT) else messages
+
+    /**
+     * Native equivalent of a due reminder: for the active character's active
+     * promises with a `dueAt`, post a notification once when due (marking
+     * [LongTermMemory.notifiedAt]) or schedule it for the future. Only the
+     * character that just took a turn is scanned, never every character.
+     */
+    private fun scheduleDueReminders(character: Character): Character {
+        val now = System.currentTimeMillis()
+        var changed = false
+        val longTerm = character.longTerm.map { memory ->
+            if (memory.category != MemoryCategory.Promises || memory.status != PromiseStatus.Active) return@map memory
+            val due = memory.dueAt?.let(::parseDueAt) ?: return@map memory
+            val text = "${memory.key}：${memory.value}"
+            when {
+                memory.notifiedAt != null -> {
+                    if (due > now) core.scheduleReminder(memory.id, due, text)
+                    memory
+                }
+                due <= now -> {
+                    core.postReminder(memory.id, text)
+                    changed = true
+                    memory.copy(notifiedAt = Instant.now().toString())
+                }
+                else -> {
+                    core.scheduleReminder(memory.id, due, text)
+                    memory
+                }
+            }
+        }
+        return if (changed) character.copy(longTerm = longTerm) else character
+    }
+
+    private fun parseDueAt(raw: String): Long? {
+        val text = raw.trim()
+        return runCatching {
+            java.time.OffsetDateTime.parse(text).toInstant().toEpochMilli()
+        }.recoverCatching {
+            java.time.LocalDateTime.parse(text, java.time.format.DateTimeFormatter.ISO_LOCAL_DATE_TIME)
+                .atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+        }.recoverCatching {
+            java.time.LocalDate.parse(text).atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+        }.getOrNull()
+    }
+
+    /** Already-completed [Job] for the no-op branches of [submitTurn]. */
+    private fun completedJob(): Job = Job().apply { complete() }
 
     /** Stores the last reply debug payload and appends a rolling usage/cache metric. */
     private suspend fun recordMetrics(cfg: AppConfig, characterId: String, result: OrchestratorResult) {
@@ -598,9 +765,10 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     fun saveSettings(newConfig: AppConfig, apiKey: String?) {
         viewModelScope.launch {
             core.data.config.update(newConfig)
-            if (!apiKey.isNullOrBlank()) {
-                core.secrets.setApiKey(newConfig.apiPlatform, apiKey)
-                core.secrets.setApiKey(apiKey)
+            val trimmedKey = apiKey?.trim()
+            if (!trimmedKey.isNullOrEmpty()) {
+                core.secrets.setApiKey(newConfig.apiPlatform, trimmedKey)
+                core.secrets.setApiKey(trimmedKey)
             }
         }
     }
@@ -617,10 +785,12 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     private val testResultState = MutableStateFlow<String?>(null)
     val testResult: StateFlow<String?> = testResultState
 
-    fun testApiConnection(config: AppConfig) {
+    fun testApiConnection(config: AppConfig, typedKey: String? = null) {
         viewModelScope.launch {
             testResultState.value = "测试中…"
-            val key = core.secrets.getApiKey(config.apiPlatform) ?: core.secrets.getApiKey()
+            val key = typedKey?.trim()?.takeIf { it.isNotEmpty() }
+                ?: core.secrets.getApiKey(config.apiPlatform)?.trim()?.takeIf { it.isNotEmpty() }
+                ?: core.secrets.getApiKey()?.trim()?.takeIf { it.isNotEmpty() }
             testResultState.value = if (key.isNullOrBlank()) {
                 "未配置 API Key"
             } else {
@@ -637,13 +807,18 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
 
     fun exportJson(onReady: (String) -> Unit) {
         viewModelScope.launch {
-            onReady(core.backup.exportJson())
+            val json = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                core.backup.exportJson()
+            }
+            onReady(json)
         }
     }
 
     fun importJson(json: String) {
         viewModelScope.launch {
-            val summary = runCatching { core.backup.importJson(json) }.getOrElse { error ->
+            val summary = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                runCatching { core.backup.importJson(json) }
+            }.getOrElse { error ->
                 eventsState.tryEmit(UiEvent("导入失败：${error.message ?: error}"))
                 return@launch
             }
@@ -701,6 +876,8 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
 
     private companion object {
         const val PROACTIVE_IDLE_MS = 60_000L
+        const val FIELD_MIGRATION_SKIP_KEY = "deeptalking_field_migration_skip_v1"
+        const val LOREBOOK_MIGRATION_SKIP_KEY = "deeptalking_lorebook_migration_skip_v1"
     }
 
     // ------------------------------------------------------------------- theme

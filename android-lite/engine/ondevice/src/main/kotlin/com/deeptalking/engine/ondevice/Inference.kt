@@ -61,6 +61,8 @@ data class LlmResult(
     val toolCalls: List<ToolCall> = emptyList(),
     val usage: TokenUsage? = null,
     val raw: String? = null,
+    /** Serialized Responses `reasoning` items produced this round, for thinking continuity. */
+    val reasoning: List<String> = emptyList(),
 )
 
 sealed interface LlmChunk {

@@ -4,6 +4,7 @@ import android.content.Context
 import com.deeptalking.core.data.CoreDataContainer
 import com.deeptalking.core.data.legacy.BackupService
 import com.deeptalking.core.data.legacy.FileStickerSink
+import com.deeptalking.core.data.legacy.MediaRef
 import com.deeptalking.core.model.AppConfig
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
@@ -17,6 +18,7 @@ import com.deeptalking.engine.ondevice.InferenceRegistry
 import com.deeptalking.engine.ondevice.LlmRequest
 import com.deeptalking.domain.agent.ChatOrchestrator
 import com.deeptalking.domain.agent.ToolRegistry
+import com.deeptalking.domain.agent.background.BackgroundTaskQueue
 import com.deeptalking.domain.agent.background.BackgroundTasks
 import com.deeptalking.domain.agent.defaultTools
 import com.deeptalking.domain.memory.MemoryServiceImpl
@@ -25,12 +27,20 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.withContext
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 
 /** Manual DI graph for the native app, created once from [DeepTalkingApp]. */
 class NativeCore(context: Context) {
 
     val appContext: Context = context.applicationContext
+
+    /** Client UA sent on API calls (OpenCode Go requires a non-generic identifier). */
+    private val userAgent: String = "DeepTalking-Lite/" + BuildConfig.VERSION_NAME
 
     val secrets: SecretStore = SecretStore(appContext)
     val data: CoreDataContainer = CoreDataContainer(appContext)
@@ -38,9 +48,18 @@ class NativeCore(context: Context) {
     val web: HttpWebContentProvider = HttpWebContentProvider()
     val tools: ToolRegistry = ToolRegistry(defaultTools(memory, web, stickersEnabled = true))
 
+    /**
+     * App-process-lifetime scope + serial background queue: legacy background
+     * tasks (style critique, memory extraction, quick-reply repair) run for the
+     * lifetime of the loaded page, so they must outlive an individual ViewModel
+     * / configuration change. [appScope] is also used to persist results.
+     */
+    val appScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val backgroundQueue: BackgroundTaskQueue = BackgroundTaskQueue(appScope)
+
     /** Only LLM is wired today; embedding/asr/tts stay null until their milestones. */
     val inference: InferenceRegistry = InferenceRegistry(
-        llm = ResponsesLlmBackend(apiKeyProvider = { secrets.getApiKey() }),
+        llm = ResponsesLlmBackend(apiKeyProvider = { secrets.getApiKey() }, userAgent = userAgent),
     )
 
     val stickerSink: FileStickerSink = FileStickerSink(appContext)
@@ -49,40 +68,127 @@ class NativeCore(context: Context) {
         chat = data.chat,
         config = data.config,
         stickerSink = stickerSink,
+        mediaSource = MediaRef.source(appContext),
     )
 
     suspend fun currentConfig(): AppConfig = data.config.current()
 
+    /** True when the active platform (or the legacy global slot) has an API key. */
+    fun hasApiKey(platform: String): Boolean = !apiKeyFor(platform).isNullOrBlank()
+
     /** Resolves the active platform's key, falling back to the legacy global key. */
     private fun apiKeyFor(platform: String): String? =
         secrets.getApiKey(platform) ?: secrets.getApiKey()
+
+    private fun backgroundTasks(config: AppConfig): BackgroundTasks =
+        BackgroundTasks(
+            ResponsesLlmBackend(apiKeyProvider = { apiKeyFor(config.apiPlatform) }, baseUrl = config.apiBaseUrl, userAgent = userAgent),
+            memory,
+            config.modelName,
+            config.apiPlatform,
+            backgroundQueue,
+        )
+
+    /**
+     * Startup maintenance mirroring the legacy on-load tasks: silently fill empty
+     * static-profile fields (bounded to 3 jobs). Best-effort; never throws. World-book
+     * / field migrations are interactive in the legacy UI and exposed separately via
+     * [runWorldLoreMigration] / [remapCharacterFields].
+     */
+    suspend fun runStartupMaintenance(config: AppConfig) {
+        if (apiKeyFor(config.apiPlatform).isNullOrBlank()) return
+        runCatching {
+            val tasks = backgroundTasks(config)
+            val characters = data.characters.all()
+            val updated = tasks.autoFillStaticFields(characters)
+            updated.forEachIndexed { index, character ->
+                if (character != characters.getOrNull(index)) data.characters.upsert(character)
+            }
+        }
+    }
+
+    /** One-time world-book migration for characters whose background has not been migrated. */
+    suspend fun runWorldLoreMigration(config: AppConfig, trimSource: Boolean): Int {
+        if (apiKeyFor(config.apiPlatform).isNullOrBlank()) return 0
+        return runCatching {
+            val tasks = backgroundTasks(config)
+            var count = 0
+            data.characters.all().forEach { character ->
+                val source = if (character.isGroup) character.description else character.staticProfile.background
+                if (character.lorebookMigratedAt == null && source.trim().length >= 40) {
+                    val updated = tasks.migrateWorldLore(character, trimSource)
+                    if (updated != character) {
+                        data.characters.upsert(updated)
+                        count++
+                    }
+                }
+            }
+            count
+        }.getOrDefault(0)
+    }
+
+    /** One-time field-structure remap for characters not yet on the current schema. */
+    suspend fun remapCharacterFields(config: AppConfig): Int {
+        if (apiKeyFor(config.apiPlatform).isNullOrBlank()) return 0
+        return runCatching {
+            val tasks = backgroundTasks(config)
+            var count = 0
+            data.characters.all().forEach { character ->
+                if (character.fieldsMigrationVersion != "1.2.0") {
+                    val updated = tasks.remapFields(character)
+                    if (updated != character) {
+                        data.characters.upsert(updated)
+                        count++
+                    }
+                }
+            }
+            count
+        }.getOrDefault(0)
+    }
+
+    /** Characters not yet on the current field schema (legacy `FIELD_MIGRATION_TARGETS`). */
+    suspend fun fieldMigrationTargetCount(): Int =
+        data.characters.all().count { it.fieldsMigrationVersion != "1.2.0" }
+
+    /** Legacy `collectLorebookMigrationTargets`: background/description long enough to hold world facts. */
+    suspend fun lorebookMigrationTargetCount(): Int =
+        data.characters.all().count {
+            it.lorebookMigratedAt == null && migrationSourceText(it).trim().length >= 40
+        }
+
+    private fun migrationSourceText(character: Character): String =
+        if (character.isGroup) character.description else character.staticProfile.background
 
     /**
      * Two-phase connectivity probe mirroring the legacy `testApiConnection`:
      * (1) site reachability, (2) a minimal Responses call. Returns a
      * human-readable multi-line report. Never throws.
      */
-    suspend fun testApiConnection(config: AppConfig, apiKey: String): String {
+    suspend fun testApiConnection(config: AppConfig, apiKey: String): String = withContext(Dispatchers.IO) {
         val base = config.apiBaseUrl.trimEnd('/')
         val report = StringBuilder()
         report.append("① 站点可达性：")
         report.append(
             runCatching {
                 val client = okhttp3.OkHttpClient.Builder()
-                    .connectTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
-                    .readTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
+                    .connectTimeout(8, TimeUnit.SECONDS)
+                    .readTimeout(8, TimeUnit.SECONDS)
                     .build()
+                // Probe the OpenAI-compatible model list: a real HTTP response (200 on
+                // OpenCode Go, 401 without a key elsewhere) means the site is reachable.
+                val probeUrl = (base.ifBlank { "https://api.deepseek.com/v1" }) + "/models"
                 client.newCall(
                     okhttp3.Request.Builder()
-                        .url(base.ifBlank { "https://api.deepseek.com/v1" })
+                        .url(probeUrl)
+                        .header("User-Agent", userAgent)
                         .build(),
-                ).execute().use { "${it.code} ${it.message}" }
-            }.getOrElse { "失败（${it.message ?: it}）" },
+                ).execute().use { "可达（HTTP ${it.code}）" }
+            }.getOrElse { "无法连接（${it.message ?: it}）。可能是网络不通、域名无法解析或被拦截" },
         )
         report.append("\n② 接口调用：")
         report.append(
             runCatching {
-                val backend = ResponsesLlmBackend(apiKeyProvider = { apiKey }, baseUrl = base)
+                val backend = ResponsesLlmBackend(apiKeyProvider = { apiKey }, baseUrl = base, userAgent = userAgent)
                 val result = backend.complete(
                     LlmRequest(
                         model = config.modelName,
@@ -94,16 +200,16 @@ class NativeCore(context: Context) {
                         sessionId = "deeptalking-general",
                     ),
                 )
-                "正常（返回 ${result.text.take(40).ifBlank { "空" }}）"
+                "HTTP 200，正常返回（${result.text.take(40).ifBlank { "空" }}）"
             }.getOrElse { "失败（${it.message ?: it}）" },
         )
         report.append("\n当前端点：$base/responses")
-        return report.toString()
+        report.toString()
     }
 
     /** One-line character/group generation; returns the raw JSON string from the model. */
     suspend fun quickGenerate(config: AppConfig, prompt: String): String? {
-        val backend = ResponsesLlmBackend(apiKeyProvider = { apiKeyFor(config.apiPlatform) }, baseUrl = config.apiBaseUrl)
+        val backend = ResponsesLlmBackend(apiKeyProvider = { apiKeyFor(config.apiPlatform) }, baseUrl = config.apiBaseUrl, userAgent = userAgent)
         val result = backend.complete(
             LlmRequest(
                 model = config.modelName,
@@ -121,7 +227,7 @@ class NativeCore(context: Context) {
 
     /** Generates a single emoji avatar from a character's description. */
     suspend fun generateEmojiAvatar(config: AppConfig, character: Character): String? {
-        val backend = ResponsesLlmBackend(apiKeyProvider = { apiKeyFor(config.apiPlatform) }, baseUrl = config.apiBaseUrl)
+        val backend = ResponsesLlmBackend(apiKeyProvider = { apiKeyFor(config.apiPlatform) }, baseUrl = config.apiBaseUrl, userAgent = userAgent)
         val description = buildString {
             append(character.name).append(' ')
             append(character.staticProfile.appearance).append(' ')
@@ -172,7 +278,7 @@ class NativeCore(context: Context) {
         member: GroupMember,
         hint: String,
     ): String? {
-        val backend = ResponsesLlmBackend(apiKeyProvider = { apiKeyFor(config.apiPlatform) }, baseUrl = config.apiBaseUrl)
+        val backend = ResponsesLlmBackend(apiKeyProvider = { apiKeyFor(config.apiPlatform) }, baseUrl = config.apiBaseUrl, userAgent = userAgent)
         val otherMembers = group.members
             .filter { it.id != member.id }
             .map { mapOf("name" to it.name, "personality" to it.staticProfile.personality, "roleInGroup" to it.roleInGroup) }
@@ -233,6 +339,22 @@ class NativeCore(context: Context) {
         )
     }
 
+    /** Posts a reminder notification immediately (Android-native equivalent of "到时间提醒"). */
+    fun postReminder(id: String, text: String) {
+        com.deeptalking.core.notifications.Reminders.post(appContext, id, "DeepTalking · 待办提醒", text)
+    }
+
+    /** Schedules a reminder notification at [triggerAtMillis] (idempotent per id). */
+    fun scheduleReminder(id: String, triggerAtMillis: Long, text: String) {
+        com.deeptalking.core.notifications.Reminders.schedule(
+            context = appContext,
+            id = id,
+            triggerAtMillis = triggerAtMillis,
+            title = "DeepTalking · 待办提醒",
+            text = text,
+        )
+    }
+
     /**
      * Builds a per-turn orchestrator using the current config snapshot so model,
      * base URL, temperature and stream settings always reflect the latest
@@ -247,8 +369,9 @@ class NativeCore(context: Context) {
         val llm = ResponsesLlmBackend(
             apiKeyProvider = { apiKeyFor(config.apiPlatform) },
             baseUrl = config.apiBaseUrl,
+            userAgent = userAgent,
         )
-        val background = BackgroundTasks(llm, memory, config.modelName, config.apiPlatform)
+        val background = BackgroundTasks(llm, memory, config.modelName, config.apiPlatform, backgroundQueue)
         return ChatOrchestrator(
             llm = llm,
             tools = tools,

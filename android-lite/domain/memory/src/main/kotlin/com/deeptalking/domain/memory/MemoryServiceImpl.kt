@@ -128,7 +128,16 @@ class MemoryServiceImpl : MemoryService {
         val nowIso = Instant.now().toString()
         val updated = withLongTermStore(character, memberName) { list ->
             list.map { item ->
-                if (item.id in ids) item.copy(lastRecalled = nowIso, recallCount = item.recallCount + 1) else item
+                if (item.id in ids) {
+                    item.copy(
+                        lastRecalled = nowIso,
+                        recallCount = item.recallCount + 1,
+                        usageCount = item.usageCount + 1,
+                        lastUsageAt = nowIso,
+                    )
+                } else {
+                    item
+                }
             }
         }
         return updated.copy(

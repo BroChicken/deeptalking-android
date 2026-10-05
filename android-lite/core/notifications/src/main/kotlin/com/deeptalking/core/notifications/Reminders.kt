@@ -50,7 +50,7 @@ object Reminders {
         }
 
         val notification = NotificationCompat.Builder(context, NotificationChannels.REMINDERS_CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setSmallIcon(R.drawable.ic_stat_deeptalking)
             .setContentTitle(title)
             .setContentText(text)
             .setStyle(NotificationCompat.BigTextStyle().bigText(text))

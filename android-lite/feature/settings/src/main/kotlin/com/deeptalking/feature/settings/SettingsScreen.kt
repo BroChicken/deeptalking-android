@@ -25,9 +25,11 @@ import androidx.compose.material3.CheckboxDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -87,14 +89,18 @@ fun SettingsScreen(
     testResult: String?,
     onSave: (AppConfig, apiKey: String?) -> Unit,
     onTestReminder: () -> Unit,
-    onTestConnection: (AppConfig) -> Unit,
+    onTestConnection: (AppConfig, String?) -> Unit,
 ) {
     val context = LocalContext.current
     val legacy = MaterialTheme.legacy
     var edited by remember(config) { mutableStateOf(config) }
     var apiKey by remember { mutableStateOf("") }
-    var platformMenuOpen by remember { mutableStateOf(false) }
-    var thinkingMenuOpen by remember { mutableStateOf(false) }
+    var platformMenuOpen by rememberSaveable { mutableStateOf(false) }
+    var thinkingMenuOpen by rememberSaveable { mutableStateOf(false) }
+
+    // Per-platform API keys live in SecretStore; clear the typed field on switch so
+    // a key entered for one platform is never saved onto another (legacy slot swap).
+    LaunchedEffect(edited.apiPlatform) { apiKey = "" }
 
     val models = BuiltinPlatforms.firstOrNull { it.id == edited.apiPlatform }?.models.orEmpty()
 
@@ -139,7 +145,7 @@ fun SettingsScreen(
         )
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            LegacyButton("测试连接", modifier = Modifier.weight(1f), onClick = { onTestConnection(edited) })
+            LegacyButton("测试连接", modifier = Modifier.weight(1f), onClick = { onTestConnection(edited, apiKey) })
             LegacyButton("保存设置", modifier = Modifier.weight(1f), onClick = { onSave(edited, apiKey.ifBlank { null }) })
         }
 

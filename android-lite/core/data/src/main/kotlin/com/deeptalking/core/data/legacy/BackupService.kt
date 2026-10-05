@@ -33,26 +33,33 @@ import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
 
+/** Reads a stored media reference back into a `data:image/...;base64,...` URI for export. */
+fun interface MediaSource {
+    fun toDataUri(ref: String): String?
+}
+
 /**
  * Exports/imports the native stores in the legacy JSON root shape so a backup
  * file stays usable by the WebView build and vice-versa.
  *
- * Known limitations (native export cannot perfectly reconstruct the JS shape):
+ * Media (message images + stickers) is inlined as base64 `data:` URIs on export
+ * (legacy-compatible) and written back to local files on import, so a backup
+ * restored on another device still shows images.
+ *
  * - `apiKey` is intentionally never exported (mirrors `exportAllData`).
  * - `platformSettings`, `cacheStats` and `requestMetrics` are not part of
  *   [com.deeptalking.core.model.AppConfig] and therefore omitted.
- * - Stickers export their `fileRef` (no base64 `dataUrl`: the payload is not
- *   retained after migration).
  * - `memory.scenes`, `sceneState`, `counters`, `pendingRecall`,
  *   `lastInjectedRecallIds`, group member `roleInGroup` and
  *   `groupInfo.interactionRules` have no native field and are omitted.
- * - `activeCharacterId` is always `null` and `activeTheme` empty (not modeled).
+ * - `activeCharacterId` is always `null` (not modeled).
  */
 class BackupService(
     private val characters: CharacterRepository,
     private val chat: ChatRepository,
     private val config: ConfigRepository,
     private val stickerSink: StickerSink? = null,
+    private val mediaSource: MediaSource? = null,
 ) {
     private val codec = Json {
         prettyPrint = true
@@ -171,7 +178,7 @@ class BackupService(
         if (message.internalOnly) put("internalOnly", true)
         val images = message.attachments
             .filter { it.kind == MessageAttachment.Kind.Image }
-            .map { it.uri }
+            .map { mediaSource?.toDataUri(it.uri) ?: it.uri }
         if (images.isNotEmpty()) {
             putJsonArray("images") { images.forEach { add(it) } }
         }
@@ -235,6 +242,9 @@ class BackupService(
     private fun stickerToJson(sticker: Sticker): JsonObject = buildJsonObject {
         put("id", sticker.id)
         put("tag", sticker.tag)
+        // Inline the payload so a restored backup (other device / after clear-data)
+        // can re-materialize the image; keep fileRef as a fallback.
+        mediaSource?.toDataUri(sticker.fileRef)?.let { put("dataUrl", it) }
         put("fileRef", sticker.fileRef)
         sticker.createdAt?.let { put("createdAt", it) }
     }

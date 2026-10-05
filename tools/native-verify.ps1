@@ -25,6 +25,23 @@ $env:JAVA_HOME = $javaHome
 $env:ANDROID_SDK_ROOT = $sdkRoot
 $env:ANDROID_HOME = $sdkRoot
 
+# [0/2] Static assertions (parity with the legacy verify-hub checks):
+# version format/code and required docs must be present before building.
+Write-Host '== [0/2] Static checks (version + docs) ==' -ForegroundColor Cyan
+$staticBad = 0
+$gradleKts = Get-Content -LiteralPath (Join-Path $android 'app\build.gradle.kts') -Raw
+$vName = ([regex]::Match($gradleKts, 'versionName\s*=\s*"([^"]+)"')).Groups[1].Value
+$vCodeMatch = [regex]::Match($gradleKts, 'versionCode\s*=\s*(\d+)')
+$vCode = if ($vCodeMatch.Success) { [int]$vCodeMatch.Groups[1].Value } else { -1 }
+Write-Host ('  versionName=' + $vName + ' versionCode=' + $vCode)
+if ($vName -notmatch '^\d+\.\d+\.\d+$') { Write-Host '  FAIL: versionName must be X.Y.Z' -ForegroundColor Red; $staticBad++ }
+if ($vCode -lt 1) { Write-Host '  FAIL: versionCode missing or not positive' -ForegroundColor Red; $staticBad++ }
+foreach ($doc in @('docs\AGENT_ARCHITECTURE.md', 'docs\NATIVE_MODULES.md')) {
+  if (-not (Test-Path -LiteralPath (Join-Path $root $doc))) { Write-Host ('  FAIL: missing ' + $doc) -ForegroundColor Red; $staticBad++ }
+}
+if ($staticBad -ne 0) { Write-Host 'VERIFY FAILED (static checks)' -ForegroundColor Red; exit 1 }
+Write-Host '  static checks OK' -ForegroundColor Green
+
 $testTasks = @(
   ':engine:ondevice:test',
   ':domain:agent:test',

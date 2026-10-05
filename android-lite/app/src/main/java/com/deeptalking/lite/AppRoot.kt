@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
@@ -25,6 +26,8 @@ import androidx.compose.material.icons.filled.Group
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -35,6 +38,7 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -49,6 +53,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -94,6 +99,8 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
     val config by vm.config.collectAsState()
     val pendingImages by vm.pendingImages.collectAsState()
     val generating by vm.isGenerating.collectAsState()
+    val fieldMigrationCount by vm.fieldMigrationPrompt.collectAsState()
+    val lorebookMigrationCount by vm.lorebookMigrationPrompt.collectAsState()
 
     val activeCharacter = characters.firstOrNull { it.id == activeId }
 
@@ -102,6 +109,8 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
     var editingCharacter by remember { mutableStateOf<com.deeptalking.core.model.Character?>(null) }
     var editingMemberIndex by remember { mutableStateOf<Int?>(null) }
     val snackbarHostState = remember { SnackbarHostState() }
+    // Legacy mobile sidebar is min(88vw, 21rem); mirror that here.
+    val sidebarWidth = minOf(LocalConfiguration.current.screenWidthDp.dp * 0.88f, 340.dp)
 
     LaunchedEffect(Unit) {
         vm.events.collect { snackbarHostState.showSnackbar(it.message) }
@@ -128,7 +137,9 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
             vm.exportJson { json ->
                 scope.launch {
                     runCatching {
-                        context.contentResolver.openOutputStream(uri)?.use { it.write(json.toByteArray()) }
+                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                            context.contentResolver.openOutputStream(uri)?.use { it.write(json.toByteArray()) }
+                        }
                     }.onSuccess { snackbarHostState.showSnackbar("已导出备份") }
                         .onFailure { snackbarHostState.showSnackbar("导出失败：${it.message}") }
                 }
@@ -141,7 +152,9 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
         if (uri != null) {
             scope.launch {
                 val text = runCatching {
-                    context.contentResolver.openInputStream(uri)?.use { it.readBytes().toString(Charsets.UTF_8) }
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        context.contentResolver.openInputStream(uri)?.use { it.readBytes().toString(Charsets.UTF_8) }
+                    }
                 }.getOrNull()
                 if (text != null) vm.importJson(text) else snackbarHostState.showSnackbar("文件读取失败")
             }
@@ -154,7 +167,7 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
         drawerState = drawerState,
         drawerContent = {
             ModalDrawerSheet(
-                modifier = Modifier.width(258.dp),
+                modifier = Modifier.width(sidebarWidth).statusBarsPadding().navigationBarsPadding(),
                 drawerContainerColor = legacy.sidebar,
             ) {
                 // .tab-btn row (角色 | 设置)
@@ -194,7 +207,7 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                         testResult = vm.testResult.collectAsState().value,
                         onSave = vm::saveSettings,
                         onTestReminder = vm::testReminder,
-                        onTestConnection = vm::testApiConnection,
+                        onTestConnection = { cfg, key -> vm.testApiConnection(cfg, key) },
                     )
                 }
             }
@@ -232,7 +245,7 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                     onAddSticker = vm::addSticker,
                     onDeleteSticker = { id -> activeCharacter?.let { vm.deleteSticker(it, id) } },
                     onSetStickerTag = { id, tag -> activeCharacter?.let { vm.setStickerTag(it, id, tag) } },
-                    onSendSticker = vm::sendSticker,
+                    onSendSticker = { sticker, text -> vm.sendSticker(sticker, text) },
                 )
             }
         }
@@ -250,6 +263,68 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
             onFillMember = { char, index, hint -> vm.fillGroupMember(char, index, hint) },
             initialMemberIndex = editingMemberIndex,
         )
+    }
+
+    // Field-structure migration is asked first; the world-book migration follows once it is gone.
+    fieldMigrationCount?.let {
+        var skipForever by remember { mutableStateOf(false) }
+        AlertDialog(
+            onDismissRequest = { vm.dismissFieldMigration() },
+            title = { Text("字段结构升级") },
+            text = {
+                Column {
+                    Text("检测到旧版字段结构。是否用 AI 把旧字段内容整理迁移到新版结构？（不迁移也可用，只是内容可能有些重复或错位）")
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(checked = skipForever, onCheckedChange = { skipForever = it })
+                        Text("以后不再询问", fontSize = 13.sp)
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { if (skipForever) vm.skipFieldMigrationForever() else vm.runFieldMigration() }) {
+                    Text("开始迁移")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { if (skipForever) vm.skipFieldMigrationForever() else vm.dismissFieldMigration() }) {
+                    Text("跳过")
+                }
+            },
+        )
+    }
+
+    if (fieldMigrationCount == null) {
+        lorebookMigrationCount?.let { count ->
+            var trimSource by remember { mutableStateOf(false) }
+            var skipForever by remember { mutableStateOf(false) }
+            AlertDialog(
+                onDismissRequest = { vm.dismissLorebookMigration() },
+                title = { Text("世界书整理") },
+                text = {
+                    Column {
+                        Text("检测到 $count 个角色/群组的描述里含有世界观类内容。世界书已改为由 AI 自动维护：是否用 AI 把这些内容整理成世界书条目？（不整理也能用，只是世界观会一直常驻占字数）")
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(checked = trimSource, onCheckedChange = { trimSource = it })
+                            Text("同时把已迁出的内容从原文里精简掉", fontSize = 13.sp)
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(checked = skipForever, onCheckedChange = { skipForever = it })
+                            Text("以后不再询问", fontSize = 13.sp)
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        if (skipForever) vm.skipLorebookMigrationForever() else vm.runLorebookMigration(trimSource)
+                    }) { Text("开始整理") }
+                },
+                dismissButton = {
+                    TextButton(onClick = {
+                        if (skipForever) vm.skipLorebookMigrationForever() else vm.dismissLorebookMigration()
+                    }) { Text("跳过") }
+                },
+            )
+        }
     }
 }
 
@@ -356,8 +431,6 @@ private fun AppHeader(
                     modifier = Modifier.padding(end = 6.dp),
                 )
             }
-            CachePill(config)
-            Spacer(Modifier.width(4.dp))
             ThemeMenu(currentThemeId = currentThemeId, onSelect = onSelectTheme)
             Text(
                 "v" + version,
@@ -367,11 +440,19 @@ private fun AppHeader(
             )
         }
         Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(legacy.border).align(Alignment.BottomStart))
+        // Legacy mutual exclusion (`setActivity` hides `#cacheStatsBar`, `clearActivity`
+        // restores it): the cache pill only shows while no activity status is present.
+        if (status.isBlank()) {
+            CachePill(
+                config,
+                Modifier.align(Alignment.BottomEnd).padding(end = 12.dp, bottom = 3.dp),
+            )
+        }
     }
 }
 
 @Composable
-private fun CachePill(config: com.deeptalking.core.model.AppConfig) {
+private fun CachePill(config: com.deeptalking.core.model.AppConfig, modifier: Modifier = Modifier) {
     val legacy = MaterialTheme.legacy
     val metrics = config.requestMetrics
     if (metrics.isEmpty()) return
@@ -390,7 +471,7 @@ private fun CachePill(config: com.deeptalking.core.model.AppConfig) {
         color = legacy.textMuted,
         maxLines = 1,
         overflow = TextOverflow.Ellipsis,
-        modifier = Modifier
+        modifier = modifier
             .clip(RoundedCornerShape(4.dp))
             .background(legacy.bg)
             .border(1.dp, legacy.border, RoundedCornerShape(4.dp))

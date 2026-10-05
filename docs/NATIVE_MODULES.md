@@ -17,8 +17,8 @@ DeepTalking 是原生 Android 应用（Kotlin + Jetpack Compose 多模块），�
 | `:core:security` | core | `SecretStore`：API Key 存 Keystore/EncryptedSharedPreferences |
 | `:core:notifications` | core | 通知渠道、`ReminderWorker`、`Reminders`（WorkManager 调度） |
 | `:core:designsystem` | core | `DeepTalkingTheme` + `AppTheme`（清浅/夜色/深海/旧灯 四套固定配色） |
-| `:domain:agent` | domain | `AgentTool/ToolRegistry`、`ChatOrchestrator`、`AgentLoop`、提示词装配（`prompts/`）、结构化解析（`ResponseParser`）、工具实现（`tools/`） |
-| `:domain:memory` | domain | `MemoryService` + `MemoryServiceImpl`、检索/世界书匹配/记忆策略/时间工具 |
+| `:domain:agent` | domain | `AgentTool/ToolRegistry`、`ChatOrchestrator`、`AgentLoop`、提示词装配（`prompts/`）、结构化解析（`ResponseParser`）、工具实现（`tools/`）、后台任务（`background/BackgroundTasks`：文风校对、快速回应换位生成、记忆抽取/分析、场景概要、世界书整理、空字段补全、字段/世界书迁移） |
+| `:domain:memory` | domain | `MemoryService` + `MemoryServiceImpl`、检索/世界书匹配/记忆策略/时间工具、`MemoryEvidence`（证据与静态修改意图校验、自学习重要度）、`LorebookStore`（世界书写入/合并/来源校验/去重） |
 | `:engine:ondevice` | engine | 端侧推理接口：`LlmBackend/EmbeddingBackend/AsrBackend/TtsBackend` + `InferenceRegistry` |
 | `:feature:chat` | feature | 聊天界面：头像/气泡（尾角圆角）/流式打字/工具活动/快速回应/图片/表情包（含标签编辑）/消息操作（复制、编辑重发、重新生成）/⚡📖 状态改动提示/图片灯箱。**性能**：消息仅在有公式时才用 `RichTextWebView`，其余走纯 Compose `RichText`（`renderMarkdownAnnotated`），配合稳定 `key` 保证滚动顺滑 |
 | `:feature:characters` | feature | 角色/群组列表（群组展开成员子行，可直接编辑成员）、创建弹窗（单角色/群组 + 一句话生成）、角色卡编辑器（基础/当前状态/世界书 **三** 标签，不再有记忆可视化页；世界书每条含 **启用** + **常驻** 两勾选、条目名、命中次数/最近命中时间、来源标签）、AI emoji 头像、成员一句话补全、升级为群组、导出/导入、补全头像（含群组成员） |
@@ -49,12 +49,24 @@ DeepTalking 是原生 Android 应用（Kotlin + Jetpack Compose 多模块），�
 - 媒体/表情以文件（`filesDir`）存放（`app/MediaStore`：图片压到 ≤1280px/2MB，表情 ≤384px/120KB），不再以 base64 进库。
 - API Key 存 `:core:security` 的 `SecretStore`（Keystore），UI 只见脱敏状态；导出时剔除。
 
+## 记忆维护任务（对齐旧版 `src/js/memory/tasks.js`）
+
+每轮后台串行执行（`BackgroundTasks.scheduleTurn` → `runMemoryMaintenance`），均可用假后端单测：
+
+- **自适应重要度** `selfLearnMemoryImportance`（`:domain:memory`）：30 天内被使用过的记忆按 `usageCount/2` 升权（封顶 +3）；userProfile/habits 45/90/180 天未召回逐档降到 -3（只降权不删除）。召回时累计 `usageCount`/`lastUsageAt`。
+- **场景概要** `summarizeScene`：场景切换（`currentLocation` 变化）或超过 `Scene.SPAN`(24) 条消息且 ≥6 条时，压缩为一条 `scenes`（保留最近 `Scene.SUMMARIES`(2) 条）。游标存 `character.sceneState`。
+- **世界书整理** `consolidateLorebook`：`shortTerm` 有未整理项（`lorebookScannedAt == null`）且积压 ≥ `Lorebook.CONSOLIDATE_SPAN`(8) 或有已分析项时触发；从已沉淀的短期记忆里抽取世界层设定（≤`AUTO_ENTRIES_PER_PASS`(3) 条，`sourceShortTermIds` 必须可回溯），写前整批校验、失败不改标记；写后本地 `dedupeLorebook` 兜底并执行 `evictStaleLorebookEntries` 淘汰（AI 近重复合并、常驻/用户条目豁免）。
+- **空字段补全** `autoFillStaticFields`：启动时静默补齐为空的静态字段（最多 3 个），只补空、绝不覆盖；退避用 `character.staticFillMeta`（成功清零，失败 5→30 分钟指数退避，无失败冷却 24h）。
+- **一次性迁移** `migrateWorldLore`（旧 `description`/`background` 里的世界观拆成世界书条目，可选精简原文，标记 `lorebookMigratedAt`）与 `remapFields`（旧字段结构重排，标记 `fieldsMigrationVersion`）。启动时（有 API Key 且未勾选"以后不再询问"）由 `AppViewModel.checkMigrationPrompts` 弹`AlertDialog`询问——先"字段结构升级"，后"世界书整理"（含"同时精简原文"勾选）；确认走 `NativeCore.runWorldLoreMigration` / `remapCharacterFields`，"以后不再询问"写入 `SettingsStore`（键 `deeptalking_field_migration_skip_v1` / `deeptalking_lorebook_migration_skip_v1`，对应旧版 localStorage 跳过键）。
+
+**证据与意图校验**（`MemoryEvidence`）：`hasValidUserEvidence` 要求 `sourceMessageIds` 解析为真实用户消息且 `evidence` 逐字出现；`hasStaticEditIntent` 要求用户原话明确在要求修改该字段。`update_memory` 与 `update_character_field` 工具据此拒绝无据写入；自动写入冲突时 `memoriesSemanticallyDiffer`（token 重叠 <0.35）阻止静默覆盖。
+
 ## 构建与自检
 
 统一走 `tools/` 下的原生脚本（自动解析 JDK17/Android SDK/Gradle，见 `tools/native/env.ps1`）：
 
 ```powershell
-powershell -File tools/native-verify.ps1    # 全量自检：编译 + 全部单测
+powershell -File tools/native-verify.ps1    # 全量自检：静态检查 + 编译 + 全部单测
 powershell -File tools/native-test.ps1      # 仅单测
 powershell -File tools/native-build.ps1     # debug
 powershell -File tools/native-build.ps1 -Release   # 需 keystore 环境变量
@@ -62,7 +74,7 @@ powershell -File tools/native-version.ps1 [-BumpPatch]
 ```
 
 等价于在 `android-lite/` 下用 JDK17 / Android SDK35 运行：
-`gradle :app:assembleDebug` + `gradle :engine:ondevice:test :domain:agent:test :domain:memory:test :core:data:testDebugUnitTest :feature:richtext:testDebugUnitTest`。
+`gradle :app:assembleDebug` + `gradle :engine:ondevice:test :domain:agent:test :core:network:test :domain:memory:test :core:data:testDebugUnitTest :feature:richtext:testDebugUnitTest`。
 
 工具链本地路径（开发机）：JDK17 `D:\devtools\temurin17\jdk-17.0.20.1+1`、SDK `D:\Android`（`local.properties` 的 `sdk.dir`）、Gradle `D:\devtools\gradle\gradle-8.10.2`。可用 `JAVA_HOME` / `DEVTOOLS_JDK17` / `ANDROID_SDK_ROOT` / `DEVTOOLS_GRADLE` 覆盖。
 

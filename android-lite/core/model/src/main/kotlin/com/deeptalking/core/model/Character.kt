@@ -68,8 +68,30 @@ data class Character(
     val pendingRecall: PendingRecall? = null,
     /** Stored scene summaries used by the volatile context (legacy `memory.scenes`). */
     val scenes: List<SceneSummary> = emptyList(),
+    /** Cursor for the scene-summary task (legacy `memory.sceneState`). */
+    val sceneState: SceneState? = null,
+    /** Retry bookkeeping for automatic static-field completion (legacy `staticFillMeta`). */
+    val staticFillMeta: StaticFillMeta? = null,
+    /** Guards the one-time relative-time migration (legacy `timeParseVersion`). */
+    val timeParseVersion: Int = 0,
+    /** When the one-time world-book migration ran (legacy `lorebookMigratedAt`). */
+    val lorebookMigratedAt: String? = null,
     val createdAt: String? = null,
     val updatedAt: String? = null,
+)
+
+@Serializable
+data class SceneState(
+    val key: String = "",
+    val startMessageId: String? = null,
+    val messageCount: Int = 0,
+)
+
+@Serializable
+data class StaticFillMeta(
+    val attemptedAt: String? = null,
+    val failures: Int = 0,
+    val retryAt: String? = null,
 )
 
 @Serializable

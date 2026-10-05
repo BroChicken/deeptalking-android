@@ -4,18 +4,33 @@ import com.deeptalking.core.common.AppLimits
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.LongTermMemory
+import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.MemoryCategory
 import com.deeptalking.core.model.MemorySubject
 import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.Role
+import com.deeptalking.core.model.SceneSummary
 import com.deeptalking.core.model.ShortTermMemory
+import com.deeptalking.core.model.StaticFillMeta
 import com.deeptalking.domain.agent.ResponseParser
+import com.deeptalking.domain.agent.prompts.DYNAMIC_STATE_FIELDS
+import com.deeptalking.domain.agent.prompts.GROUP_SHARED_DYNAMIC_FIELDS
+import com.deeptalking.domain.agent.prompts.STATIC_PROFILE_FIELDS
+import com.deeptalking.domain.agent.prompts.normalizeUserAddress
 import com.deeptalking.domain.agent.prompts.trimText
+import com.deeptalking.domain.agent.prompts.withDynamicField
+import com.deeptalking.domain.agent.prompts.withStaticField
 import com.deeptalking.domain.agent.sessionIdFor
+import com.deeptalking.domain.memory.LorebookProposal
 import com.deeptalking.domain.memory.MemoryService
+import com.deeptalking.domain.memory.dedupeLorebook
+import com.deeptalking.domain.memory.evictStaleLorebookEntries
 import com.deeptalking.domain.memory.getTimeSlot
 import com.deeptalking.domain.memory.logicalDay
 import com.deeptalking.domain.memory.parseZoned
+import com.deeptalking.domain.memory.selfLearnMemoryImportance
+import com.deeptalking.domain.memory.upsertLorebookEntry
+import com.deeptalking.domain.memory.upsertLorebookEntryForCharacter
 import com.deeptalking.engine.ondevice.LlmBackend
 import com.deeptalking.engine.ondevice.LlmRequest
 import kotlinx.coroutines.CancellationException
@@ -27,8 +42,10 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.put
 import java.time.Instant
 import java.time.ZoneId
 import kotlin.random.Random
@@ -55,6 +72,8 @@ internal data class AnalysisInput(
     val content: String,
     val sourceMessageIds: List<String> = emptyList(),
     val eventTime: String? = null,
+    val participants: List<String> = emptyList(),
+    val location: String = "",
 )
 
 private data class PreparedPoint(
@@ -161,9 +180,9 @@ class BackgroundTasks(
     private val memory: MemoryService,
     private val model: String = "deepseek-flash",
     private val apiPlatform: String? = null,
+    /** Shared app-lifetime queue; defaults to a private one (tests). */
+    val queue: BackgroundTaskQueue = BackgroundTaskQueue(),
 ) {
-
-    val queue: BackgroundTaskQueue = BackgroundTaskQueue()
 
     private val json = Json {
         ignoreUnknownKeys = true
@@ -286,29 +305,380 @@ class BackgroundTasks(
     }
 
     suspend fun analyzeShortToLongTerm(character: Character): Character {
-        val items = character.shortTerm.take(AppLimits.Memory.ANALYSIS_BATCH)
+        // Only items not yet folded; mark them once processed so the same batch
+        // is not re-analyzed every turn (legacy `analyzedAt`).
+        val items = character.shortTerm.filter { it.analyzedAt == null }.take(AppLimits.Memory.ANALYSIS_BATCH)
         if (items.isEmpty()) return character
+        val analyzedIds = items.map { it.id }.toSet()
+        val nowIso = Instant.now().toString()
+        val marked = character.copy(
+            shortTerm = character.shortTerm.map {
+                if (it.id in analyzedIds) it.copy(analyzedAt = nowIso) else it
+            },
+        )
         val inputs = items.map { item ->
             AnalysisInput(
                 id = item.id,
                 content = trimText(item.content, 600),
                 sourceMessageIds = item.sourceMessageIds,
                 eventTime = item.eventTime,
+                participants = item.participants,
+                location = item.location,
             )
         }
         val prompt = ANALYSIS_PROMPT_HEAD + json.encodeToString(inputs) + ANALYSIS_PROMPT_TAIL
         val raw = complete(ANALYSIS_SYSTEM, prompt, temperature = 0.2, maxOutputTokens = 4096, sessionId = sessionIdFor(character))
-        if (raw.isBlank()) return character
-        val root = ResponseParser.parseJsonLenient(raw) as? JsonObject ?: return character
-        if (root.string("status") != "ok") return character
-        val longTermArray = root["longTerm"] as? JsonArray ?: return character
+        if (raw.isBlank()) return marked
+        val root = ResponseParser.parseJsonLenient(raw) as? JsonObject ?: return marked
+        if (root.string("status") != "ok") return marked
+        val longTermArray = root["longTerm"] as? JsonArray ?: return marked
         val parsed = longTermArray.mapNotNull { (it as? JsonObject)?.let(::parseLongTerm) }
-        if (parsed.isEmpty()) return character
-        return memory.applyTurn(character, shortTerm = emptyList(), longTerm = parsed)
+        if (parsed.isEmpty()) return marked
+        return memory.applyTurn(marked, shortTerm = emptyList(), longTerm = parsed)
     }
 
-    suspend fun critiqueStyle(character: Character, reply: String): String {
-        val original = reply
+    /** Outcome of a memory sub-task: Success updates state, Failure retries, Stale aborts. */
+    enum class TaskStatus { Success, Failure, Stale }
+
+    /** Current scene key = trimmed current location, or "未说明" (legacy `getSceneKey`). */
+    fun sceneKey(character: Character): String =
+        trimText(character.dynamicState.currentLocation.trim().ifEmpty { "未说明" }, 80)
+
+    /**
+     * Scene-summary trigger + execution (legacy `checkMemoryTriggers` scene branch).
+     * Summarizes when the location changed or the scene grew past the span, once
+     * at least [AppLimits.Scene.MIN_MESSAGES] messages have accumulated.
+     */
+    suspend fun checkScene(character: Character): Pair<TaskStatus, Character> {
+        val currentKey = sceneKey(character)
+        val state = character.sceneState
+        val messages = character.instant.filter { !it.isLoading && it.content.isNotBlank() }
+        val cursorIndex = state?.startMessageId?.let { id -> messages.indexOfFirst { it.id == id } } ?: -1
+        val afterCount = if (state?.startMessageId == null) {
+            messages.size
+        } else {
+            (messages.size - (cursorIndex + 1)).coerceAtLeast(0)
+        }
+        val changed = state != null && state.key.isNotEmpty() && state.key != currentKey
+        val longEnough = afterCount >= AppLimits.Scene.SPAN
+        val ready = (changed || longEnough) && afterCount >= AppLimits.Scene.MIN_MESSAGES
+        if (ready) {
+            val (status, updated) = summarizeScene(character, state?.key?.ifEmpty { currentKey } ?: currentKey)
+            return when (status) {
+                TaskStatus.Success -> TaskStatus.Success to updated.copy(
+                    sceneState = com.deeptalking.core.model.SceneState(
+                        key = currentKey,
+                        startMessageId = messages.lastOrNull()?.id,
+                        messageCount = 0,
+                    ),
+                )
+                else -> status to character
+            }
+        }
+        return TaskStatus.Success to character.copy(
+            sceneState = com.deeptalking.core.model.SceneState(
+                key = currentKey,
+                startMessageId = state?.startMessageId,
+                messageCount = afterCount,
+            ),
+        )
+    }
+
+    /** Compresses the messages after the scene cursor into one `scenes` summary. */
+    suspend fun summarizeScene(character: Character, sceneKey: String): Pair<TaskStatus, Character> {
+        val messages = character.instant.filter { !it.isLoading && it.content.isNotBlank() }
+        val cursor = character.sceneState?.startMessageId
+        val slice = (if (cursor != null) {
+            val index = messages.indexOfFirst { it.id == cursor }
+            if (index >= 0) messages.drop(index + 1) else messages
+        } else {
+            messages
+        }).takeLast(AppLimits.Memory.INSTANT_TRIM_FLOOR)
+        if (slice.size < AppLimits.Scene.MIN_MESSAGES) return TaskStatus.Failure to character
+        val speakerName = character.name.ifBlank { "角色" }
+        val transcript = slice.mapIndexed { index, message ->
+            "[" + (index + 1) + "] " + (if (message.role == Role.User) "用户" else speakerName) +
+                ": " + trimText(message.content, 500)
+        }.joinToString("\n")
+        val raw = complete(SCENE_SYSTEM, SCENE_PROMPT + transcript, temperature = 0.4, maxOutputTokens = 1024, sessionId = sessionIdFor(character))
+        val summary = raw.trim()
+        if (summary.length < 8) return TaskStatus.Failure to character
+        val scene = SceneSummary(
+            id = newId("scene"),
+            content = trimText(summary, 2000),
+            fromMessageId = slice.firstOrNull()?.id,
+            toMessageId = slice.lastOrNull()?.id,
+            createdAt = Instant.now().toString(),
+        )
+        return TaskStatus.Success to character.copy(scenes = (character.scenes + scene).takeLast(AppLimits.Scene.SUMMARIES))
+    }
+
+    /** True when lorebook consolidation is due for [character]. */
+    fun lorebookDue(character: Character): Boolean {
+        val pending = character.shortTerm.filter { it.lorebookScannedAt == null }
+        return pending.size >= AppLimits.Lorebook.CONSOLIDATE_SPAN || pending.any { it.analyzedAt != null }
+    }
+
+    /**
+     * Consolidates settled short-term facts into the world book and retires stale
+     * AI entries (legacy `consolidateLorebook`). Returns `Failure` unchanged when
+     * the model output is malformed, so no markers/counters are touched.
+     */
+    suspend fun consolidateLorebook(character: Character): Pair<TaskStatus, Character> {
+        val fresh = character.shortTerm.filter { it.lorebookScannedAt == null }.take(AppLimits.Memory.ANALYSIS_BATCH)
+        if (fresh.isEmpty()) return TaskStatus.Success to character
+
+        val books = mutableListOf(character.lorebook)
+        character.members.forEach { books += it.lorebook }
+        val existingLines = books.flatMap { book ->
+            book.map { entry ->
+                "- " + entry.name + "｜关键词: " + entry.keywords.joinToString("、") +
+                    (if (entry.alwaysActive) "｜常驻" else "") + "｜内容: " + trimText(entry.content, 160)
+            }
+        }
+        val sourceLines = fresh.map { "[" + it.id + "] " + trimText(it.content, 600) }
+        val prompt = LOREBOOK_PROMPT_HEAD + (existingLines.joinToString("\n").ifEmpty { "（空）" }) +
+            LOREBOOK_PROMPT_TAIL + sourceLines.joinToString("\n")
+
+        val raw = complete(LOREBOOK_SYSTEM, prompt, temperature = 0.2, maxOutputTokens = 4096, sessionId = sessionIdFor(character))
+        if (raw.isBlank()) return TaskStatus.Failure to character
+        val root = ResponseParser.parseJsonLenient(raw) as? JsonObject ?: return TaskStatus.Failure to character
+        val entries = root["entries"] as? JsonArray ?: return TaskStatus.Failure to character
+
+        val allowed = fresh.map { it.id }.toSet()
+        val items = entries.take(AppLimits.Lorebook.AUTO_ENTRIES_PER_PASS)
+        for (entry in items) {
+            val obj = entry as? JsonObject ?: return TaskStatus.Failure to character
+            val name = obj.string("name")
+            val content = obj.string("content")
+            val ids = stringList(obj["sourceShortTermIds"]).map { it.trim() }.filter { it.isNotEmpty() }
+            if (name.isBlank() || content.isBlank() || ids.isEmpty() || ids.any { it !in allowed }) {
+                return TaskStatus.Failure to character
+            }
+        }
+
+        // Eviction only runs after the batch parsed cleanly (legacy order).
+        var working = character.copy(
+            lorebook = evictStaleLorebookEntries(character.lorebook).kept,
+            members = character.members.map { it.copy(lorebook = evictStaleLorebookEntries(it.lorebook).kept) },
+        )
+        items.forEach { entry ->
+            val obj = entry as JsonObject
+            val proposal = LorebookProposal(
+                name = obj.string("name"),
+                content = obj.string("content"),
+                keywords = stringList(obj["keywords"]),
+                alwaysActive = obj.string("alwaysActive").equals("true", ignoreCase = true) || (obj["alwaysActive"] as? JsonPrimitive)?.contentOrNull == "true",
+            )
+            val ids = stringList(obj["sourceShortTermIds"]).map { it.trim() }.filter { it.isNotEmpty() }
+            working = upsertLorebookEntryForCharacter(working, proposal, ids).first
+        }
+        working = working.copy(
+            lorebook = dedupeLorebook(working.lorebook),
+            members = working.members.map { it.copy(lorebook = dedupeLorebook(it.lorebook)) },
+        )
+        val now = Instant.now().toString()
+        val freshIds = fresh.map { it.id }.toSet()
+        working = working.copy(
+            shortTerm = working.shortTerm.map { if (it.id in freshIds) it.copy(lorebookScannedAt = now) else it },
+        )
+        return TaskStatus.Success to working
+    }
+
+    /**
+     * Runs the non-blocking memory maintenance pass: adaptive importance, scene
+     * summary and world-book consolidation. Never throws; a failing sub-task just
+     * leaves its state for the next turn.
+     */
+    suspend fun runMemoryMaintenance(character: Character): Character {
+        var working = selfLearnMemoryImportance(character)
+        val (_, afterScene) = checkScene(working)
+        working = afterScene
+        if (lorebookDue(working)) {
+            val (status, afterLore) = consolidateLorebook(working)
+            if (status == TaskStatus.Success) working = afterLore
+        }
+        return working
+    }
+
+    /** Whether an auto static-field fill may be attempted for [meta] right now. */
+    fun canAttemptStaticFill(meta: StaticFillMeta?, nowMillis: Long = System.currentTimeMillis()): Boolean {
+        meta ?: return true
+        val retryAt = parseZoned(meta.retryAt)?.toInstant()?.toEpochMilli() ?: 0L
+        if (retryAt > nowMillis) return false
+        val cooldown = when {
+            meta.failures > 0 -> minOf(30 * 60_000L, 5 * 60_000L * (1L shl (meta.failures - 1).coerceIn(0, 4)))
+            else -> 24 * 3_600_000L
+        }
+        val attemptedAt = parseZoned(meta.attemptedAt)?.toInstant()?.toEpochMilli() ?: 0L
+        return attemptedAt == 0L || nowMillis - attemptedAt >= cooldown
+    }
+
+    /** Silently fills the empty static-profile fields the model can infer. */
+    suspend fun fillStaticFields(character: Character, missing: List<String>, nowMillis: Long = System.currentTimeMillis()): Character {
+        if (missing.isEmpty()) return character
+        val nowIso = Instant.ofEpochMilli(nowMillis).toString()
+        val labels = missing.joinToString("、") { key ->
+            val label = STATIC_PROFILE_FIELDS.firstOrNull { it.first == key }?.second ?: key
+            "$label($key)"
+        }
+        val existing = STATIC_PROFILE_FIELDS
+            .filter { it.first !in missing }
+            .mapNotNull { (key, _) ->
+                val value = trimText(com.deeptalking.domain.agent.prompts.staticProfileValue(character.staticProfile, key), 300)
+                if (value.isEmpty()) null else "\"" + key + "\":\"" + value.replace("\"", "\\\"") + "\""
+            }
+        val samplesRule = if ("speakingStyle" in missing) SPEAKING_STYLE_SAMPLES_RULE else ""
+        val addressRule = if ("userAddress" in missing) "“对用户的称呼”(userAddress) 只填一个简短称呼词（如“明明”“老公”），不带任何解释。" else ""
+        val prompt = "请只补全下列【当前为空】的字段：$labels。\n" +
+            "要求：只补空字段，绝不修改或覆盖已有设定（已有设定是绝对权威）；只根据已知信息合理补写，没有把握的字段直接省略；不要编造与已有设定冲突的内容。" +
+            samplesRule + addressRule + "\n已有设定:\n{" + existing.joinToString(",") + "}\n只返回JSON对象，键为字段英文名，值为补写内容。"
+        val raw = complete(FILL_SYSTEM, prompt, temperature = 0.4, maxOutputTokens = 2048, sessionId = sessionIdFor(character))
+        val data = if (raw.isBlank()) null else ResponseParser.parseJsonLenient(raw) as? JsonObject
+        var profile = character.staticProfile
+        var filled = 0
+        missing.forEach { key ->
+            if (com.deeptalking.domain.agent.prompts.staticProfileValue(profile, key).isNotBlank()) return@forEach
+            val value = data?.string(key)?.trim().orEmpty()
+            if (value.isEmpty()) return@forEach
+            val cleaned = if (key == "userAddress") normalizeUserAddress(value) else trimText(value, 700)
+            if (cleaned.isEmpty()) return@forEach
+            profile = withStaticField(profile, key, cleaned)
+            filled++
+        }
+        val meta = StaticFillMeta(attemptedAt = nowIso, failures = if (filled > 0) 0 else (character.staticFillMeta?.failures ?: 0) + 1, retryAt = null)
+        return character.copy(staticProfile = profile, staticFillMeta = meta)
+    }
+
+    /** Fills empty static fields for up to 3 eligible characters (legacy `autoFillStaticFields`). */
+    suspend fun autoFillStaticFields(characters: List<Character>): List<Character> {
+        val updated = characters.toMutableList()
+        var attempts = 0
+        characters.forEachIndexed { index, character ->
+            if (attempts >= 3) return@forEachIndexed
+            if (character.isGroup) return@forEachIndexed
+            val missing = STATIC_PROFILE_FIELDS
+                .map { it.first }
+                .filter { com.deeptalking.domain.agent.prompts.staticProfileValue(character.staticProfile, it).isBlank() }
+            if (missing.isEmpty() || !canAttemptStaticFill(character.staticFillMeta)) return@forEachIndexed
+            attempts++
+            updated[index] = fillStaticFields(character, missing)
+        }
+        return updated
+    }
+
+    /** Legacy `FIELDS_MIGRATION_VERSION`. */
+    private val fieldsMigrationVersion = "1.2.0"
+
+    /**
+     * One-time world-book migration (legacy `migrateWorldLoreForEntity`): splits
+     * world-layer facts out of the character background / group description into
+     * lorebook entries. Only reorganizes existing text; user entries are protected.
+     */
+    suspend fun migrateWorldLore(character: Character, trimSource: Boolean): Character {
+        val isGroup = character.isGroup
+        val sourceText = if (isGroup) character.description else character.staticProfile.background
+        val trimmed = sourceText.trim()
+        if (trimmed.isEmpty()) return character.copy(lorebookMigratedAt = Instant.now().toString())
+        val existing = character.lorebook.map {
+            LorebookProposal(name = it.name, content = it.content, keywords = it.keywords, alwaysActive = it.alwaysActive)
+        }
+        val prompt = "下面是一个" + (if (isGroup) "群组前提" else "角色的个人背景") + "文本，其中可能混有世界观类内容（时代/世界观、地点、组织、专有名词、历史、规则）。\n" +
+            "请把其中的**世界层设定**整理成世界书条目；只整理原文已有的信息，禁止编造或扩写；角色/群组本人的性格、经历、关系不要抽成条目。\n" +
+            "每条给出 name、keywords、content、alwaysActive（世界前提/规则设 true，其余 false）。最多 6 条。\n" +
+            (if (trimSource) "另外请给出精简后的原文 trimmedSource：删掉已抽成条目的世界观内容，只保留角色/群组本人相关的部分；没有可精简的就原样返回。\n" else "") +
+            "只返回 JSON：{\"entries\":[{\"name\":\"\",\"keywords\":[],\"content\":\"\",\"alwaysActive\":false}]" + (if (trimSource) ",\"trimmedSource\":\"\"" else "") + "}。\n\n" +
+            "现有世界书条目：" + (if (existing.isEmpty()) "（空）" else json.encodeToString(existing)) +
+            "\n\n" + (if (isGroup) "群组前提" else "个人背景") + "：\n" + trimText(trimmed, 2000)
+        val raw = complete(LOREBOOK_SYSTEM, prompt, temperature = 0.2, maxOutputTokens = 4096, sessionId = sessionIdFor(character))
+        val data = if (raw.isBlank()) null else ResponseParser.parseJsonLenient(raw) as? JsonObject
+        var lorebook = character.lorebook
+        val entries = (data?.get("entries") as? JsonArray)?.take(6).orEmpty()
+        entries.forEach { element ->
+            val obj = element as? JsonObject ?: return@forEach
+            val name = obj.string("name").trim()
+            val content = obj.string("content").trim()
+            if (name.isEmpty() || content.isEmpty()) return@forEach
+            val proposal = LorebookProposal(
+                name = name,
+                content = content,
+                keywords = stringList(obj["keywords"]),
+                alwaysActive = (obj["alwaysActive"] as? JsonPrimitive)?.contentOrNull == "true",
+            )
+            val result = upsertLorebookEntry(lorebook, proposal)
+            if (result.ok) lorebook = result.list
+        }
+        var updated = character.copy(lorebook = lorebook, lorebookMigratedAt = Instant.now().toString())
+        if (trimSource) {
+            val newSource = data?.string("trimmedSource")?.trim().orEmpty()
+            val limit = if (isGroup) 1200 else 800
+            if (newSource.isNotEmpty() && newSource.length < trimmed.length) {
+                updated = if (isGroup) {
+                    updated.copy(description = trimText(newSource, limit))
+                } else {
+                    updated.copy(staticProfile = updated.staticProfile.copy(background = trimText(newSource, limit)))
+                }
+            }
+        }
+        return updated
+    }
+
+    /**
+     * One-time field-structure remap (legacy `aiRemapFieldsForEntity`): reorganizes
+     * the dynamic-state fields and background into the current schema, dropping
+     * duplicates. Group entities only keep their two shared dynamic fields.
+     */
+    suspend fun remapFields(character: Character): Character {
+        val isGroup = character.isGroup
+        val state = com.deeptalking.core.model.DynamicState(
+            currentSituation = character.dynamicState.currentSituation,
+            currentLocation = character.dynamicState.currentLocation,
+            currentMood = if (isGroup) "" else character.dynamicState.currentMood,
+            currentOccupation = if (isGroup) "" else character.dynamicState.currentOccupation,
+            currentGoal = if (isGroup) "" else character.dynamicState.currentGoal,
+            currentRelationship = if (isGroup) "" else character.dynamicState.currentRelationship,
+            currentImportantOthers = if (isGroup) "" else character.dynamicState.currentImportantOthers,
+        )
+        val payload = buildJsonObject {
+            put("name", character.name)
+            put("entityType", if (isGroup) "group" else "character")
+            put("dynamicState", buildJsonObject {
+                put("currentSituation", state.currentSituation)
+                put("currentLocation", state.currentLocation)
+                put("currentMood", state.currentMood)
+                put("currentOccupation", state.currentOccupation)
+                put("currentGoal", state.currentGoal)
+                put("currentRelationship", state.currentRelationship)
+                put("currentImportantOthers", state.currentImportantOthers)
+            })
+            put("background", if (isGroup) character.description else character.staticProfile.background)
+        }
+        val prompt = "下面是一个角色/成员的当前字段文本。请把它整理成新版字段结构：\n" +
+            "动态状态字段只能是：currentSituation、currentLocation、currentMood、currentOccupation、currentGoal、currentRelationship、currentImportantOthers；静态设定只保留 background（仅单角色）。\n" +
+            "要求：①按语义归入最贴切字段，消除重复；②时间写绝对日期；③只整理已有信息，不编造；④写成自然完整的陈述句。\n" +
+            "只返回JSON对象：{\"dynamicState\":{...},\"background\":\"...\"}。\n现有内容（JSON）:\n" + json.encodeToString(payload)
+        val raw = complete(FILL_SYSTEM, prompt, temperature = 0.3, maxOutputTokens = 2048, sessionId = sessionIdFor(character))
+        val data = if (raw.isBlank()) null else ResponseParser.parseJsonLenient(raw) as? JsonObject
+        var dynamic = character.dynamicState
+        val ds = data?.get("dynamicState") as? JsonObject
+        if (ds != null) {
+            DYNAMIC_STATE_FIELDS.forEach { (key, _) ->
+                if (isGroup && key !in GROUP_SHARED_DYNAMIC_FIELDS) return@forEach
+                val value = (ds[key] as? JsonPrimitive)?.contentOrNull?.trim().orEmpty()
+                if (value.isNotEmpty()) dynamic = withDynamicField(dynamic, key, trimText(value, 700))
+            }
+        }
+        var updated = character.copy(dynamicState = dynamic, fieldsMigrationVersion = fieldsMigrationVersion)
+        if (!isGroup) {
+            val background = data?.string("background")?.trim().orEmpty()
+            if (background.isNotEmpty()) {
+                updated = updated.copy(staticProfile = updated.staticProfile.copy(background = trimText(background, 800)))
+            }
+        }
+        return updated
+    }
+
+    suspend fun critiqueStyle(character: Character, reply: String): String {        val original = reply
         if (original.trim().isEmpty()) return original
         val violations = detectStyleViolations(
             original,
@@ -374,6 +744,7 @@ class BackgroundTasks(
         critiqueEnabled: Boolean,
         quickReplyRepairEnabled: Boolean,
         onCharacterUpdated: (Character) -> Unit,
+        onQuickRepliesRepaired: (List<String>) -> Unit = {},
     ): Job = queue.enqueue {
         var working = character
 
@@ -391,8 +762,9 @@ class BackgroundTasks(
 
         val issues = detectQuickReplyIssues(currentQuickReplies, working, reply)
         if (quickReplyRepairEnabled && (currentQuickReplies.size < 2 || issues.isNotEmpty())) {
-            repairQuickReplies(working, reply, userText, currentQuickReplies)
+            val repaired = repairQuickReplies(working, reply, userText, currentQuickReplies)
             working = updateReplyMessage(working, reply) { it.copy(quickReplyIssues = issues) }
+            if (repaired.size >= 2 && repaired != currentQuickReplies) onQuickRepliesRepaired(repaired)
         }
 
         val extracted = extractMemory(working, messages)
@@ -401,6 +773,10 @@ class BackgroundTasks(
         // Consolidate short-term events into long-term memories (legacy analyzeShortToLongTerm).
         val analyzed = analyzeShortToLongTerm(working)
         if (analyzed != working) working = analyzed
+
+        // Scene summaries + world-book consolidation + adaptive importance.
+        val maintained = runMemoryMaintenance(working)
+        if (maintained != working) working = maintained
 
         if (working != character) onCharacterUpdated(working)
     }
@@ -503,8 +879,15 @@ class BackgroundTasks(
             promisor = obj.string("promisor").takeIf { it.isNotBlank() },
             promisee = obj.string("promisee").takeIf { it.isNotBlank() },
             status = status,
+            participants = normalizeParticipants(stringList(obj["participants"])),
+            location = obj.string("location").trim(),
+            arcOf = obj.string("arcOf").takeIf { it.isNotBlank() },
+            arcStage = obj.string("arcStage").takeIf { it.isNotBlank() },
         )
     }
+
+    private fun normalizeParticipants(values: List<String>): List<String> =
+        values.map { it.trim() }.filter { it.isNotEmpty() }.take(8).sorted()
 
     private fun stringList(element: JsonElement?): List<String> =
         (element as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }.orEmpty()
@@ -528,6 +911,25 @@ class BackgroundTasks(
         prefix + "_" + Instant.now().toEpochMilli() + "_" + Random.nextInt(100000, 999999)
 
     private companion object {
+        const val SCENE_SYSTEM = "你是对话记录整理助手。只输出场景摘要正文，不要任何额外文字。"
+        const val SCENE_PROMPT =
+            "把下面这段已经告一段落的情节压缩成 1-2 段、不超过 300 字的「场景记忆」，供之后长期参考。\n" +
+                "只保留会影响后续剧情的要点：谁做了什么、学到或决定了什么；地点、物品、伤势、关系的变化；新的发现或线索；仍未解决的目标、承诺、威胁或期限。\n" +
+                "要求：①写明主体（涉及用户写“用户”，涉及角色写角色名），禁止“我/你/TA”这类指代不清的代词；②时间写绝对日期，禁止“今天/昨天/刚才”这类相对时间词；③不要引用对白原句、不要加标题或 markdown、不要文学化描写；④不得编造原文没有的事实；⑤直接输出摘要正文，不要任何前后缀或解释。\n\n对话内容：\n"
+
+        const val LOREBOOK_SYSTEM = "你是世界书整理助手。只返回 JSON，不要任何额外文字。"
+        const val LOREBOOK_PROMPT_HEAD =
+            "下面是一段角色扮演对话里已经发生的事件摘要，以及现有的世界书条目清单（含内容）。\n" +
+                "请找出其中**已经出现、值得日后复用**的世界层设定（时代/世界观、地点、组织、专有名词、历史、规则、背景事实），整理成世界书条目。\n" +
+                "要求：①只写已经出现或已被明确说出的内容，禁止推测、扩写或发明新设定；②**同一件事物只能有一条**：对照现有条目的名称、关键词与内容，凡与已有条目讲的是同一件事，必须复用它的名字来更新合并，绝不新建近似条目；③只沉淀会反复复用的世界层设定；④每条 content 只写该条目本身的信息；⑤keywords 写剧情里可能出现的称呼；若需要每轮生效把 alwaysActive 设为 true；⑥最多 3 条；没有值得沉淀的就返回空数组。\n" +
+                "只返回 JSON：{\"entries\":[{\"name\":\"条目名\",\"keywords\":[\"触发词\"],\"content\":\"设定内容\",\"alwaysActive\":false,\"sourceShortTermIds\":[\"上面的摘要ID\"]}]}。sourceShortTermIds 必须是上面出现过的摘要ID，至少要有一个。\n\n" +
+                "现有条目清单：\n"
+        const val LOREBOOK_PROMPT_TAIL = "\n\n事件摘要：\n"
+
+        const val FILL_SYSTEM = "你是角色卡补全助手。只返回JSON。"
+        const val SPEAKING_STYLE_SAMPLES_RULE =
+            "说话风格要用 1-2 句能体现口吻的示例台词来写（如「啧，又来这套」），不要把形容词当风格。"
+
         const val EXTRACTION_SYSTEM = "你是一个信息提取助手。只返回JSON数组，不要其他文字。"
         const val ANALYSIS_SYSTEM = "你是一个记忆分析助手。只返回JSON，不要其他文字。"
         const val CRITIQUE_SYSTEM = "你是文风校对助手。只返回JSON。"

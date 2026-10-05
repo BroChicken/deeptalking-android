@@ -111,9 +111,15 @@ class LegacyMapperTest {
 
     private class RecordingSink : StickerSink {
         val calls = mutableListOf<String>()
+        val imageCalls = mutableListOf<String>()
         override fun refFor(dataUri: String): String {
             calls += dataUri
             return "/tmp/stickers/${calls.size}.jpg"
+        }
+
+        override fun imageRefFor(dataUri: String): String {
+            imageCalls += dataUri
+            return "images/${imageCalls.size}.jpg"
         }
     }
 
@@ -153,7 +159,7 @@ class LegacyMapperTest {
         assertEquals("hello", message.content)
         assertEquals("2026-01-01T00:00:00.000Z", message.timestamp)
         assertEquals(1, message.attachments.size)
-        assertEquals("data:image/png;base64,AAAA", message.attachments.first().uri)
+        assertEquals("images/1.jpg", message.attachments.first().uri)
 
         assertEquals(1, character.shortTerm.size)
         assertEquals("today", character.shortTerm.first().timeRef)

@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Transaction
 import kotlinx.coroutines.flow.Flow
 
 @Dao
@@ -28,6 +29,13 @@ interface CharacterDao {
 
     @Query("SELECT COUNT(*) FROM characters")
     suspend fun count(): Int
+
+    /** Atomic full replace so an interruption cannot leave the table empty. */
+    @Transaction
+    suspend fun replaceAll(entities: List<CharacterEntity>) {
+        deleteAll()
+        upsertAll(entities)
+    }
 }
 
 @Dao
@@ -49,6 +57,13 @@ interface MessageDao {
 
     @Query("DELETE FROM messages")
     suspend fun deleteAll()
+
+    /** Atomic replace of one character's history. */
+    @Transaction
+    suspend fun replaceForCharacter(characterId: String, entities: List<MessageEntity>) {
+        deleteForCharacter(characterId)
+        upsertAll(entities)
+    }
 }
 
 @Dao

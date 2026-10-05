@@ -7,11 +7,17 @@ import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
@@ -59,6 +65,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -75,11 +82,14 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
+import com.deeptalking.core.data.legacy.MediaRef
 import com.deeptalking.core.designsystem.appColors
 import com.deeptalking.core.designsystem.legacy
 import com.deeptalking.core.model.Character
@@ -87,7 +97,6 @@ import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.MessageAttachment
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.Sticker
-import java.io.File
 import java.util.Locale
 
 @Composable
@@ -108,25 +117,26 @@ fun ChatScreen(
     onAddSticker: (Uri) -> Unit = {},
     onDeleteSticker: (String) -> Unit = {},
     onSetStickerTag: (String, String) -> Unit = { _, _ -> },
-    onSendSticker: (Sticker) -> Unit = {},
+    onSendSticker: (Sticker, String) -> Unit = { _, _ -> },
 ) {
-    var input by remember { mutableStateOf("") }
-    var imagePreview by remember { mutableStateOf<String?>(null) }
+    var input by rememberSaveable(stateSaver = TextFieldValue.Saver) { mutableStateOf(TextFieldValue("")) }
+    var imagePreview by rememberSaveable { mutableStateOf<String?>(null) }
     var editTarget by remember { mutableStateOf<ChatMessage?>(null) }
-    var stickerPanelOpen by remember { mutableStateOf(false) }
+    var confirmRegenerate by remember { mutableStateOf<ChatMessage?>(null) }
+    var stickerPanelOpen by rememberSaveable { mutableStateOf(false) }
     val listState = rememberLazyListState()
     val context = LocalContext.current
 
     val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
         uris.forEach(onAddImage)
     }
-    val stickerPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri -> uri?.let(onAddSticker) }
+    val stickerPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris -> uris.forEach(onAddSticker) }
 
     val submit = {
-        val text = input.trim()
+        val text = input.text.trim()
         if (!isSending && (text.isNotEmpty() || pendingImages.isNotEmpty())) {
             onSend(text)
-            input = ""
+            input = TextFieldValue("")
         }
     }
 
@@ -161,18 +171,25 @@ fun ChatScreen(
                     contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 16.dp, vertical = 14.dp),
                 ) {
                     items(visibleMessages, key = { it.id }) { message ->
-                        MessageRow(
-                            message = message,
-                            character = character,
-                            isSending = isSending,
-                            onCopy = { copyToClipboard(context, message.content) },
-                            onEditResend = { editTarget = message },
-                            onRegenerate = { onRegenerate(message.id) },
-                            onImageClick = { imagePreview = it },
-                        )
+                        BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+                            MessageRow(
+                                message = message,
+                                character = character,
+                                isSending = isSending,
+                                maxBubbleWidth = maxWidth * 0.8f,
+                                onCopy = { copyToClipboard(context, message.content) },
+                                onEditResend = { editTarget = message },
+                                onRegenerate = { confirmRegenerate = message },
+                                onImageClick = { imagePreview = it },
+                            )
+                        }
                     }
                     if (quickReplies.isNotEmpty() && !isSending) {
-                        item { QuickReplyRow(quickReplies, isSending, onQuickReply) }
+                        item {
+                            BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+                                QuickReplyRow(quickReplies, isSending, maxWidth * 0.8f, onQuickReply)
+                            }
+                        }
                     }
                 }
             }
@@ -206,7 +223,7 @@ fun ChatScreen(
                     StickerPanel(
                         stickers = character.stickers,
                         onUpload = { stickerPicker.launch("image/*") },
-                        onSend = { onSendSticker(it); stickerPanelOpen = false },
+                        onSend = { sticker -> onSendSticker(sticker, input.text); input = TextFieldValue(""); stickerPanelOpen = false },
                         onDelete = onDeleteSticker,
                         onSetTag = onSetStickerTag,
                     )
@@ -230,7 +247,11 @@ fun ChatScreen(
                             .weight(1f)
                             .heightIn(min = 46.dp, max = 140.dp)
                             .onPreviewKeyEvent { event ->
-                                if (event.type == KeyEventType.KeyDown && event.key == Key.Enter && !event.isShiftPressed) {
+                                // Skip Enter while the IME is mid-composition so committing a
+                                // candidate never sends the message early (legacy `isComposing`).
+                                if (event.type == KeyEventType.KeyDown && event.key == Key.Enter &&
+                                    !event.isShiftPressed && input.composition == null
+                                ) {
                                     submit()
                                     true
                                 } else {
@@ -253,7 +274,7 @@ fun ChatScreen(
                     )
                     IconButton(
                         onClick = { submit() },
-                        enabled = !isSending && (input.isNotBlank() || pendingImages.isNotEmpty()),
+                        enabled = !isSending && (input.text.isNotBlank() || pendingImages.isNotEmpty()),
                         modifier = Modifier
                             .size(48.dp)
                             .clip(RoundedCornerShape(12.dp))
@@ -271,7 +292,7 @@ fun ChatScreen(
             modifier = Modifier.fillMaxSize().background(Color(0xD9000000)).clickable { imagePreview = null },
             contentAlignment = Alignment.Center,
         ) {
-            AsyncImage(model = File(path), contentDescription = "图片", contentScale = ContentScale.Fit, modifier = Modifier.fillMaxWidth().padding(24.dp))
+            AsyncImage(model = MediaRef.model(context, path), contentDescription = "图片", contentScale = ContentScale.Fit, modifier = Modifier.fillMaxWidth().padding(24.dp))
         }
     }
 
@@ -282,9 +303,24 @@ fun ChatScreen(
             title = { Text("编辑并重新发送消息：") },
             text = { OutlinedTextField(value = draft, onValueChange = { draft = it }, modifier = Modifier.fillMaxWidth()) },
             confirmButton = {
-                TextButton(onClick = { onEditResend(target.id, draft); editTarget = null }) { Text("重发") }
+                TextButton(
+                    enabled = draft.isNotBlank(),
+                    onClick = { onEditResend(target.id, draft); editTarget = null },
+                ) { Text("重发") }
             },
             dismissButton = { TextButton(onClick = { editTarget = null }) { Text("取消") } },
+        )
+    }
+
+    confirmRegenerate?.let { target ->
+        AlertDialog(
+            onDismissRequest = { confirmRegenerate = null },
+            title = { Text("重新生成回复？") },
+            text = { Text("将删除这条回复之后的内容并重新生成，此操作不可撤销。") },
+            confirmButton = {
+                TextButton(onClick = { onRegenerate(target.id); confirmRegenerate = null }) { Text("重新生成") }
+            },
+            dismissButton = { TextButton(onClick = { confirmRegenerate = null }) { Text("取消") } },
         )
     }
 }
@@ -338,6 +374,7 @@ private fun MessageRow(
     message: ChatMessage,
     character: Character,
     isSending: Boolean,
+    maxBubbleWidth: Dp,
     onCopy: () -> Unit,
     onEditResend: () -> Unit,
     onRegenerate: () -> Unit,
@@ -347,10 +384,11 @@ private fun MessageRow(
     val colors = MaterialTheme.appColors
     val bubbleColor = if (isUser) colors.userBubble else colors.aiBubble
     val contentColor = if (isUser) colors.onUserBubble else colors.onAiBubble
+    // Capsule with a small tail corner pointing at the avatar.
     val shape = if (isUser) {
-        RoundedCornerShape(topStart = 12.dp, topEnd = 12.dp, bottomStart = 12.dp, bottomEnd = 4.dp)
+        RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp, bottomStart = 20.dp, bottomEnd = 6.dp)
     } else {
-        RoundedCornerShape(topStart = 12.dp, topEnd = 12.dp, bottomStart = 4.dp, bottomEnd = 12.dp)
+        RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp, bottomStart = 6.dp, bottomEnd = 20.dp)
     }
 
     Row(
@@ -367,14 +405,14 @@ private fun MessageRow(
                 color = bubbleColor,
                 contentColor = contentColor,
                 shape = shape,
-                modifier = Modifier.widthIn(max = 560.dp).fillMaxWidth(0.84f),
+                modifier = Modifier.widthIn(max = maxBubbleWidth),
             ) {
-                Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
+                Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
                     if (message.isLoading && message.content.isEmpty()) {
                         TypingIndicator(colors.onAiBubble.copy(alpha = 0.6f))
                     } else {
                         if (message.content.isNotBlank()) {
-                            RichText(source = message.content, isUser = isUser, modifier = Modifier.fillMaxWidth())
+                            RichText(source = message.content, isUser = isUser)
                         }
                         MessageImages(message, onImageClick)
                         message.staticChanges.takeIf { !isUser && it.isNotEmpty() }?.let {
@@ -404,15 +442,15 @@ private fun MessageMeta(
 ) {
     val legacy = MaterialTheme.legacy
     Row(
-        modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+        modifier = Modifier.padding(top = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         Text(
             text = formatTime(message.timestamp),
             fontSize = 11.sp,
             color = if (isUser) legacy.onUserBubble.copy(alpha = 0.7f) else legacy.textMuted,
         )
-        Spacer(Modifier.weight(1f))
         if (!isSending) {
             IconButton(onClick = onCopy, modifier = Modifier.size(30.dp)) {
                 Icon(Icons.Default.ContentCopy, contentDescription = "复制消息", tint = legacy.textMuted, modifier = Modifier.size(15.dp))
@@ -431,11 +469,11 @@ private fun MessageMeta(
 }
 
 @Composable
-private fun QuickReplyRow(replies: List<String>, isSending: Boolean, onQuickReply: (String) -> Unit) {
+private fun QuickReplyRow(replies: List<String>, isSending: Boolean, maxBubbleWidth: Dp, onQuickReply: (String) -> Unit) {
     val legacy = MaterialTheme.legacy
     Row(modifier = Modifier.fillMaxWidth()) {
         Spacer(Modifier.width(38.dp))
-        Column(modifier = Modifier.widthIn(max = 560.dp).fillMaxWidth(0.84f)) {
+        Column(modifier = Modifier.widthIn(max = maxBubbleWidth)) {
             Text("快速回应 · 以用户身份直接回复", fontSize = 11.sp, color = legacy.textMuted)
             Spacer(Modifier.height(6.dp))
             replies.forEach { reply ->
@@ -475,9 +513,19 @@ private fun Avatar(emoji: String) {
 
 @Composable
 private fun TypingIndicator(color: Color) {
+    val transition = rememberInfiniteTransition(label = "typing")
     Row(horizontalArrangement = Arrangement.spacedBy(5.dp), verticalAlignment = Alignment.CenterVertically) {
-        repeat(3) {
-            Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(color.copy(alpha = 0.5f)))
+        repeat(3) { index ->
+            val alpha by transition.animateFloat(
+                initialValue = 0.3f,
+                targetValue = 1f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(durationMillis = 600, delayMillis = index * 160),
+                    repeatMode = RepeatMode.Reverse,
+                ),
+                label = "dot$index",
+            )
+            Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(color.copy(alpha = alpha)))
         }
     }
 }
@@ -486,10 +534,11 @@ private fun TypingIndicator(color: Color) {
 private fun MessageImages(message: ChatMessage, onImageClick: (String) -> Unit) {
     val media = message.attachments.filter { it.kind == MessageAttachment.Kind.Image || it.kind == MessageAttachment.Kind.Sticker }
     if (media.isEmpty()) return
+    val context = LocalContext.current
     Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(top = 6.dp)) {
         media.forEach { attachment ->
             AsyncImage(
-                model = File(attachment.uri),
+                model = MediaRef.model(context, attachment.uri),
                 contentDescription = "图片",
                 contentScale = ContentScale.Crop,
                 modifier = Modifier
@@ -510,6 +559,7 @@ private fun StickerPanel(
     onSetTag: (String, String) -> Unit,
 ) {
     var tagEdit by remember { mutableStateOf<Sticker?>(null) }
+    val context = LocalContext.current
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -536,7 +586,7 @@ private fun StickerPanel(
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Box {
                             AsyncImage(
-                                model = File(sticker.fileRef),
+                                model = MediaRef.model(context, sticker.fileRef),
                                 contentDescription = sticker.tag,
                                 contentScale = ContentScale.Crop,
                                 modifier = Modifier.size(72.dp).clip(RoundedCornerShape(8.dp)).clickable { onSend(sticker) },
@@ -563,7 +613,14 @@ private fun StickerPanel(
         AlertDialog(
             onDismissRequest = { tagEdit = null },
             title = { Text("编辑标签") },
-            text = { OutlinedTextField(value = tag, onValueChange = { tag = it }, singleLine = true) },
+            text = {
+                OutlinedTextField(
+                    value = tag,
+                    // Legacy caps sticker tags at 6 chars with no whitespace.
+                    onValueChange = { raw -> tag = raw.replace(Regex("\\s+"), "").take(6) },
+                    singleLine = true,
+                )
+            },
             confirmButton = {
                 TextButton(onClick = { onSetTag(sticker.id, tag); tagEdit = null }) { Text("保存") }
             },

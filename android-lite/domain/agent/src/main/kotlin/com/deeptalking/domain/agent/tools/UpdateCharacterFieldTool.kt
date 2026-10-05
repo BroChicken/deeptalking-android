@@ -6,6 +6,8 @@ import com.deeptalking.domain.agent.AgentToolResult
 import com.deeptalking.domain.agent.prompts.STATIC_PROFILE_FIELDS
 import com.deeptalking.domain.agent.prompts.staticFieldLabel
 import com.deeptalking.domain.agent.prompts.withStaticField
+import com.deeptalking.domain.memory.hasStaticEditIntent
+import com.deeptalking.domain.memory.hasValidUserEvidence
 import com.deeptalking.engine.ondevice.ToolCall
 import com.deeptalking.engine.ondevice.ToolDefinition
 import kotlinx.serialization.json.add
@@ -58,8 +60,15 @@ class UpdateCharacterFieldTool : AgentTool {
         val value = ToolArgs.string(args, "value").trim().take(700)
         if (value.isEmpty()) return AgentToolResult(errorJson("value 为空或全部为说明性文字，请只提供内容本身"))
         val sourceIds = ToolArgs.strings(args, "sourceMessageIds").map { it.trim() }.filter { it.isNotEmpty() }
-        if (sourceIds.isEmpty()) {
+        val evidence = ToolArgs.string(args, "evidence").trim()
+        if (sourceIds.isEmpty() || evidence.isEmpty()) {
             return AgentToolResult(errorJson("sourceMessageIds 必须是真实用户消息ID，且 evidence 逐字摘录用户原话；找不到可引用来源时不修改"))
+        }
+        // Static fields are only touched when the user explicitly asks for the change.
+        val resolved = hasValidUserEvidence(context.character, sourceIds, evidence)
+            ?: return AgentToolResult(errorJson("evidence 必须逐字来自 sourceMessageIds 指定的用户消息，找不到用户原话时不修改"))
+        if (!hasStaticEditIntent(field, resolved)) {
+            return AgentToolResult(errorJson("用户并未明确要求修改「$label」，静态设定不修改"))
         }
         val updated = context.character.copy(
             staticProfile = withStaticField(context.character.staticProfile, field, value),

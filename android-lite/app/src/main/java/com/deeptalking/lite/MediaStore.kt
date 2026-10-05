@@ -63,7 +63,8 @@ class MediaStore(private val context: Context) {
         val file = File(directory, sha256Hex(bytes) + ".jpg")
         return runCatching {
             file.writeBytes(bytes)
-            file.absolutePath
+            // Relative key (survives reinstall/cross-device restore); `MediaRef` resolves it.
+            "$directoryName/${file.name}"
         }.getOrNull()
     }
 

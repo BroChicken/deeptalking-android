@@ -27,6 +27,8 @@ data class ChatMessage(
     val internalOnly: Boolean = false,
     /** True while a streamed assistant turn is still being generated. */
     val isLoading: Boolean = false,
+    /** When this message was folded into short-term memory (legacy `extractedAt`). */
+    val extractedAt: String? = null,
     /** Style violations detected on this assistant turn (persisted for the review pass). */
     val styleViolations: List<String> = emptyList(),
     /** Quick-reply issues detected on this assistant turn. */
@@ -35,6 +37,20 @@ data class ChatMessage(
     val staticChanges: List<String> = emptyList(),
     /** Lorebook entry names created/updated after this assistant turn (legacy `lorebookChanges`). */
     val lorebookChanges: List<String> = emptyList(),
+    /**
+     * Responses `function_call` id. Set on an assistant turn that requested a tool
+     * and on the matching `Role.Tool` output item (`function_call_output.call_id`).
+     */
+    val toolCallId: String? = null,
+    /** Tool name when this assistant turn is a Responses `function_call` item. */
+    val toolName: String? = null,
+    /** Raw JSON arguments of the assistant `function_call`. */
+    val toolArguments: String? = null,
+    /**
+     * JSON array of Responses `reasoning` item(s) that must be replayed before this
+     * turn's `function_call` (DeepSeek thinking continuity). Null when none.
+     */
+    val reasoningJson: String? = null,
 )
 
 @Serializable
