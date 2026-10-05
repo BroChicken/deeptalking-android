@@ -78,6 +78,8 @@ data class Character(
     val lorebookMigratedAt: String? = null,
     val createdAt: String? = null,
     val updatedAt: String? = null,
+    /** Memory revision counter, bumped when a branch is discarded (legacy `memory.revision`). */
+    val revision: Int = 0,
 )
 
 @Serializable

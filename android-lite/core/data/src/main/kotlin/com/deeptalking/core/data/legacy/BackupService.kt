@@ -15,9 +15,13 @@ import com.deeptalking.core.model.LorebookOrigin
 import com.deeptalking.core.model.MemoryCategory
 import com.deeptalking.core.model.MemorySubject
 import com.deeptalking.core.model.MessageAttachment
+import com.deeptalking.core.model.PendingRecall
 import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.Role
+import com.deeptalking.core.model.SceneState
+import com.deeptalking.core.model.SceneSummary
 import com.deeptalking.core.model.ShortTermMemory
+import com.deeptalking.core.model.StaticFillMeta
 import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.core.model.Sticker
 import kotlinx.coroutines.flow.first
@@ -32,6 +36,35 @@ import kotlinx.serialization.json.encodeToJsonElement
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
+import java.nio.ByteBuffer
+import java.nio.charset.Charset
+import java.nio.charset.CodingErrorAction
+
+/**
+ * Decodes an imported backup file the way `decodeImportBuffer`
+ * (src/js/storage/backup.js) does: strict UTF-8 first, then GBK, then a lenient
+ * UTF-8 decode. The strict pass rejects invalid UTF-8 so a GBK-encoded (legacy
+ * Windows) backup still parses.
+ */
+fun decodeImportBytes(bytes: ByteArray): String {
+    val strictUtf8 = runCatching {
+        Charsets.UTF_8.newDecoder()
+            .onMalformedInput(CodingErrorAction.REPORT)
+            .onUnmappableCharacter(CodingErrorAction.REPORT)
+            .decode(ByteBuffer.wrap(bytes))
+            .toString()
+    }.getOrNull()
+    if (strictUtf8 != null) return strictUtf8
+
+    val gbk = runCatching {
+        Charset.forName("GBK").newDecoder()
+            .onMalformedInput(CodingErrorAction.REPLACE)
+            .onUnmappableCharacter(CodingErrorAction.REPLACE)
+            .decode(ByteBuffer.wrap(bytes))
+            .toString()
+    }.getOrNull()
+    return gbk ?: String(bytes, Charsets.UTF_8)
+}
 
 /** Reads a stored media reference back into a `data:image/...;base64,...` URI for export. */
 fun interface MediaSource {
@@ -49,10 +82,10 @@ fun interface MediaSource {
  * - `apiKey` is intentionally never exported (mirrors `exportAllData`).
  * - `platformSettings`, `cacheStats` and `requestMetrics` are not part of
  *   [com.deeptalking.core.model.AppConfig] and therefore omitted.
- * - `memory.scenes`, `sceneState`, `counters`, `pendingRecall`,
- *   `lastInjectedRecallIds`, group member `roleInGroup` and
- *   `groupInfo.interactionRules` have no native field and are omitted.
- * - `activeCharacterId` is always `null` (not modeled).
+ * - `counters` / `lastInjectedRecallIds` and long-term `sourceRoles` /
+ *   `conflicts` / `relatedTo` have no native field and are omitted.
+ * - `activeCharacterId` is accepted as a parameter (native stores do not model
+ *   an active character); pass the current selection, or omit for `null`.
  */
 class BackupService(
     private val characters: CharacterRepository,
@@ -66,7 +99,7 @@ class BackupService(
         encodeDefaults = true
     }
 
-    suspend fun exportJson(): String {
+    suspend fun exportJson(activeCharacterId: String? = null): String {
         val all = characters.observeAll().first()
         val appConfig = config.observe().first()
         val messagesByCharacter = all.associate { it.id to chat.getMessages(it.id) }
@@ -78,7 +111,11 @@ class BackupService(
                     put(character.id, characterToJson(character, messagesByCharacter[character.id].orEmpty()))
                 }
             }
-            put("activeCharacterId", JsonNull)
+            if (activeCharacterId.isNullOrBlank()) {
+                put("activeCharacterId", JsonNull)
+            } else {
+                put("activeCharacterId", activeCharacterId)
+            }
             put("activeTheme", appConfig.activeTheme)
             put("exportDate", appConfig.exportDateOrNow())
             put("version", "native")
@@ -97,12 +134,28 @@ class BackupService(
         put("entityType", if (character.isGroup) "group" else "character")
         put("basicInfo", basicInfoToJson(character.name, character.emoji, character.staticProfile))
         put("dynamicState", dynamicStateToJson(character.dynamicState))
-        put("memory", memoryToJson(messages.ifEmpty { character.instant }, character.shortTerm, character.longTerm))
+        put(
+            "memory",
+            memoryToJson(
+                instant = messages.ifEmpty { character.instant },
+                shortTerm = character.shortTerm,
+                longTerm = character.longTerm,
+                scenes = character.scenes,
+                sceneState = character.sceneState,
+                pendingRecall = character.pendingRecall,
+                revision = character.revision,
+            ),
+        )
         putJsonArray("lorebook") { character.lorebook.forEach { add(lorebookToJson(it)) } }
         putJsonArray("stickers") { character.stickers.forEach { add(stickerToJson(it)) } }
         if (character.fieldsMigrationVersion.isNotBlank()) {
             put("fieldsMigrationVersion", character.fieldsMigrationVersion)
         }
+        if (character.timeParseVersion > 0) {
+            put("timeParseVersion", character.timeParseVersion)
+        }
+        character.staticFillMeta?.let { put("staticFillMeta", staticFillMetaToJson(it)) }
+        character.lorebookMigratedAt?.let { put("lorebookMigratedAt", it) }
         if (character.isGroup) {
             putJsonObject("groupInfo") {
                 put("name", character.name)
@@ -156,10 +209,20 @@ class BackupService(
         instant: List<ChatMessage>,
         shortTerm: List<ShortTermMemory>,
         longTerm: List<LongTermMemory>,
+        scenes: List<SceneSummary> = emptyList(),
+        sceneState: SceneState? = null,
+        pendingRecall: PendingRecall? = null,
+        revision: Int = 0,
     ): JsonObject = buildJsonObject {
         putJsonArray("instant") { instant.forEach { add(instantToJson(it)) } }
         putJsonArray("shortTerm") { shortTerm.forEach { add(shortTermToJson(it)) } }
         put("longTerm", longTermMapToJson(longTerm))
+        if (scenes.isNotEmpty()) {
+            putJsonArray("scenes") { scenes.forEach { add(sceneToJson(it)) } }
+        }
+        sceneState?.let { put("sceneState", sceneStateToJson(it)) }
+        pendingRecall?.let { putJsonArray("pendingRecall") { add(pendingRecallToJson(it)) } }
+        if (revision != 0) put("revision", revision)
     }
 
     private fun longTermMapToJson(items: List<LongTermMemory>): JsonObject = buildJsonObject {
@@ -174,7 +237,9 @@ class BackupService(
         put("id", message.id)
         put("role", roleKey(message.role))
         put("content", message.content)
+        if (message.sequence != 0) put("sequence", message.sequence)
         message.timestamp?.let { put("timestamp", it) }
+        message.extractedAt?.let { put("extractedAt", it) }
         if (message.internalOnly) put("internalOnly", true)
         val images = message.attachments
             .filter { it.kind == MessageAttachment.Kind.Image }
@@ -188,19 +253,35 @@ class BackupService(
         if (message.lorebookChanges.isNotEmpty()) {
             putJsonArray("lorebookChanges") { message.lorebookChanges.forEach { add(it) } }
         }
+        if (message.styleViolations.isNotEmpty()) {
+            putJsonArray("styleViolations") { message.styleViolations.forEach { add(it) } }
+        }
+        if (message.quickReplyIssues.isNotEmpty()) {
+            putJsonArray("quickReplyIssues") { message.quickReplyIssues.forEach { add(it) } }
+        }
     }
 
     private fun shortTermToJson(memory: ShortTermMemory): JsonObject = buildJsonObject {
         put("id", memory.id)
         put("content", memory.content)
         memory.createdAt?.let { put("timestamp", it) }
+        memory.analyzedAt?.let { put("analyzedAt", it) }
+        memory.lorebookScannedAt?.let { put("lorebookScannedAt", it) }
         memory.eventTime?.let { put("eventTime", it) }
         if (memory.sourceMessageIds.isNotEmpty()) {
             putJsonArray("sourceMessageIds") { memory.sourceMessageIds.forEach { add(it) } }
         }
+        if (memory.participants.isNotEmpty()) {
+            putJsonArray("participants") { memory.participants.forEach { add(it) } }
+        }
+        if (memory.location.isNotEmpty()) put("location", memory.location)
         memory.timeRef?.let { anchor ->
             putJsonObject("timeRef") { put("anchor", anchor) }
         }
+        if (memory.sourceRoles.isNotEmpty()) {
+            putJsonArray("sourceRoles") { memory.sourceRoles.forEach { add(it) } }
+        }
+        if (memory.userEvidence.isNotEmpty()) put("userEvidence", memory.userEvidence)
     }
 
     private fun longTermToJson(memory: LongTermMemory): JsonObject = buildJsonObject {
@@ -223,6 +304,55 @@ class BackupService(
         memory.updatedAt?.let { put("updatedAt", it) }
         memory.lastRecalled?.let { put("lastRecalled", it) }
         put("recallCount", memory.recallCount)
+        if (memory.participants.isNotEmpty()) {
+            putJsonArray("participants") { memory.participants.forEach { add(it) } }
+        }
+        if (memory.location.isNotEmpty()) put("location", memory.location)
+        if (memory.learnedBonus != 0) put("learnedBonus", memory.learnedBonus)
+        if (memory.usageCount != 0) put("usageCount", memory.usageCount)
+        memory.lastUsageAt?.let { put("lastUsageAt", it) }
+        memory.arcOf?.let { put("arcOf", it) }
+        memory.arcStage?.let { put("arcStage", it) }
+        memory.recordedAt?.let { put("recordedAt", it) }
+        if (memory.conflicts.isNotEmpty()) {
+            putJsonArray("conflicts") { memory.conflicts.forEach { add(it) } }
+        }
+        memory.conflictedAt?.let { put("conflictedAt", it) }
+        if (memory.relatedTo.isNotEmpty()) {
+            putJsonArray("relatedTo") { memory.relatedTo.forEach { add(it) } }
+        }
+        if (memory.sourceRoles.isNotEmpty()) {
+            putJsonArray("sourceRoles") { memory.sourceRoles.forEach { add(it) } }
+        }
+        if (memory.userEvidence.isNotEmpty()) put("userEvidence", memory.userEvidence)
+        if (memory.corrections.isNotEmpty()) {
+            putJsonArray("corrections") { memory.corrections.forEach { add(it) } }
+        }
+    }
+
+    private fun sceneToJson(scene: SceneSummary): JsonObject = buildJsonObject {
+        put("id", scene.id)
+        put("content", scene.content)
+        scene.fromMessageId?.let { put("fromMessageId", it) }
+        scene.toMessageId?.let { put("toMessageId", it) }
+        scene.createdAt?.let { put("createdAt", it) }
+    }
+
+    private fun sceneStateToJson(state: SceneState): JsonObject = buildJsonObject {
+        put("key", state.key)
+        state.startMessageId?.let { put("startMessageId", it) }
+        put("messageCount", state.messageCount)
+    }
+
+    private fun pendingRecallToJson(recall: PendingRecall): JsonObject = buildJsonObject {
+        put("category", recall.category)
+        putJsonArray("tags") { recall.tags.forEach { add(it) } }
+    }
+
+    private fun staticFillMetaToJson(meta: StaticFillMeta): JsonObject = buildJsonObject {
+        meta.attemptedAt?.let { put("attemptedAt", it) }
+        put("failures", meta.failures)
+        meta.retryAt?.let { put("retryAt", it) }
     }
 
     private fun lorebookToJson(entry: LorebookEntry): JsonObject = buildJsonObject {
@@ -232,6 +362,7 @@ class BackupService(
         put("content", entry.content)
         put("enabled", entry.enabled)
         put("alwaysActive", entry.alwaysActive)
+        put("order", entry.order)
         put("origin", if (entry.origin == LorebookOrigin.Model) "ai" else "user")
         put("mentions", entry.mentions)
         put("misses", entry.misses)

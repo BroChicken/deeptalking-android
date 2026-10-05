@@ -9,12 +9,14 @@ import com.deeptalking.core.model.LorebookOrigin
  * Lorebook selection, similarity merge/dedup and eviction helpers ported from
  * `src/js/memory/lorebook.js`. Pure and deterministic: inputs are never mutated.
  *
- * NOTE (SIMPLIFIED): the legacy entry carried `enabled`, `order`, `mentions`,
- * `lastMentionedAt`, `sourceMessageIds` and `evidence`. The native
- * [LorebookEntry] only keeps id/name/content/keywords/alwaysActive/origin/
- * memberName/timestamps/misses, so ordering falls back to always-active then
- * name, and eviction only tracks `misses`.
+ * Ordering honours the legacy `order` field through [matchLorebookEntries]'s
+ * `orderOf` selector; the native [LorebookEntry] does not carry `order` yet, so
+ * callers with that data pass a selector and every other call keeps the legacy
+ * default ([DEFAULT_LOREBOOK_ORDER]).
  */
+
+/** Legacy entry `order` fallback when the field is absent (`normalizeLorebook`). */
+const val DEFAULT_LOREBOOK_ORDER = 100
 
 /** Tunable limits for lorebook matching/merge. Defaults come from [AppLimits]. */
 data class LorebookLimits(
@@ -27,6 +29,8 @@ data class LorebookLimits(
     val contentSimilarity: Double = 0.45,
     val mergeSentenceSimilarity: Double = 0.6,
     val evictionMisses: Int = 3,
+    /** How many recent instant messages feed the keyword haystack (legacy `scanMessages`). */
+    val scanMessages: Int = 6,
 )
 
 /** Removes whitespace, quotes/brackets and punctuation so near names collide. */
@@ -36,24 +40,28 @@ fun normalizeLorebookName(value: String?): String =
         .replace(Regex("[「」『』“”‘’\"'《》〈〉（）()\\[\\]【】{}<>]"), "")
         .replace(Regex("[，。！？、；：,.!?;:·—_\\-]"), "")
 
-private fun tokenizeForJaccard(value: String?): Set<String> {
-    val text = value.orEmpty().lowercase()
-    val tokens = mutableSetOf<String>()
-    Regex("[a-z0-9_]+").findAll(text).forEach { tokens += it.value }
-    Regex("[\\u4e00-\\u9fff]+").findAll(text).forEach { match ->
-        val run = match.value
-        for (index in run.indices) {
-            tokens += run[index].toString()
-            if (index + 2 <= run.length) tokens += run.substring(index, index + 2)
-        }
+private val LOREBOOK_BIGRAM = Regex("^[\\u4e00-\\u9fff\\w]{2}$")
+
+/**
+ * Sliding 2-gram set over a normalized name (legacy `lorebookBigrams`): keeps a
+ * pair only when both UTF-16 units are CJK or word characters.
+ */
+private fun lorebookBigrams(value: String?): Set<String> {
+    val normalized = normalizeLorebookName(value)
+    val pairs = mutableSetOf<String>()
+    var index = 0
+    while (index + 2 <= normalized.length) {
+        val pair = normalized.substring(index, index + 2)
+        if (LOREBOOK_BIGRAM.matches(pair)) pairs += pair
+        index++
     }
-    return tokens
+    return pairs
 }
 
-/** Token Jaccard similarity in `[0, 1]`. */
+/** Bigram Jaccard overlap in `[0, 1]` (legacy `bigramOverlapRatio`). */
 fun similarity(a: String?, b: String?): Double {
-    val left = tokenizeForJaccard(a)
-    val right = tokenizeForJaccard(b)
+    val left = lorebookBigrams(a)
+    val right = lorebookBigrams(b)
     if (left.isEmpty() || right.isEmpty()) return 0.0
     val intersection = left.count { it in right }
     val union = left.size + right.size - intersection
@@ -156,31 +164,66 @@ private fun applyCharCap(hits: List<LorebookEntry>, maxChars: Int): List<Loreboo
 }
 
 /**
- * Selects entries for injection: always-active entries are unconditional, then
- * keyword hits over [recentText] (case-insensitive). Always-active entries sort
- * first, then by name. Applies the inject-entry cap and the char budget.
+ * Raw hits from `matchLorebookEntries`: always-active entries are unconditional,
+ * keyword entries match the haystack built from [query] plus the last
+ * [LorebookLimits.scanMessages] of [recentMessages] (case-insensitive). Sorted by
+ * always-active, then [orderOf], then name, and capped at [LorebookLimits.injectEntries].
+ *
+ * The char budget is intentionally not applied here (legacy `buildLorebookLines`
+ * does that); [select] wraps this and applies it.
+ */
+fun matchLorebookEntries(
+    entries: List<LorebookEntry>,
+    query: String,
+    recentMessages: List<String> = emptyList(),
+    limits: LorebookLimits = LorebookLimits(),
+    orderOf: (LorebookEntry) -> Int = { DEFAULT_LOREBOOK_ORDER },
+): List<LorebookEntry> {
+    val parts = mutableListOf(query)
+    recentMessages.takeLast(limits.scanMessages.coerceAtLeast(0)).forEach { parts += it }
+    val haystack = parts.joinToString("\n").lowercase()
+    val hits = entries.filter { entry ->
+        if (!entry.enabled || entry.content.isBlank()) return@filter false
+        if (entry.alwaysActive) return@filter true
+        if (haystack.isBlank()) return@filter false
+        entry.keywords.any { keyword ->
+            val needle = keyword.trim().lowercase()
+            needle.isNotEmpty() && haystack.contains(needle)
+        }
+    }.sortedWith { a, b ->
+        val alwaysDiff = (if (b.alwaysActive) 1 else 0) - (if (a.alwaysActive) 1 else 0)
+        if (alwaysDiff != 0) {
+            alwaysDiff
+        } else {
+            val orderDiff = orderOf(a) - orderOf(b)
+            if (orderDiff != 0) orderDiff else a.name.compareTo(b.name)
+        }
+    }
+    return hits.take(limits.injectEntries)
+}
+
+/**
+ * Selects entries for injection and applies the char budget. Backwards-compatible
+ * entry point for callers that only have the current query text.
  */
 fun select(
     entries: List<LorebookEntry>,
     recentText: String,
     limits: LorebookLimits = LorebookLimits(),
-): List<LorebookEntry> {
-    val haystack = recentText.lowercase()
-    val hits = entries.filter { entry ->
-        entry.enabled && (
-            entry.alwaysActive || (
-                haystack.isNotBlank() &&
-                    entry.keywords.any { keyword ->
-                        val needle = keyword.trim().lowercase()
-                        needle.isNotEmpty() && haystack.contains(needle)
-                    }
-                )
-            )
-    }.sortedWith(
-        compareByDescending<LorebookEntry> { it.alwaysActive }.thenBy { it.name },
-    )
-    return applyCharCap(hits.take(limits.injectEntries), limits.injectChars)
-}
+): List<LorebookEntry> = select(entries, recentText, emptyList(), limits)
+
+/**
+ * Selects entries using both the current [query] and the [recentMessages] window
+ * (legacy `matchLorebookEntries` scanning `char.memory.instant`).
+ */
+fun select(
+    entries: List<LorebookEntry>,
+    query: String,
+    recentMessages: List<String>,
+    limits: LorebookLimits = LorebookLimits(),
+    orderOf: (LorebookEntry) -> Int = { DEFAULT_LOREBOOK_ORDER },
+): List<LorebookEntry> =
+    applyCharCap(matchLorebookEntries(entries, query, recentMessages, limits, orderOf), limits.injectChars)
 
 /** Result of an eviction pass: entries to keep and entries retired this round. */
 data class EvictionResult(

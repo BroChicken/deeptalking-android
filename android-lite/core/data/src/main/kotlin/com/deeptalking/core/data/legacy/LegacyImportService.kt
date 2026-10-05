@@ -15,6 +15,7 @@ data class ImportSummary(
     val messages: Int,
     val stickers: Int,
     val configUpdated: Boolean,
+    val activeCharacterId: String? = null,
 )
 
 /**
@@ -53,12 +54,12 @@ class LegacyImportService(
         }
 
         // Legacy global stickers were folded into the active (first) character.
-        val globalStickers = (root["stickers"] as? JsonArray)
+        val globalStickerDtos = (root["stickers"] as? JsonArray)
             .orEmpty()
             .mapNotNull { element ->
                 runCatching { codec.decodeFromJsonElement(LegacySticker.serializer(), element) }.getOrNull()
             }
-            .mapNotNull { mapSticker(it, stickerSink) }
+        val globalStickers = mapStickers(globalStickerDtos, stickerSink)
         val imported = if (globalStickers.isEmpty()) {
             mapped
         } else {
@@ -66,23 +67,30 @@ class LegacyImportService(
             if (host == null) mapped else mapped.map { if (it === host) it.copy(stickers = globalStickers) else it }
         }
 
+        // Legacy `importData` replaces the whole store, and repairs same-day
+        // duplicate event memories before persisting.
+        val reconciled = imported.map { reconcileLegacyMemories(it).character }
+
+        val activeCharacterId = (root["activeCharacterId"] as? kotlinx.serialization.json.JsonPrimitive)?.contentOrNull
+            ?.takeIf { it.isNotBlank() }
+
         var characterCount = 0
         var messageCount = 0
         var stickerCount = 0
-        for (character in imported) {
-            val ok = runCatching {
-                characters.upsert(character)
-                // The legacy short window is persisted both on the entity and in
-                // the messages table.
+        runCatching {
+            // Full replace: drop any pre-existing characters/messages first so an
+            // import is a faithful restore rather than a merge.
+            chat.clearAll()
+            characters.replaceAll(reconciled)
+            for (character in reconciled) {
                 for (message in character.instant) {
                     chat.append(character.id, message)
                 }
-            }.isSuccess
-            if (ok) {
-                characterCount++
-                messageCount += character.instant.size
-                stickerCount += character.stickers.size
             }
+        }.onSuccess {
+            characterCount = reconciled.size
+            messageCount = reconciled.sumOf { it.instant.size }
+            stickerCount = reconciled.sumOf { it.stickers.size }
         }
 
         val configDto = root["config"]?.let { element ->
@@ -98,6 +106,6 @@ class LegacyImportService(
             }
         }
 
-        return ImportSummary(characterCount, messageCount, stickerCount, configUpdated)
+        return ImportSummary(characterCount, messageCount, stickerCount, configUpdated, activeCharacterId)
     }
 }

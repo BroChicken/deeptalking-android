@@ -22,6 +22,7 @@ import com.deeptalking.domain.agent.background.BackgroundTaskQueue
 import com.deeptalking.domain.agent.background.BackgroundTasks
 import com.deeptalking.domain.agent.defaultTools
 import com.deeptalking.domain.memory.MemoryServiceImpl
+import com.deeptalking.domain.memory.RelativeTimeMigration
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -30,6 +31,8 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.util.UUID
 import java.util.concurrent.TimeUnit
@@ -56,6 +59,15 @@ class NativeCore(context: Context) {
      */
     val appScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val backgroundQueue: BackgroundTaskQueue = BackgroundTaskQueue(appScope)
+
+    /**
+     * Serializes everything that rewrites whole `Character` rows at startup
+     * (auto-fill, world-book migration, field migration). Without this, two
+     * tasks can upsert copies taken from different snapshots and silently
+     * clobber each other's markers (e.g. `lorebookMigratedAt`), which made the
+     * migration dialog reappear on every launch.
+     */
+    private val characterMaintenanceMutex = Mutex()
 
     /** Only LLM is wired today; embedding/asr/tts stay null until their milestones. */
     val inference: InferenceRegistry = InferenceRegistry(
@@ -97,12 +109,52 @@ class NativeCore(context: Context) {
      */
     suspend fun runStartupMaintenance(config: AppConfig) {
         if (apiKeyFor(config.apiPlatform).isNullOrBlank()) return
-        runCatching {
-            val tasks = backgroundTasks(config)
-            val characters = data.characters.all()
-            val updated = tasks.autoFillStaticFields(characters)
-            updated.forEachIndexed { index, character ->
-                if (character != characters.getOrNull(index)) data.characters.upsert(character)
+        characterMaintenanceMutex.withLock {
+            runCatching {
+                val tasks = backgroundTasks(config)
+                val snapshot = data.characters.all()
+                val updated = tasks.autoFillStaticFields(snapshot)
+                updated.forEachIndexed { index, character ->
+                    val original = snapshot.getOrNull(index) ?: return@forEachIndexed
+                    if (character == original) return@forEachIndexed
+                    // Re-read so a concurrent migration's markers are not reverted;
+                    // only apply the fields this task owns.
+                    val latest = data.characters.get(character.id) ?: return@forEachIndexed
+                    if (latest.staticProfile == character.staticProfile && latest.staticFillMeta == character.staticFillMeta) {
+                        return@forEachIndexed
+                    }
+                    data.characters.upsert(
+                        latest.copy(
+                            staticProfile = character.staticProfile,
+                            staticFillMeta = character.staticFillMeta,
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    /** One-time relative-time → absolute migration (legacy `convertLegacyRelativeTimes`). */
+    suspend fun runStartupMigrations() {
+        characterMaintenanceMutex.withLock {
+            runCatching {
+                data.characters.all().forEach { character ->
+                    if (character.timeParseVersion >= RelativeTimeMigration.TIME_PARSE_VERSION) return@forEach
+                    val latest = data.characters.get(character.id) ?: return@forEach
+                    if (latest.timeParseVersion >= RelativeTimeMigration.TIME_PARSE_VERSION) return@forEach
+                    val updated = RelativeTimeMigration.convert(latest)
+                    if (updated != latest) {
+                        val fresh = data.characters.get(character.id) ?: latest
+                        data.characters.upsert(
+                            fresh.copy(
+                                shortTerm = updated.shortTerm,
+                                longTerm = updated.longTerm,
+                                dynamicState = updated.dynamicState,
+                                timeParseVersion = updated.timeParseVersion,
+                            ),
+                        )
+                    }
+                }
             }
         }
     }
@@ -110,40 +162,62 @@ class NativeCore(context: Context) {
     /** One-time world-book migration for characters whose background has not been migrated. */
     suspend fun runWorldLoreMigration(config: AppConfig, trimSource: Boolean): Int {
         if (apiKeyFor(config.apiPlatform).isNullOrBlank()) return 0
-        return runCatching {
-            val tasks = backgroundTasks(config)
-            var count = 0
-            data.characters.all().forEach { character ->
-                val source = if (character.isGroup) character.description else character.staticProfile.background
-                if (character.lorebookMigratedAt == null && source.trim().length >= 40) {
-                    val updated = tasks.migrateWorldLore(character, trimSource)
-                    if (updated != character) {
-                        data.characters.upsert(updated)
+        return characterMaintenanceMutex.withLock {
+            runCatching {
+                val tasks = backgroundTasks(config)
+                var count = 0
+                data.characters.all().forEach { character ->
+                    val source = migrationSourceText(character)
+                    if (character.lorebookMigratedAt != null || source.trim().length < 40) return@forEach
+                    val latest = data.characters.get(character.id) ?: character
+                    if (latest.lorebookMigratedAt != null) return@forEach
+                    val updated = tasks.migrateWorldLore(latest, trimSource)
+                    if (updated != latest) {
+                        // Merge onto the freshest row so we don't lose concurrent edits.
+                        val fresh = data.characters.get(character.id) ?: latest
+                        data.characters.upsert(
+                            fresh.copy(
+                                lorebook = updated.lorebook,
+                                lorebookMigratedAt = updated.lorebookMigratedAt,
+                                staticProfile = updated.staticProfile,
+                                description = updated.description,
+                            ),
+                        )
                         count++
                     }
                 }
-            }
-            count
-        }.getOrDefault(0)
+                count
+            }.getOrDefault(0)
+        }
     }
 
     /** One-time field-structure remap for characters not yet on the current schema. */
     suspend fun remapCharacterFields(config: AppConfig): Int {
         if (apiKeyFor(config.apiPlatform).isNullOrBlank()) return 0
-        return runCatching {
-            val tasks = backgroundTasks(config)
-            var count = 0
-            data.characters.all().forEach { character ->
-                if (character.fieldsMigrationVersion != "1.2.0") {
-                    val updated = tasks.remapFields(character)
-                    if (updated != character) {
-                        data.characters.upsert(updated)
+        return characterMaintenanceMutex.withLock {
+            runCatching {
+                val tasks = backgroundTasks(config)
+                var count = 0
+                data.characters.all().forEach { character ->
+                    if (character.fieldsMigrationVersion == "1.2.0") return@forEach
+                    val latest = data.characters.get(character.id) ?: character
+                    if (latest.fieldsMigrationVersion == "1.2.0") return@forEach
+                    val updated = tasks.remapFields(latest)
+                    if (updated != latest) {
+                        val fresh = data.characters.get(character.id) ?: latest
+                        data.characters.upsert(
+                            fresh.copy(
+                                dynamicState = updated.dynamicState,
+                                staticProfile = updated.staticProfile,
+                                fieldsMigrationVersion = updated.fieldsMigrationVersion,
+                            ),
+                        )
                         count++
                     }
                 }
-            }
-            count
-        }.getOrDefault(0)
+                count
+            }.getOrDefault(0)
+        }
     }
 
     /** Characters not yet on the current field schema (legacy `FIELD_MIGRATION_TARGETS`). */
@@ -228,16 +302,11 @@ class NativeCore(context: Context) {
     /** Generates a single emoji avatar from a character's description. */
     suspend fun generateEmojiAvatar(config: AppConfig, character: Character): String? {
         val backend = ResponsesLlmBackend(apiKeyProvider = { apiKeyFor(config.apiPlatform) }, baseUrl = config.apiBaseUrl, userAgent = userAgent)
-        val description = buildString {
-            append(character.name).append(' ')
-            append(character.staticProfile.appearance).append(' ')
-            append(character.staticProfile.personality)
-        }.trim()
+        val description = com.deeptalking.feature.characters.CharacterParity.buildAvatarDescription(character)
         val result = backend.complete(
             LlmRequest(
                 model = config.modelName,
-                instructions = "You output exactly ONE emoji character that best represents the person. " +
-                    "Output only the emoji, nothing else.",
+                instructions = "你是角色头像助手。只输出一个最能代表该角色的 emoji 字符，不要任何文字、标点或解释。",
                 input = listOf(ChatMessage(role = Role.User, content = description.ifBlank { character.name })),
                 temperature = 1.2,
                 maxOutputTokens = 16,
@@ -246,30 +315,57 @@ class NativeCore(context: Context) {
                 sessionId = "deeptalking-general",
             ),
         )
-        return result.text.trim().takeIf { it.isNotBlank() }?.take(4)
+        return extractEmoji(result.text)
+    }
+
+    /** Legacy `extractEmoji`: pick the first emoji codepoint from a model reply. */
+    private fun extractEmoji(raw: String): String? {
+        val text = raw.trim()
+        if (text.isEmpty()) return null
+        var index = 0
+        while (index < text.length) {
+            val cp = text.codePointAt(index)
+            val isEmoji = (cp in 0x1F300..0x1FAFF) || (cp in 0x2600..0x27BF) ||
+                (cp in 0x1F000..0x1F2FF) || (cp in 0x2190..0x21FF) || (cp in 0x2B00..0x2BFF)
+            if (isEmoji) {
+                val charCount = java.lang.Character.charCount(cp)
+                return String(text.toCharArray(), index, charCount)
+            }
+            index += java.lang.Character.charCount(cp)
+        }
+        return null
+    }
+
+    /** Legacy `tagStickerImage`: vision-classify a sticker into one vocabulary tag. */
+    suspend fun tagSticker(config: AppConfig, imageRef: String): String? {
+        if (MediaRef.toDataUri(appContext, imageRef) == null) return null
+        val backend = ResponsesLlmBackend(apiKeyProvider = { apiKeyFor(config.apiPlatform) }, baseUrl = config.apiBaseUrl, userAgent = userAgent)
+        val message = ChatMessage(
+            role = Role.User,
+            content = "给这张表情包选一个标签。",
+            attachments = listOf(com.deeptalking.core.model.MessageAttachment(com.deeptalking.core.model.MessageAttachment.Kind.Image, imageRef)),
+        )
+        val result = backend.complete(
+            LlmRequest(
+                model = config.modelName,
+                instructions = "你是表情包打标签助手。从这些标签里选一个最贴切的：" + STICKER_TAGS.joinToString("、") +
+                    "。只回复一个词，不要标点、不要解释。",
+                input = listOf(message),
+                temperature = 0.2,
+                maxOutputTokens = 8,
+                reasoningEffort = "none",
+                apiPlatform = config.apiPlatform,
+                sessionId = "deeptalking-general",
+                imageResolver = { ref -> MediaRef.toDataUri(appContext, ref) },
+            ),
+        )
+        val tag = result.text.trim().replace(Regex("\\s+"), "").take(6)
+        return tag.takeIf { it.isNotEmpty() }
     }
 
     /** Parses the model's group/member JSON into [GroupMember]s (tolerating prose/fences). */
-    fun parseGroupMembers(raw: String): List<GroupMember> {
-        val obj = extractJsonObject(raw) ?: return emptyList()
-        val array = obj["members"] as? JsonArray ?: return emptyList()
-        return array.mapNotNull { element ->
-            val member = element as? JsonObject ?: return@mapNotNull null
-            val name = member.str("name")
-            if (name.isBlank()) return@mapNotNull null
-            GroupMember(
-                id = UUID.randomUUID().toString(),
-                name = name,
-                emoji = member.str("avatar").ifBlank { member.str("emoji").ifBlank { "👤" } },
-                roleInGroup = member.str("roleInGroup"),
-                staticProfile = StaticProfile(
-                    personality = member.str("personality"),
-                    speakingStyle = member.str("speakingStyle"),
-                    background = member.str("background"),
-                ),
-            )
-        }
-    }
+    fun parseGroupMembers(raw: String): List<GroupMember> =
+        com.deeptalking.feature.characters.CharacterParity.parseGroupMembersJson(raw)
 
     /** Legacy `fillGroupMemberFields`: AI completion constrained to empty fields only. */
     suspend fun fillMemberFields(
@@ -304,30 +400,8 @@ class NativeCore(context: Context) {
     }
 
     /** Applies a fill payload to a member, only overwriting empty fields. */
-    fun applyMemberFill(member: GroupMember, raw: String): GroupMember {
-        val obj = extractJsonObject(raw) ?: return member
-        fun fill(current: String, key: String) = current.ifBlank { obj.str(key) }
-        var profile = member.staticProfile
-        profile = profile.copy(
-            gender = fill(profile.gender, "gender"),
-            age = fill(profile.age, "age"),
-            race = fill(profile.race, "race"),
-            appearance = fill(profile.appearance, "appearance"),
-            personality = fill(profile.personality, "personality"),
-            values = fill(profile.values, "values"),
-            fears = fill(profile.fears, "fears"),
-            background = fill(profile.background, "background"),
-            keyEvents = fill(profile.keyEvents, "keyEvents"),
-            speakingStyle = fill(profile.speakingStyle, "speakingStyle"),
-            language = fill(profile.language, "language"),
-            userAddress = fill(profile.userAddress, "userAddress"),
-        )
-        return member.copy(
-            emoji = member.emoji.ifBlank { obj.str("avatar").ifBlank { obj.str("emoji") } },
-            roleInGroup = fill(member.roleInGroup, "roleInGroup"),
-            staticProfile = profile,
-        )
-    }
+    fun applyMemberFill(member: GroupMember, raw: String): GroupMember =
+        com.deeptalking.feature.characters.CharacterParity.applyMemberFillPayload(member, raw, java.time.ZonedDateTime.now())
 
     fun scheduleTestReminder() {
         com.deeptalking.core.notifications.Reminders.schedule(
@@ -379,6 +453,7 @@ class NativeCore(context: Context) {
             config = config,
             backgroundTasks = background,
             onCharacterUpdated = onCharacterUpdated,
+            imageResolver = { ref -> MediaRef.toDataUri(appContext, ref) },
         )
     }
 
@@ -395,13 +470,15 @@ class NativeCore(context: Context) {
         (this[key] as? JsonPrimitive)?.contentOrNull.orEmpty().trim()
 
     private companion object {
+        /** Legacy `STICKER_TAGS` (`src/js/core/config.js:107`). */
+        val STICKER_TAGS = listOf(
+            "开心", "大笑", "难过", "委屈", "生气", "无语", "惊讶", "疑惑", "害羞",
+            "得意", "爱意", "亲亲", "抱抱", "加油", "点赞", "拒绝", "睡觉", "干杯",
+        )
+
         val QUICK_GEN_INSTRUCTIONS = """
-            你是角色设定助手。根据用户的一句话描述，生成一个角色或群组设定，只输出 JSON，不要任何解释或代码块标记。
-            单角色 JSON 结构：
-            {"entityType":"character","name":"","avatar":"单个emoji","personality":"性格简述","background":"背景故事"}
-            群组 JSON 结构：
-            {"entityType":"group","name":"","avatar":"单个emoji","description":"群组前提","scene":"共同场景","members":[{"name":"","personality":"","avatar":"单个emoji"}]}
-            判断：描述涉及多个角色/团队时输出群组（至少 2 名成员），否则输出单角色。
+            你是角色设计助手。严格按用户在消息里给出的 JSON 结构返回，只输出 JSON，不要任何解释、旁白或代码块标记。
+            不得使用陈词滥调的人设模板；世界层设定一律写进 lorebook，不要写进角色个人背景。
         """.trimIndent()
 
         val FILL_MEMBER_INSTRUCTIONS = """
@@ -409,7 +486,8 @@ class NativeCore(context: Context) {
             只能根据群组设定、现有角色卡和用户的一句话补全空字段，不能覆盖或编造与已有字段冲突的信息。
             已有字段是绝对权威，任何情况下不得改写、润色或替换。
             返回字段：name, avatar, gender, age, race, appearance, personality, values, fears,
-            background, keyEvents, speakingStyle, language, userAddress, roleInGroup。
+            background, keyEvents, speakingStyle, language, userAddress, roleInGroup,
+            dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccupation, currentGoal, currentRelationship, currentImportantOthers)。
             只给出有把握的字段，没有把握就省略。成员的说话方式必须与群内其他成员显著不同。
         """.trimIndent()
     }

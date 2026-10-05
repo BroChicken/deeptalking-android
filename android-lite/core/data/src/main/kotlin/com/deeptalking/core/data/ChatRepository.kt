@@ -19,7 +19,10 @@ class ChatRepository(private val dao: MessageDao) {
         dao.getForCharacter(characterId).mapNotNull(::decode)
 
     suspend fun append(characterId: String, message: ChatMessage) {
-        dao.upsert(toEntity(characterId, message))
+        // Legacy `ensureMessageSequences`: every persisted message gets a monotonic
+        // per-conversation sequence (1-based).
+        val sequence = if (message.sequence > 0) message.sequence else dao.getForCharacter(characterId).size + 1
+        dao.upsert(toEntity(characterId, message.copy(sequence = sequence)))
     }
 
     suspend fun replace(characterId: String, messages: List<ChatMessage>) {
@@ -27,6 +30,8 @@ class ChatRepository(private val dao: MessageDao) {
     }
 
     suspend fun clear(characterId: String) = dao.deleteForCharacter(characterId)
+
+    suspend fun clearAll() = dao.deleteAll()
 
     private fun toEntity(characterId: String, message: ChatMessage): MessageEntity {
         val timestamp = message.timestamp ?: Instant.now().toString()

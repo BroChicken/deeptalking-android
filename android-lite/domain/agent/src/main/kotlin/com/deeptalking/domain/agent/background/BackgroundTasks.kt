@@ -3,6 +3,7 @@ package com.deeptalking.domain.agent.background
 import com.deeptalking.core.common.AppLimits
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
+import com.deeptalking.core.model.GroupMember
 import com.deeptalking.core.model.LongTermMemory
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.MemoryCategory
@@ -10,12 +11,13 @@ import com.deeptalking.core.model.MemorySubject
 import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.SceneSummary
-import com.deeptalking.core.model.ShortTermMemory
 import com.deeptalking.core.model.StaticFillMeta
 import com.deeptalking.domain.agent.ResponseParser
 import com.deeptalking.domain.agent.prompts.DYNAMIC_STATE_FIELDS
 import com.deeptalking.domain.agent.prompts.GROUP_SHARED_DYNAMIC_FIELDS
 import com.deeptalking.domain.agent.prompts.STATIC_PROFILE_FIELDS
+import com.deeptalking.domain.agent.prompts.buildRoleContext
+import com.deeptalking.domain.agent.prompts.buildVolatileContext
 import com.deeptalking.domain.agent.prompts.normalizeUserAddress
 import com.deeptalking.domain.agent.prompts.trimText
 import com.deeptalking.domain.agent.prompts.withDynamicField
@@ -23,12 +25,22 @@ import com.deeptalking.domain.agent.prompts.withStaticField
 import com.deeptalking.domain.agent.sessionIdFor
 import com.deeptalking.domain.memory.LorebookProposal
 import com.deeptalking.domain.memory.MemoryService
+import com.deeptalking.domain.memory.ShortTermDraft
+import com.deeptalking.domain.memory.addShortTermMemory
+import com.deeptalking.domain.memory.applyMemoryDecay
 import com.deeptalking.domain.memory.dedupeLorebook
 import com.deeptalking.domain.memory.evictStaleLorebookEntries
 import com.deeptalking.domain.memory.getTimeSlot
+import com.deeptalking.domain.memory.isValidAutomaticMemory
+import com.deeptalking.domain.memory.knownSources
 import com.deeptalking.domain.memory.logicalDay
 import com.deeptalking.domain.memory.parseZoned
+import com.deeptalking.domain.memory.resolveDynamicStateSources
 import com.deeptalking.domain.memory.selfLearnMemoryImportance
+import com.deeptalking.domain.memory.shouldCaptureUserTurn
+import com.deeptalking.domain.memory.trimInstant
+import com.deeptalking.domain.memory.trimShortTerm
+import com.deeptalking.domain.memory.upsertLongTermMemory
 import com.deeptalking.domain.memory.upsertLorebookEntry
 import com.deeptalking.domain.memory.upsertLorebookEntryForCharacter
 import com.deeptalking.engine.ondevice.LlmBackend
@@ -81,6 +93,8 @@ private data class PreparedPoint(
     val eventTime: String?,
     val sourceMessageIds: List<String>,
     val firstIndex: Int,
+    val participants: List<String>,
+    val location: String,
 )
 
 private val META_TALK_REGEX = Regex(
@@ -175,6 +189,76 @@ fun detectQuickReplyIssues(replies: List<String>, character: Character, replyTex
     return hits.distinct()
 }
 
+/** Background memory sub-tasks with independent retry bookkeeping (legacy `memoryTaskKeys`). */
+enum class MemoryTaskKind { Extraction, Analysis, Scene, Lorebook }
+
+/**
+ * Retry counters for the background memory sub-tasks (legacy
+ * `memory.counters.<task>Failures` / `<task>RetryAt`). Exposed so a caller that
+ * can persist them keeps the backoff across turns.
+ *
+ * GAP: [Character] has no `counters` field, so these cannot be stored on the
+ * character yet; [BackgroundTasks] keeps them for the lifetime of one instance.
+ */
+data class MemoryTaskCounters(
+    val extractionFailures: Int = 0,
+    val extractionRetryAt: String? = null,
+    val analysisFailures: Int = 0,
+    val analysisRetryAt: String? = null,
+    val sceneFailures: Int = 0,
+    val sceneRetryAt: String? = null,
+    val lorebookFailures: Int = 0,
+    val lorebookRetryAt: String? = null,
+) {
+    fun failuresOf(task: MemoryTaskKind): Int = when (task) {
+        MemoryTaskKind.Extraction -> extractionFailures
+        MemoryTaskKind.Analysis -> analysisFailures
+        MemoryTaskKind.Scene -> sceneFailures
+        MemoryTaskKind.Lorebook -> lorebookFailures
+    }
+
+    fun retryAtOf(task: MemoryTaskKind): String? = when (task) {
+        MemoryTaskKind.Extraction -> extractionRetryAt
+        MemoryTaskKind.Analysis -> analysisRetryAt
+        MemoryTaskKind.Scene -> sceneRetryAt
+        MemoryTaskKind.Lorebook -> lorebookRetryAt
+    }
+
+    fun with(task: MemoryTaskKind, failures: Int, retryAt: String?): MemoryTaskCounters = when (task) {
+        MemoryTaskKind.Extraction -> copy(extractionFailures = failures, extractionRetryAt = retryAt)
+        MemoryTaskKind.Analysis -> copy(analysisFailures = failures, analysisRetryAt = retryAt)
+        MemoryTaskKind.Scene -> copy(sceneFailures = failures, sceneRetryAt = retryAt)
+        MemoryTaskKind.Lorebook -> copy(lorebookFailures = failures, lorebookRetryAt = retryAt)
+    }
+}
+
+/** Records a failure and sets an exponential-backoff retry time (legacy `scheduleMemoryRetry`). */
+fun scheduleMemoryRetry(
+    counters: MemoryTaskCounters,
+    task: MemoryTaskKind,
+    nowMillis: Long = System.currentTimeMillis(),
+): MemoryTaskCounters {
+    val failures = (counters.failuresOf(task) + 1).coerceAtMost(10)
+    val delayMinutes = minOf(30L, 5L * (1L shl (failures - 1).coerceIn(0, 4)))
+    val retryAt = Instant.ofEpochMilli(nowMillis + delayMinutes * 60_000L).toString()
+    return counters.with(task, failures, retryAt)
+}
+
+/** Clears a task's failure state after a success (legacy `resetMemoryRetry`). */
+fun resetMemoryRetry(counters: MemoryTaskCounters, task: MemoryTaskKind): MemoryTaskCounters =
+    counters.with(task, 0, null)
+
+/** True when [task] is past its backoff window (legacy `canRunMemoryTask`). */
+fun canRunMemoryTask(
+    counters: MemoryTaskCounters,
+    task: MemoryTaskKind,
+    nowMillis: Long = System.currentTimeMillis(),
+): Boolean {
+    val retryAt = counters.retryAtOf(task) ?: return true
+    val at = parseZoned(retryAt)?.toInstant()?.toEpochMilli() ?: return true
+    return at <= nowMillis
+}
+
 class BackgroundTasks(
     private val llm: LlmBackend,
     private val memory: MemoryService,
@@ -191,6 +275,16 @@ class BackgroundTasks(
         isLenient = true
     }
 
+    /** Per-character retry state for this instance; see [MemoryTaskCounters] gap note. */
+    private val retryCounters = mutableMapOf<String, MemoryTaskCounters>()
+
+    private fun countersFor(characterId: String): MemoryTaskCounters =
+        retryCounters.getOrDefault(characterId, MemoryTaskCounters())
+
+    private fun storeCounters(characterId: String, counters: MemoryTaskCounters) {
+        retryCounters[characterId] = counters
+    }
+
     fun detectStyleViolations(
         reply: String,
         character: Character,
@@ -205,22 +299,44 @@ class BackgroundTasks(
     ): List<String> =
         com.deeptalking.domain.agent.background.detectQuickReplyIssues(replies, character, replyText)
 
+    /**
+     * Extracts new short-term events from the live instant window (legacy
+     * `extractInstantToShortTerm`). Returns a changed character on success and the
+     * unchanged character on failure, so callers can schedule a retry.
+     */
     suspend fun extractMemory(
         character: Character,
         messages: List<ChatMessage>,
         migration: Boolean = false,
     ): Character {
-        val sourceMessages = messages
-            .filter { !it.isLoading && it.content.isNotBlank() }
+        val (status, updated) = extractInstantToShortTermTask(character, migration)
+        return if (status == TaskStatus.Success) updated else character
+    }
+
+    /** Extraction with an explicit status (legacy `extractInstantToShortTerm`). */
+    private suspend fun extractInstantToShortTermTask(
+        character: Character,
+        migration: Boolean,
+    ): Pair<TaskStatus, Character> {
+        if (character.instant.size <= 8) return TaskStatus.Failure to character
+        val extractableLimit = (character.instant.size - AppLimits.Memory.INSTANT_TRIM_FLOOR).coerceAtLeast(0)
+        val sourceMessages = character.instant.take(extractableLimit)
+            .filter { !it.isLoading && it.extractedAt == null }
             .take(AppLimits.Memory.SUMMARY_SOURCES)
-        if (sourceMessages.isEmpty()) return character
+        if (sourceMessages.isEmpty()) return TaskStatus.Failure to character
 
         val recentIdentities = character.shortTerm
             .sortedByDescending { parseZoned(it.eventTime)?.toInstant()?.toEpochMilli() ?: 0L }
             .take(4)
-            .map { RecentEventIdentity(eventTime = it.eventTime, content = trimText(it.content, 240)) }
-
-        val sources = sourceMessages.map { message ->
+            .map {
+                RecentEventIdentity(
+                    eventTime = it.eventTime,
+                    participants = it.participants,
+                    location = it.location,
+                    content = trimText(it.content, 240),
+                )
+            }
+        val payload = sourceMessages.map { message ->
             ExtractSource(
                 id = message.id,
                 role = message.role.name.lowercase(),
@@ -228,18 +344,17 @@ class BackgroundTasks(
                 timestamp = message.timestamp,
             )
         }
-
         val countClause = if (migration) EXTRACTION_COUNT_UNLIMITED else EXTRACTION_COUNT_LIMITED
         val prompt = EXTRACTION_PROMPT_HEAD + countClause + EXTRACTION_PROMPT_TAIL +
-            json.encodeToString(recentIdentities) + "\n对话内容:\n" + json.encodeToString(sources)
+            json.encodeToString(recentIdentities) + "\n对话内容:\n" + json.encodeToString(payload)
 
         val raw = complete(EXTRACTION_SYSTEM, prompt, temperature = 0.2, maxOutputTokens = 4096, sessionId = sessionIdFor(character))
-        if (raw.isBlank()) return character
+        if (raw.isBlank()) return TaskStatus.Failure to character
 
         val root = ResponseParser.parseJsonLenient(raw)
         var points = (root as? JsonArray)?.mapNotNull { it as? JsonObject }.orEmpty()
         if (!migration) points = points.take(15)
-        if (points.isEmpty()) return character
+        if (points.isEmpty()) return TaskStatus.Failure to character
 
         val sourceIdSet = sourceMessages.map { it.id }.toSet()
         val sourceIndexes = sourceMessages.withIndex().associate { it.value.id to it.index }
@@ -247,17 +362,24 @@ class BackgroundTasks(
         val prepared = mutableListOf<PreparedPoint>()
 
         for (point in points) {
-            val ids = stringList(point["sourceMessageIds"]).filter { it.isNotBlank() }.distinct()
-            val content = point.string("content").orEmpty()
+            val ids = stringList(point["sourceMessageIds"]).map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+            val content = point.string("content")
             val eventTime = point.string("eventTime")
-            if (trimText(content, 500).isEmpty()) return character
-            if (eventIdentity(eventTime).isEmpty() || ids.isEmpty()) return character
-            if (ids.any { it !in sourceIdSet }) return character
+            if (trimText(content, 500).isEmpty()) return TaskStatus.Failure to character
+            if (eventIdentity(eventTime).isEmpty() || ids.isEmpty()) return TaskStatus.Failure to character
+            if (ids.any { it !in sourceIdSet }) return TaskStatus.Failure to character
             val firstIndex = ids.minOf { sourceIndexes[it] ?: Int.MAX_VALUE }
             covered += ids
-            prepared += PreparedPoint(content, eventTime, ids, firstIndex)
+            prepared += PreparedPoint(
+                content = content,
+                eventTime = eventTime,
+                sourceMessageIds = ids,
+                firstIndex = firstIndex,
+                participants = normalizeParticipants(stringList(point["participants"])),
+                location = point.string("location").trim(),
+            )
         }
-        if (covered.isEmpty()) return character
+        if (covered.isEmpty()) return TaskStatus.Failure to character
 
         var coveredPrefixLength = 0
         while (coveredPrefixLength < sourceMessages.size && covered.contains(sourceMessages[coveredPrefixLength].id)) {
@@ -268,11 +390,11 @@ class BackgroundTasks(
         } else {
             prepared
         }
-        if (filtered.isEmpty()) return character
+        if (filtered.isEmpty()) return TaskStatus.Failure to character
 
         val nowIso = Instant.now().toString()
-        val accepted = mutableListOf<ShortTermMemory>()
-        val seenIdentities = mutableSetOf<String>()
+        var working = character
+        val markedIds = mutableSetOf<String>()
         for (point in filtered) {
             var pointTime = normalizeTimestamp(point.eventTime, "")
             if (pointTime.isEmpty()) {
@@ -284,38 +406,48 @@ class BackgroundTasks(
                 pointTime = latestSourceTime
             }
             if (pointTime.isEmpty()) pointTime = nowIso
-            val content = trimText(point.content, 500)
-            val identity = content + "|" + eventIdentity(pointTime)
-            if (!seenIdentities.add(identity)) continue
-            accepted += ShortTermMemory(
-                id = newId("short"),
-                content = content,
-                sourceMessageIds = point.sourceMessageIds,
-                eventTime = pointTime,
-                createdAt = nowIso,
+            val result = addShortTermMemory(
+                list = working.shortTerm,
+                draft = ShortTermDraft(
+                    content = point.content,
+                    sourceMessageIds = point.sourceMessageIds,
+                    eventTime = pointTime,
+                    participants = point.participants,
+                    location = point.location,
+                ),
+                timestamp = pointTime,
+                sources = knownSources(working),
             )
+            if (result.accepted) {
+                working = working.copy(shortTerm = result.list)
+                markedIds += point.sourceMessageIds
+            }
         }
-        if (accepted.isEmpty()) return character
-
-        var updated = memory.applyTurn(character, shortTerm = accepted, longTerm = emptyList())
-        if (updated.shortTerm.size >= AppLimits.Memory.SHORT_TERM) {
-            updated = analyzeShortToLongTerm(updated)
-        }
-        return updated
+        if (markedIds.isEmpty()) return TaskStatus.Failure to character
+        working = working.copy(
+            instant = working.instant.map { if (it.id in markedIds) it.copy(extractedAt = nowIso) else it },
+        )
+        return TaskStatus.Success to trimMemory(working)
     }
 
+    /**
+     * Folds unanalyzed short-term events into long-term memory (legacy
+     * `analyzeShortToLongTerm`). The analyzed set must be acknowledged in full and
+     * every entry re-validated against its declared short-term sources; on any
+     * failure the character is returned unchanged so nothing is marked analyzed.
+     */
     suspend fun analyzeShortToLongTerm(character: Character): Character {
-        // Only items not yet folded; mark them once processed so the same batch
-        // is not re-analyzed every turn (legacy `analyzedAt`).
-        val items = character.shortTerm.filter { it.analyzedAt == null }.take(AppLimits.Memory.ANALYSIS_BATCH)
-        if (items.isEmpty()) return character
-        val analyzedIds = items.map { it.id }.toSet()
-        val nowIso = Instant.now().toString()
-        val marked = character.copy(
-            shortTerm = character.shortTerm.map {
-                if (it.id in analyzedIds) it.copy(analyzedAt = nowIso) else it
-            },
-        )
+        val (status, updated) = analyzeShortToLongTermTask(character)
+        return if (status == TaskStatus.Success) updated else character
+    }
+
+    private suspend fun analyzeShortToLongTermTask(character: Character): Pair<TaskStatus, Character> {
+        val analyzeLimit = (character.shortTerm.size - AppLimits.Memory.SHORT_TERM_TRIM_FLOOR).coerceAtLeast(0)
+        val items = character.shortTerm.take(analyzeLimit)
+            .filter { it.analyzedAt == null }
+            .take(AppLimits.Memory.ANALYSIS_BATCH)
+        if (items.isEmpty()) return TaskStatus.Failure to character
+
         val inputs = items.map { item ->
             AnalysisInput(
                 id = item.id,
@@ -328,17 +460,85 @@ class BackgroundTasks(
         }
         val prompt = ANALYSIS_PROMPT_HEAD + json.encodeToString(inputs) + ANALYSIS_PROMPT_TAIL
         val raw = complete(ANALYSIS_SYSTEM, prompt, temperature = 0.2, maxOutputTokens = 4096, sessionId = sessionIdFor(character))
-        if (raw.isBlank()) return marked
-        val root = ResponseParser.parseJsonLenient(raw) as? JsonObject ?: return marked
-        if (root.string("status") != "ok") return marked
-        val longTermArray = root["longTerm"] as? JsonArray ?: return marked
-        val parsed = longTermArray.mapNotNull { (it as? JsonObject)?.let(::parseLongTerm) }
-        if (parsed.isEmpty()) return marked
-        return memory.applyTurn(marked, shortTerm = emptyList(), longTerm = parsed)
+        if (raw.isBlank()) return TaskStatus.Failure to character
+        val root = ResponseParser.parseJsonLenient(raw) as? JsonObject ?: return TaskStatus.Failure to character
+        if (root.string("status") != "ok") return TaskStatus.Failure to character
+        val longTermArray = root["longTerm"] as? JsonArray ?: return TaskStatus.Failure to character
+
+        val analyzableIds = items.map { it.id }.toSet()
+        val acknowledgedList = stringList(root["analyzedShortTermIds"]).map { it.trim() }.filter { it.isNotEmpty() }
+        val acknowledged = acknowledgedList.toSet()
+        if (acknowledgedList.size != analyzableIds.size ||
+            acknowledged.size != analyzableIds.size ||
+            acknowledged.any { it !in analyzableIds }
+        ) {
+            return TaskStatus.Failure to character
+        }
+
+        data class Prepared(val item: LongTermMemory, val shortTermIds: List<String>)
+        val sources = knownSources(character)
+        val prepared = mutableListOf<Prepared>()
+        for (element in longTermArray) {
+            val obj = element as? JsonObject ?: return TaskStatus.Failure to character
+            val item = parseLongTerm(obj)
+            val sourceShortTermIds = stringList(obj["sourceShortTermIds"]).map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+            if (sourceShortTermIds.isEmpty() || sourceShortTermIds.any { it !in analyzableIds }) {
+                return TaskStatus.Failure to character
+            }
+            val claimed = items.filter { it.id in sourceShortTermIds }
+            val allowedMessageIds = claimed.flatMap { it.sourceMessageIds }.toSet()
+            val itemMessageIds = item.sourceMessageIds.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+            if (itemMessageIds.isEmpty() || itemMessageIds.any { it !in allowedMessageIds }) {
+                return TaskStatus.Failure to character
+            }
+            if (claimed.any { short -> short.sourceMessageIds.none { it in itemMessageIds } }) {
+                return TaskStatus.Failure to character
+            }
+            if (item.category == MemoryCategory.Events) {
+                val identity = eventIdentity(item.eventTime)
+                if (identity.isEmpty() || claimed.any { eventIdentity(it.eventTime) != identity }) {
+                    return TaskStatus.Failure to character
+                }
+            }
+            if (trimText(item.key, 100).isEmpty() || trimText(item.value, 900).isEmpty() ||
+                !isValidAutomaticMemory(character, item, sources, null)
+            ) {
+                return TaskStatus.Failure to character
+            }
+            prepared += Prepared(item, sourceShortTermIds)
+        }
+
+        val longTermSnapshot = character.longTerm
+        var working = character
+        for (entry in prepared) {
+            val (newList, ok) = upsertLongTermMemory(
+                character = working,
+                item = entry.item,
+                store = working.longTerm,
+                sources = sources,
+                assistantMessage = null,
+            )
+            if (!ok) return TaskStatus.Failure to character.copy(longTerm = longTermSnapshot)
+            working = working.copy(longTerm = newList)
+        }
+
+        val nowIso = Instant.now().toString()
+        working = working.copy(
+            shortTerm = working.shortTerm.map {
+                if (it.id in analyzableIds) it.copy(analyzedAt = nowIso) else it
+            },
+        )
+        return TaskStatus.Success to trimMemory(working)
     }
 
     /** Outcome of a memory sub-task: Success updates state, Failure retries, Stale aborts. */
     enum class TaskStatus { Success, Failure, Stale }
+
+    /** Applies the legacy window trims (instant FIFO + short-term retention). */
+    private fun trimMemory(character: Character): Character = character.copy(
+        instant = trimInstant(character.instant),
+        shortTerm = trimShortTerm(character.shortTerm),
+    )
 
     /** Current scene key = trimmed current location, or "未说明" (legacy `getSceneKey`). */
     fun sceneKey(character: Character): String =
@@ -486,17 +686,174 @@ class BackgroundTasks(
     }
 
     /**
-     * Runs the non-blocking memory maintenance pass: adaptive importance, scene
-     * summary and world-book consolidation. Never throws; a failing sub-task just
-     * leaves its state for the next turn.
+     * Runs the non-blocking memory maintenance pass: decay, adaptive importance,
+     * scene summary and world-book consolidation. Failed sub-tasks back off
+     * instead of hot-looping; never throws.
      */
     suspend fun runMemoryMaintenance(character: Character): Character {
-        var working = selfLearnMemoryImportance(character)
-        val (_, afterScene) = checkScene(working)
-        working = afterScene
-        if (lorebookDue(working)) {
+        var working = applyMemoryDecay(character)
+        working = selfLearnMemoryImportance(working)
+        var counters = countersFor(working.id)
+        val nowMillis = System.currentTimeMillis()
+
+        if (canRunMemoryTask(counters, MemoryTaskKind.Scene, nowMillis)) {
+            val (sceneStatus, afterScene) = checkScene(working)
+            working = afterScene
+            counters = when (sceneStatus) {
+                TaskStatus.Success -> resetMemoryRetry(counters, MemoryTaskKind.Scene)
+                TaskStatus.Failure -> scheduleMemoryRetry(counters, MemoryTaskKind.Scene, nowMillis)
+                TaskStatus.Stale -> counters
+            }
+        }
+
+        if (lorebookDue(working) && canRunMemoryTask(counters, MemoryTaskKind.Lorebook, nowMillis)) {
             val (status, afterLore) = consolidateLorebook(working)
-            if (status == TaskStatus.Success) working = afterLore
+            counters = when (status) {
+                TaskStatus.Success -> {
+                    working = afterLore
+                    resetMemoryRetry(counters, MemoryTaskKind.Lorebook)
+                }
+                TaskStatus.Failure -> scheduleMemoryRetry(counters, MemoryTaskKind.Lorebook, nowMillis)
+                TaskStatus.Stale -> counters
+            }
+        }
+        storeCounters(working.id, counters)
+        return working
+    }
+
+    /**
+     * Applies one parsed memory-update object (legacy `applyMemoryUpdate`):
+     * short-term writes go through [addShortTermMemory], long-term through
+     * [upsertLongTermMemory], and `dynamicState` through the source-evidence gate.
+     * `staticFields` / `memberDynamicState` / `promiseUpdates` are handled by the
+     * orchestrator, not here.
+     */
+    fun applyMemoryUpdate(
+        character: Character,
+        update: JsonObject,
+        assistantMessage: ChatMessage?,
+        allowedSourceIds: Set<String>? = null,
+    ): Character {
+        var working = character
+        (update["shortTerm"] as? JsonArray)?.forEach { element ->
+            val obj = element as? JsonObject ?: return@forEach
+            val rawIds = stringList(obj["sourceMessageIds"])
+            val ids = if (allowedSourceIds == null) rawIds else rawIds.filter { it in allowedSourceIds }
+            val draft = ShortTermDraft(
+                content = obj.string("content"),
+                sourceMessageIds = ids,
+                eventTime = (obj["eventTime"] as? JsonPrimitive)?.contentOrNull,
+                participants = stringList(obj["participants"]),
+                location = obj.string("location"),
+            )
+            val result = addShortTermMemory(working.shortTerm, draft, null, knownSources(working))
+            if (result.accepted) working = working.copy(shortTerm = result.list)
+        }
+        (update["longTerm"] as? JsonArray)?.forEach { element ->
+            val obj = element as? JsonObject ?: return@forEach
+            var item = parseLongTerm(obj)
+            if (allowedSourceIds != null) {
+                val ids = item.sourceMessageIds.filter { it in allowedSourceIds }
+                if (ids.isEmpty()) return@forEach
+                item = item.copy(sourceMessageIds = ids)
+            }
+            val (list, ok) = upsertLongTermMemory(working, item, working.longTerm, knownSources(working), assistantMessage)
+            if (ok) working = working.copy(longTerm = list)
+        }
+        (update["dynamicState"] as? JsonObject)?.let { dynamic ->
+            working = applyDynamicStateUpdate(working, dynamic, assistantMessage)
+        }
+        return working
+    }
+
+    private fun applyDynamicStateUpdate(
+        character: Character,
+        dynamic: JsonObject,
+        assistantMessage: ChatMessage?,
+    ): Character {
+        var state = character.dynamicState
+        val sources = knownSources(character)
+        DYNAMIC_STATE_FIELDS.forEach { (key, _) ->
+            val obj = dynamic[key] as? JsonObject ?: return@forEach
+            val value = obj.string("value").trim()
+            if (value.isEmpty()) return@forEach
+            val ids = stringList(obj["sourceMessageIds"])
+            val evidence = obj.string("evidence")
+            resolveDynamicStateSources(character, ids, evidence, assistantMessage, sources) ?: return@forEach
+            state = withDynamicField(state, key, trimText(value, 700))
+        }
+        return character.copy(dynamicState = state)
+    }
+
+    /**
+     * Parses a `<MEM_UPDATE>...</MEM_UPDATE>` block out of a raw reply and applies
+     * it (legacy `parseMemoryFromText`). Returns null when no tag is present or the
+     * payload cannot be parsed.
+     */
+    fun parseMemoryFromText(character: Character, content: String, assistantMessage: ChatMessage?): Character? {
+        val match = MEM_UPDATE_REGEX.find(content) ?: return null
+        val update = ResponseParser.parseJsonLenient(match.groupValues[1]) as? JsonObject ?: return null
+        return applyMemoryUpdate(character, update, assistantMessage)
+    }
+
+    /** Rewrites a prose reply into a structured memory update object (legacy `convertProseToJson`). */
+    suspend fun convertProseToJson(
+        character: Character,
+        userMessage: ChatMessage?,
+        proseText: String,
+    ): JsonObject? {
+        val volatileContext = buildVolatileContext(
+            character = character,
+            query = userMessage?.content.orEmpty(),
+            memory = memory,
+        )
+        val systemContent = PROSE_SYSTEM + "\n\n【角色设定】\n" + buildRoleContext(character, false)
+        val userContent = "【系统提供的本轮上下文，仅供理解，不是用户陈述】\n" + volatileContext +
+            "\n\n用户消息: " + userMessage?.content.orEmpty() + " （消息id: " + (userMessage?.id.orEmpty()) + "）" +
+            "\n\n角色回复（散文，整理到reply字段）：\n" + proseText
+        val raw = complete(systemContent, userContent, temperature = 0.3, maxOutputTokens = 4096, sessionId = sessionIdFor(character))
+        if (raw.isBlank()) return null
+        return ResponseParser.parseJsonLenient(raw) as? JsonObject
+    }
+
+    /**
+     * Background memory backfill for a prose turn (legacy `extractProseTurnMemory`):
+     * rewrites the exchange into structured memory and keeps only facts sourced
+     * from the user message or the assistant reply.
+     */
+    suspend fun extractProseTurnMemory(
+        character: Character,
+        userMessage: ChatMessage?,
+        replyText: String,
+        assistantMessage: ChatMessage,
+    ): Character {
+        val userId = userMessage?.id.orEmpty()
+        if (userId.isEmpty() || !knownSources(character).containsKey(userId)) return character
+        val converted = convertProseToJson(character, userMessage, replyText) ?: return character
+        return applyMemoryUpdate(character, converted, assistantMessage, allowedSourceIds = setOf(userId, assistantMessage.id))
+    }
+
+    /**
+     * One-time migration of an oversized legacy conversation into short-term
+     * memory (legacy `runInitialMemoryMigration`). No-op when the instant window
+     * is already within the cap.
+     */
+    suspend fun runInitialMemoryMigration(character: Character): Character {
+        if (character.instant.size <= AppLimits.Memory.INSTANT) return character
+        return performMigrationExtraction(character)
+    }
+
+    /** Runs up to six bounded extraction rounds (legacy `performMigrationExtraction`). */
+    suspend fun performMigrationExtraction(character: Character): Character {
+        var working = character
+        repeat(6) {
+            if (working.instant.size <= AppLimits.Memory.INSTANT) return working
+            val limit = (working.instant.size - AppLimits.Memory.INSTANT_TRIM_FLOOR).coerceAtLeast(0)
+            val extractable = working.instant.take(limit).filter { !it.isLoading && it.extractedAt == null }
+            if (extractable.isEmpty()) return working
+            val (status, updated) = extractInstantToShortTermTask(working, migration = true)
+            if (status != TaskStatus.Success) return working
+            working = updated
         }
         return working
     }
@@ -556,15 +913,75 @@ class BackgroundTasks(
         var attempts = 0
         characters.forEachIndexed { index, character ->
             if (attempts >= 3) return@forEachIndexed
-            if (character.isGroup) return@forEachIndexed
-            val missing = STATIC_PROFILE_FIELDS
-                .map { it.first }
-                .filter { com.deeptalking.domain.agent.prompts.staticProfileValue(character.staticProfile, it).isBlank() }
+            if (character.isGroup) {
+                // Legacy `collectStaticFillJobs` also fills group members.
+                if (canAttemptStaticFill(character.staticFillMeta) &&
+                    character.members.any { missingStaticFields(it.staticProfile).isNotEmpty() }
+                ) {
+                    attempts++
+                    updated[index] = fillGroupMembers(character)
+                }
+                return@forEachIndexed
+            }
+            val missing = missingStaticFields(character.staticProfile)
             if (missing.isEmpty() || !canAttemptStaticFill(character.staticFillMeta)) return@forEachIndexed
             attempts++
             updated[index] = fillStaticFields(character, missing)
         }
         return updated
+    }
+
+    private fun missingStaticFields(profile: com.deeptalking.core.model.StaticProfile): List<String> =
+        STATIC_PROFILE_FIELDS.map { it.first }
+            .filter { com.deeptalking.domain.agent.prompts.staticProfileValue(profile, it).isBlank() }
+
+    /** Legacy `fillGroupMemberFields` background pass: fills up to 3 members' empty fields. */
+    private suspend fun fillGroupMembers(group: Character): Character {
+        var attempts = 0
+        val members = group.members.map { member ->
+            if (attempts >= 3) return@map member
+            val missing = missingStaticFields(member.staticProfile)
+            if (missing.isEmpty()) return@map member
+            attempts++
+            fillMemberFields(group, member, missing)
+        }
+        if (members == group.members) return group
+        val nowIso = Instant.ofEpochMilli(System.currentTimeMillis()).toString()
+        return group.copy(
+            members = members,
+            staticFillMeta = StaticFillMeta(attemptedAt = nowIso, failures = 0, retryAt = null),
+        )
+    }
+
+    private suspend fun fillMemberFields(group: Character, member: GroupMember, missing: List<String>): GroupMember {
+        if (missing.isEmpty()) return member
+        val labels = missing.joinToString("、") { key ->
+            STATIC_PROFILE_FIELDS.firstOrNull { it.first == key }?.second ?: key
+        }
+        val existing = STATIC_PROFILE_FIELDS
+            .filter { it.first !in missing }
+            .mapNotNull { (key, _) ->
+                val value = com.deeptalking.domain.agent.prompts.staticProfileValue(member.staticProfile, key)
+                if (value.isBlank()) null else "\"" + key + "\":\"" + value.replace("\"", "\\\"") + "\""
+            }
+        val others = group.members
+            .filter { it.id != member.id }
+            .joinToString("；") { it.name + "（" + it.staticProfile.personality.take(60) + "）" }
+        val prompt = "所属群组：" + group.name + "（" + group.description.take(200) + "）\n" +
+            "群内其他成员：" + others.ifEmpty { "（无）" } + "\n" +
+            "请只补全该成员下列【当前为空】的字段：$labels。\n" +
+            "要求：只补空字段，绝不修改或覆盖已有设定；只根据已知信息合理补写，没有把握就省略；不得编造与已有设定冲突的内容。\n" +
+            "已有设定:\n{" + existing.joinToString(",") + "}\n只返回JSON对象，键为字段英文名，值为补写内容。"
+        val raw = complete(FILL_SYSTEM, prompt, temperature = 0.4, maxOutputTokens = 2048, sessionId = sessionIdFor(group))
+        val data = if (raw.isBlank()) null else ResponseParser.parseJsonLenient(raw) as? JsonObject
+        var profile = member.staticProfile
+        missing.forEach { key ->
+            if (com.deeptalking.domain.agent.prompts.staticProfileValue(profile, key).isNotBlank()) return@forEach
+            val value = data?.string(key)?.trim().orEmpty()
+            if (value.isEmpty()) return@forEach
+            profile = withStaticField(profile, key, trimText(value, 700))
+        }
+        return member.copy(staticProfile = profile)
     }
 
     /** Legacy `FIELDS_MIGRATION_VERSION`. */
@@ -745,6 +1162,7 @@ class BackgroundTasks(
         quickReplyRepairEnabled: Boolean,
         onCharacterUpdated: (Character) -> Unit,
         onQuickRepliesRepaired: (List<String>) -> Unit = {},
+        proseFallback: Boolean = false,
     ): Job = queue.enqueue {
         var working = character
 
@@ -767,12 +1185,67 @@ class BackgroundTasks(
             if (repaired.size >= 2 && repaired != currentQuickReplies) onQuickRepliesRepaired(repaired)
         }
 
-        val extracted = extractMemory(working, messages)
-        if (extracted != working) working = extracted
+        var counters = countersFor(working.id)
+        val nowMillis = System.currentTimeMillis()
+        val lastUser = working.instant.lastOrNull { it.role == Role.User && !it.isLoading }
+
+        // Extraction (only at the legacy high watermark), with backoff on failure.
+        var extractedSomething = false
+        if (working.instant.size >= AppLimits.Memory.INSTANT &&
+            canRunMemoryTask(counters, MemoryTaskKind.Extraction, nowMillis)
+        ) {
+            val extracted = extractMemory(working, messages)
+            if (extracted != working) {
+                working = extracted
+                extractedSomething = true
+                counters = resetMemoryRetry(counters, MemoryTaskKind.Extraction)
+            } else {
+                counters = scheduleMemoryRetry(counters, MemoryTaskKind.Extraction, nowMillis)
+            }
+        }
+
+        // Prose reply fallback (legacy `convertProseToJson` + `extractProseTurnMemory`):
+        // a non-structured reply still gets its memory extracted in the background.
+        if (proseFallback && lastUser != null) {
+            val assistantMsg = messages.lastOrNull { it.role == Role.Assistant && !it.isLoading }
+            if (assistantMsg != null) {
+                val proseUpdated = extractProseTurnMemory(working, lastUser, reply, assistantMsg)
+                if (proseUpdated != working) {
+                    working = proseUpdated
+                    extractedSomething = true
+                }
+            }
+        }
+
+        // Fallback capture when even the prose pass produced nothing (legacy `shouldCaptureUserTurn`).
+        if (!extractedSomething && lastUser != null && shouldCaptureUserTurn(lastUser.content)) {
+            val capture = addShortTermMemory(
+                list = working.shortTerm,
+                draft = ShortTermDraft(
+                    content = "本轮事件：用户表示“" + lastUser.content + "”。尚未形成更完整的事件经过。",
+                    sourceMessageIds = listOf(lastUser.id),
+                    eventTime = lastUser.timestamp,
+                ),
+                timestamp = lastUser.timestamp,
+                sources = knownSources(working),
+            )
+            if (capture.accepted) working = working.copy(shortTerm = capture.list)
+        }
 
         // Consolidate short-term events into long-term memories (legacy analyzeShortToLongTerm).
-        val analyzed = analyzeShortToLongTerm(working)
-        if (analyzed != working) working = analyzed
+        val hasAnalyzable = working.shortTerm
+            .take((working.shortTerm.size - AppLimits.Memory.SHORT_TERM_TRIM_FLOOR).coerceAtLeast(0))
+            .any { it.analyzedAt == null }
+        if (hasAnalyzable && canRunMemoryTask(counters, MemoryTaskKind.Analysis, nowMillis)) {
+            val analyzed = analyzeShortToLongTerm(working)
+            if (analyzed != working) {
+                working = analyzed
+                counters = resetMemoryRetry(counters, MemoryTaskKind.Analysis)
+            } else {
+                counters = scheduleMemoryRetry(counters, MemoryTaskKind.Analysis, nowMillis)
+            }
+        }
+        storeCounters(working.id, counters)
 
         // Scene summaries + world-book consolidation + adaptive importance.
         val maintained = runMemoryMaintenance(working)
@@ -911,6 +1384,13 @@ class BackgroundTasks(
         prefix + "_" + Instant.now().toEpochMilli() + "_" + Random.nextInt(100000, 999999)
 
     private companion object {
+        val MEM_UPDATE_REGEX = Regex("<\\s*MEM_UPDATE\\s*>([\\s\\S]*?)</\\s*MEM_UPDATE\\s*>", RegexOption.IGNORE_CASE)
+
+        const val PROSE_SYSTEM =
+            "你是「对话记录整理助手」。下面是一次角色扮演交互（用户消息 + 角色回复），请整理成与主对话一致的标准 JSON，包含全部字段：" +
+                "{\"reply\":\"角色回复原文（一字不改）\",\"quickReplies\":[\"用户下一句1\",\"用户下一句2\"],\"shortTerm\":[{\"content\":\"从交互提取的本轮事件摘要，写明谁做了什么\",\"sourceMessageIds\":[\"<用户消息id>\"]}],\"longTerm\":[{\"category\":\"userProfile|relationship|events|promises|habits\",\"subject\":\"user|relationship|world\",\"key\":\"稳定标识\",\"value\":\"用户的具体事实（写明主体）\",\"tags\":[],\"importance\":1-10,\"sourceMessageIds\":[\"<用户消息id>\"],\"evidence\":\"用户原话\",\"promisor\":\"可选，约定的承诺方 user|character\",\"promisee\":\"可选，约定的受约方 user|character\"}],\"dynamicState\":{\"currentSituation\":{\"value\":\"当前处境\",\"sourceMessageIds\":[\"current_response\"],\"evidence\":\"回复中引原句\"},\"currentMood\":{\"value\":\"当前情绪\",\"sourceMessageIds\":[\"current_response\"],\"evidence\":\"概括回复原句\"},\"currentGoal\":{\"value\":\"当前目标\",\"sourceMessageIds\":[\"current_response\"],\"evidence\":\"回复中引原句\"}},\"staticFields\":{},\"memberDynamicState\":[],\"promiseUpdates\":[]}" +
+                "。规则：reply必须一字不改保留角色回复原文；quickReplies必须恰好两条用户可直接发送给角色的短句；所有记忆只能从这次交互中明确提取，不得凭空编造；dynamicState来源用current_response、evidence引用回复原句；shortTerm和longTerm的sourceMessageIds引用用户消息id；用户未明确陈述或表现的内容不要写入；无合格记忆返回空数组。记忆字段（shortTerm的content、longTerm的key与value）必须写明主体：涉及用户写“用户”，涉及角色写角色名，禁止“我/你/TA”这类指代不清的代词；时间一律写绝对日期（YYYY-MM-DD 或 YYYY-MM-DD 时段），禁止“明天/明晚/上周/上个月/三天后”这类相对时间词，用户用相对时间说法时改用timeRef（anchor/offsetDays/weekday/slot/explicit）。dynamicState与staticFields的值以段落式的陈述句书写（自然完整陈述句，简短段落），禁止括号注释或理由。只返回JSON对象，不要其他任何文字。"
+
         const val SCENE_SYSTEM = "你是对话记录整理助手。只输出场景摘要正文，不要任何额外文字。"
         const val SCENE_PROMPT =
             "把下面这段已经告一段落的情节压缩成 1-2 段、不超过 300 字的「场景记忆」，供之后长期参考。\n" +

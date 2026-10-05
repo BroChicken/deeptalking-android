@@ -4,6 +4,7 @@ import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.LongTermMemory
 import com.deeptalking.core.model.MemoryCategory
+import com.deeptalking.core.model.MemorySubject
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.ShortTermMemory
 import org.junit.Assert.assertEquals
@@ -126,5 +127,98 @@ class MemoryEvidenceTest {
             createdAt = Instant.ofEpochMilli(now).toString(),
         )
         assertEquals(7.0, computeEffectiveImportance(base, now), 0.0001)
+    }
+
+    @Test
+    fun isValidAutomaticMemoryEnforcesCategorySubjectEvidenceAndRole() {
+        val character = Character(
+            id = "c1",
+            instant = listOf(
+                userMessage("u1", "用户喜欢喝美式咖啡。"),
+                assistantMessage("a1", "我记住了。"),
+            ),
+        )
+        val valid = LongTermMemory(
+            category = MemoryCategory.UserProfile,
+            subject = MemorySubject.User,
+            key = "饮品",
+            value = "用户喜欢咖啡",
+            sourceMessageIds = listOf("u1"),
+            evidence = "用户喜欢喝美式咖啡",
+        )
+        assertTrue(isValidAutomaticMemory(character, valid))
+
+        assertFalse(
+            "assistant sources are not user evidence",
+            isValidAutomaticMemory(character, valid.copy(sourceMessageIds = listOf("a1"))),
+        )
+        assertFalse("subject=legacy is rejected", isValidAutomaticMemory(character, valid.copy(subject = MemorySubject.Legacy)))
+        assertFalse("subject=character is rejected", isValidAutomaticMemory(character, valid.copy(subject = MemorySubject.Character)))
+        assertFalse("missing evidence is rejected", isValidAutomaticMemory(character, valid.copy(evidence = "")))
+        assertFalse(
+            "profile requires all-user sources",
+            isValidAutomaticMemory(character, valid.copy(sourceMessageIds = listOf("u1", "a1"))),
+        )
+    }
+
+    @Test
+    fun isValidAutomaticMemoryPromiseRules() {
+        val character = Character(
+            id = "c1",
+            instant = listOf(userMessage("u1", "用户答应明天请客。")),
+        )
+        val userPromise = LongTermMemory(
+            category = MemoryCategory.Promises,
+            subject = MemorySubject.User,
+            key = "请客",
+            value = "用户答应请客",
+            sourceMessageIds = listOf("u1"),
+            evidence = "用户答应明天请客",
+            promisor = "user",
+        )
+        assertTrue(isValidAutomaticMemory(character, userPromise))
+        assertFalse(
+            "character-subject promises are rejected",
+            isValidAutomaticMemory(character, userPromise.copy(subject = MemorySubject.Character)),
+        )
+    }
+
+    @Test
+    fun resolvePromiseSourcesSupportsCurrentResponse() {
+        val character = Character(id = "c1")
+        val assistant = assistantMessage("a1", "我会一直陪着你。")
+        val item = LongTermMemory(
+            category = MemoryCategory.Promises,
+            subject = MemorySubject.Relationship,
+            key = "陪伴",
+            value = "角色承诺陪伴用户",
+            sourceMessageIds = listOf("current_response"),
+            evidence = "我会一直陪着你",
+            promisor = "character",
+        )
+        assertNull("no assistant message means no resolution", resolvePromiseSources(character, item, null))
+        assertNotNull(resolvePromiseSources(character, item, assistant))
+        assertNull(resolvePromiseSources(character, item.copy(evidence = "完全不同的话"), assistant))
+    }
+
+    @Test
+    fun resolveDynamicStateSourcesSupportsCurrentResponse() {
+        val character = Character(id = "c1")
+        val assistant = assistantMessage("a1", "（笑了笑）我现在心情不错。")
+        assertNotNull(
+            resolveDynamicStateSources(character, listOf("current_response"), "我现在心情不错", assistant),
+        )
+        assertNull(
+            "current_response must be the only source",
+            resolveDynamicStateSources(character, listOf("current_response", "u1"), "我现在心情不错", assistant),
+        )
+    }
+
+    @Test
+    fun shouldCaptureUserTurnSkipsGreetingsAndShortTurns() {
+        assertTrue(shouldCaptureUserTurn("我今天想去公园散步"))
+        assertFalse(shouldCaptureUserTurn("你好"))
+        assertFalse(shouldCaptureUserTurn("嗯嗯"))
+        assertFalse(shouldCaptureUserTurn("好"))
     }
 }

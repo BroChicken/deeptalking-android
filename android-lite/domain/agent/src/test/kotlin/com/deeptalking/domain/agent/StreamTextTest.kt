@@ -38,6 +38,14 @@ class StreamTextTest {
     }
 
     @Test
+    fun extractsReplyWithRawNewlineViaRepair() {
+        assertEquals(
+            "line1\nline2",
+            StreamText.extractReplyFromJson("{\"reply\":\"line1\nline2\",\"quickReplies\":[]}"),
+        )
+    }
+
+    @Test
     fun displayForSkipsRawJsonWithoutReply() {
         assertNull(StreamText.displayFor("""{"quickReplies":["a","b"]""", null))
     }

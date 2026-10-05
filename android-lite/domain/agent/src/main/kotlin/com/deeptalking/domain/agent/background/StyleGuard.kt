@@ -144,6 +144,26 @@ internal fun recentReplyTexts(character: Character?, limit: Int): List<String> =
         .takeLast(limit.coerceAtLeast(1))
         .map { it.content }
 
+/** Legacy `isMeaningfulEnding`: at least 4 non-punctuation characters. */
+internal fun isMeaningfulEnding(ending: String?): Boolean =
+    ending.orEmpty().replace(Regex("[。！？!?…\\s\"'”’）)\\]】]"), "").length >= 4
+
+/**
+ * Legacy `dedupeRepeatedEnding`: when this turn's ending is byte-identical to the
+ * previous assistant reply's ending, drop the duplicated trailing sentence.
+ */
+internal fun dedupeRepeatedEnding(reply: String, previousReply: String?): String {
+    if (reply.isBlank() || previousReply.isNullOrBlank()) return reply
+    val previousEnding = extractReplyEnding(previousReply)
+    val currentEnding = extractReplyEnding(reply)
+    if (currentEnding.isEmpty() || currentEnding != previousEnding) return reply
+    if (!isMeaningfulEnding(previousEnding) || !isMeaningfulEnding(currentEnding)) return reply
+    val index = reply.lastIndexOf(currentEnding)
+    if (index <= 0) return reply
+    val trimmed = reply.substring(0, index).trimEnd()
+    return trimmed.ifBlank { reply }
+}
+
 fun getLastStyleViolations(character: Character?): List<String> {
     val messages = character?.instant.orEmpty()
     for (i in messages.indices.reversed()) {

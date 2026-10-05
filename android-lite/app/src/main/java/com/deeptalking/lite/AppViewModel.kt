@@ -107,6 +107,10 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         }
         viewModelScope.launch { proactiveLoop() }
         viewModelScope.launch { themeLoop() }
+        // Legacy one-time relative-time → absolute migration (no key required).
+        viewModelScope.launch {
+            runCatching { core.runStartupMigrations() }.onFailure { DeepTalkingApp.recordError(it) }
+        }
         // Legacy on-load silent static-field completion (only with an API key).
         viewModelScope.launch {
             runCatching {
@@ -118,6 +122,8 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         viewModelScope.launch {
             runCatching { checkMigrationPrompts() }.onFailure { DeepTalkingApp.recordError(it) }
         }
+        // Legacy silent avatar auto-repair for damaged placeholders.
+        autoRepairAvatars()
     }
 
     // --------------------------------------------------------- migrations
@@ -139,8 +145,15 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     fun runFieldMigration() {
         fieldMigrationState.value = null
         viewModelScope.launch {
-            val count = core.remapCharacterFields(core.currentConfig())
-            eventsState.tryEmit(UiEvent("字段结构迁移完成（$count 个角色）"))
+            val cfg = core.currentConfig()
+            if (!core.hasApiKey(cfg.apiPlatform)) {
+                eventsState.tryEmit(UiEvent("未配置 API Key，无法迁移"))
+                return@launch
+            }
+            val count = core.remapCharacterFields(cfg)
+            val remaining = runCatching { core.fieldMigrationTargetCount() }.getOrDefault(0)
+            val suffix = if (remaining > 0) "，仍有 $remaining 个待处理" else ""
+            eventsState.tryEmit(UiEvent("字段结构迁移完成（$count 个角色$suffix）"))
         }
     }
 
@@ -165,8 +178,15 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     fun runLorebookMigration(trimSource: Boolean) {
         lorebookMigrationState.value = null
         viewModelScope.launch {
-            val count = core.runWorldLoreMigration(core.currentConfig(), trimSource)
-            eventsState.tryEmit(UiEvent("世界书整理完成（$count 个角色）"))
+            val cfg = core.currentConfig()
+            if (!core.hasApiKey(cfg.apiPlatform)) {
+                eventsState.tryEmit(UiEvent("未配置 API Key，无法整理"))
+                return@launch
+            }
+            val count = core.runWorldLoreMigration(cfg, trimSource)
+            val remaining = runCatching { core.lorebookMigrationTargetCount() }.getOrDefault(0)
+            val suffix = if (remaining > 0) "，仍有 $remaining 个待处理" else ""
+            eventsState.tryEmit(UiEvent("世界书整理完成（$count 个角色$suffix）"))
         }
     }
 
@@ -200,22 +220,48 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
 
     // --------------------------------------------------------------- characters
 
-    fun createCharacter(name: String, emoji: String, personality: String = "", background: String = "") {
+    fun createCharacter(
+        name: String,
+        emoji: String,
+        personality: String = "",
+        background: String = "",
+        draft: com.deeptalking.feature.characters.CharacterParity.GeneratedDraft? = null,
+    ) {
         viewModelScope.launch {
+            val now = Instant.now().toString()
+            val profile = (draft?.staticProfile ?: StaticProfile()).copy(
+                personality = personality.ifBlank { draft?.staticProfile?.personality.orEmpty() },
+                background = background.ifBlank { draft?.staticProfile?.background.orEmpty() },
+            )
             val character = Character(
                 id = UUID.randomUUID().toString(),
                 name = name.ifBlank { "新角色" },
                 emoji = emoji.ifBlank { "🙂" },
-                staticProfile = StaticProfile(personality = personality, background = background),
-                createdAt = Instant.now().toString(),
+                staticProfile = profile,
+                dynamicState = draft?.dynamicState ?: com.deeptalking.core.model.DynamicState(),
+                lorebook = draft?.lorebook.orEmpty(),
+                createdAt = now,
+                // Fresh entities are already on the current schema and hold no
+                // legacy world-layer prose, so they must not re-trigger migrations.
+                fieldsMigrationVersion = "1.2.0",
+                lorebookMigratedAt = now,
             )
             core.data.characters.upsert(character)
             activeIdState.value = character.id
         }
     }
 
-    fun createGroup(name: String, emoji: String, description: String, scene: String, rules: String, members: List<GroupMember>) {
+    fun createGroup(
+        name: String,
+        emoji: String,
+        description: String,
+        scene: String,
+        rules: String,
+        members: List<GroupMember>,
+        lorebook: List<LorebookEntry> = emptyList(),
+    ) {
         viewModelScope.launch {
+            val now = Instant.now().toString()
             val group = Character(
                 id = UUID.randomUUID().toString(),
                 name = name.ifBlank { "新群组" },
@@ -225,7 +271,10 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 interactionRules = rules,
                 groupSharedDynamic = com.deeptalking.core.model.DynamicState(currentLocation = scene),
                 members = members,
-                createdAt = Instant.now().toString(),
+                lorebook = lorebook,
+                createdAt = now,
+                fieldsMigrationVersion = "1.2.0",
+                lorebookMigratedAt = now,
             )
             core.data.characters.upsert(group)
             activeIdState.value = group.id
@@ -274,32 +323,62 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 return@launch
             }
             val history = core.data.chat.getMessages(character.id)
+            val transcript = history.filter { !it.isLoading }.takeLast(20).joinToString("\n") { message ->
+                val label = if (message.role == Role.User) "用户" else character.name
+                "$label: " + message.content.take(1000)
+            }
             val prompt = buildString {
-                append("把以下角色升级为一个群组，保留其身份作为群主，并新增 2-3 名与当前剧情相符的成员。")
-                append("\n角色：").append(character.name)
-                if (character.staticProfile.personality.isNotBlank()) {
-                    append("（").append(character.staticProfile.personality).append("）")
-                }
-                val context = history.takeLast(6).joinToString("\n") { "${it.role}: ${it.content.take(200)}" }
-                if (context.isNotBlank()) append("\n近期对话：\n").append(context)
+                append("将以下角色和近期对话升级为群组。原角色会由系统完整保留，因此绝不能在输出成员列表中再次生成原角色，也不要生成同名或明显重复的变体。")
+                append("请列出所有近期对话中已出现、应成为固定成员的其他角色；若不足一人，再新增一名最适合当前剧情的成员。")
+                append("返回JSON：{\"groupInfo\":{\"name\":\"群组名\",\"avatar\":\"emoji\",\"description\":\"群组前提（这群人是谁、为什么在一起，1-2 句；不要写世界观/地点/组织等世界层设定）\",\"scene\":\"场景\",\"interactionRules\":\"成员互动规则\"},")
+                append("\"lorebook\":[{\"name\":\"条目名\",\"keywords\":[\"触发词\"],\"content\":\"命中后注入的世界层设定\",\"alwaysActive\":false}],")
+                append("\"additionalMembers\":[{\"name\":\"\",\"avatar\":\"emoji\",\"gender\":\"\",\"age\":\"\",\"race\":\"\",\"appearance\":\"\",\"personality\":\"\",\"values\":\"\",\"fears\":\"\",\"background\":\"\",\"keyEvents\":\"\",\"speakingStyle\":\"\",\"language\":\"\",\"userAddress\":\"\",\"roleInGroup\":\"\",\"dynamicState\":{\"currentSituation\":\"\",\"currentLocation\":\"\",\"currentMood\":\"\",\"currentOccupation\":\"\",\"currentGoal\":\"\",\"currentRelationship\":\"\",\"currentImportantOthers\":\"\"}}]}。")
+                append("lorebook 只需补上近期对话中出现、值得日后复用的世界层设定（没有就返回空数组）；additionalMembers 只能包含新增成员，至少一名，且姓名必须互不重复；每名成员必须尽可能填满所有字段。")
+                append("\n原角色（禁止重复输出）:\n").append(character.name)
+                if (character.staticProfile.personality.isNotBlank()) append("（").append(character.staticProfile.personality).append("）")
+                if (transcript.isNotBlank()) append("\n近期对话:\n").append(transcript)
             }
             val raw = runCatching { core.quickGenerate(cfg, prompt) }.getOrNull()
-            val members = raw?.let { core.parseGroupMembers(it) }.orEmpty()
-            if (members.isEmpty()) {
+            val draft = raw?.let { com.deeptalking.feature.characters.CharacterParity.parseGeneratedDraft(it) }
+            if (draft == null) {
                 eventsState.tryEmit(UiEvent("升级失败，请重试"))
                 onDone(false)
                 return@launch
             }
+            val originalName = character.name.trim().lowercase()
+            val original = GroupMember(
+                id = character.id,
+                name = character.name,
+                emoji = character.emoji,
+                roleInGroup = "原有成员",
+                staticProfile = character.staticProfile,
+                dynamicState = character.dynamicState,
+            )
+            val members = (listOf(original) + draft.members.filter { it.name.trim().lowercase() != originalName })
+                .filter { it.name.isNotBlank() }
+                .distinctBy { it.name.trim().lowercase() }
+            if (members.size < 2) {
+                eventsState.tryEmit(UiEvent("升级失败：成员不足，请重试"))
+                onDone(false)
+                return@launch
+            }
+            val mergedLorebook = (character.lorebook + draft.lorebook)
+                .distinctBy { it.name.trim().lowercase().ifBlank { it.id } }
+            val now = Instant.now().toString()
             val group = character.copy(
                 isGroup = true,
-                emoji = character.emoji.ifBlank { "👥" },
-                description = character.staticProfile.personality.ifBlank { character.description },
-                interactionRules = character.interactionRules,
+                name = draft.name.ifBlank { character.name + "的群组" },
+                emoji = character.emoji.ifBlank { draft.emoji.ifBlank { "👥" } },
+                description = draft.description.ifBlank { character.description },
+                interactionRules = draft.interactionRules.ifBlank { character.interactionRules },
                 groupSharedDynamic = com.deeptalking.core.model.DynamicState(
                     currentSituation = character.dynamicState.currentSituation,
-                    currentLocation = character.dynamicState.currentLocation,
+                    currentLocation = character.dynamicState.currentLocation.ifBlank { draft.scene },
                 ),
                 members = members,
+                lorebook = mergedLorebook,
+                fieldsMigrationVersion = "1.2.0",
+                lorebookMigratedAt = now,
             )
             core.data.characters.upsert(group)
             onDone(true)
@@ -390,6 +469,20 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 createdAt = Instant.now().toString(),
             )
             core.data.characters.upsert(character.copy(stickers = character.stickers + sticker))
+            // Legacy `tagStickerInBackground`: vision-classify, fill only while untagged.
+            viewModelScope.launch {
+                val cfg = runCatching { core.currentConfig() }.getOrNull() ?: return@launch
+                if (!core.hasApiKey(cfg.apiPlatform)) return@launch
+                val tag = runCatching { core.tagSticker(cfg, path) }.getOrNull() ?: return@launch
+                val latest = core.data.characters.get(id) ?: return@launch
+                core.data.characters.upsert(
+                    latest.copy(
+                        stickers = latest.stickers.map {
+                            if (it.fileRef == path && it.tag == "未分类") it.copy(tag = tag) else it
+                        },
+                    ),
+                )
+            }
         }
     }
 
@@ -516,6 +609,40 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         return v.none { it.code > 127 }
     }
 
+    /** Legacy `autoRepairAvatars`: silently repair damaged avatars on startup/import. */
+    fun autoRepairAvatars() {
+        viewModelScope.launch {
+            val cfg = runCatching { core.currentConfig() }.getOrNull() ?: return@launch
+            if (!core.hasApiKey(cfg.apiPlatform)) return@launch
+            val all = core.data.characters.observeAll().first()
+            for (character in all) {
+                var updated = character
+                var changed = false
+                if (needsRepair(character.emoji)) {
+                    val emoji = runCatching { core.generateEmojiAvatar(cfg, character) }.getOrNull()
+                    if (!emoji.isNullOrBlank()) {
+                        updated = updated.copy(emoji = emoji)
+                        changed = true
+                    }
+                }
+                if (character.members.isNotEmpty()) {
+                    val members = updated.members.toMutableList()
+                    updated.members.forEachIndexed { index, member ->
+                        if (needsRepair(member.emoji)) {
+                            val emoji = runCatching { core.generateEmojiAvatar(cfg, character) }.getOrNull()
+                            if (!emoji.isNullOrBlank()) {
+                                members[index] = member.copy(emoji = emoji)
+                                changed = true
+                            }
+                        }
+                    }
+                    updated = updated.copy(members = members)
+                }
+                if (changed) core.data.characters.upsert(updated)
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- messaging
 
     fun send(text: String) {
@@ -583,29 +710,48 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 val orchestrator = core.createOrchestrator(cfg) { updated ->
                     core.appScope.launch { core.data.characters.upsert(updated) }
                 }
-                val result = orchestrator.run(
-                    character = character,
-                    history = history,
-                    userText = text.trim(),
-                    onDelta = { streamingState.value = it },
-                    onToolActivity = { statusState.value = it },
-                    onQuickRepliesRepaired = { quickRepliesState.value = it },
-                    proactive = proactive,
-                )
+                // Legacy `chatStageDecision('empty')`: an empty turn is retried once
+                // before failing, so the user never gets an empty bubble.
+                var result: OrchestratorResult? = null
+                var attempt = 0
+                while (attempt < 2) {
+                    if (attempt > 0) {
+                        statusState.value = "正在重新生成…"
+                        streamingState.value = ""
+                    }
+                    val outcome = orchestrator.run(
+                        character = character,
+                        history = history,
+                        userText = text.trim(),
+                        onDelta = { streamingState.value = it },
+                        onToolActivity = { statusState.value = it },
+                        onQuickRepliesRepaired = { quickRepliesState.value = it },
+                        proactive = proactive,
+                    )
+                    result = outcome
+                    if (outcome.reply.isNotBlank()) break
+                    attempt++
+                }
                 streamingState.value = null
+                val finalResult = result ?: return@launch
+                if (finalResult.reply.isBlank()) {
+                    statusState.value = ""
+                    eventsState.tryEmit(UiEvent("收到空回复，请重试。你的消息已保留。"))
+                    return@launch
+                }
                 core.data.chat.append(
                     id,
                     ChatMessage(
                         id = UUID.randomUUID().toString(),
                         role = Role.Assistant,
-                        content = result.reply,
+                        content = finalResult.reply,
                         timestamp = Instant.now().toString(),
                         internalOnly = false,
-                        staticChanges = result.staticChanges,
-                        lorebookChanges = result.lorebookChanges,
+                        staticChanges = finalResult.staticChanges,
+                        lorebookChanges = finalResult.lorebookChanges,
                     ),
                 )
-                result.stickerFileRef?.let { ref ->
+                finalResult.stickerFileRef?.let { ref ->
                     core.data.chat.append(
                         id,
                         ChatMessage(
@@ -617,11 +763,11 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                         ),
                     )
                 }
-                val withReminders = scheduleDueReminders(result.updatedCharacter)
+                val withReminders = scheduleDueReminders(finalResult.updatedCharacter)
                 core.data.characters.upsert(withReminders)
-                quickRepliesState.value = result.quickReplies
+                quickRepliesState.value = finalResult.quickReplies
                 statusState.value = ""
-                recordMetrics(cfg, id, result)
+                recordMetrics(cfg, id, finalResult)
             } catch (error: Exception) {
                 streamingState.value = null
                 statusState.value = ""
@@ -756,6 +902,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 pendingRecall = character.pendingRecall?.takeIf {
                     removedIds.isEmpty()
                 },
+                revision = character.revision + 1,
             ),
         )
     }
@@ -807,8 +954,9 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
 
     fun exportJson(onReady: (String) -> Unit) {
         viewModelScope.launch {
+            val activeId = activeIdState.value
             val json = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                core.backup.exportJson()
+                core.backup.exportJson(activeId)
             }
             onReady(json)
         }
@@ -823,10 +971,19 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 return@launch
             }
             val all = core.data.characters.observeAll().first()
-            activeIdState.value = all.firstOrNull()?.id
+            val restored = summary.activeCharacterId?.takeIf { id -> all.any { it.id == id } }
+            activeIdState.value = restored ?: all.firstOrNull()?.id
             eventsState.tryEmit(
                 UiEvent("导入成功：${summary.characters} 个角色，${summary.messages} 条消息"),
             )
+            // Legacy runs silent static-field completion + migration prompts after import.
+            runCatching { core.runStartupMigrations() }.onFailure { DeepTalkingApp.recordError(it) }
+            runCatching {
+                val cfg = core.data.config.observe().first()
+                core.runStartupMaintenance(cfg)
+            }.onFailure { DeepTalkingApp.recordError(it) }
+            runCatching { checkMigrationPrompts() }.onFailure { DeepTalkingApp.recordError(it) }
+            autoRepairAvatars()
         }
     }
 

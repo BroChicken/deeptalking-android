@@ -3,13 +3,18 @@ package com.deeptalking.domain.agent.tools
 import com.deeptalking.domain.agent.AgentContext
 import com.deeptalking.domain.agent.AgentTool
 import com.deeptalking.domain.agent.AgentToolResult
+import com.deeptalking.domain.agent.prompts.maskUserWord
+import com.deeptalking.domain.agent.prompts.trimText
 import com.deeptalking.domain.memory.MemoryService
+import com.deeptalking.domain.memory.score as memoryScore
 import com.deeptalking.engine.ondevice.ToolCall
 import com.deeptalking.engine.ondevice.ToolDefinition
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import java.time.Instant
+import kotlin.math.round
 
 /** Port of the `search_memory` branch in tool-execution.js. */
 class SearchMemoryTool(private val memory: MemoryService) : AgentTool {
@@ -30,28 +35,71 @@ class SearchMemoryTool(private val memory: MemoryService) : AgentTool {
         val character = context.character
         val member = if (memberName.isNotEmpty()) MemoryToolSupport.resolveMember(character, memberName) else null
         val host = if (member != null) MemoryToolSupport.memberAsCharacter(character, member) else character
-        val entries = memory.retrieve(host, query, 6)
-        val results = buildJsonArray {
-            entries.forEach { item ->
-                add(
-                    buildJsonObject {
-                        put("id", item.id)
-                        put("category", item.category.name)
-                        put("subject", item.subject.name.lowercase())
-                        put("subjectLabel", MemoryToolSupport.actorLabel(character, item.subject))
-                        put("key", item.key.take(80))
-                        put("value", item.value.take(420))
-                        put("importance", item.importance)
-                    },
-                )
-            }
+
+        val now = System.currentTimeMillis()
+        val candidates = host.longTerm
+            .map { it to memoryScore(query, it, now) }
+            .filter { it.second > 0.0 }
+            .sortedByDescending { it.second }
+            .take(MAX_CANDIDATES)
+
+        // Legacy bumps usage for every retrieved candidate (before the relevance filter).
+        val nowIso = Instant.now().toString()
+        val bumpIds = candidates.map { it.first.id }.filter { it.isNotEmpty() }.toSet()
+        val updated = bumpUsage(character, member, bumpIds, nowIso)
+
+        val items = buildJsonArray {
+            candidates.asSequence()
+                .filter { it.second >= MIN_RELEVANCE }
+                .take(MAX_RESULTS)
+                .forEach { (item, score) ->
+                    add(
+                        buildJsonObject {
+                            put("id", item.id)
+                            put("category", item.category.legacyKey)
+                            put("subject", item.subject.name.lowercase())
+                            put("subjectLabel", MemoryToolSupport.actorLabel(host, item.subject))
+                            put("key", maskUserWord(host, trimText(item.key, 80)))
+                            put("value", maskUserWord(host, trimText(item.value, 420)))
+                            put("eventTime", MemoryToolSupport.formatContextTime(item.eventTime ?: item.createdAt))
+                            put("importance", item.importance)
+                            put("relevance", round(score * 100) / 100)
+                        },
+                    )
+                }
         }
         val payload = buildJsonObject {
             put("ok", true)
             put("query", query)
-            put("total", entries.size)
-            put("results", results)
+            put("total", items.size)
+            put("results", items)
         }
-        return AgentToolResult(payload.toString())
+        return AgentToolResult(payload.toString(), updatedCharacter = updated)
+    }
+
+    private fun bumpUsage(
+        character: com.deeptalking.core.model.Character,
+        member: com.deeptalking.core.model.GroupMember?,
+        ids: Set<String>,
+        nowIso: String,
+    ): com.deeptalking.core.model.Character {
+        fun bump(item: com.deeptalking.core.model.LongTermMemory) =
+            if (item.id in ids) item.copy(usageCount = item.usageCount + 1, lastUsageAt = nowIso) else item
+        if (ids.isEmpty()) return character
+        return if (member != null) {
+            character.copy(
+                members = character.members.map { m ->
+                    if (m.id == member.id) m.copy(longTerm = m.longTerm.map(::bump)) else m
+                },
+            )
+        } else {
+            character.copy(longTerm = character.longTerm.map(::bump))
+        }
+    }
+
+    private companion object {
+        const val MIN_RELEVANCE = 4.0
+        const val MAX_CANDIDATES = 12
+        const val MAX_RESULTS = 6
     }
 }

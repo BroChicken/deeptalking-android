@@ -10,24 +10,36 @@ import com.deeptalking.core.database.ConfigDao
 import com.deeptalking.core.database.ConfigEntity
 import com.deeptalking.core.database.MessageDao
 import com.deeptalking.core.database.MessageEntity
+import com.deeptalking.core.model.AppConfig
+import com.deeptalking.core.model.Character
+import com.deeptalking.core.model.ChatMessage
+import com.deeptalking.core.model.LongTermMemory
 import com.deeptalking.core.model.LorebookOrigin
 import com.deeptalking.core.model.MemoryCategory
 import com.deeptalking.core.model.MemorySubject
+import com.deeptalking.core.model.PendingRecall
 import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.Role
+import com.deeptalking.core.model.SceneState
+import com.deeptalking.core.model.SceneSummary
+import com.deeptalking.core.model.ShortTermMemory
+import com.deeptalking.core.model.StaticFillMeta
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.nio.charset.Charset
 
 class LegacyMapperTest {
 
@@ -348,6 +360,196 @@ class LegacyMapperTest {
         val summary = fresh.importJson(exported)
         assertEquals(1, summary.characters)
         assertEquals(1, summary.stickers)
+    }
+
+    @Test
+    fun mapConfigCoercesLegacyDeepseekChatAlias() {
+        val deepseek = parse("""{ "config": { "apiPlatform": "deepseek", "modelName": "deepseek-chat" } }""").config
+        assertEquals("deepseek-flash", mapConfig(deepseek).modelName)
+
+        val custom = parse("""{ "config": { "apiPlatform": "custom", "modelName": "deepseek-chat" } }""").config
+        assertEquals("deepseek-chat", mapConfig(custom).modelName)
+    }
+
+    @Test
+    fun mapStickersDedupesByDataUrlAndNormalizesTag() {
+        val json = """
+            {
+              "characters": {
+                "c1": {
+                  "id": "c1",
+                  "stickers": [
+                    { "id": "s1", "dataUrl": "data:image/png;base64,AAAA", "tag": " 开心 开心 " },
+                    { "id": "s2", "dataUrl": "data:image/png;base64,AAAA", "tag": "duplicate" },
+                    { "id": "s3", "dataUrl": "data:image/png;base64,BBBB", "tag": "一二三四五六七八" },
+                    { "id": "s4", "tag": "no payload" }
+                  ]
+                }
+              }
+            }
+        """.trimIndent()
+        val character = mapCharacter(parse(json).characters!!.getValue("c1"), null)
+        assertEquals(2, character.stickers.size)
+        assertEquals("开心开心", character.stickers[0].tag)
+        assertEquals("一二三四五六", character.stickers[1].tag)
+    }
+
+    @Test
+    fun preservesExtendedMemoryFields() {
+        val json = """
+            {
+              "characters": {
+                "c1": {
+                  "id": "c1", "basicInfo": { "name": "A" },
+                  "memory": {
+                    "shortTerm": [
+                      { "id": "st1", "content": "x", "timestamp": "2026-01-01T00:00:00.000Z",
+                        "analyzedAt": "2026-01-02T00:00:00.000Z",
+                        "lorebookScannedAt": "2026-01-03T00:00:00.000Z",
+                        "participants": ["Bob", "Aria"], "location": "forest" }
+                    ],
+                    "longTerm": {
+                      "events": [
+                        { "id": "lt1", "key": "k", "value": "v", "eventTime": "2026-01-01T00:00:00.000Z",
+                          "participants": ["Aria"], "location": "forest", "learnedBonus": 2.5,
+                          "usageCount": 4, "lastUsageAt": "2026-01-04T00:00:00.000Z",
+                          "arcOf": "arc", "arcStage": "发展", "recordedAt": "2026-01-01T00:00:00.000Z" }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+        """.trimIndent()
+        val character = mapCharacter(parse(json).characters!!.getValue("c1"), null)
+        val short = character.shortTerm.single()
+        assertEquals("2026-01-02T00:00:00.000Z", short.analyzedAt)
+        assertEquals("2026-01-03T00:00:00.000Z", short.lorebookScannedAt)
+        assertEquals(listOf("Bob", "Aria"), short.participants)
+        assertEquals("forest", short.location)
+        val long = character.longTerm.single()
+        assertEquals(listOf("Aria"), long.participants)
+        assertEquals("forest", long.location)
+        assertEquals(2, long.learnedBonus)
+        assertEquals(4, long.usageCount)
+        assertEquals("2026-01-04T00:00:00.000Z", long.lastUsageAt)
+        assertEquals("arc", long.arcOf)
+        assertEquals("发展", long.arcStage)
+        assertEquals("2026-01-01T00:00:00.000Z", long.recordedAt)
+    }
+
+    @Test
+    fun decodeImportBytesHandlesUtf8AndGbk() {
+        val json = """{"name":"中文备份"}"""
+        assertEquals(json, decodeImportBytes(json.toByteArray(Charsets.UTF_8)))
+        val gbkBytes = "中文备份".toByteArray(Charset.forName("GBK"))
+        assertEquals("中文备份", decodeImportBytes(gbkBytes))
+    }
+
+    @Test
+    fun reconcileLegacyMemoriesMergesMatchingEventIdentity() {
+        val early = "2026-01-01T10:00:00Z"
+        val late = "2026-06-01T10:00:00Z"
+        val character = Character(
+            id = "c1",
+            shortTerm = listOf(
+                ShortTermMemory(id = "a", content = "first", eventTime = early, sourceMessageIds = listOf("m1")),
+                ShortTermMemory(id = "b", content = "second", eventTime = early, sourceMessageIds = listOf("m2")),
+                ShortTermMemory(id = "c", content = "other", eventTime = late),
+            ),
+            longTerm = listOf(
+                LongTermMemory(id = "e1", category = MemoryCategory.Events, value = "one", eventTime = early, tags = listOf("t1"), participants = listOf("A"), location = "x"),
+                LongTermMemory(id = "e2", category = MemoryCategory.Events, value = "two", eventTime = early, tags = listOf("t2"), participants = listOf("B"), location = "y"),
+                LongTermMemory(id = "p1", category = MemoryCategory.Promises, value = "keep", eventTime = early),
+            ),
+        )
+        val result = reconcileLegacyMemories(character)
+        assertEquals(2, result.repaired)
+        assertEquals(2, result.character.shortTerm.size)
+        assertEquals(2, result.character.longTerm.size)
+        val mergedShort = result.character.shortTerm.first { it.id == "a" }
+        assertTrue(mergedShort.content.contains("first"))
+        assertTrue(mergedShort.content.contains("second"))
+        val mergedEvent = result.character.longTerm.first { it.id == "e1" }
+        assertEquals(setOf("t1", "t2"), mergedEvent.tags.toSet())
+        assertEquals(setOf("A", "B"), mergedEvent.participants.toSet())
+        assertNotNull(result.character.longTerm.firstOrNull { it.id == "p1" })
+        assertTrue(eventIdentity(null, emptyList(), "") == "")
+    }
+
+    @Test
+    fun ensureMessageSequencesNumbersInListOrder() {
+        val messages = listOf(
+            ChatMessage(id = "1", role = Role.User),
+            ChatMessage(id = "2", role = Role.Assistant),
+            ChatMessage(id = "3", role = Role.User),
+        )
+        assertEquals(listOf(1, 2, 3), ensureMessageSequences(messages))
+        assertTrue(ensureMessageSequences(emptyList()).isEmpty())
+    }
+
+    @Test
+    fun exportRoundTripsNativeOnlyFields() = runTest {
+        val characterDao = FakeCharacterDao()
+        val characters = CharacterRepository(characterDao)
+        val chat = ChatRepository(FakeMessageDao())
+        val config = ConfigRepository(FakeConfigDao())
+        characters.upsert(
+            Character(
+                id = "c1",
+                name = "Aria",
+                instant = listOf(
+                    ChatMessage(
+                        id = "m1",
+                        role = Role.User,
+                        content = "hi",
+                        timestamp = "2026-01-01T00:00:00Z",
+                        extractedAt = "2026-01-02T00:00:00Z",
+                    ),
+                ),
+                scenes = listOf(
+                    SceneSummary(id = "sc1", content = "scene one", fromMessageId = "m1", toMessageId = "m1", createdAt = "2026-01-02T00:00:00Z"),
+                ),
+                sceneState = SceneState(key = "forest", startMessageId = "m1", messageCount = 5),
+                pendingRecall = PendingRecall(category = "userProfile", tags = listOf("tea")),
+                staticFillMeta = StaticFillMeta(attemptedAt = "2026-01-01T00:00:00Z", failures = 2, retryAt = "2026-01-05T00:00:00Z"),
+                timeParseVersion = 1,
+                lorebookMigratedAt = "2026-01-03T00:00:00Z",
+            )
+        )
+        config.update(AppConfig(modelName = "deepseek-flash"))
+
+        val exported = BackupService(characters, chat, config).exportJson(activeCharacterId = "c1")
+        val root = Json { ignoreUnknownKeys = true }.parseToJsonElement(exported) as JsonObject
+        assertEquals("\"c1\"", root["activeCharacterId"].toString())
+        val characterJson = (root["characters"] as JsonObject)["c1"] as JsonObject
+        assertEquals("1", characterJson["timeParseVersion"].toString())
+        assertEquals("\"2026-01-03T00:00:00Z\"", characterJson["lorebookMigratedAt"].toString())
+        val memory = characterJson["memory"] as JsonObject
+        assertEquals(1, (memory["scenes"] as JsonArray).size)
+        assertEquals("forest", ((memory["sceneState"] as JsonObject)["key"] as JsonPrimitive).content)
+        assertEquals(1, (memory["pendingRecall"] as JsonArray).size)
+        val instant = (memory["instant"] as JsonArray)[0] as JsonObject
+        assertEquals("\"2026-01-02T00:00:00Z\"", instant["extractedAt"].toString())
+
+        val freshDao = FakeCharacterDao()
+        val fresh = LegacyImportService(
+            CharacterRepository(freshDao),
+            ChatRepository(FakeMessageDao()),
+            ConfigRepository(FakeConfigDao()),
+            null,
+        )
+        assertEquals(1, fresh.importJson(exported).characters)
+        val restored = CharacterRepository(freshDao).get("c1")!!
+        assertEquals(1, restored.timeParseVersion)
+        assertEquals("2026-01-03T00:00:00Z", restored.lorebookMigratedAt)
+        assertEquals("userProfile", restored.pendingRecall?.category)
+        assertEquals(listOf("tea"), restored.pendingRecall?.tags)
+        assertEquals("forest", restored.sceneState?.key)
+        assertEquals("m1", restored.sceneState?.startMessageId)
+        assertEquals(1, restored.scenes.size)
+        assertEquals("2026-01-02T00:00:00Z", restored.instant.single().extractedAt)
+        assertEquals(2, restored.staticFillMeta?.failures)
     }
 
     private class FakeCharacterDao : CharacterDao {

@@ -17,8 +17,11 @@ import com.deeptalking.domain.agent.prompts.buildVolatileContext
 import com.deeptalking.domain.agent.prompts.withDynamicField
 import com.deeptalking.domain.agent.prompts.withStaticField
 import com.deeptalking.domain.agent.background.BackgroundTasks
+import com.deeptalking.domain.agent.background.dedupeRepeatedEnding
+import com.deeptalking.domain.agent.background.recentReplyTexts
 import com.deeptalking.domain.agent.tools.SubmitResponseTool
 import com.deeptalking.domain.memory.MemoryService
+import com.deeptalking.domain.memory.resolveMemoryConflicts
 import com.deeptalking.engine.ondevice.LlmBackend
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -64,6 +67,7 @@ class ChatOrchestrator(
     private val backgroundTasks: BackgroundTasks? = null,
     private val runBackgroundTasks: Boolean = true,
     private val onCharacterUpdated: (Character) -> Unit = {},
+    private val imageResolver: ((String) -> String?)? = null,
 ) {
 
     suspend fun run(
@@ -75,7 +79,7 @@ class ChatOrchestrator(
         onQuickRepliesRepaired: (List<String>) -> Unit = {},
         proactive: Boolean = false,
     ): OrchestratorResult {
-        val builder = RequestBuilder(config)
+        val builder = RequestBuilder(config, imageResolver)
         val instructions = buildSystemPrompt(PersonaInputs(character, config, proactive))
         val context = AgentContext(character = character, activeCharacterId = character.id)
 
@@ -130,19 +134,31 @@ class ChatOrchestrator(
         // Tool-driven edits win first; memory deltas fold onto that copy.
         // The pending recall surfaced in this turn's volatile context is consumed here;
         // applyMemory may set a fresh one from this turn's `recall`.
+        // Legacy scans the recent instant window (not just the current query) for
+        // lorebook keyword hits.
+        val lorebookQuery = buildString {
+            val recent = character.instant
+                .filter { !it.isLoading && it.content.isNotBlank() }
+                .takeLast(6)
+                .joinToString("\n") { it.content }
+            if (recent.isNotEmpty()) append(recent).append('\n')
+            append(userText)
+        }
         val base = bumpLorebookMentions(
             outcome.updatedCharacter ?: character,
-            memory.selectLorebook(character, userText),
+            memory.selectLorebook(character, lorebookQuery),
         ).copy(pendingRecall = null)
         val updated = applyMemory(base, parsed)
 
         // The visible reply may be replaced by the style critique before it is shown,
         // matching the legacy flow (critique runs inline; repair + extraction run after).
-        val displayReply = if (backgroundTasks != null && runBackgroundTasks && config.styleCritique) {
+        val previousReply = recentReplyTexts(character, 1).firstOrNull()
+        val critiqued = if (backgroundTasks != null && runBackgroundTasks && config.styleCritique) {
             backgroundTasks.critiqueStyle(updated, parsed.reply)
         } else {
             parsed.reply
         }
+        val displayReply = dedupeRepeatedEnding(critiqued, previousReply)
 
         // Mirror the live conversation window into `character.instant` (legacy
         // `memory.instant`): tools (set_reminder), the volatile context and the
@@ -155,7 +171,7 @@ class ChatOrchestrator(
         val instantWindow = (history.filter { !it.rejected } + assistantMessage).let {
             if (it.size > AppLimits.Memory.INSTANT) it.takeLast(AppLimits.Memory.INSTANT) else it
         }
-        val characterWithInstant = updated.copy(instant = instantWindow)
+        val characterWithInstant = updated.copy(instant = instantWindow, revision = character.revision + 1)
 
         if (backgroundTasks != null && runBackgroundTasks) {
             backgroundTasks.scheduleTurn(
@@ -168,6 +184,7 @@ class ChatOrchestrator(
                 quickReplyRepairEnabled = config.quickReplyRepair,
                 onCharacterUpdated = onCharacterUpdated,
                 onQuickRepliesRepaired = onQuickRepliesRepaired,
+                proseFallback = parsed.raw == null,
             )
         }
 
@@ -299,7 +316,7 @@ class ChatOrchestrator(
             updated = updated.copy(members = members)
         }
 
-        return updated
+        return resolveMemoryConflicts(updated)
     }
 
     /** Reads `{ "value": "..." }` (or a bare string) from a state-field element. */

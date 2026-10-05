@@ -24,6 +24,7 @@ internal object StreamText {
     )
     private val MEM_UPDATE_OPEN = Regex("""<\s*MEM_UPDATE\s*>""", RegexOption.IGNORE_CASE)
     private val REPLY_KEY = Regex(""""reply"\s*:""")
+    private val REPAIRED_REPLY = Regex(""""reply"\s*:\s*("(?:[^"\\]|\\.)*")""")
 
     /** Restores literal `\n` to real newlines, keeping an already-double-escaped `\\n` literal. */
     fun unescapeLiteralNewlines(text: String): String =
@@ -64,9 +65,20 @@ internal object StreamText {
             if (ch == '"') {
                 if (backslashes % 2 == 0) {
                     val token = text.substring(start, j + 1)
-                    return runCatching {
+                    val parsed = runCatching {
                         (json.parseToJsonElement(token) as? JsonPrimitive)?.contentOrNull
                     }.getOrNull()
+                    if (parsed != null) return parsed
+                    // Unescaped quotes / control chars inside the reply value: apply
+                    // the same targeted repair then re-extract (legacy responses.js:186-193).
+                    val repaired = ResponseParser.repairFreetextFields(text)
+                    val repairedMatch = REPAIRED_REPLY.find(repaired)
+                    if (repairedMatch != null) {
+                        return runCatching {
+                            (json.parseToJsonElement(repairedMatch.groupValues[1]) as? JsonPrimitive)?.contentOrNull
+                        }.getOrNull()
+                    }
+                    return null
                 }
                 backslashes = 0
                 j++

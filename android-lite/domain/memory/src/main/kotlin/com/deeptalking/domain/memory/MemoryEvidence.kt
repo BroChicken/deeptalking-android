@@ -2,9 +2,10 @@ package com.deeptalking.domain.memory
 
 import com.deeptalking.core.common.trimTo
 import com.deeptalking.core.model.Character
+import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.LongTermMemory
 import com.deeptalking.core.model.MemoryCategory
-import com.deeptalking.core.model.Role
+import com.deeptalking.core.model.MemorySubject
 import java.time.Instant
 
 /**
@@ -133,6 +134,113 @@ fun hasStaticEditIntent(fieldKey: String, resolved: List<SourceRef>): Boolean {
         if (EDIT_INTENT_DENY.containsMatchIn(text)) return@any false
         entry.role == "user" && alias.containsMatchIn(text.lowercase()) && EDIT_INTENT.containsMatchIn(text)
     }
+}
+
+/**
+ * Resolves the sources backing a promise entry (legacy `resolvePromiseSources`).
+ * A character promise may cite `current_response` (validated against
+ * [assistantMessage]); otherwise the cited sources must resolve, with an
+ * assistant message whose text contains [LongTermMemory.evidence]. Non-character
+ * promises must be backed by real user evidence.
+ */
+fun resolvePromiseSources(
+    character: Character,
+    item: LongTermMemory,
+    assistantMessage: ChatMessage?,
+    sources: Map<String, SourceRef> = knownSources(character),
+): List<SourceRef>? {
+    val ids = item.sourceMessageIds.map { it.trim() }.filter { it.isNotEmpty() }.take(8)
+    val evidence = item.evidence.trimTo(300)
+    if (evidence.length < 2) return null
+    if (item.promisor == "character") {
+        if (ids.contains("current_response")) {
+            val message = assistantMessage ?: return null
+            if (!evidenceMatchesSummary(message.content, evidence)) return null
+            return listOf(SourceRef(message.id, "assistant", message.content))
+        }
+        val resolvedAssistant = resolveMemorySources(character, item.sourceMessageIds, sources) ?: return null
+        if (resolvedAssistant.none { it.role == "assistant" && it.text.contains(evidence) }) return null
+        return resolvedAssistant
+    }
+    return hasValidUserEvidence(character, item.sourceMessageIds, evidence, sources)
+}
+
+/**
+ * Resolves a dynamic-state update's sources (legacy `resolveDynamicStateSources`):
+ * `current_response` alone maps to the assistant message when its content matches
+ * [evidence]; everything else must satisfy the user-evidence rule.
+ */
+fun resolveDynamicStateSources(
+    character: Character,
+    sourceMessageIds: List<String>,
+    evidence: String?,
+    assistantMessage: ChatMessage?,
+    sources: Map<String, SourceRef> = knownSources(character),
+): List<SourceRef>? {
+    val ids = sourceMessageIds.map { it.trim() }.filter { it.isNotEmpty() }.take(8)
+    if (ids.contains("current_response")) {
+        if (ids.size != 1) return null
+        val message = assistantMessage ?: return null
+        if (!evidenceMatchesSummary(message.content, evidence)) return null
+        return listOf(SourceRef(message.id, "assistant", message.content))
+    }
+    return hasValidUserEvidence(character, ids, evidence, sources)
+}
+
+/**
+ * Category/subject/evidence/role gate for automatic long-term writes
+ * (legacy `isValidAutomaticMemory`). Model-authored entries must trace to a real
+ * message with the right role; a `legacy`/`character` subject or missing evidence
+ * is always rejected.
+ *
+ * SIMPLIFIED: the legacy `userEvidence`/`sourceRoles` short-term arrays are not
+ * stored on [com.deeptalking.core.model.ShortTermMemory], so only sources still
+ * present in `character.instant` can satisfy the user-evidence rule.
+ */
+fun isValidAutomaticMemory(
+    character: Character,
+    item: LongTermMemory,
+    sources: Map<String, SourceRef> = knownSources(character),
+    assistantMessage: ChatMessage? = null,
+): Boolean {
+    val subject = item.subject
+    if (subject == MemorySubject.Legacy) return false
+    val evidence = item.evidence.trimTo(300)
+    if (evidence.length < 2) return false
+    if (item.category == MemoryCategory.Promises) {
+        if (item.promisor == "character") {
+            if (subject == MemorySubject.User) return false
+            return resolvePromiseSources(character, item, assistantMessage, sources) != null
+        }
+        if (subject == MemorySubject.Character) return false
+        val promiseSources = resolveMemorySources(character, item.sourceMessageIds, sources) ?: return false
+        if (promiseSources.none { it.text.contains(evidence) }) return false
+        val promiseRoles = promiseSources.map { it.role }
+        return (subject == MemorySubject.User && promiseRoles.all { it == "user" }) ||
+            (subject == MemorySubject.Relationship && promiseRoles.contains("user"))
+    }
+    if (subject == MemorySubject.Character) return false
+    val resolved = resolveMemorySources(character, item.sourceMessageIds, sources) ?: return false
+    if (resolved.none { it.text.contains(evidence) }) return false
+    val roles = resolved.map { it.role }
+    val allUser = roles.all { it == "user" }
+    val includesUser = roles.contains("user")
+    return when (item.category) {
+        MemoryCategory.UserProfile, MemoryCategory.Habits -> subject == MemorySubject.User && allUser
+        MemoryCategory.Relationship -> subject == MemorySubject.Relationship && includesUser
+        MemoryCategory.Events ->
+            eventIdentity(item.eventTime).isNotEmpty() &&
+                ((subject == MemorySubject.User && allUser) ||
+                    ((subject == MemorySubject.Relationship || subject == MemorySubject.World) && includesUser))
+        else -> false
+    }
+}
+
+/** True when a short user turn is substantive enough to capture (legacy `shouldCaptureUserTurn`). */
+fun shouldCaptureUserTurn(text: String): Boolean {
+    val value = text.trim()
+    if (value.length < 3) return false
+    return !Regex("^(你好|您好|嗨|哈喽|早安|晚安|在吗|谢谢|好的|嗯+|哈哈+)[！!。.，,\\s]*$").matches(value)
 }
 
 // ---- semantic conflict + self-learned importance --------------------------------------

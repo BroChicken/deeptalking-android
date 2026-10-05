@@ -7,22 +7,26 @@ import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.domain.agent.AgentContext
 import com.deeptalking.domain.agent.AgentTool
 import com.deeptalking.domain.agent.AgentToolResult
+import com.deeptalking.domain.agent.prompts.trimText
 import com.deeptalking.domain.memory.MemoryService
+import com.deeptalking.domain.memory.hasValidUserEvidence
+import com.deeptalking.domain.memory.parseRelativeText
+import com.deeptalking.domain.memory.parseZoned
+import com.deeptalking.domain.memory.resolveTimeRef
 import com.deeptalking.engine.ondevice.ToolCall
 import com.deeptalking.engine.ondevice.ToolDefinition
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import java.time.Instant
+import java.time.ZonedDateTime
+import java.util.UUID
 
-/**
- * Port of the `set_reminder` branch in tool-execution.js.
- *
- * SIMPLIFIED: source evidence is validated against real user messages in the
- * character's history; the full `hasValidUserEvidence` excerpt matching stays
- * in the memory layer. The promise is persisted through [MemoryService.applyTurn].
- */
+/** Port of the `set_reminder` branch in tool-execution.js. */
 class SetReminderTool(private val memory: MemoryService) : AgentTool {
 
     override val definition = ToolDefinition(
@@ -50,55 +54,88 @@ class SetReminderTool(private val memory: MemoryService) : AgentTool {
 
     override suspend fun execute(call: ToolCall, context: AgentContext): AgentToolResult {
         val args = ToolArgs.parse(call.arguments)
-        val key = ToolArgs.string(args, "key").trim().take(100)
-        val value = ToolArgs.string(args, "value").trim().take(900)
-        if (key.isEmpty() || value.isEmpty()) return AgentToolResult(errorJson("缺少 key 或 value"))
-        val evidence = ToolArgs.string(args, "evidence").trim().take(300)
+        val reminderKey = trimText(ToolArgs.string(args, "key"), 100)
+        val reminderValue = trimText(ToolArgs.string(args, "value"), 900)
+        if (reminderKey.isEmpty() || reminderValue.isEmpty()) return AgentToolResult(errorJson("缺少 key 或 value"))
+
+        val evidence = trimText(ToolArgs.string(args, "evidence"), 300)
         val sourceIds = ToolArgs.strings(args, "sourceMessageIds").map { it.trim() }.filter { it.isNotEmpty() }
-        val knownUserIds = context.character.instant.filter { it.role.name == "User" }.map { it.id }.toSet()
-        val validSources = sourceIds.filter { it in knownUserIds }
-        if (validSources.isEmpty() || evidence.isEmpty()) {
+        val resolvedSources = hasValidUserEvidence(context.character, sourceIds, evidence)
+        if (resolvedSources == null) {
             return AgentToolResult(
                 errorJson("只能记录用户自己明确提出或同意的待办：请附用户原话 sourceMessageIds 与 evidence；若是你要求用户去做的事，请先在回复中征询用户，等用户答应后再记录"),
             )
         }
+
+        val character = context.character
+        val requestedMember = ToolArgs.string(args, "memberName").trim().ifEmpty { null }
+        val member = requestedMember?.let { MemoryToolSupport.resolveMember(character, it) }
+        val memberName = member?.name
+
         val now = Instant.now().toString()
-        val dueAt = ToolArgs.string(args, "dueAt").trim().ifEmpty { null }
-        val memberName = ToolArgs.string(args, "memberName").trim().ifEmpty { null }
-        // Update an existing active promise with the same key rather than inserting a
-        // duplicate (legacy set_reminder merges by key).
-        val existing = context.character.longTerm.firstOrNull {
+        val nowZoned = ZonedDateTime.now()
+        val resolved = resolveTimeRef(ToolArgs.timeRef(args, "timeRef"), nowZoned)
+        val base = resolved?.iso ?: now
+        val baseZoned = parseZoned(base) ?: nowZoned
+        val parsedKey = parseRelativeText(reminderKey, baseZoned)
+        val parsedValue = parseRelativeText(reminderValue, baseZoned)
+        val dueAt = MemoryToolSupport.normalizeTimestamp(ToolArgs.string(args, "dueAt"), null) ?: resolved?.iso
+
+        val store = member?.longTerm ?: character.longTerm
+        val existing = store.firstOrNull {
             it.category == MemoryCategory.Promises &&
                 it.status == PromiseStatus.Active &&
-                it.key.equals(key, ignoreCase = true) &&
-                (memberName == null || it.memberName.equals(memberName, ignoreCase = true))
+                it.key.equals(reminderKey, ignoreCase = true)
         }
-        val reminder = LongTermMemory(
-            id = existing?.id ?: java.util.UUID.randomUUID().toString(),
-            category = MemoryCategory.Promises,
-            subject = MemorySubject.User,
-            key = key,
-            value = value,
-            tags = existing?.tags ?: emptyList(),
-            importance = existing?.importance ?: 6,
-            sourceMessageIds = validSources,
-            evidence = evidence,
-            eventTime = existing?.eventTime ?: now,
-            dueAt = dueAt,
-            promisor = "user",
-            promisee = "character",
-            status = PromiseStatus.Active,
-            createdAt = existing?.createdAt ?: now,
-            updatedAt = now,
-            lastRecalled = existing?.lastRecalled,
-            recallCount = existing?.recallCount ?: 0,
-            notifiedAt = null,
-        )
-        val memberLongTerm = if (memberName != null) mapOf(memberName to listOf(reminder)) else emptyMap()
-        val shared = if (memberName != null) emptyList() else listOf(reminder)
-        memory.applyTurn(context.character, shortTerm = emptyList(), longTerm = shared, memberLongTerm = memberLongTerm)
-        return AgentToolResult(
-            """{"ok":true,"key":${quote(key)},"dueAt":${dueAt?.let { quote(it) } ?: "null"}}""",
-        )
+
+        val updatedCharacter: com.deeptalking.core.model.Character
+        val resultId: String
+        if (existing != null) {
+            updatedCharacter = memory.updateMemory(character, existing.id, memberName) { old ->
+                old.copy(
+                    value = reminderValue,
+                    dueAt = dueAt ?: old.dueAt,
+                    updatedAt = now,
+                )
+            }
+            resultId = existing.id
+        } else {
+            val reminder = LongTermMemory(
+                id = UUID.randomUUID().toString(),
+                category = MemoryCategory.Promises,
+                subject = MemorySubject.User,
+                key = parsedKey,
+                value = parsedValue,
+                tags = emptyList(),
+                importance = 6,
+                sourceMessageIds = resolvedSources.map { it.id }.distinct().take(8),
+                evidence = evidence,
+                eventTime = now,
+                dueAt = dueAt,
+                promisor = "user",
+                promisee = "character",
+                status = PromiseStatus.Active,
+                createdAt = now,
+                updatedAt = now,
+                recallCount = 0,
+            )
+            resultId = reminder.id
+            val shared = if (member == null) listOf(reminder) else emptyList()
+            val memberLongTerm = if (member != null) mapOf(member.name to listOf(reminder)) else emptyMap()
+            updatedCharacter = memory.applyTurn(character, emptyList(), shared, memberLongTerm)
+        }
+
+        val dueAtJson: JsonElement = if (dueAt != null) {
+            JsonPrimitive(MemoryToolSupport.formatContextTime(dueAt))
+        } else {
+            JsonNull
+        }
+        val payload = buildJsonObject {
+            put("ok", true)
+            put("id", resultId)
+            put("key", reminderKey)
+            put("dueAt", dueAtJson)
+        }
+        return AgentToolResult(payload.toString(), updatedCharacter = updatedCharacter)
     }
 }

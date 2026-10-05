@@ -1,5 +1,6 @@
 package com.deeptalking.domain.agent
 
+import com.deeptalking.domain.agent.tools.SendStickerTool
 import com.deeptalking.engine.ondevice.ToolCall
 import com.deeptalking.engine.ondevice.ToolDefinition
 
@@ -10,7 +11,9 @@ import com.deeptalking.engine.ondevice.ToolDefinition
 class ToolRegistry(private val tools: List<AgentTool>) {
 
     fun definitions(context: AgentContext): List<ToolDefinition> =
-        tools.filter { it.isEnabled(context) }.map { it.definition }
+        tools.filter { it.isEnabled(context) }.map { tool ->
+            if (tool is SendStickerTool) tool.definitionFor(context) else tool.definition
+        }
 
     suspend fun execute(call: ToolCall, context: AgentContext): AgentToolResult {
         val tool = tools.firstOrNull { it.definition.name == call.name }

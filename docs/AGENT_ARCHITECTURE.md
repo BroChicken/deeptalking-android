@@ -400,6 +400,8 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 | 其余 | src/js/characters/avatar.js:98 emoji 头像 / src/js/prompts/request.js:88 散文转 JSON / src/js/storage/profile-migration.js:68 字段重排 / src/js/storage/lorebook-migration.js:124 群组字段迁移 / src/js/media/stickers.js:92 贴图标签 | 低价值路径，未做经验对齐 |
 
 > 像素头像提示词 `PIXEL_AVATAR_PROMPT`（src/js/characters/avatar.js:72）**不参与任何建卡/补全 prompt**（像素头像为已废弃试验品），仅保留定义与遗留生成器 `requestPixelAvatar`。
+>
+> 原生化：建卡/群组升级/成员补全的 prompt 拼装与 JSON 解析已按同一约束移植到 `:feature:characters` 的 `CharacterParity`（静态 12 + `dynamicState` 7 + 2-4 条 `lorebook`，成员全字段解析、头像描述含 `roleInGroup`、只补空字段），网络调用仍在 `:app` 的 `NativeCore`；详见 `docs/NATIVE_MODULES.md`。
 
 ## 八、健壮性
 

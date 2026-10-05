@@ -42,6 +42,11 @@ data class LlmRequest(
     val apiPlatform: String? = null,
     /** Stable session id (`deeptalking-<charId>` / `deeptalking-general`). */
     val sessionId: String? = null,
+    /**
+     * Resolves a stored image reference to a `data:` URL for multimodal input
+     * (legacy `buildUserMessageContent`). Null when the caller has no media access.
+     */
+    val imageResolver: ((String) -> String?)? = null,
 )
 
 data class ToolCall(

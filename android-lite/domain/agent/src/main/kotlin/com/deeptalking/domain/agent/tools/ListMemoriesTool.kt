@@ -3,9 +3,12 @@ package com.deeptalking.domain.agent.tools
 import com.deeptalking.domain.agent.AgentContext
 import com.deeptalking.domain.agent.AgentTool
 import com.deeptalking.domain.agent.AgentToolResult
+import com.deeptalking.domain.agent.prompts.maskUserWord
+import com.deeptalking.domain.agent.prompts.trimText
 import com.deeptalking.domain.memory.MemoryService
 import com.deeptalking.engine.ondevice.ToolCall
 import com.deeptalking.engine.ondevice.ToolDefinition
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
@@ -32,6 +35,8 @@ class ListMemoriesTool(private val memory: MemoryService) : AgentTool {
         val limit = (ToolArgs.int(args, "limit") ?: 30).coerceIn(1, 50)
         val memberName = ToolArgs.string(args, "memberName").trim().ifEmpty { null }
         val character = context.character
+        val member = memberName?.let { MemoryToolSupport.resolveMember(character, it) }
+        val host = if (member != null) MemoryToolSupport.memberAsCharacter(character, member) else character
 
         val listed = memory
             .listMemories(character, category = category, keyword = keyword, memberName = memberName, limit = limit)
@@ -42,13 +47,13 @@ class ListMemoriesTool(private val memory: MemoryService) : AgentTool {
                 add(
                     buildJsonObject {
                         put("id", item.id)
-                        put("category", item.category.name)
+                        put("category", item.category.legacyKey)
                         put("subject", item.subject.name.lowercase())
-                        put("subjectLabel", MemoryToolSupport.actorLabel(character, item.subject))
-                        put("key", item.key.take(100))
+                        put("subjectLabel", MemoryToolSupport.actorLabel(host, item.subject))
+                        put("key", maskUserWord(host, trimText(item.key, 100)))
                         put("importance", item.importance)
                         put("status", item.status.name.lowercase())
-                        put("updatedAt", item.updatedAt ?: item.createdAt ?: "")
+                        put("updatedAt", MemoryToolSupport.formatContextTime(item.updatedAt ?: item.createdAt))
                     },
                 )
             }
@@ -56,7 +61,7 @@ class ListMemoriesTool(private val memory: MemoryService) : AgentTool {
         val payload = buildJsonObject {
             put("ok", true)
             put("category", category.ifEmpty { "all" })
-            put("keyword", keyword)
+            put("keyword", if (keyword.isEmpty()) JsonNull else kotlinx.serialization.json.JsonPrimitive(keyword))
             put("count", listed.size)
             put("items", items)
         }

@@ -28,4 +28,6 @@ data class LorebookEntry(
     val lastMentionedAt: String? = null,
     /** Consecutive consolidation passes without a hit (legacy `misses`). */
     val misses: Int = 0,
+    /** Sort priority for injection order (legacy `order`, default 100). */
+    val order: Int = 100,
 )

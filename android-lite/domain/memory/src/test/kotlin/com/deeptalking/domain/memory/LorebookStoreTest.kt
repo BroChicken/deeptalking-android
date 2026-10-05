@@ -1,8 +1,10 @@
 package com.deeptalking.domain.memory
 
 import com.deeptalking.core.model.Character
+import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.LorebookOrigin
+import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.ShortTermMemory
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -86,6 +88,46 @@ class LorebookStoreTest {
         assertFalse(resolveLorebookSources(character, listOf("nope"), "银月商会"))
         assertFalse(resolveLorebookSources(character, listOf("s1"), "完全无关的内容"))
         assertFalse(resolveLorebookSources(character, listOf("s1"), ""))
+    }
+
+    @Test
+    fun generatedNormalizationMarksModelAndPromotesKeywordlessUpToCap() {
+        val entries = listOf(
+            LorebookEntry(id = "e0", name = "显式常驻", content = "c", origin = LorebookOrigin.User, alwaysActive = true),
+            LorebookEntry(id = "e1", name = "无名一", content = "c", origin = LorebookOrigin.User),
+            LorebookEntry(id = "e2", name = "有关键词", content = "c", keywords = listOf("k"), origin = LorebookOrigin.User),
+            LorebookEntry(id = "e3", name = "无名二", content = "c", origin = LorebookOrigin.User),
+        )
+
+        val normalized = normalizeGeneratedLorebook(entries, LorebookLimits(maxAlwaysActive = 2))
+
+        assertTrue(normalized.all { it.origin == LorebookOrigin.Model })
+        assertTrue(normalized.first { it.id == "e0" }.alwaysActive)
+        assertTrue(normalized.first { it.id == "e1" }.alwaysActive)
+        assertFalse(normalized.first { it.id == "e2" }.alwaysActive)
+        assertFalse(normalized.first { it.id == "e3" }.alwaysActive)
+    }
+
+    @Test
+    fun evidenceOverlapAcceptsASingleSubstantiveBigram() {
+        assertTrue(lorebookEvidenceOverlaps("银月商会在西街，经营药材", "经营药材贸易"))
+        assertFalse(lorebookEvidenceOverlaps("银月商会在西街", "完全无关的内容"))
+        assertFalse(lorebookEvidenceOverlaps("xyz", "ab"))
+    }
+
+    @Test
+    fun resolveLorebookSourcesAcceptsUserAndAssistantMessages() {
+        val character = Character(
+            id = "c1",
+            instant = listOf(
+                ChatMessage(id = "m1", role = Role.Assistant, content = "潮汐镇终年多雾"),
+                ChatMessage(id = "m2", role = Role.User, content = "我们住在海边"),
+            ),
+        )
+        assertTrue(resolveLorebookSources(character, listOf("m1"), "潮汐镇"))
+        assertTrue(resolveLorebookSources(character, listOf("m2"), "海边"))
+        assertFalse(resolveLorebookSources(character, listOf("missing"), "潮汐镇"))
+        assertFalse(resolveLorebookSources(character, listOf("m1"), "完全无关"))
     }
 
     @Test

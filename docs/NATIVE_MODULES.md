@@ -18,10 +18,10 @@ DeepTalking 是原生 Android 应用（Kotlin + Jetpack Compose 多模块），�
 | `:core:notifications` | core | 通知渠道、`ReminderWorker`、`Reminders`（WorkManager 调度） |
 | `:core:designsystem` | core | `DeepTalkingTheme` + `AppTheme`（清浅/夜色/深海/旧灯 四套固定配色） |
 | `:domain:agent` | domain | `AgentTool/ToolRegistry`、`ChatOrchestrator`、`AgentLoop`、提示词装配（`prompts/`）、结构化解析（`ResponseParser`）、工具实现（`tools/`）、后台任务（`background/BackgroundTasks`：文风校对、快速回应换位生成、记忆抽取/分析、场景概要、世界书整理、空字段补全、字段/世界书迁移） |
-| `:domain:memory` | domain | `MemoryService` + `MemoryServiceImpl`、检索/世界书匹配/记忆策略/时间工具、`MemoryEvidence`（证据与静态修改意图校验、自学习重要度）、`LorebookStore`（世界书写入/合并/来源校验/去重） |
+| `:domain:memory` | domain | `MemoryService` + `MemoryServiceImpl`、检索/世界书匹配/记忆策略/时间工具、`MemoryEvidence`（证据与意图校验、自学习重要度、自动写入合法性判定、promise/dynamic 来源解析）、`MemoryPolicy`（记忆衰减/淘汰、短/长期裁剪、冲突保留与裁决）、`LorebookStore`（世界书写入/合并/来源校验/去重/生成条目规范化）、`RelativeTimeMigration`（旧相对时间一次性转绝对日期） |
 | `:engine:ondevice` | engine | 端侧推理接口：`LlmBackend/EmbeddingBackend/AsrBackend/TtsBackend` + `InferenceRegistry` |
 | `:feature:chat` | feature | 聊天界面：头像/气泡（尾角圆角）/流式打字/工具活动/快速回应/图片/表情包（含标签编辑）/消息操作（复制、编辑重发、重新生成）/⚡📖 状态改动提示/图片灯箱。**性能**：消息仅在有公式时才用 `RichTextWebView`，其余走纯 Compose `RichText`（`renderMarkdownAnnotated`），配合稳定 `key` 保证滚动顺滑 |
-| `:feature:characters` | feature | 角色/群组列表（群组展开成员子行，可直接编辑成员）、创建弹窗（单角色/群组 + 一句话生成）、角色卡编辑器（基础/当前状态/世界书 **三** 标签，不再有记忆可视化页；世界书每条含 **启用** + **常驻** 两勾选、条目名、命中次数/最近命中时间、来源标签）、AI emoji 头像、成员一句话补全、升级为群组、导出/导入、补全头像（含群组成员） |
+| `:feature:characters` | feature | 角色/群组列表（群组展开成员子行，可直接编辑成员）、创建弹窗（单角色/群组 + 一句话生成）、角色卡编辑器（基础/当前状态/世界书 **三** 标签，不再有记忆可视化页；世界书每条含 **启用** + **常驻** 两勾选、条目名、命中次数/最近命中时间、来源标签）、AI emoji 头像、成员一句话补全、升级为群组、导出/导入、补全头像（含群组成员）。纯解析/清洗助手集中在本模块 `CharacterParity` / `FieldCleaning`（供 `:app` 复用） |
 | `:feature:settings` | feature | 平台下拉（显示名；切换时按平台独立保存 Base URL/模型/API Key）、Base URL、模型（可输入 + 预设建议）、Temperature、流式、思考强度、API Key、测试连接、测试提醒、调试信息（最近回应/用量/缓存）+ 复制 |
 | `:feature:richtext` | feature | `MarkdownRenderer`（纯 Kotlin）+ `RichTextWebView`（KaTeX 早渲染） |
 
@@ -40,11 +40,21 @@ DeepTalking 是原生 Android 应用（Kotlin + Jetpack Compose 多模块），�
 - 消息区：`max-width 56rem` 居中；气泡 `max-width min(84%,560)`、内距 `12px 14px`、圆角 12 + 尾角 4、无阴影、字号 15、行高 1.68；AI 头像 30dp 圆角方块（用户消息无头像）；typing 三点；消息 meta 行（时间 + 30dp 圆形操作按钮）。
 - 交互回退回旧版：角色**主动开口**为面板空闲 **60s** 自动触发（随应用可见性暂停/重置），非手动按钮；编辑重发/重新生成会**丢弃后续分支及相关记忆**。
 - 世界书条目受 `enabled` 控制：禁用的条目不参与注入（`LorebookMatcher.select` 过滤），与「常驻」互不影响。
+- 多模态：用户图片在请求装配时由 `LlmRequest.imageResolver` 解析为 `data:` URL，`buildResponsesInput` 生成 `input_text` + `input_image(detail:auto)` 内容数组（对齐 `buildUserMessageContent`）。
+- 表情包：新增后由视觉模型从 `STICKER_TAGS` 词表自动打标签（`NativeCore.tagSticker`，未分类时才写）；`send_sticker` 按标签精确匹配，失败再按子串双向兜底，schema 内联该角色的标签枚举。
+- 对话循环（`AgentLoop`/`ResponsesLlmBackend`）：工具上限、提交重试、空回复的 `extractResponsesText`/内嵌 `reply` JSON（含 reasoning 项）/`extractAnyResponseText` 抢救顺序对齐旧版；带 180s 硬超时 + 60s 流式空闲中断；`web_search_call.*` 事件经保留状态 chunk 上报为活动提示；启动/导入时静默修损坏头像（`autoRepairAvatars`）。
+- 注入顺序：世界书按 `order`（默认 100）→ 常驻 → 名称排序后按字符预算截断；命中记 `mentions` 并重置 `misses`。
+- 角色功能对齐旧版（`feature:characters`，纯助手无 Android 依赖、可单测）：
+  - 一句话建卡/群组升级的 prompt 覆盖完整静态 12 字段 + 7 项 `dynamicState` + 2-4 条 `lorebook`（`CharacterParity.buildQuickGeneratePrompt`），模型 JSON 解析保留全部字段（`parseGeneratedDraft` / `parseGroupMembersJson`）。
+  - 头像描述含群内定位（`buildAvatarDescription`，成员版追加 `roleInGroup`）。
+  - 编辑器保存前对基础/动态字段做清洗与相对时间→绝对日期换算、`userAddress` 归一化（`normalizeEditedDraft` / `FieldCleaning.cleanFieldValue` / `parseRelativeText`）。
+  - 成员一句话补全只填空字段并覆盖静态 + `roleInGroup` + 7 项动态状态（`applyMemberFillPayload`）。
+  - 世界书新增条目默认 `alwaysActive=true`（`newUserLorebookEntry`），名称/内容受 `AppLimits.Lorebook` 上限约束，关键词清空即转常驻（`keywordsToAlwaysActive`）。
 
 ## 数据与迁移
 
 - 数据唯一入口：`:core:data` 仓库层（Room + DataStore）。禁止绕过仓库访问数据库。
-- 旧版 WebView 的 localStorage 数据通过 `legacy/LegacyImportService` 一次性导入；`legacy/BackupService` 保留旧 JSON 根结构（`{config, characters, activeCharacterId, activeTheme, version}`）的导入导出，导出时每个角色的会话从聊天表（`ChatRepository`）读入 `memory.instant`，不再依赖 `character.instant`。UI 通过系统文件选择器（SAF）导出/导入备份。
+- 旧版 WebView 的 localStorage 数据通过 `legacy/LegacyImportService` 一次性导入；`legacy/BackupService` 保留旧 JSON 根结构（`{config, characters, activeCharacterId, activeTheme, version}`）的导入导出，导出时每个角色的会话从聊天表（`ChatRepository`）读入 `memory.instant`，不再依赖 `character.instant`。UI 通过系统文件选择器（SAF）导出/导入备份；**导入为整体替换（先清空再写入，带覆盖确认），按 `decodeImportBytes`（UTF-8→GBK→UTF-8 兜底）解码，并迁移同一天重复事件记忆、恢复 `activeCharacterId`、导入后静默补全并询问迁移**。
 - 每平台配置槽 `AppConfig.platformSettings` 保存非密的 Base URL/模型；API Key 走 `SecretStore` 的按平台键（切换平台互不覆盖）。
 - 媒体/表情以文件（`filesDir`）存放（`app/MediaStore`：图片压到 ≤1280px/2MB，表情 ≤384px/120KB），不再以 base64 进库。
 - API Key 存 `:core:security` 的 `SecretStore`（Keystore），UI 只见脱敏状态；导出时剔除。
@@ -53,11 +63,16 @@ DeepTalking 是原生 Android 应用（Kotlin + Jetpack Compose 多模块），�
 
 每轮后台串行执行（`BackgroundTasks.scheduleTurn` → `runMemoryMaintenance`），均可用假后端单测：
 
-- **自适应重要度** `selfLearnMemoryImportance`（`:domain:memory`）：30 天内被使用过的记忆按 `usageCount/2` 升权（封顶 +3）；userProfile/habits 45/90/180 天未召回逐档降到 -3（只降权不删除）。召回时累计 `usageCount`/`lastUsageAt`。
+- **自适应重要度** `selfLearnMemoryImportance`（`:domain:memory`）：30 天内被使用过的记忆按 `usageCount/2` 升权（封顶 +3）；userProfile/habits 45/90/180 天未召回逐档降到 -3（只降权不删除）。召回时累计 `usageCount`/`lastUsageAt`。**记忆衰减/淘汰** `applyMemoryDecay` 同样在维护任务里执行。
+- **自动写入校验**（`MemoryEvidence`）：`isValidAutomaticMemory` 校验模型自动写入的 `longTerm` 的 category/subject/证据/角色规则；promise/dynamic 的来源按 `resolvePromiseSources`/`resolveDynamicStateSources`（含 `current_response`）解析；语义冲突写入 `LongTermMemory.conflicts`/`conflictedAt` 并在维护时由 `resolveMemoryConflicts` 裁决（手动 `update_memory` 会把旧值记入 `corrections` 并清空冲突）。
+- **序号与修订**：每条消息落库带单调 `sequence`（`ensureMessageSequences`）；`Character.revision` 每轮与丢弃分支时自增（`discardConversationBranch` 对齐）。
+- **散文兜底**：本轮若模型返回散文（非结构化 JSON），后台用 `convertProseToJson` + `extractProseTurnMemory` 补齐记忆，再退到 `shouldCaptureUserTurn` 的最小事件捕获。
+- **失败退避**：抽取/分析任务带 `scheduleMemoryRetry`/`canRunMemoryTask` 指数退避，避免失败热循环。
+- **旧会话迁移**：`runInitialMemoryMigration`/`performMigrationExtraction` 对超长旧对话做有界抽取。
 - **场景概要** `summarizeScene`：场景切换（`currentLocation` 变化）或超过 `Scene.SPAN`(24) 条消息且 ≥6 条时，压缩为一条 `scenes`（保留最近 `Scene.SUMMARIES`(2) 条）。游标存 `character.sceneState`。
 - **世界书整理** `consolidateLorebook`：`shortTerm` 有未整理项（`lorebookScannedAt == null`）且积压 ≥ `Lorebook.CONSOLIDATE_SPAN`(8) 或有已分析项时触发；从已沉淀的短期记忆里抽取世界层设定（≤`AUTO_ENTRIES_PER_PASS`(3) 条，`sourceShortTermIds` 必须可回溯），写前整批校验、失败不改标记；写后本地 `dedupeLorebook` 兜底并执行 `evictStaleLorebookEntries` 淘汰（AI 近重复合并、常驻/用户条目豁免）。
-- **空字段补全** `autoFillStaticFields`：启动时静默补齐为空的静态字段（最多 3 个），只补空、绝不覆盖；退避用 `character.staticFillMeta`（成功清零，失败 5→30 分钟指数退避，无失败冷却 24h）。
-- **一次性迁移** `migrateWorldLore`（旧 `description`/`background` 里的世界观拆成世界书条目，可选精简原文，标记 `lorebookMigratedAt`）与 `remapFields`（旧字段结构重排，标记 `fieldsMigrationVersion`）。启动时（有 API Key 且未勾选"以后不再询问"）由 `AppViewModel.checkMigrationPrompts` 弹`AlertDialog`询问——先"字段结构升级"，后"世界书整理"（含"同时精简原文"勾选）；确认走 `NativeCore.runWorldLoreMigration` / `remapCharacterFields`，"以后不再询问"写入 `SettingsStore`（键 `deeptalking_field_migration_skip_v1` / `deeptalking_lorebook_migration_skip_v1`，对应旧版 localStorage 跳过键）。
+- **空字段补全** `autoFillStaticFields`：启动时静默补齐为空的静态字段（最多 3 个），只补空、绝不覆盖；单角色与**群组成员**都补（成员补全带群组上下文）；退避用 `staticFillMeta`（成功清零，失败 5→30 分钟指数退避，无失败冷却 24h）。
+- **一次性迁移** `migrateWorldLore`（旧 `description`/`background` 里的世界观拆成世界书条目，可选精简原文，标记 `lorebookMigratedAt`）与 `remapFields`（旧字段结构重排，标记 `fieldsMigrationVersion`）；另有 `RelativeTimeMigration`（相对时间转绝对日期，标记 `timeParseVersion`）。启动时（有 API Key 且未勾选"以后不再询问"）由 `AppViewModel.checkMigrationPrompts` 弹`AlertDialog`询问——先"字段结构升级"，后"世界书整理"（含"同时精简原文"勾选）；确认走 `NativeCore.runWorldLoreMigration` / `remapCharacterFields`，"以后不再询问"写入 `SettingsStore`（键 `deeptalking_field_migration_skip_v1` / `deeptalking_lorebook_migration_skip_v1`）。**这些写整行角色的任务（补全/迁移/相对时间）在 `NativeCore` 里用同一把 `Mutex` 串行，且 upsert 前按 id 重读最新角色、只覆盖自己负责的字段**，避免互相覆盖标记。新建/导入的实体直接写入 `fieldsMigrationVersion="1.2.0"`、`lorebookMigratedAt=now`，不再反复弹迁移框。
 
 **证据与意图校验**（`MemoryEvidence`）：`hasValidUserEvidence` 要求 `sourceMessageIds` 解析为真实用户消息且 `evidence` 逐字出现；`hasStaticEditIntent` 要求用户原话明确在要求修改该字段。`update_memory` 与 `update_character_field` 工具据此拒绝无据写入；自动写入冲突时 `memoriesSemanticallyDiffer`（token 重叠 <0.35）阻止静默覆盖。
 

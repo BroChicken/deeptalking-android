@@ -1,5 +1,6 @@
 package com.deeptalking.domain.agent.tools
 
+import com.deeptalking.domain.memory.TimeRef
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -53,6 +54,19 @@ internal object ToolArgs {
 
     fun strings(obj: JsonObject, key: String): List<String> =
         array(obj, key)?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull } ?: emptyList()
+
+    /** Parses an optional `timeRef` object (`buildTimeRefSchema` shape). */
+    fun timeRef(obj: JsonObject, key: String): TimeRef? {
+        val ref = obj[key] as? JsonObject ?: return null
+        if (ref.isEmpty()) return null
+        return TimeRef(
+            explicit = string(ref, "explicit").trim().ifEmpty { null },
+            anchor = string(ref, "anchor").trim().ifEmpty { null },
+            offsetDays = int(ref, "offsetDays"),
+            slot = string(ref, "slot").trim().ifEmpty { null },
+            weekday = string(ref, "weekday").trim().ifEmpty { null },
+        )
+    }
 
     private val JsonPrimitive.booleanOrNull: Boolean?
         get() = contentOrNull?.let { it == "true" || it == "1" }

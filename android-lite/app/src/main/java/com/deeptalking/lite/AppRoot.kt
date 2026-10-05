@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -68,6 +69,7 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import com.deeptalking.core.designsystem.AppTheme
 import com.deeptalking.core.designsystem.DeepTalkingTheme
 import com.deeptalking.core.designsystem.legacy
+import com.deeptalking.core.data.legacy.decodeImportBytes
 import com.deeptalking.feature.characters.CharactersScreen
 import com.deeptalking.feature.chat.ChatScreen
 import com.deeptalking.feature.settings.SettingsScreen
@@ -146,17 +148,22 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
             }
         }
     }
+    var pendingImport by remember { mutableStateOf<String?>(null) }
     val importLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument(),
     ) { uri ->
         if (uri != null) {
             scope.launch {
+                // Legacy `decodeImportBuffer`: UTF-8 → GBK → lenient UTF-8.
                 val text = runCatching {
                     kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                        context.contentResolver.openInputStream(uri)?.use { it.readBytes().toString(Charsets.UTF_8) }
+                        val bytes = context.contentResolver.openInputStream(uri)?.use { stream: java.io.InputStream ->
+                            stream.readBytes()
+                        }
+                        bytes?.let { decodeImportBytes(it) }
                     }
                 }.getOrNull()
-                if (text != null) vm.importJson(text) else snackbarHostState.showSnackbar("文件读取失败")
+                if (text != null) pendingImport = text else snackbarHostState.showSnackbar("文件读取失败")
             }
         }
     }
@@ -185,11 +192,11 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                             vm.select(it)
                             scope.launch { drawerState.close() }
                         },
-                        onCreateCharacter = { name, emoji, personality, background ->
-                            vm.createCharacter(name, emoji, personality, background)
+                        onCreateCharacter = { name, emoji, personality, background, draft ->
+                            vm.createCharacter(name, emoji, personality, background, draft)
                         },
-                        onCreateGroup = { name, emoji, description, scene, rules, members ->
-                            vm.createGroup(name, emoji, description, scene, rules, members)
+                        onCreateGroup = { name, emoji, description, scene, rules, members, lorebook ->
+                            vm.createGroup(name, emoji, description, scene, rules, members, lorebook)
                         },
                         onDelete = vm::deleteCharacter,
                         onEdit = { editingCharacter = it; editingMemberIndex = null },
@@ -326,6 +333,18 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
             )
         }
     }
+
+    pendingImport?.let { text ->
+        AlertDialog(
+            onDismissRequest = { pendingImport = null },
+            title = { Text("导入备份") },
+            text = { Text("导入会覆盖当前所有角色与对话，且不可撤销。确定继续吗？") },
+            confirmButton = {
+                TextButton(onClick = { pendingImport = null; vm.importJson(text) }) { Text("覆盖导入") }
+            },
+            dismissButton = { TextButton(onClick = { pendingImport = null }) { Text("取消") } },
+        )
+    }
 }
 
 @Composable
@@ -421,6 +440,8 @@ private fun AppHeader(
                 }
             }
             Spacer(Modifier.weight(1f))
+            // Legacy `#activityStatusBar` and `#cacheStatsBar` are mutually exclusive
+            // siblings in the header row; keep both inline so nothing overlaps.
             if (status.isNotBlank()) {
                 Text(
                     status,
@@ -430,6 +451,8 @@ private fun AppHeader(
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.padding(end = 6.dp),
                 )
+            } else {
+                CachePill(config, Modifier.padding(end = 6.dp))
             }
             ThemeMenu(currentThemeId = currentThemeId, onSelect = onSelectTheme)
             Text(
@@ -440,14 +463,6 @@ private fun AppHeader(
             )
         }
         Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(legacy.border).align(Alignment.BottomStart))
-        // Legacy mutual exclusion (`setActivity` hides `#cacheStatsBar`, `clearActivity`
-        // restores it): the cache pill only shows while no activity status is present.
-        if (status.isBlank()) {
-            CachePill(
-                config,
-                Modifier.align(Alignment.BottomEnd).padding(end = 12.dp, bottom = 3.dp),
-            )
-        }
     }
 }
 
@@ -462,7 +477,10 @@ private fun CachePill(config: com.deeptalking.core.model.AppConfig, modifier: Mo
             val recent = metrics.takeLast(12).filter { it.inputTokens > 0 }
             val last = recent.lastOrNull()?.hitRate ?: 0.0
             val avg = if (recent.isEmpty()) 0.0 else recent.map { it.hitRate }.average()
-            "缓存命中 ${(last * 100).toInt()}% · 近${recent.size}轮均值 ${(avg * 100).toInt()}%"
+            val tokens = recent.lastOrNull()?.let { m ->
+                " · " + formatCompactNumber(m.hitTokens) + "/" + formatCompactNumber(m.missTokens)
+            } ?: ""
+            "缓存命中 ${(last * 100).toInt()}% · 近${recent.size}轮均值 ${(avg * 100).toInt()}%$tokens"
         }
     }
     Text(
@@ -472,11 +490,20 @@ private fun CachePill(config: com.deeptalking.core.model.AppConfig, modifier: Mo
         maxLines = 1,
         overflow = TextOverflow.Ellipsis,
         modifier = modifier
+            .widthIn(max = 200.dp)
             .clip(RoundedCornerShape(4.dp))
             .background(legacy.bg)
             .border(1.dp, legacy.border, RoundedCornerShape(4.dp))
             .padding(horizontal = 6.dp, vertical = 2.dp),
     )
+}
+
+/** Legacy `formatCompactNumber` (`src/js/media/stickers.js:290`). */
+private fun formatCompactNumber(value: Int): String {
+    if (value >= 1_000_000) return String.format(java.util.Locale.CHINA, "%.1fM", value / 1_000_000.0)
+    if (value >= 10_000) return Math.round(value / 1000.0).toString() + "k"
+    if (value >= 1000) return String.format(java.util.Locale.CHINA, "%.1fk", value / 1000.0)
+    return value.toString()
 }
 
 @Composable

@@ -4,6 +4,7 @@ import com.deeptalking.core.common.AppLimits
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.Role
+import com.deeptalking.core.network.LLM_STATUS_CHUNK_NAME
 import com.deeptalking.domain.agent.prompts.RequestBuilder
 import com.deeptalking.domain.agent.prompts.RequestPhase
 import com.deeptalking.engine.ondevice.LlmBackend
@@ -69,99 +70,155 @@ class AgentLoop(
         val messages = baseInput.toMutableList()
         var rounds = 0
         var executedCalls = 0
-        var lastText = ""
         var latestCharacter: Character? = null
         var latestSticker: String? = null
         var lastUsage: com.deeptalking.engine.ondevice.TokenUsage? = null
         var lastReasoning: List<String> = emptyList()
         var phase = RequestPhase.AUTO
-        var attempts = 0
+        var submitAttempted = false
 
-        while (attempts < 3) {
-            attempts++
+        while (true) {
             val tools = if (phase == RequestPhase.AUTO) autoTools else listOf(submitTool)
             val request = builder.build(phase, instructions, messages, tools, model, sessionIdFor(workingCharacter))
-            val result = collectResultWithRetry(request, onDelta)
-            if (result.text.isNotBlank()) lastText = result.text
+            val turn = collectResultWithRetry(request, onDelta, onToolActivity)
+            val result = turn.result
             result.usage?.let { lastUsage = it }
             lastReasoning = result.reasoning
+            val responseText = salvageText(result)
+            val salvaged = turn.salvaged
 
-            val submit = result.toolCalls.firstOrNull { it.name == "submit_response" }
-            if (submit != null) return LoopOutcome(result.text, submit, rounds, executedCalls, latestCharacter, latestSticker, lastUsage)
-
+            val submitCall = result.toolCalls.firstOrNull { it.name == "submit_response" }
+            val parsedSubmit = submitCall?.let { ResponseParser.parseSubmitResponse(it.arguments) }
             val infoCalls = result.toolCalls.filter { it.name != "submit_response" }
-            if (phase == RequestPhase.AUTO) {
-                // Special case: a lone ask_user becomes this turn's reply.
-                if (infoCalls.size == 1 && infoCalls[0].name == "ask_user") {
-                    val question = ToolJson.question(infoCalls[0].arguments)
-                    if (question.isNotBlank()) {
-                        return LoopOutcome(
-                            text = result.text,
-                            submitCall = syntheticSubmitReply(question),
-                            rounds = rounds,
-                            executedCalls = executedCalls,
-                            updatedCharacter = latestCharacter,
-                            stickerFileRef = latestSticker,
-                        )
-                    }
-                }
 
-                val withinLimits = rounds < AppLimits.Agent.MAX_TOOL_ROUNDS &&
-                    executedCalls < AppLimits.Agent.MAX_TOOL_CALLS
-                if (infoCalls.isNotEmpty() && withinLimits) {
-                    rounds++
-                    executedCalls++
-                    val call = infoCalls.first()
-                    val callId = call.id.ifBlank { "call_$rounds" }
-                    onToolActivity(toolActivityHint(call.name))
-                    val toolResult = registry.execute(call, context)
-                    toolResult.stickerFileRef?.let { latestSticker = it }
-                    toolResult.updatedCharacter?.let { updated ->
-                        latestCharacter = updated
-                        workingCharacter = updated
-                        context = AgentContext(character = workingCharacter, activeCharacterId = workingCharacter.id)
+            // Special case: a lone ask_user becomes this turn's reply.
+            if (phase == RequestPhase.AUTO && infoCalls.size == 1 && infoCalls[0].name == "ask_user") {
+                val question = ToolJson.question(infoCalls[0].arguments)
+                if (question.isNotBlank()) {
+                    return LoopOutcome(
+                        text = responseText,
+                        submitCall = syntheticSubmitReply(question),
+                        rounds = rounds,
+                        executedCalls = executedCalls,
+                        updatedCharacter = latestCharacter,
+                        stickerFileRef = latestSticker,
+                        usage = lastUsage,
+                    )
+                }
+            }
+
+            var toolFailed = false
+            if (phase == RequestPhase.AUTO && infoCalls.isNotEmpty()) {
+                val atLimit = rounds >= AppLimits.Agent.MAX_TOOL_ROUNDS ||
+                    executedCalls >= AppLimits.Agent.MAX_TOOL_CALLS
+                if (atLimit) {
+                    // chatStageDecision('auto-tool-limit')
+                    val accumulated = responseText.ifBlank { salvaged.orEmpty() }
+                    if (accumulated.isNotBlank()) {
+                        onToolActivity("工具调用已达上限，直接收尾…")
+                        return LoopOutcome(accumulated, null, rounds, executedCalls, latestCharacter, latestSticker, lastUsage)
                     }
-                    messages += ChatMessage(
-                        id = "assistant_${rounds}",
-                        role = Role.Assistant,
-                        content = "",
-                        toolCallId = callId,
-                        toolName = call.name,
-                        toolArguments = call.arguments,
-                        reasoningJson = reasoningArray(lastReasoning),
-                        internalOnly = false,
-                        isLoading = false,
-                    )
-                    messages += ChatMessage(
-                        id = callId,
-                        role = Role.Tool,
-                        content = toolResult.contentJson,
-                        toolCallId = callId,
-                    )
-                    onToolActivity("正在继续推理…")
+                    onToolActivity("正在整理回复…")
+                    phase = RequestPhase.SUBMIT
+                    submitAttempted = false
                     continue
                 }
-                if (lastText.isNotBlank()) {
-                    return LoopOutcome(lastText, null, rounds, executedCalls, latestCharacter, latestSticker, lastUsage)
+                rounds++
+                executedCalls++
+                val call = infoCalls.first()
+                val callId = call.id.ifBlank { "call_$rounds" }
+                onToolActivity(toolActivityHint(call.name))
+                val toolResult = registry.execute(call, context)
+                toolResult.stickerFileRef?.let { latestSticker = it }
+                toolResult.updatedCharacter?.let { updated ->
+                    latestCharacter = updated
+                    workingCharacter = updated
+                    context = AgentContext(character = workingCharacter, activeCharacterId = workingCharacter.id)
                 }
-                reasoningArray(lastReasoning)?.let { reasoning ->
-                    messages += ChatMessage(
-                        id = "reasoning_${rounds}",
-                        role = Role.Assistant,
-                        content = "",
-                        reasoningJson = reasoning,
-                    )
+                toolFailed = isToolFailure(toolResult.contentJson)
+                messages += ChatMessage(
+                    id = "assistant_${rounds}",
+                    role = Role.Assistant,
+                    content = "",
+                    toolCallId = callId,
+                    toolName = call.name,
+                    toolArguments = call.arguments,
+                    reasoningJson = reasoningArray(lastReasoning),
+                    internalOnly = false,
+                    isLoading = false,
+                )
+                messages += ChatMessage(
+                    id = callId,
+                    role = Role.Tool,
+                    content = toolResult.contentJson,
+                    toolCallId = callId,
+                )
+                onToolActivity("工具结果已返回，正在继续推理…")
+                if (parsedSubmit == null || toolFailed) continue
+            }
+
+            if (parsedSubmit != null) {
+                return LoopOutcome(responseText, submitCall, rounds, executedCalls, latestCharacter, latestSticker, lastUsage)
+            }
+
+            if (phase == RequestPhase.AUTO) {
+                // chatStageDecision('auto-final'): prose or valid JSON text is final.
+                if (responseText.isNotBlank()) {
+                    return LoopOutcome(responseText, null, rounds, executedCalls, latestCharacter, latestSticker, lastUsage)
                 }
+                onToolActivity("正在整理回复…")
+                appendReasoning(messages, result.reasoning, rounds)
                 phase = RequestPhase.SUBMIT
-                attempts = 0
+                submitAttempted = false
                 continue
             }
 
-            // Submit phase: no submit_response call came back.
-            if (lastText.isNotBlank()) return LoopOutcome(lastText, null, rounds, executedCalls, latestCharacter, latestSticker, lastUsage)
-            if (attempts >= 2) break
+            // Submit phase: give the forced submit_response exactly one explicit re-attempt.
+            if (!submitAttempted) {
+                // chatStageDecision('submit-retry')
+                submitAttempted = true
+                onToolActivity("正在重新整理回复…")
+                continue
+            }
+            val usable = responseText.ifBlank { salvaged.orEmpty() }
+            if (usable.isNotBlank()) {
+                return LoopOutcome(usable, null, rounds, executedCalls, latestCharacter, latestSticker, lastUsage)
+            }
+            break
         }
-        return LoopOutcome(lastText, null, rounds, executedCalls, latestCharacter, latestSticker, lastUsage)
+        return LoopOutcome("", null, rounds, executedCalls, latestCharacter, latestSticker, lastUsage)
+    }
+
+    /**
+     * Applies the legacy fallback order for a turn whose streamed/returned text is
+     * empty: `extractResponsesText` -> embedded `reply` JSON in any reasoning item
+     * (`extractReplyJsonFromAnyOutput`) -> `extractAnyResponseText`.
+     */
+    private fun salvageText(result: LlmResult): String {
+        if (result.text.isNotBlank()) return result.text
+        val response = result.raw
+            ?.let { runCatching { Json.parseToJsonElement(it) as? JsonObject }.getOrNull() }
+        ResponseParser.extractResponsesText(response).takeIf { it.isNotBlank() }?.let { return it }
+        ResponseParser.extractReplyJsonFromAnyOutput(response, result.reasoning)
+            .takeIf { it.isNotBlank() }?.let { return it }
+        return ResponseParser.extractAnyResponseText(response)
+    }
+
+    private fun isToolFailure(contentJson: String): Boolean {
+        val element = runCatching { Json.parseToJsonElement(contentJson) }.getOrNull() ?: return true
+        val obj = element as? JsonObject ?: return false
+        return obj["ok"]?.let { (it as? JsonPrimitive)?.contentOrNull } == "false"
+    }
+
+    private fun appendReasoning(messages: MutableList<ChatMessage>, reasoning: List<String>, round: Int) {
+        reasoningArray(reasoning)?.let { json ->
+            messages += ChatMessage(
+                id = "reasoning_$round",
+                role = Role.Assistant,
+                content = "",
+                reasoningJson = json,
+            )
+        }
     }
 
     /**
@@ -169,6 +226,8 @@ class AgentLoop(
      * reply text; partial `submit_response` arguments are salvaged when the
      * model answers through the terminal tool instead of plain text.
      */
+    private data class TurnResult(val result: LlmResult, val salvaged: String?)
+
     /**
      * Wraps the model request with the legacy request-level retry policy
      * (`src/js/api/retry.js`): transient transport failures are retried up to
@@ -180,11 +239,16 @@ class AgentLoop(
     private suspend fun collectResultWithRetry(
         request: com.deeptalking.engine.ondevice.LlmRequest,
         onDelta: (String) -> Unit,
-    ): LlmResult {
+        onToolActivity: (String) -> Unit,
+    ): TurnResult {
         var attempt = 0
         while (true) {
             try {
-                return if (request.stream) collectStream(request, onDelta) else llm.complete(request)
+                return if (request.stream) {
+                    collectStream(request, onDelta, onToolActivity)
+                } else {
+                    TurnResult(llm.complete(request), null)
+                }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Throwable) {
@@ -198,7 +262,8 @@ class AgentLoop(
     private suspend fun collectStream(
         request: com.deeptalking.engine.ondevice.LlmRequest,
         onDelta: (String) -> Unit,
-    ): LlmResult {
+        onToolActivity: (String) -> Unit,
+    ): TurnResult {
         val text = StringBuilder()
         var completed: LlmResult? = null
         val pending = LinkedHashMap<String, ToolCall>()
@@ -209,15 +274,20 @@ class AgentLoop(
                 when (chunk) {
                     is LlmChunk.TextDelta -> {
                         text.append(chunk.text)
+                        StreamText.extractReplyFromJson(text.toString())?.let { salvaged = it }
                         StreamText.displayFor(text.toString(), salvaged)?.let(onDelta)
                     }
                     is LlmChunk.ToolCallStart -> {
                         val call = chunk.call
-                        pending[call.id.ifBlank { call.name }] = call
-                        if (call.name == "submit_response" && text.isEmpty()) {
-                            StreamText.extractReplyFromJson(call.arguments)?.let { reply ->
-                                salvaged = reply
-                                StreamText.displayFor(text.toString(), reply)?.let(onDelta)
+                        if (call.name == LLM_STATUS_CHUNK_NAME) {
+                            if (call.arguments.isNotBlank()) onToolActivity(call.arguments)
+                        } else {
+                            pending[call.id.ifBlank { call.name }] = call
+                            if (call.name == "submit_response" && call.arguments.trimStart().startsWith("{")) {
+                                StreamText.extractReplyFromJson(call.arguments)?.let { reply ->
+                                    salvaged = reply
+                                    StreamText.displayFor(text.toString(), reply)?.let(onDelta)
+                                }
                             }
                         }
                     }
@@ -232,7 +302,7 @@ class AgentLoop(
         }
         val finished = completed
         if (finished != null && (finished.text.isNotBlank() || finished.toolCalls.isNotEmpty())) {
-            return finished
+            return TurnResult(finished, salvaged)
         }
         // Nothing usable accumulated: surface transient transport failures so the
         // caller can retry (legacy `performChatRequestWithRetry`). When partial
@@ -240,7 +310,7 @@ class AgentLoop(
         if (failure != null && text.isEmpty() && pending.isEmpty()) {
             throw failure
         }
-        return LlmResult(text = text.toString(), toolCalls = pending.values.toList())
+        return TurnResult(LlmResult(text = text.toString(), toolCalls = pending.values.toList()), salvaged)
     }
 
     /** Serializes captured reasoning items into a JSON array for [ChatMessage.reasoningJson]. */

@@ -8,9 +8,11 @@ import com.deeptalking.core.model.LorebookOrigin
 import java.time.Instant
 
 /**
- * Lorebook write helpers ported from `src/js/memory/lorebook.js` (`upsertLorebookEntry`,
- * `resolveLorebookSources`). Used by the automatic consolidation task; the
- * `upsert_lorebook_entry` tool keeps its own matching implementation.
+ * Lorebook write helpers ported from `src/js/memory/lorebook.js`
+ * (`upsertLorebookEntry`, `resolveLorebookSources`, `normalizeGeneratedLorebook`,
+ * `lorebookEvidenceOverlaps`, `markLorebookMentions`). Used by the automatic
+ * consolidation task; the `upsert_lorebook_entry` tool keeps its own matching
+ * implementation.
  */
 
 data class LorebookUpsertResult(
@@ -30,18 +32,53 @@ data class LorebookProposal(
     val alwaysActive: Boolean = false,
 )
 
+private val LOREBOOK_EVIDENCE_PAIR = Regex("[\\u4e00-\\u9fff\\w]{2}")
+
 /**
- * Validates that both source ids and evidence trace back to real short-term
- * items whose content matches the evidence. Mirrors `resolveLorebookSources`.
+ * Looser world-book evidence check (legacy `lorebookEvidenceOverlaps`): verbatim
+ * containment, or any single substantive 2-gram of [evidence] appearing in
+ * [source]. Unlike [evidenceMatchesSummary] this accepts grounded summaries.
+ */
+fun lorebookEvidenceOverlaps(source: String?, evidence: String?): Boolean {
+    if (evidenceMatchesSource(source, evidence)) return true
+    val ev = evidence.orEmpty().trim()
+    val src = source.orEmpty().lowercase()
+    if (ev.length < 4 || src.length < 4) return false
+    var index = 0
+    while (index + 2 <= ev.length) {
+        val pair = ev.substring(index, index + 2).lowercase()
+        if (LOREBOOK_EVIDENCE_PAIR.matches(pair) && src.contains(pair)) return true
+        index++
+    }
+    return false
+}
+
+/**
+ * Validates that both source ids and evidence trace back to real messages.
+ * Mirrors `resolveLorebookSources`: ids may be native short-term items (matched
+ * on summarized content) or live user/assistant messages, and the evidence only
+ * needs a loose 2-gram overlap ([lorebookEvidenceOverlaps]).
  */
 fun resolveLorebookSources(character: Character, sourceIds: List<String>, evidence: String?): Boolean {
     val excerpt = evidence?.trimTo(300).orEmpty()
-    if (excerpt.isEmpty()) return false
-    val ids = sourceIds.map { it.trim() }.filter { it.isNotEmpty() }
+    if (excerpt.length < 2) return false
+    val ids = sourceIds.map { it.trim() }.filter { it.isNotEmpty() }.take(8)
     if (ids.isEmpty()) return false
-    val items = ids.mapNotNull { id -> character.shortTerm.firstOrNull { it.id == id } }
-    if (items.isEmpty()) return false
-    return items.any { evidenceMatchesSummary(it.content, excerpt) }
+    val sources = knownSources(character)
+    for (id in ids) {
+        // Native callers pass short-term item ids; match their summarized content.
+        val shortTerm = character.shortTerm.firstOrNull { it.id == id }
+        if (shortTerm != null) {
+            if (lorebookEvidenceOverlaps(shortTerm.content, excerpt)) return true
+            continue
+        }
+        // Otherwise the id must resolve to a live user/assistant message (legacy).
+        val ref = sources[id] ?: return false
+        if ((ref.role == "user" || ref.role == "assistant") && lorebookEvidenceOverlaps(ref.text, excerpt)) {
+            return true
+        }
+    }
+    return false
 }
 
 /**
@@ -170,3 +207,47 @@ private fun findEntry(list: List<LorebookEntry>, entryId: String, name: String):
 
 private fun replaceEntry(list: List<LorebookEntry>, id: String, entry: LorebookEntry): List<LorebookEntry> =
     list.map { if (it.id == id) entry else it }
+
+/**
+ * Normalizes a batch of AI-generated entries (legacy `normalizeGeneratedLorebook`):
+ * every entry is marked model-origin, and keyword-less entries are promoted to
+ * always-active so they can actually be injected. Explicit always-active entries
+ * claim the [LorebookLimits.maxAlwaysActive] slots first; the rest stay
+ * keyword-driven. Returns new entries; the input is not modified.
+ */
+fun normalizeGeneratedLorebook(
+    entries: List<LorebookEntry>,
+    limits: LorebookLimits = LorebookLimits(),
+): List<LorebookEntry> {
+    val generated = entries.map { it.copy(origin = LorebookOrigin.Model) }
+    var activeCount = generated.count { it.alwaysActive }
+    return generated.map { entry ->
+        if (entry.alwaysActive || entry.keywords.isNotEmpty() || activeCount >= limits.maxAlwaysActive) {
+            entry
+        } else {
+            activeCount++
+            entry.copy(alwaysActive = true)
+        }
+    }
+}
+
+/**
+ * Records that [injected] entries were actually placed into context (legacy
+ * `markLorebookMentions`): bumps `mentions`, stamps `lastMentionedAt` and resets
+ * the `misses` streak. Returns new entries; the input is not modified.
+ */
+fun markLorebookMentions(
+    entries: List<LorebookEntry>,
+    injected: List<LorebookEntry>,
+    nowIso: String = Instant.now().toString(),
+): List<LorebookEntry> {
+    if (injected.isEmpty()) return entries
+    val ids = injected.map { it.id }.toHashSet()
+    return entries.map { entry ->
+        if (entry.id in ids) {
+            entry.copy(mentions = entry.mentions + 1, lastMentionedAt = nowIso, misses = 0)
+        } else {
+            entry
+        }
+    }
+}

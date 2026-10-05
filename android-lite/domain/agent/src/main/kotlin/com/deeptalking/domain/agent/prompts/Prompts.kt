@@ -223,6 +223,7 @@ internal fun buildDynamicStateContext(profile: DynamicState): String {
 internal fun buildMemberContext(member: GroupMember, staticOnly: Boolean): String {
     val lines = mutableListOf<String>()
     lines += "- " + trimText(member.name, 100)
+    if (member.roleInGroup.isNotBlank()) lines += "  群内定位: " + trimText(member.roleInGroup, 200)
     STATIC_PROFILE_FIELDS.forEach { (key, label) ->
         val value = trimText(staticProfileValue(member.staticProfile, key), if (key == "background" || key == "keyEvents") 600 else 400)
         if (value.isNotEmpty()) lines += "  $label: " + maskUserWordName(member.name, value)
@@ -244,11 +245,11 @@ internal fun buildRoleContext(character: Character, staticOnly: Boolean): String
         groupLines += "群组前提: " + maskUserWord(character, trimText(character.description, 700))
         groupLines += "场景: " + maskUserWord(
             character,
-            trimText(if (staticOnly) "" else character.dynamicState.currentLocation, 500),
+            trimText(if (staticOnly) "" else character.groupSharedDynamic.currentLocation, 500),
         )
-        groupLines += "互动规则: " + maskUserWord(character, trimText("", 700))
+        groupLines += "互动规则: " + maskUserWord(character, trimText(character.interactionRules, 700))
         if (!staticOnly) {
-            val shared = character.dynamicState.copy(
+            val shared = character.groupSharedDynamic.copy(
                 currentMood = "",
                 currentOccupation = "",
                 currentGoal = "",
@@ -843,7 +844,10 @@ enum class RequestPhase { AUTO, SUBMIT }
  * Only the first system message maps to `instructions`; conversation history
  * is mapped to `input` as [ChatMessage] items.
  */
-class RequestBuilder(private val config: AppConfig = AppConfig()) {
+class RequestBuilder(
+    private val config: AppConfig = AppConfig(),
+    private val imageResolver: ((String) -> String?)? = null,
+) {
 
     fun normalizeTemperature(value: Double): Double =
         if (value.isNaN() || value.isInfinite()) config.temperature else value.coerceIn(0.0, 2.0)
@@ -869,6 +873,7 @@ class RequestBuilder(private val config: AppConfig = AppConfig()) {
             reasoningEffort = if (submitPhase) "none" else config.reasoningEffort,
             apiPlatform = config.apiPlatform,
             sessionId = sessionId,
+            imageResolver = imageResolver,
         )
     }
 

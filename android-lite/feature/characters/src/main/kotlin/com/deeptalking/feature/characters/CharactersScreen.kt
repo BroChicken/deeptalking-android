@@ -63,13 +63,6 @@ import com.deeptalking.core.model.GroupMember
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.LorebookOrigin
 import com.deeptalking.core.model.StaticProfile
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.contentOrNull
-import java.util.UUID
-
 private val STATIC_FIELDS = listOf(
     "gender" to "性别",
     "age" to "年龄",
@@ -101,8 +94,8 @@ fun CharactersScreen(
     activeId: String?,
     generating: Boolean,
     onSelect: (String) -> Unit,
-    onCreateCharacter: (name: String, emoji: String, personality: String, background: String) -> Unit,
-    onCreateGroup: (name: String, emoji: String, description: String, scene: String, rules: String, members: List<GroupMember>) -> Unit,
+    onCreateCharacter: (name: String, emoji: String, personality: String, background: String, draft: CharacterParity.GeneratedDraft?) -> Unit,
+    onCreateGroup: (name: String, emoji: String, description: String, scene: String, rules: String, members: List<GroupMember>, lorebook: List<LorebookEntry>) -> Unit,
     onDelete: (String) -> Unit,
     onEdit: (Character) -> Unit,
     onEditMember: (Character, Int) -> Unit,
@@ -165,12 +158,12 @@ fun CharactersScreen(
             generating = generating,
             onQuickGenerate = onQuickGenerate,
             onDismiss = { createOpen = false },
-            onCreateCharacter = { n, e, p, b ->
-                onCreateCharacter(n, e, p, b)
+            onCreateCharacter = { n, e, p, b, d ->
+                onCreateCharacter(n, e, p, b, d)
                 createOpen = false
             },
-            onCreateGroup = { n, e, d, s, r, m ->
-                onCreateGroup(n, e, d, s, r, m)
+            onCreateGroup = { n, e, d, s, r, m, lb ->
+                onCreateGroup(n, e, d, s, r, m, lb)
                 createOpen = false
             },
         )
@@ -340,8 +333,8 @@ private fun CreateDialog(
     generating: Boolean,
     onQuickGenerate: (String, (String?) -> Unit) -> Unit,
     onDismiss: () -> Unit,
-    onCreateCharacter: (String, String, String, String) -> Unit,
-    onCreateGroup: (String, String, String, String, String, List<GroupMember>) -> Unit,
+    onCreateCharacter: (String, String, String, String, CharacterParity.GeneratedDraft?) -> Unit,
+    onCreateGroup: (String, String, String, String, String, List<GroupMember>, List<LorebookEntry>) -> Unit,
 ) {
     val legacy = MaterialTheme.legacy
     var isGroup by rememberSaveable { mutableStateOf(false) }
@@ -355,6 +348,11 @@ private fun CreateDialog(
     var membersText by rememberSaveable { mutableStateOf("") }
     var quickGenInput by rememberSaveable { mutableStateOf("") }
     var createTypeExpanded by rememberSaveable { mutableStateOf(false) }
+    var generatedMembers by remember { mutableStateOf<List<GroupMember>>(emptyList()) }
+    var generatedDraft by remember { mutableStateOf<CharacterParity.GeneratedDraft?>(null) }
+
+    fun effectiveMembers(): List<GroupMember> =
+        generatedMembers.ifEmpty { CharacterParity.parseGroupMembersText(membersText) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -380,9 +378,10 @@ private fun CreateDialog(
                         modifier = Modifier.width(72.dp),
                         onClick = {
                             if (quickGenInput.isBlank() || generating) return@LegacyButton
-                            onQuickGenerate(quickGenInput) { raw ->
+                            onQuickGenerate(CharacterParity.buildQuickGeneratePrompt(quickGenInput, isGroup)) { raw ->
                                 if (raw != null) {
-                                    parseGenerated(raw)?.let { parsed ->
+                                    CharacterParity.parseGeneratedDraft(raw)?.let { parsed ->
+                                        generatedDraft = parsed
                                         isGroup = parsed.isGroup
                                         name = parsed.name
                                         emoji = parsed.emoji
@@ -390,6 +389,8 @@ private fun CreateDialog(
                                         background = parsed.background
                                         groupDescription = parsed.description
                                         groupScene = parsed.scene
+                                        groupRules = parsed.interactionRules
+                                        generatedMembers = parsed.members
                                         membersText = parsed.members.joinToString("\n") {
                                             it.name + "｜" + it.staticProfile.personality
                                         }
@@ -421,8 +422,14 @@ private fun CreateDialog(
                     LegacyField(value = groupDescription, onValueChange = { groupDescription = it }, label = "群组前提", minLines = 2)
                     LegacyField(value = groupScene, onValueChange = { groupScene = it }, label = "共同场景", minLines = 2)
                     LegacyField(value = groupRules, onValueChange = { groupRules = it }, label = "成员互动规则", minLines = 2)
-                    LegacyField(value = membersText, onValueChange = { membersText = it }, label = "群成员", placeholder = "每行：名称｜性格简述", minLines = 3)
-                    if (membersText.isNotBlank() && parseMembers(membersText).size < 2) {
+                    LegacyField(
+                        value = membersText,
+                        onValueChange = { membersText = it; generatedMembers = emptyList() },
+                        label = "群成员",
+                        placeholder = "每行：名称｜性格简述",
+                        minLines = 3,
+                    )
+                    if (membersText.isNotBlank() && effectiveMembers().size < 2) {
                         Text("群组至少需要两名成员", fontSize = 12.sp, color = legacy.warning)
                     }
                 } else {
@@ -435,12 +442,12 @@ private fun CreateDialog(
             TextButton(
                 onClick = {
                     if (isGroup) {
-                        val members = parseMembers(membersText)
+                        val members = effectiveMembers().map { CharacterParity.normalizeMember(it) }
                         if (name.isNotBlank() && members.size >= 2) {
-                            onCreateGroup(name.trim(), emoji.trim(), groupDescription.trim(), groupScene.trim(), groupRules.trim(), members)
+                            onCreateGroup(name.trim(), emoji.trim(), groupDescription.trim(), groupScene.trim(), groupRules.trim(), members, generatedDraft?.lorebook.orEmpty())
                         }
                     } else if (name.isNotBlank()) {
-                        onCreateCharacter(name.trim(), emoji.trim(), personality.trim(), background.trim())
+                        onCreateCharacter(name.trim(), emoji.trim(), personality.trim(), background.trim(), generatedDraft)
                     }
                 },
                 enabled = name.isNotBlank(),
@@ -546,13 +553,7 @@ fun CharacterEditorDialog(
         },
         confirmButton = {
             TextButton(onClick = {
-                if (memberIndex != null) {
-                    val idx = memberIndex!!
-                    val member = draft.members[idx]
-                    onUpdate(draft.copy(members = draft.members.toMutableList().also { it[idx] = member }))
-                } else {
-                    onUpdate(draft)
-                }
+                onUpdate(CharacterParity.normalizeEditedDraft(draft, memberIndex))
                 onDismiss()
             }) { Text("保存修改") }
         },
@@ -728,7 +729,9 @@ private fun LorebookTab(
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     LegacyField(
                         value = entry.name,
-                        onValueChange = { name -> onUpdateLorebook(draft, entry.copy(name = name, origin = LorebookOrigin.User)) },
+                        onValueChange = { name ->
+                            onUpdateLorebook(draft, entry.copy(name = CharacterParity.capLorebookName(name), origin = LorebookOrigin.User))
+                        },
                         placeholder = "条目名（如：赤月王国）",
                         modifier = Modifier.weight(1f),
                     )
@@ -752,15 +755,17 @@ private fun LorebookTab(
                 LegacyField(
                     value = entry.keywords.joinToString("、"),
                     onValueChange = { raw ->
-                        val keywords = raw.split(',', '，', '、', '\n').map { it.trim() }.filter { it.isNotEmpty() }.take(20)
-                        val alwaysActive = if (keywords.isEmpty()) true else entry.alwaysActive
+                        val keywords = CharacterParity.splitLorebookKeywords(raw)
+                        val alwaysActive = CharacterParity.keywordsToAlwaysActive(entry.alwaysActive, keywords)
                         onUpdateLorebook(draft, entry.copy(keywords = keywords, alwaysActive = alwaysActive, origin = LorebookOrigin.User))
                     },
                     placeholder = "触发关键词（用、或逗号分隔；常驻条目可留空）",
                 )
                 LegacyField(
                     value = entry.content,
-                    onValueChange = { content -> onUpdateLorebook(draft, entry.copy(content = content, origin = LorebookOrigin.User)) },
+                    onValueChange = { content ->
+                        onUpdateLorebook(draft, entry.copy(content = CharacterParity.capLorebookContent(content), origin = LorebookOrigin.User))
+                    },
                     placeholder = "命中后注入的设定内容",
                     minLines = 2,
                 )
@@ -883,64 +888,6 @@ private fun relativeFrom(iso: String?): String? {
         else -> "${Math.round(minutes / 1440.0)} 天前"
     }
 }
-
-private data class GeneratedDraft(
-    val isGroup: Boolean,
-    val name: String,
-    val emoji: String,
-    val personality: String,
-    val background: String,
-    val description: String,
-    val scene: String,
-    val members: List<GroupMember>,
-)
-
-private fun parseGenerated(raw: String): GeneratedDraft? {
-    val start = raw.indexOf('{')
-    val end = raw.lastIndexOf('}')
-    if (start < 0 || end <= start) return null
-    val json = runCatching {
-        Json.parseToJsonElement(raw.substring(start, end + 1)) as JsonObject
-    }.getOrNull() ?: return null
-
-    fun str(key: String): String = (json[key] as? JsonPrimitive)?.contentOrNull.orEmpty()
-
-    val isGroup = str("entityType").equals("group", ignoreCase = true)
-    val members = (json["members"] as? JsonArray).orEmpty().mapNotNull { element ->
-        val obj = element as? JsonObject ?: return@mapNotNull null
-        fun m(key: String) = (obj[key] as? JsonPrimitive)?.contentOrNull.orEmpty()
-        GroupMember(
-            id = UUID.randomUUID().toString(),
-            name = m("name"),
-            emoji = m("avatar").ifBlank { "👤" },
-            staticProfile = StaticProfile(personality = m("personality")),
-        )
-    }
-    return GeneratedDraft(
-        isGroup = isGroup,
-        name = str("name"),
-        emoji = str("avatar"),
-        personality = str("personality"),
-        background = str("background"),
-        description = str("description"),
-        scene = str("scene"),
-        members = members,
-    )
-}
-
-private fun parseMembers(text: String): List<GroupMember> =
-    text.lines()
-        .map { it.trim() }
-        .filter { it.isNotEmpty() }
-        .map { line ->
-            val parts = line.split('｜', '|').map { it.trim() }
-            GroupMember(
-                id = UUID.randomUUID().toString(),
-                name = parts.getOrNull(0).orEmpty(),
-                emoji = "👤",
-                staticProfile = StaticProfile(personality = parts.getOrNull(1).orEmpty()),
-            )
-        }
 
 private fun staticValue(profile: StaticProfile, key: String): String = when (key) {
     "gender" -> profile.gender

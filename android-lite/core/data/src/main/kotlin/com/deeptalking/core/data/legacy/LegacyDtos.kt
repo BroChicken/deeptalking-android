@@ -128,8 +128,50 @@ data class LegacyMemory(
     @SerialName("shortTerm") val shortTerm: List<LegacyShortTerm>? = null,
     /** Keyed by category: userProfile / relationship / events / promises / habits. */
     @SerialName("longTerm") val longTerm: Map<String, List<LegacyLongTerm>>? = null,
-    @SerialName("pendingRecall") val pendingRecall: List<LegacyLongTerm>? = null,
+    @SerialName("pendingRecall") val pendingRecall: List<LegacyPendingRecall>? = null,
+    @SerialName("scenes") val scenes: List<LegacyScene>? = null,
+    @SerialName("sceneState") val sceneState: LegacySceneState? = null,
     @SerialName("revision") val revision: Int? = null,
+)
+
+/**
+ * Legacy `memory.pendingRecall` was a list of full long-term items, but the
+ * native [com.deeptalking.core.model.PendingRecall] only keeps the requested
+ * `category` + `tags`; the legacy `subject` spelling is accepted as a fallback.
+ */
+@Serializable
+data class LegacyPendingRecall(
+    @SerialName("category") val category: String? = null,
+    @SerialName("subject") val subject: String? = null,
+    @SerialName("tags") val tags: List<String>? = null,
+)
+
+@Serializable
+data class LegacyScene(
+    @SerialName("id") val id: String? = null,
+    @SerialName("key") val key: String? = null,
+    @SerialName("content") val content: String? = null,
+    @SerialName("fromMessageId") val fromMessageId: String? = null,
+    @SerialName("toMessageId") val toMessageId: String? = null,
+    @SerialName("startedAt") val startedAt: String? = null,
+    @SerialName("endedAt") val endedAt: String? = null,
+    @SerialName("createdAt") val createdAt: String? = null,
+)
+
+@Serializable
+data class LegacySceneState(
+    @SerialName("key") val key: String? = null,
+    @SerialName("startMessageId") val startMessageId: String? = null,
+    @SerialName("startCount") val startCount: Int? = null,
+    @SerialName("startSequence") val startSequence: Int? = null,
+    @SerialName("messageCount") val messageCount: Int? = null,
+)
+
+@Serializable
+data class LegacyStaticFillMeta(
+    @SerialName("attemptedAt") val attemptedAt: String? = null,
+    @SerialName("failures") val failures: Int? = null,
+    @SerialName("retryAt") val retryAt: String? = null,
 )
 
 @Serializable
@@ -145,6 +187,8 @@ data class LegacyInstantMessage(
     @SerialName("isLoading") val isLoading: Boolean? = null,
     @SerialName("staticChanges") val staticChanges: List<String>? = null,
     @SerialName("lorebookChanges") val lorebookChanges: List<String>? = null,
+    @SerialName("styleViolations") val styleViolations: List<String>? = null,
+    @SerialName("quickReplyIssues") val quickReplyIssues: List<String>? = null,
 )
 
 @Serializable
@@ -152,9 +196,15 @@ data class LegacyShortTerm(
     @SerialName("id") val id: String? = null,
     @SerialName("content") val content: String? = null,
     @SerialName("timestamp") val timestamp: String? = null,
+    @SerialName("analyzedAt") val analyzedAt: String? = null,
+    @SerialName("lorebookScannedAt") val lorebookScannedAt: String? = null,
     @SerialName("eventTime") val eventTime: String? = null,
     @SerialName("sourceMessageIds") val sourceMessageIds: List<String>? = null,
+    @SerialName("participants") val participants: List<String>? = null,
+    @SerialName("location") val location: String? = null,
     @SerialName("timeRef") val timeRef: LegacyTimeRef? = null,
+    @SerialName("sourceRoles") val sourceRoles: List<String>? = null,
+    @SerialName("userEvidence") val userEvidence: String? = null,
 )
 
 @Serializable
@@ -181,6 +231,20 @@ data class LegacyLongTerm(
     @SerialName("updatedAt") val updatedAt: String? = null,
     @SerialName("lastRecalled") val lastRecalled: String? = null,
     @SerialName("recallCount") val recallCount: Int? = null,
+    @SerialName("participants") val participants: List<String>? = null,
+    @SerialName("location") val location: String? = null,
+    @SerialName("learnedBonus") val learnedBonus: Double? = null,
+    @SerialName("usageCount") val usageCount: Int? = null,
+    @SerialName("lastUsageAt") val lastUsageAt: String? = null,
+    @SerialName("arcOf") val arcOf: String? = null,
+    @SerialName("arcStage") val arcStage: String? = null,
+    @SerialName("recordedAt") val recordedAt: String? = null,
+    @SerialName("conflicts") val conflicts: List<String>? = null,
+    @SerialName("conflictedAt") val conflictedAt: String? = null,
+    @SerialName("relatedTo") val relatedTo: List<String>? = null,
+    @SerialName("sourceRoles") val sourceRoles: List<String>? = null,
+    @SerialName("userEvidence") val userEvidence: String? = null,
+    @SerialName("corrections") val corrections: List<String>? = null,
 )
 
 @Serializable
@@ -249,6 +313,10 @@ data class LegacyCharacter(
     @SerialName("groupInfo") val groupInfo: LegacyGroupInfo? = null,
     @SerialName("members") val members: List<LegacyGroupMember>? = null,
     @SerialName("fieldsMigrationVersion") val fieldsMigrationVersion: String? = null,
+    @SerialName("staticFillMeta") val staticFillMeta: LegacyStaticFillMeta? = null,
+    @SerialName("staticFieldMeta") val staticFieldMeta: JsonElement? = null,
+    @SerialName("timeParseVersion") val timeParseVersion: Int? = null,
+    @SerialName("lorebookMigratedAt") val lorebookMigratedAt: String? = null,
     /** Flattened variant: dynamic fields hoisted to the character root. */
     @SerialName("fields") val fields: LegacyFieldBag? = null,
 )

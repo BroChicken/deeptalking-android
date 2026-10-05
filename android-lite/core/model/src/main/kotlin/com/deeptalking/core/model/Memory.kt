@@ -54,6 +54,10 @@ data class ShortTermMemory(
     val location: String = "",
     /** When this item was last handed to the lorebook consolidation pass. */
     val lorebookScannedAt: String? = null,
+    /** Roles of the source messages (legacy `sourceRoles`, e.g. `user`/`assistant`). */
+    val sourceRoles: List<String> = emptyList(),
+    /** Verbatim user evidence excerpt (legacy `userEvidence`). */
+    val userEvidence: String = "",
 )
 
 @Serializable
@@ -95,4 +99,16 @@ data class LongTermMemory(
     val arcStage: String? = null,
     /** Recorded-at timestamp (legacy `recordedAt`). */
     val recordedAt: String? = null,
+    /** Semantically-different competing values kept for reconciliation (legacy `conflicts`). */
+    val conflicts: List<String> = emptyList(),
+    /** When the last conflict was recorded (legacy `conflictedAt`). */
+    val conflictedAt: String? = null,
+    /** Ids of related memories (legacy `relatedTo`). */
+    val relatedTo: List<String> = emptyList(),
+    /** Roles of the source messages (legacy `sourceRoles`). */
+    val sourceRoles: List<String> = emptyList(),
+    /** Verbatim user evidence excerpt (legacy `userEvidence`). */
+    val userEvidence: String = "",
+    /** Prior values replaced by manual edits (legacy corrections history). */
+    val corrections: List<String> = emptyList(),
 )

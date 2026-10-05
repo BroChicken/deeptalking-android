@@ -8,17 +8,25 @@ import com.deeptalking.domain.agent.prompts.staticFieldLabel
 import com.deeptalking.domain.agent.prompts.withStaticField
 import com.deeptalking.domain.memory.hasStaticEditIntent
 import com.deeptalking.domain.memory.hasValidUserEvidence
+import com.deeptalking.domain.memory.parseRelativeText
+import com.deeptalking.domain.memory.parseZoned
+import com.deeptalking.domain.memory.resolveTimeRef
 import com.deeptalking.engine.ondevice.ToolCall
 import com.deeptalking.engine.ondevice.ToolDefinition
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import java.time.ZonedDateTime
 
 /**
  * Port of the `update_character_field` branch in tool-execution.js: sets the
  * requested [STATIC_PROFILE_FIELDS] key on a copy of the character and returns
  * it via [AgentToolResult.updatedCharacter].
+ *
+ * Group entities keep the legacy [GROUP_SHARED_STATIC_FIELDS] whitelist (empty
+ * in the legacy config, so groups reject every static field with the shared-field
+ * guidance message rather than the tool being hidden).
  */
 class UpdateCharacterFieldTool : AgentTool {
 
@@ -48,8 +56,6 @@ class UpdateCharacterFieldTool : AgentTool {
         }.toString(),
     )
 
-    override fun isEnabled(context: AgentContext): Boolean = !context.character.isGroup
-
     override suspend fun execute(call: ToolCall, context: AgentContext): AgentToolResult {
         val args = ToolArgs.parse(call.arguments)
         val field = ToolArgs.string(args, "field").trim()
@@ -57,17 +63,26 @@ class UpdateCharacterFieldTool : AgentTool {
         if (label == null) {
             return AgentToolResult(errorJson("field 必须是基础设定字段之一：" + STATIC_PROFILE_FIELDS.joinToString("、") { it.first }))
         }
-        val value = ToolArgs.string(args, "value").trim().take(700)
+        if (context.character.isGroup && field !in GROUP_SHARED_STATIC_FIELDS) {
+            val shared = GROUP_SHARED_STATIC_FIELDS.mapNotNull { staticFieldLabel(it) }.joinToString("、")
+            return AgentToolResult(errorJson("群组只有公用字段可改：$shared；成员的个人字段请在该成员卡片上修改"))
+        }
+
+        val nowZoned = ZonedDateTime.now()
+        val resolved = resolveTimeRef(ToolArgs.timeRef(args, "timeRef"), nowZoned)
+        val base = resolved?.iso?.let { parseZoned(it) } ?: nowZoned
+        val value = MemoryToolSupport.cleanFieldValue(field, parseRelativeText(ToolArgs.string(args, "value"), base))
         if (value.isEmpty()) return AgentToolResult(errorJson("value 为空或全部为说明性文字，请只提供内容本身"))
+
         val sourceIds = ToolArgs.strings(args, "sourceMessageIds").map { it.trim() }.filter { it.isNotEmpty() }
         val evidence = ToolArgs.string(args, "evidence").trim()
         if (sourceIds.isEmpty() || evidence.isEmpty()) {
             return AgentToolResult(errorJson("sourceMessageIds 必须是真实用户消息ID，且 evidence 逐字摘录用户原话；找不到可引用来源时不修改"))
         }
         // Static fields are only touched when the user explicitly asks for the change.
-        val resolved = hasValidUserEvidence(context.character, sourceIds, evidence)
+        val resolvedSources = hasValidUserEvidence(context.character, sourceIds, evidence)
             ?: return AgentToolResult(errorJson("evidence 必须逐字来自 sourceMessageIds 指定的用户消息，找不到用户原话时不修改"))
-        if (!hasStaticEditIntent(field, resolved)) {
+        if (!hasStaticEditIntent(field, resolvedSources)) {
             return AgentToolResult(errorJson("用户并未明确要求修改「$label」，静态设定不修改"))
         }
         val updated = context.character.copy(
@@ -77,5 +92,10 @@ class UpdateCharacterFieldTool : AgentTool {
             contentJson = """{"ok":true,"field":${quote(field)},"label":${quote(label)},"value":${quote(value)},"changed":true}""",
             updatedCharacter = updated,
         )
+    }
+
+    private companion object {
+        /** Legacy `GROUP_SHARED_STATIC_FIELDS` (empty: world lore lives in the group description). */
+        val GROUP_SHARED_STATIC_FIELDS: Set<String> = emptySet()
     }
 }

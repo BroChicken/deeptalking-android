@@ -30,4 +30,6 @@ dependencies {
     implementation(libs.coil.compose)
     implementation(libs.kotlinx.serialization.json)
     debugImplementation(libs.compose.ui.tooling)
+
+    testImplementation(libs.junit)
 }

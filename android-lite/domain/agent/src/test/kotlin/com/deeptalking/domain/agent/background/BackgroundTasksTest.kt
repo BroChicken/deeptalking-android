@@ -195,4 +195,79 @@ class BackgroundTasksTest {
         assertEquals("咖啡馆", background.sceneKey(Character(id = "c1", dynamicState = DynamicState(currentLocation = "咖啡馆"))))
         assertEquals("未说明", background.sceneKey(Character(id = "c1", dynamicState = DynamicState(currentLocation = "   "))))
     }
+
+    @Test
+    fun memoryRetryBacksOffThenResets() {
+        var counters = scheduleMemoryRetry(MemoryTaskCounters(), MemoryTaskKind.Extraction, nowMillis = 0L)
+        assertEquals(1, counters.extractionFailures)
+        assertFalse(canRunMemoryTask(counters, MemoryTaskKind.Extraction, nowMillis = 0L))
+        assertFalse(canRunMemoryTask(counters, MemoryTaskKind.Extraction, nowMillis = 5 * 60_000L - 1))
+        assertTrue(canRunMemoryTask(counters, MemoryTaskKind.Extraction, nowMillis = 5 * 60_000L + 1))
+        counters = resetMemoryRetry(counters, MemoryTaskKind.Extraction)
+        assertEquals(0, counters.extractionFailures)
+        assertTrue(canRunMemoryTask(counters, MemoryTaskKind.Extraction, nowMillis = 0L))
+    }
+
+    private fun analyzableCharacter(): Character {
+        val user = ChatMessage(id = "u1", role = Role.User, content = "用户喜欢喝美式咖啡。")
+        val target = ShortTermMemory(
+            id = "s1",
+            content = "用户喜欢喝美式咖啡。",
+            sourceMessageIds = listOf("u1"),
+            eventTime = "2026-08-01T12:00:00Z",
+        )
+        val filler = (2..21).map { index ->
+            ShortTermMemory(
+                id = "s$index",
+                content = "占位$index",
+                sourceMessageIds = listOf("u1"),
+                eventTime = "2026-08-01T12:00:00Z",
+                analyzedAt = "done",
+            )
+        }
+        return Character(id = "c1", instant = listOf(user), shortTerm = listOf(target) + filler)
+    }
+
+    @Test
+    fun analyzeWritesValidatedLongTermAndMarksAnalyzed() = runBlocking {
+        val response = """{"status":"ok","analyzedShortTermIds":["s1"],"longTerm":[{"category":"userProfile","subject":"user","key":"饮品","value":"用户喜欢喝美式咖啡。","sourceShortTermIds":["s1"],"sourceMessageIds":["u1"],"evidence":"用户喜欢喝美式咖啡。"}]}"""
+        val (background, _) = tasks(listOf(response))
+        val updated = background.analyzeShortToLongTerm(analyzableCharacter())
+        assertEquals(1, updated.longTerm.size)
+        assertTrue(updated.shortTerm.first { it.id == "s1" }.analyzedAt != null)
+    }
+
+    @Test
+    fun analyzeRollsBackWhenSourceIsInvalid() = runBlocking {
+        val response = """{"status":"ok","analyzedShortTermIds":["s1"],"longTerm":[{"category":"userProfile","subject":"user","key":"饮品","value":"用户喜欢喝美式咖啡。","sourceShortTermIds":["s1"],"sourceMessageIds":["ghost"],"evidence":"用户喜欢喝美式咖啡。"}]}"""
+        val (background, _) = tasks(listOf(response))
+        val character = analyzableCharacter()
+        val updated = background.analyzeShortToLongTerm(character)
+        assertTrue(updated.longTerm.isEmpty())
+        assertEquals(null, updated.shortTerm.first { it.id == "s1" }.analyzedAt)
+    }
+
+    @Test
+    fun parseMemoryFromTextAppliesMemUpdate() {
+        val (background, _) = tasks(emptyList())
+        val character = Character(
+            id = "c1",
+            instant = listOf(ChatMessage(id = "u1", role = Role.User, content = "用户喜欢咖啡")),
+        )
+        val reply = """<MEM_UPDATE>{"shortTerm":[{"content":"用户喜欢咖啡","sourceMessageIds":["u1"]}]}</MEM_UPDATE>"""
+        val updated = background.parseMemoryFromText(character, reply, null)
+        assertTrue(updated != null)
+        assertEquals(1, updated!!.shortTerm.size)
+        assertEquals(null, background.parseMemoryFromText(character, "无标签", null))
+    }
+
+    @Test
+    fun initialMemoryMigrationIsNoOpForSmallWindow() = runBlocking {
+        val (background, _) = tasks(emptyList())
+        val character = Character(
+            id = "c1",
+            instant = listOf(ChatMessage(id = "u1", role = Role.User, content = "你好")),
+        )
+        assertEquals(character, background.runInitialMemoryMigration(character))
+    }
 }

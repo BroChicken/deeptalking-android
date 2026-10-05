@@ -67,6 +67,8 @@ object ResponseParser {
 
     private val trailingCommaRegex = Regex(TRAILING_COMMA)
 
+    private val JSON_SHAPES = listOf('{' to '}', '[' to ']')
+
     // ---------------------------------------------------------------- entry points
 
     fun parseSubmitResponse(arguments: String?): ParsedTurn? {
@@ -177,21 +179,151 @@ object ResponseParser {
         parseOrNull(cleaned)?.let { return it }
         parseOrNull(removeTrailingCommas(cleaned))?.let { return it }
 
+        val repaired = repairFreetextFields(cleaned)
+        parseOrNull(repaired)?.let { return it }
+        parseOrNull(removeTrailingCommas(repaired))?.let { return it }
+
         val shapeStart = cleaned.indexOf('{')
         val shapeEnd = cleaned.lastIndexOf('}')
         if (shapeStart in 0 until shapeEnd) {
             val slice = cleaned.substring(shapeStart, shapeEnd + 1)
-            parseOrNull(slice)?.let { return it }
-            parseOrNull(removeTrailingCommas(repairFreetextFields(slice)))?.let { return it }
+            val repairedSlice = repairFreetextFields(slice)
+            parseOrNull(repairedSlice)?.let { return it }
+            parseOrNull(removeTrailingCommas(repairedSlice))?.let { return it }
         }
-        val repaired = repairFreetextFields(cleaned)
-        parseOrNull(repaired)?.let { return it }
-        parseOrNull(removeTrailingCommas(repaired))?.let { return it }
+
+        JSON_SHAPES.forEach { (open, close) ->
+            val start = cleaned.indexOf(open)
+            val end = cleaned.lastIndexOf(close)
+            if (start in 0 until end) {
+                val slice = cleaned.substring(start, end + 1)
+                parseOrNull(removeTrailingCommas(safeJson(slice)))?.let { return it }
+            }
+        }
+        parseOrNull(removeTrailingCommas(safeJson(cleaned)))?.let { return it }
         return null
+    }
+
+    /**
+     * Escapes bare control characters that appear inside JSON string literals
+     * (port of `safeJson` in response-parsing.js:267-289). The model often emits
+     * real newlines/tabs inside `reply`-style values, which strict JSON rejects.
+     */
+    internal fun safeJson(value: String): String {
+        val result = StringBuilder()
+        var inString = false
+        var escaped = false
+        for (ch in value) {
+            if (inString) {
+                when {
+                    escaped -> { escaped = false; result.append(ch) }
+                    ch == '\\' -> { escaped = true; result.append(ch) }
+                    ch == '"' -> { inString = false; result.append(ch) }
+                    ch.code < 0x20 -> result.append("\\u%04x".format(ch.code))
+                    else -> result.append(ch)
+                }
+            } else {
+                if (ch == '"') inString = true
+                result.append(ch)
+            }
+        }
+        return result.toString()
     }
 
     private fun parseOrNull(text: String): JsonElement? =
         runCatching { json.parseToJsonElement(text) }.getOrNull()
+
+    // ---------------------------------------------------------------- output salvage
+
+    /**
+     * Port of `extractResponsesText` (responses.js:92-104): the canonical
+     * `output_text` or the joined `output[type=message] > content[type=output_text]`.
+     */
+    fun extractResponsesText(response: JsonObject?): String {
+        if (response == null) return ""
+        (response["output_text"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotEmpty() }?.let { return it }
+        val output = response["output"] as? JsonArray ?: return ""
+        return output.mapNotNull { item ->
+            val obj = item as? JsonObject ?: return@mapNotNull null
+            if (obj.string("type") != "message") return@mapNotNull null
+            val content = obj["content"] as? JsonArray ?: return@mapNotNull null
+            content.mapNotNull { part ->
+                val p = part as? JsonObject ?: return@mapNotNull null
+                if (p.string("type") != "output_text") return@mapNotNull null
+                p.string("text").orEmpty()
+            }.joinToString("")
+        }.joinToString("")
+    }
+
+    /**
+     * Port of `extractAnyResponseText` (responses.js:106-124): collects every
+     * `output_text` node anywhere in the tree except under a `reasoning` item.
+     */
+    fun extractAnyResponseText(response: JsonObject?): String {
+        if (response == null) return ""
+        val chunks = mutableListOf<String>()
+        fun collect(node: JsonElement?) {
+            when (node) {
+                null -> return
+                is JsonArray -> node.forEach { collect(it) }
+                is JsonObject -> {
+                    val type = node.string("type")
+                    if (type == "reasoning") return
+                    if (type == "output_text") {
+                        val text = node.string("text").orEmpty()
+                        if (text.isNotBlank()) chunks += text
+                        return
+                    }
+                    (node["content"] as? JsonArray)?.forEach { collect(it) }
+                }
+                else -> Unit
+            }
+        }
+        collect(response["output"] ?: response)
+        val combined = chunks.joinToString("\n").trim()
+        if (combined.isNotEmpty()) return combined
+        return (response["output_text"] as? JsonPrimitive)?.contentOrNull?.trim().orEmpty()
+    }
+
+    /**
+     * Port of `extractReplyJsonFromAnyOutput` (responses.js:126-149): scans
+     * `reasoning` items (content and summary text, plus optional extra reasoning
+     * items) for an embedded `"reply"` JSON object and returns the first candidate.
+     */
+    fun extractReplyJsonFromAnyOutput(response: JsonObject?, extraReasoning: List<String> = emptyList()): String {
+        val candidates = mutableListOf<String>()
+        fun scanTexts(texts: List<String>) {
+            texts.forEach { txt ->
+                val idx = txt.indexOf("\"reply\"")
+                if (idx < 0) return@forEach
+                val start = txt.lastIndexOf('{', idx)
+                if (start < 0) return@forEach
+                val candidate = txt.substring(start)
+                val parsed = parseJsonLenient(candidate) as? JsonObject
+                if (parsed != null && !parsed.string("reply").orEmpty().isBlank()) candidates += candidate
+            }
+        }
+        val output = response?.get("output") as? JsonArray
+        output?.forEach { item ->
+            val obj = item as? JsonObject ?: return@forEach
+            if (obj.string("type") != "reasoning") return@forEach
+            scanTexts(reasoningTexts(obj))
+        }
+        if (candidates.isEmpty()) {
+            extraReasoning.forEach { raw ->
+                val obj = runCatching { json.parseToJsonElement(raw) as? JsonObject }.getOrNull()
+                if (obj != null) scanTexts(reasoningTexts(obj))
+            }
+        }
+        return candidates.firstOrNull().orEmpty()
+    }
+
+    private fun reasoningTexts(obj: JsonObject): List<String> {
+        val texts = mutableListOf<String>()
+        (obj["content"] as? JsonArray)?.forEach { (it as? JsonObject)?.string("text")?.let(texts::add) }
+        (obj["summary"] as? JsonArray)?.forEach { (it as? JsonObject)?.string("text")?.let(texts::add) }
+        return texts
+    }
 
     /** Removes a trailing comma before a closing brace/bracket. */
     private fun removeTrailingCommas(text: String): String =

@@ -22,8 +22,21 @@ class DeleteMemoryTool(private val memory: MemoryService) : AgentTool {
         if (id.isEmpty()) {
             return AgentToolResult(errorJson("缺少记忆ID id，请先调用 list_memories 获取目标ID后再试"))
         }
-        val memberName = ToolArgs.string(args, "memberName").trim().ifEmpty { null }
-        memory.deleteMemory(context.character, id, memberName)
-        return AgentToolResult("""{"ok":true,"deleted":true,"id":${quote(id)}}""")
+        val requestedMember = ToolArgs.string(args, "memberName").trim().ifEmpty { null }
+        // Legacy falls back to the shared store when the member name is unknown.
+        val memberName = requestedMember?.takeIf { MemoryToolSupport.resolveMember(context.character, it) != null }
+        val exists = memory
+            .listMemories(context.character, "", "", memberName, Int.MAX_VALUE)
+            .any { it.id == id }
+        if (!exists) {
+            return AgentToolResult(
+                """{"ok":false,"deleted":false,"id":${quote(id)},"reason":${quote("未找到该记忆ID，请先调用 list_memories 查询正确ID后再试")}}""",
+            )
+        }
+        val updated = memory.deleteMemory(context.character, id, memberName)
+        return AgentToolResult(
+            contentJson = """{"ok":true,"deleted":true,"id":${quote(id)}}""",
+            updatedCharacter = updated,
+        )
     }
 }

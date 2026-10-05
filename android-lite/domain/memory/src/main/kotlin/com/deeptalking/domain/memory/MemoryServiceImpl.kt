@@ -73,7 +73,7 @@ class MemoryServiceImpl : MemoryService {
         if (character.isGroup) {
             character.members.forEach { entries += it.lorebook }
         }
-        return select(entries, recentText, LorebookLimits())
+        return select(entries, recentText, emptyList(), LorebookLimits(), orderOf = { it.order })
     }
 
     override fun applyTurn(

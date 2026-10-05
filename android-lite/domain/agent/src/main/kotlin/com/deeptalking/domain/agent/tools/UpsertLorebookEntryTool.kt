@@ -7,9 +7,14 @@ import com.deeptalking.domain.agent.AgentContext
 import com.deeptalking.domain.agent.AgentTool
 import com.deeptalking.domain.agent.AgentToolResult
 import com.deeptalking.domain.agent.prompts.trimText
+import com.deeptalking.domain.memory.parseRelativeText
+import com.deeptalking.domain.memory.parseZoned
+import com.deeptalking.domain.memory.resolveLorebookSources
+import com.deeptalking.domain.memory.resolveTimeRef
 import com.deeptalking.engine.ondevice.ToolCall
 import com.deeptalking.engine.ondevice.ToolDefinition
 import java.time.Instant
+import java.time.ZonedDateTime
 import java.util.UUID
 
 /**
@@ -29,17 +34,32 @@ class UpsertLorebookEntryTool : AgentTool {
 
     override suspend fun execute(call: ToolCall, context: AgentContext): AgentToolResult {
         val args = ToolArgs.parse(call.arguments)
+        val character = context.character
         val name = ToolArgs.string(args, "name").trim().take(AppLimits.Lorebook.NAME_CHARS)
-        val content = ToolArgs.string(args, "content").trim().take(AppLimits.Lorebook.CONTENT_CHARS)
-        if (name.isEmpty() || content.isEmpty()) {
+        val rawContent = ToolArgs.string(args, "content").trim().take(AppLimits.Lorebook.CONTENT_CHARS)
+        if (name.isEmpty() || rawContent.isEmpty()) {
             return AgentToolResult(errorJson("name 与 content 不能为空"))
         }
         val sourceIds = ToolArgs.strings(args, "sourceMessageIds").map { it.trim() }.filter { it.isNotEmpty() }
         val evidence = ToolArgs.string(args, "evidence").trim()
-        if (sourceIds.isEmpty() || evidence.isEmpty()) {
+        // Legacy `resolveLorebookSources`: ids must be real messages and evidence
+        // must overlap the source text. `LorebookStore.resolveLorebookSources` only
+        // covers short-term ids, so allow the legacy `getKnownSources` view (which
+        // also includes live instant messages) as a fallback.
+        val sourcesOk = resolveLorebookSources(character, sourceIds, evidence) ||
+            MemoryToolSupport.validLorebookSources(character, sourceIds, evidence)
+        if (!sourcesOk) {
             return AgentToolResult(
                 errorJson("sourceMessageIds 必须是上下文里真实存在的消息ID，且 evidence 要能对上原话或明确描述；拿不出依据时不要写世界书（本轮新编、还没出现在消息里的内容也不要写）"),
             )
+        }
+        // The legacy schema has no timeRef; honor it defensively if supplied.
+        val timeRef = ToolArgs.timeRef(args, "timeRef")
+        val content = if (timeRef != null) {
+            val base = resolveTimeRef(timeRef, ZonedDateTime.now())?.iso?.let { parseZoned(it) } ?: ZonedDateTime.now()
+            trimText(parseRelativeText(rawContent, base), AppLimits.Lorebook.CONTENT_CHARS)
+        } else {
+            rawContent
         }
         val keywords = ToolArgs.strings(args, "keywords")
             .map { it.trim() }
@@ -48,7 +68,6 @@ class UpsertLorebookEntryTool : AgentTool {
         val alwaysActive = ToolArgs.bool(args, "alwaysActive") ?: false
         val entryId = ToolArgs.string(args, "entryId").trim()
         val memberName = ToolArgs.string(args, "memberName").trim()
-        val character = context.character
 
         if (memberName.isNotEmpty() && character.isGroup) {
             val member = character.members.firstOrNull { it.name.equals(memberName, ignoreCase = true) }
