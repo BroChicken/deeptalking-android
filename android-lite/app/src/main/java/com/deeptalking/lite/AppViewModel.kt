@@ -17,6 +17,7 @@ import com.deeptalking.core.model.RequestMetric
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.domain.agent.OrchestratorResult
+import com.deeptalking.feature.characters.CharacterParity
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -32,6 +33,8 @@ import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import java.time.Instant
 import java.util.UUID
 
@@ -124,6 +127,15 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         }
         // Legacy silent avatar auto-repair for damaged placeholders.
         autoRepairAvatars()
+        // Restore the on-device read-aloud voice selection and ready the built-in voices.
+        viewModelScope.launch {
+            val cfg = core.currentConfig()
+            cfg.ttsVoiceFile.takeIf { it.isNotBlank() }?.let { p ->
+                java.io.File(p).takeIf { it.exists() }?.let { core.cosyVoice.setVoiceFile(it) }
+            }
+            runCatching { core.cosyVoice.ensureDefaultVoices() }.onFailure { DeepTalkingApp.recordError(it) }
+            refreshTtsState(core.currentConfig())
+        }
     }
 
     // --------------------------------------------------------- migrations
@@ -183,10 +195,12 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 eventsState.tryEmit(UiEvent("未配置 API Key，无法整理"))
                 return@launch
             }
-            val count = core.runWorldLoreMigration(cfg, trimSource)
+            val outcome = core.runWorldLoreMigration(cfg, trimSource)
             val remaining = runCatching { core.lorebookMigrationTargetCount() }.getOrDefault(0)
-            val suffix = if (remaining > 0) "，仍有 $remaining 个待处理" else ""
-            eventsState.tryEmit(UiEvent("世界书整理完成（$count 个角色$suffix）"))
+            val parts = mutableListOf("${outcome.success} 个角色已整理")
+            if (outcome.failed > 0) parts += "${outcome.failed} 个失败（稍后会再提醒）"
+            if (remaining > 0) parts += "仍有 $remaining 个待处理"
+            eventsState.tryEmit(UiEvent("世界书整理完成：${parts.joinToString("，")}"))
         }
     }
 
@@ -327,15 +341,32 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 val label = if (message.role == Role.User) "用户" else character.name
                 "$label: " + message.content.take(1000)
             }
+            val originalCharJson = buildJsonObject {
+                put("name", character.name)
+                put("avatar", character.emoji)
+                put("gender", character.staticProfile.gender)
+                put("age", character.staticProfile.age)
+                put("race", character.staticProfile.race)
+                put("appearance", character.staticProfile.appearance)
+                put("personality", character.staticProfile.personality)
+                put("values", character.staticProfile.values)
+                put("fears", character.staticProfile.fears)
+                put("background", character.staticProfile.background)
+                put("keyEvents", character.staticProfile.keyEvents)
+                put("speakingStyle", character.staticProfile.speakingStyle)
+                put("language", character.staticProfile.language)
+                put("userAddress", character.staticProfile.userAddress)
+            }.toString()
             val prompt = buildString {
                 append("将以下角色和近期对话升级为群组。原角色会由系统完整保留，因此绝不能在输出成员列表中再次生成原角色，也不要生成同名或明显重复的变体。")
                 append("请列出所有近期对话中已出现、应成为固定成员的其他角色；若不足一人，再新增一名最适合当前剧情的成员。")
                 append("返回JSON：{\"groupInfo\":{\"name\":\"群组名\",\"avatar\":\"emoji\",\"description\":\"群组前提（这群人是谁、为什么在一起，1-2 句；不要写世界观/地点/组织等世界层设定）\",\"scene\":\"场景\",\"interactionRules\":\"成员互动规则\"},")
                 append("\"lorebook\":[{\"name\":\"条目名\",\"keywords\":[\"触发词\"],\"content\":\"命中后注入的世界层设定\",\"alwaysActive\":false}],")
                 append("\"additionalMembers\":[{\"name\":\"\",\"avatar\":\"emoji\",\"gender\":\"\",\"age\":\"\",\"race\":\"\",\"appearance\":\"\",\"personality\":\"\",\"values\":\"\",\"fears\":\"\",\"background\":\"\",\"keyEvents\":\"\",\"speakingStyle\":\"\",\"language\":\"\",\"userAddress\":\"\",\"roleInGroup\":\"\",\"dynamicState\":{\"currentSituation\":\"\",\"currentLocation\":\"\",\"currentMood\":\"\",\"currentOccupation\":\"\",\"currentGoal\":\"\",\"currentRelationship\":\"\",\"currentImportantOthers\":\"\"}}]}。")
-                append("lorebook 只需补上近期对话中出现、值得日后复用的世界层设定（没有就返回空数组）；additionalMembers 只能包含新增成员，至少一名，且姓名必须互不重复；每名成员必须尽可能填满所有字段。")
-                append("\n原角色（禁止重复输出）:\n").append(character.name)
-                if (character.staticProfile.personality.isNotBlank()) append("（").append(character.staticProfile.personality).append("）")
+                append("lorebook 只需补上近期对话中出现、值得日后复用的世界层设定（没有就返回空数组）；additionalMembers只能包含新增成员，至少一名，且姓名必须互不重复；每名成员必须尽可能填满所有字段，不能只返回名称和性格；成员之间的说话方式必须显著不同（看台词就能分辨是谁）。")
+                append(CharacterParity.CHARACTER_QUALITY_RULE)
+                append(CharacterParity.SPEAKING_STYLE_SAMPLES_RULE)
+                append("\n原角色（禁止重复输出）:\n").append(originalCharJson)
                 if (transcript.isNotBlank()) append("\n近期对话:\n").append(transcript)
             }
             val raw = runCatching { core.quickGenerate(cfg, prompt) }.getOrNull()
@@ -432,6 +463,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             id = UUID.randomUUID().toString(),
             name = "",
             content = "",
+            alwaysActive = true,
             origin = LorebookOrigin.User,
             createdAt = Instant.now().toString(),
         )
@@ -571,13 +603,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                     var memberChanged = false
                     members.forEachIndexed { index, member ->
                         if (needsRepair(member.emoji)) {
-                            val probe = Character(
-                                id = member.id,
-                                name = member.name,
-                                emoji = member.emoji,
-                                staticProfile = member.staticProfile,
-                            )
-                            val emoji = runCatching { core.generateEmojiAvatar(cfg, probe) }.getOrNull()
+                            val emoji = runCatching { core.generateEmojiAvatar(cfg, member, character) }.getOrNull()
                             if (!emoji.isNullOrBlank()) {
                                 members[index] = member.copy(emoji = emoji)
                                 memberChanged = true
@@ -600,13 +626,19 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         }
     }
 
-    /** Legacy `isAvatarDamaged`: empty, placeholder, replacement char, or ASCII-only. */
-    private fun needsRepair(emoji: String): Boolean {
+    /** Legacy `isAvatarDamaged`: empty, replacement char, or ASCII-only. */
+    private fun isAvatarDamaged(emoji: String): Boolean {
         val v = emoji.trim()
         if (v.isEmpty()) return true
-        if (v == "👤" || v == "👥") return true
         if (v.contains('?') || v.contains('\uFFFD')) return true
         return v.none { it.code > 127 }
+    }
+
+    /** Legacy `isAvatarDamaged` plus 👤/👥 placeholders (manual repair only). */
+    private fun needsRepair(emoji: String): Boolean {
+        val v = emoji.trim()
+        if (v == "👤" || v == "👥") return true
+        return isAvatarDamaged(v)
     }
 
     /** Legacy `autoRepairAvatars`: silently repair damaged avatars on startup/import. */
@@ -618,7 +650,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             for (character in all) {
                 var updated = character
                 var changed = false
-                if (needsRepair(character.emoji)) {
+                if (isAvatarDamaged(character.emoji)) {
                     val emoji = runCatching { core.generateEmojiAvatar(cfg, character) }.getOrNull()
                     if (!emoji.isNullOrBlank()) {
                         updated = updated.copy(emoji = emoji)
@@ -628,8 +660,8 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 if (character.members.isNotEmpty()) {
                     val members = updated.members.toMutableList()
                     updated.members.forEachIndexed { index, member ->
-                        if (needsRepair(member.emoji)) {
-                            val emoji = runCatching { core.generateEmojiAvatar(cfg, character) }.getOrNull()
+                        if (isAvatarDamaged(member.emoji)) {
+                            val emoji = runCatching { core.generateEmojiAvatar(cfg, member, character) }.getOrNull()
                             if (!emoji.isNullOrBlank()) {
                                 members[index] = member.copy(emoji = emoji)
                                 changed = true
@@ -710,11 +742,11 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 val orchestrator = core.createOrchestrator(cfg) { updated ->
                     core.appScope.launch { core.data.characters.upsert(updated) }
                 }
-                // Legacy `chatStageDecision('empty')`: an empty turn is retried once
-                // before failing, so the user never gets an empty bubble.
+                // Legacy `chatStageDecision('empty')`: an empty turn is retried twice
+                // (attemptsLeft=2 → up to 3 requests) before failing.
                 var result: OrchestratorResult? = null
                 var attempt = 0
-                while (attempt < 2) {
+                while (attempt < 3) {
                     if (attempt > 0) {
                         statusState.value = "正在重新生成…"
                         streamingState.value = ""
@@ -768,6 +800,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 quickRepliesState.value = finalResult.quickReplies
                 statusState.value = ""
                 recordMetrics(cfg, id, finalResult)
+                if (cfg.ttsEnabled && cfg.ttsAutoRead) speakText(finalResult.reply)
             } catch (error: Exception) {
                 streamingState.value = null
                 statusState.value = ""
@@ -899,9 +932,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             character.copy(
                 shortTerm = character.shortTerm.filterNot { hasRemovedSource(it.sourceMessageIds) },
                 longTerm = character.longTerm.filterNot { hasRemovedSource(it.sourceMessageIds) },
-                pendingRecall = character.pendingRecall?.takeIf {
-                    removedIds.isEmpty()
-                },
+                pendingRecall = character.pendingRecall.filterNot { hasRemovedSource(it.sourceMessageIds) },
                 revision = character.revision + 1,
             ),
         )
@@ -974,7 +1005,13 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             val restored = summary.activeCharacterId?.takeIf { id -> all.any { it.id == id } }
             activeIdState.value = restored ?: all.firstOrNull()?.id
             eventsState.tryEmit(
-                UiEvent("导入成功：${summary.characters} 个角色，${summary.messages} 条消息"),
+                UiEvent(
+                    if (summary.skipped > 0) {
+                        "导入成功：${summary.characters} 个角色，${summary.messages} 条消息（${summary.skipped} 个角色无法解析已跳过）"
+                    } else {
+                        "导入成功：${summary.characters} 个角色，${summary.messages} 条消息"
+                    },
+                ),
             )
             // Legacy runs silent static-field completion + migration prompts after import.
             runCatching { core.runStartupMigrations() }.onFailure { DeepTalkingApp.recordError(it) }
@@ -1046,5 +1083,147 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         core.data.config.observe().collect { cfg ->
             themeState.value = com.deeptalking.core.designsystem.AppTheme.fromId(cfg.activeTheme)
         }
+    }
+
+    // -------------------------------------------------------------------- tts
+
+    private val ttsState = MutableStateFlow(TtsState())
+
+    /** On-device read-aloud state (CosyVoice3). */
+    val tts: StateFlow<TtsState> = ttsState
+
+    private var ttsJob: Job? = null
+
+    private fun refreshTtsState(cfg: AppConfig) {
+        val voices = runCatching { core.cosyVoice.listVoices() }.getOrDefault(emptyList())
+        val activeFile = cfg.ttsVoiceFile.takeIf { it.isNotBlank() }?.let { java.io.File(it).name }
+            ?.takeIf { name -> voices.any { it.file == name } }
+            ?: voices.firstOrNull()?.file
+            ?: ""
+        ttsState.value = ttsState.value.copy(
+            enabled = cfg.ttsEnabled,
+            autoRead = cfg.ttsAutoRead,
+            modelReady = runCatching { core.cosyVoice.isModelReady }.getOrDefault(false),
+            voices = voices,
+            activeVoice = activeFile,
+            style = cfg.ttsStyle,
+            speed = cfg.ttsSpeed,
+        )
+    }
+
+    fun setTtsEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            val cfg = core.currentConfig()
+            core.data.config.update(cfg.copy(ttsEnabled = enabled))
+            refreshTtsState(core.currentConfig())
+        }
+    }
+
+    fun setTtsAutoRead(autoRead: Boolean) {
+        viewModelScope.launch {
+            core.data.config.update(core.currentConfig().copy(ttsAutoRead = autoRead))
+            refreshTtsState(core.currentConfig())
+        }
+    }
+
+    fun setTtsStyle(style: String) {
+        ttsState.value = ttsState.value.copy(style = style)
+        viewModelScope.launch { core.data.config.update(core.currentConfig().copy(ttsStyle = style)) }
+    }
+
+    fun setTtsSpeed(speed: Float) {
+        ttsState.value = ttsState.value.copy(speed = speed)
+        viewModelScope.launch { core.data.config.update(core.currentConfig().copy(ttsSpeed = speed)) }
+    }
+
+    fun downloadVoiceModel() {
+        if (ttsState.value.downloading) return
+        ttsState.value = ttsState.value.copy(downloading = true, status = "正在下载语音模型…")
+        ttsJob = viewModelScope.launch {
+            runCatching {
+                core.cosyVoice.download { done, total, label ->
+                    val pct = if (total > 0) (done.toFloat() / total).coerceIn(0f, 1f) else 0f
+                    ttsState.value = ttsState.value.copy(progress = pct, progressLabel = label)
+                }
+            }.onSuccess { ok ->
+                ttsState.value = ttsState.value.copy(downloading = false, modelReady = ok, status = if (ok) "模型已就绪" else "下载未完成")
+                if (ok) {
+                    ttsState.value = ttsState.value.copy(status = "正在准备默认音色…")
+                    runCatching { core.cosyVoice.ensureDefaultVoices() }.onFailure { DeepTalkingApp.recordError(it) }
+                }
+            }.onFailure { t ->
+                ttsState.value = ttsState.value.copy(downloading = false, status = "下载失败：${t.message}")
+            }
+            refreshTtsState(core.currentConfig())
+        }
+    }
+
+    /** Imports any audio file; the engine auto-picks a few seconds of clear speech. */
+    fun importVoice(uri: android.net.Uri, name: String, promptText: String?) {
+        if (ttsState.value.busy) return
+        ttsState.value = ttsState.value.copy(busy = true, status = "正在解析音频并挑选人声片段…")
+        ttsJob = viewModelScope.launch {
+            runCatching { core.cosyVoice.importVoice(uri, name, promptText?.trim()?.ifBlank { null }) }
+                .onSuccess { info ->
+                    core.data.config.update(core.currentConfig().copy(ttsVoiceFile = core.cosyVoice.voiceFile?.absolutePath ?: ""))
+                    ttsState.value = ttsState.value.copy(busy = false, status = "音色已导入：${info.name}")
+                }
+                .onFailure { t -> ttsState.value = ttsState.value.copy(busy = false, status = "导入失败：${t.message}") }
+            refreshTtsState(core.currentConfig())
+        }
+    }
+
+    fun selectVoice(file: String) {
+        viewModelScope.launch {
+            val resolved = core.cosyVoice.selectVoice(file) ?: return@launch
+            core.data.config.update(core.currentConfig().copy(ttsVoiceFile = resolved.absolutePath))
+            refreshTtsState(core.currentConfig())
+        }
+    }
+
+    fun renameVoice(file: String, name: String) {
+        viewModelScope.launch {
+            val ok = runCatching { core.cosyVoice.renameVoice(file, name) }.getOrDefault(false)
+            ttsState.value = ttsState.value.copy(status = if (ok) "已重命名为：${name.trim()}" else "重命名失败")
+            refreshTtsState(core.currentConfig())
+        }
+    }
+
+    fun deleteVoice(file: String) {
+        viewModelScope.launch {
+            val ok = runCatching { core.cosyVoice.deleteVoice(file) }.getOrDefault(false)
+            if (ok) {
+                val cfg = core.currentConfig()
+                if (cfg.ttsVoiceFile.endsWith(file)) {
+                    core.data.config.update(cfg.copy(ttsVoiceFile = ""))
+                }
+                ttsState.value = ttsState.value.copy(status = "音色已删除")
+            } else {
+                ttsState.value = ttsState.value.copy(status = "内置音色不可删除")
+            }
+            refreshTtsState(core.currentConfig())
+        }
+    }
+
+    /** Reads the currently visible AI reply aloud. */
+    fun speakText(text: String) {
+        val clean = text.trim()
+        if (clean.isEmpty()) return
+        viewModelScope.launch {
+            val cfg = core.currentConfig()
+            if (!cfg.ttsEnabled) {
+                eventsState.tryEmit(UiEvent("请先在设置-语音朗读中开启"))
+                return@launch
+            }
+            ttsState.value = ttsState.value.copy(speaking = true, status = "正在合成…")
+            runCatching { core.cosyVoice.speak(clean, cfg.ttsStyle.ifBlank { null }) }
+                .onFailure { t -> ttsState.value = ttsState.value.copy(status = "朗读失败：${t.message}") }
+            ttsState.value = ttsState.value.copy(speaking = false)
+        }
+    }
+
+    fun stopSpeaking() {
+        runCatching { core.cosyVoice.stop() }
+        ttsState.value = ttsState.value.copy(speaking = false)
     }
 }

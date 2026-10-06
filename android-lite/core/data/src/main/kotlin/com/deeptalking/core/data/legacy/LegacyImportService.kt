@@ -16,6 +16,8 @@ data class ImportSummary(
     val stickers: Int,
     val configUpdated: Boolean,
     val activeCharacterId: String? = null,
+    /** Characters that could not be decoded/mapped and were skipped (never silent). */
+    val skipped: Int = 0,
 )
 
 /**
@@ -42,14 +44,20 @@ class LegacyImportService(
             ?: return ImportSummary(0, 0, 0, false)
 
         val mapped = ArrayList<Character>()
+        var skipped = 0
         val characterEntries = root["characters"] as? JsonObject
         if (characterEntries != null) {
             for ((key, element) in characterEntries) {
                 val dto = runCatching {
                     codec.decodeFromJsonElement(LegacyCharacter.serializer(), element)
-                }.getOrNull() ?: continue
+                }.getOrNull()
+                if (dto == null) {
+                    skipped++
+                    continue
+                }
                 runCatching { mapCharacter(dto.copy(id = dto.id ?: key), stickerSink) }
                     .onSuccess { mapped.add(it) }
+                    .onFailure { skipped++ }
             }
         }
 
@@ -100,12 +108,25 @@ class LegacyImportService(
         val configUpdated = configDto != null || exportedTheme != null
         if (configUpdated) {
             runCatching {
-                var mapped = configDto?.let(::mapConfig) ?: config.current()
+                val current = config.current()
+                var mapped = configDto?.let(::mapConfig) ?: current
+                // A legacy export has no native-only keys (TTS, reply debug,
+                // simplified metrics), so an import must not wipe them.
+                mapped = mapped.copy(
+                    ttsEnabled = current.ttsEnabled,
+                    ttsAutoRead = current.ttsAutoRead,
+                    ttsVoiceFile = current.ttsVoiceFile,
+                    ttsStyle = current.ttsStyle,
+                    ttsSpeed = current.ttsSpeed,
+                    lastReplyDebug = current.lastReplyDebug,
+                    requestMetrics = current.requestMetrics,
+                    platformSettings = mapped.platformSettings.ifEmpty { current.platformSettings },
+                )
                 if (exportedTheme != null) mapped = mapped.copy(activeTheme = exportedTheme)
                 config.update(mapped)
             }
         }
 
-        return ImportSummary(characterCount, messageCount, stickerCount, configUpdated, activeCharacterId)
+        return ImportSummary(characterCount, messageCount, stickerCount, configUpdated, activeCharacterId, skipped)
     }
 }

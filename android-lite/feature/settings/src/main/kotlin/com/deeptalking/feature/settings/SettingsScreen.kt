@@ -90,13 +90,49 @@ fun SettingsScreen(
     onSave: (AppConfig, apiKey: String?) -> Unit,
     onTestReminder: () -> Unit,
     onTestConnection: (AppConfig, String?) -> Unit,
+    ttsEnabled: Boolean = false,
+    ttsAutoRead: Boolean = false,
+    ttsModelReady: Boolean = false,
+    ttsDownloading: Boolean = false,
+    ttsProgress: Float = 0f,
+    ttsProgressLabel: String = "",
+    ttsVoices: List<VoiceOption> = emptyList(),
+    ttsActiveVoice: String = "",
+    ttsStyle: String = "",
+    ttsStatus: String = "",
+    ttsSpeaking: Boolean = false,
+    ttsBusy: Boolean = false,
+    onToggleTtsEnabled: (Boolean) -> Unit = {},
+    onToggleTtsAutoRead: (Boolean) -> Unit = {},
+    onDownloadTtsModel: () -> Unit = {},
+    onImportTtsVoice: (android.net.Uri, String, String?) -> Unit = { _, _, _ -> },
+    onSelectTtsVoice: (String) -> Unit = {},
+    onRenameTtsVoice: (String, String) -> Unit = { _, _ -> },
+    onDeleteTtsVoice: (String) -> Unit = {},
+    onTtsStyleChange: (String) -> Unit = {},
+    onTestTtsSpeak: (String) -> Unit = {},
+    onStopTts: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val legacy = MaterialTheme.legacy
-    var edited by remember(config) { mutableStateOf(config) }
+    var edited by remember { mutableStateOf(config) }
     var apiKey by remember { mutableStateOf("") }
     var platformMenuOpen by rememberSaveable { mutableStateOf(false) }
     var thinkingMenuOpen by rememberSaveable { mutableStateOf(false) }
+    // Once the user edits, local state wins: the config flow's delayed echo of our own
+    // per-change saves must never roll the field back mid-typing.
+    var userEdited by remember { mutableStateOf(false) }
+
+    // Legacy bound every field's `change` to `saveSettings`; persist each edit right
+    // away so switching tabs or leaving settings never drops a toggle/field edit.
+    val persist: (AppConfig) -> Unit = { newConfig ->
+        userEdited = true
+        edited = newConfig
+        onSave(newConfig, null)
+    }
+
+    // Adopt external config changes (initial load/import) until the user starts editing.
+    LaunchedEffect(config) { if (!userEdited && config != edited) edited = config }
 
     // Per-platform API keys live in SecretStore; clear the typed field on switch so
     // a key entered for one platform is never saved onto another (legacy slot swap).
@@ -122,7 +158,7 @@ fun SettingsScreen(
             onExpandedChange = { platformMenuOpen = it },
             onSelect = { label ->
                 val id = PLATFORM_LABELS.entries.firstOrNull { it.value == label }?.key ?: label
-                edited = switchPlatform(edited, id)
+                persist(switchPlatform(edited, id))
                 apiKey = ""
                 platformMenuOpen = false
             },
@@ -131,14 +167,14 @@ fun SettingsScreen(
         FieldLabel("API Base URL（OpenAI 兼容）")
         LegacyField(
             value = edited.apiBaseUrl,
-            onValueChange = { edited = edited.copy(apiBaseUrl = it) },
+            onValueChange = { persist(edited.copy(apiBaseUrl = it)) },
             placeholder = "https://api.example.com/v1",
         )
 
         FieldLabel("API Key")
         LegacyField(
             value = apiKey,
-            onValueChange = { apiKey = it },
+            onValueChange = { raw -> apiKey = raw; onSave(edited, raw.ifBlank { null }) },
             placeholder = if (hasApiKey) "已保存（留空则不改）" else "sk-...",
             visualTransformation = PasswordVisualTransformation(),
             keyboardType = KeyboardType.Password,
@@ -157,18 +193,18 @@ fun SettingsScreen(
         LegacyModelField(
             value = edited.modelName,
             suggestions = models,
-            onValueChange = { edited = edited.copy(modelName = it) },
+            onValueChange = { persist(edited.copy(modelName = it)) },
         )
 
         FieldLabel("Temperature")
         LegacyField(
             value = edited.temperature.toString(),
             onValueChange = { raw ->
-                raw.toDoubleOrNull()?.let { edited = edited.copy(temperature = it.coerceIn(0.0, 2.0)) }
+                raw.toDoubleOrNull()?.let { persist(edited.copy(temperature = it.coerceIn(0.0, 2.0))) }
             },
             keyboardType = KeyboardType.Decimal,
         )
-        CheckRow("流式回复", edited.stream) { edited = edited.copy(stream = it) }
+        CheckRow("流式回复", edited.stream) { persist(edited.copy(stream = it)) }
 
         FieldLabel("思考强度（DeepSeek）")
         LegacyDropdown(
@@ -177,7 +213,7 @@ fun SettingsScreen(
             expanded = thinkingMenuOpen,
             onExpandedChange = { thinkingMenuOpen = it },
             onSelect = { label ->
-                THINKING_LEVELS.firstOrNull { it.second == label }?.let { edited = edited.copy(reasoningEffort = it.first) }
+                THINKING_LEVELS.firstOrNull { it.second == label }?.let { persist(edited.copy(reasoningEffort = it.first)) }
                 thinkingMenuOpen = false
             },
         )
@@ -186,19 +222,44 @@ fun SettingsScreen(
             "角色主动开口",
             edited.proactiveEnabled,
             hint = "打开面板停留约 1 分钟未对话时，角色主动发起开场",
-        ) { edited = edited.copy(proactiveEnabled = it) }
+        ) { persist(edited.copy(proactiveEnabled = it)) }
         CheckRow(
             "文风自动校对",
             edited.styleCritique,
             hint = "回复命中语气/风格问题时，追加一次只改文风的修订请求",
-        ) { edited = edited.copy(styleCritique = it) }
+        ) { persist(edited.copy(styleCritique = it)) }
         CheckRow(
             "快速回应视角校正",
             edited.quickReplyRepair,
             hint = "快速回应不像用户会说的话时，后台用“用户本人”身份重写一次",
-        ) { edited = edited.copy(quickReplyRepair = it) }
+        ) { persist(edited.copy(quickReplyRepair = it)) }
 
         LegacyButton("测试提醒", modifier = Modifier.fillMaxWidth(), onClick = onTestReminder)
+
+        VoiceSettingsSection(
+            enabled = ttsEnabled,
+            autoRead = ttsAutoRead,
+            modelReady = ttsModelReady,
+            downloading = ttsDownloading,
+            progress = ttsProgress,
+            progressLabel = ttsProgressLabel,
+            voices = ttsVoices,
+            activeVoiceId = ttsActiveVoice,
+            style = ttsStyle,
+            status = ttsStatus,
+            speaking = ttsSpeaking,
+            busy = ttsBusy,
+            onToggleEnabled = onToggleTtsEnabled,
+            onToggleAutoRead = onToggleTtsAutoRead,
+            onDownload = onDownloadTtsModel,
+            onImportVoice = onImportTtsVoice,
+            onSelectVoice = onSelectTtsVoice,
+            onRenameVoice = onRenameTtsVoice,
+            onDeleteVoice = onDeleteTtsVoice,
+            onStyleChange = onTtsStyleChange,
+            onTestSpeak = onTestTtsSpeak,
+            onStop = onStopTts,
+        )
 
         DebugInfoPanel(config, context)
     }
@@ -249,7 +310,7 @@ private fun LegacyField(
 }
 
 @Composable
-private fun LegacyDropdown(
+internal fun LegacyDropdown(
     selected: String,
     options: List<String>,
     expanded: Boolean,
@@ -375,7 +436,10 @@ private fun DebugInfoPanel(config: AppConfig, context: Context) {
         if (config.lastReplyDebug.isNotBlank()) add("【最近一次回应】\n" + config.lastReplyDebug)
         if (config.requestMetrics.isNotEmpty()) {
             val recent = config.requestMetrics.takeLast(12).joinToString("\n") {
-                "输入 ${it.inputTokens} · 命中 ${it.hitTokens} · 命中率 ${"%.0f".format(it.hitRate * 100)}%"
+                val input = it.inputTokens?.toString() ?: "--"
+                val hit = it.hitTokens?.toString() ?: "--"
+                val rate = it.hitRate?.let { value -> "%.0f".format(value * 100) + "%" } ?: "--"
+                "输入 $input · 命中 $hit · 命中率 $rate"
             }
             add("【最近 API 用量与缓存统计】\n$recent")
         }

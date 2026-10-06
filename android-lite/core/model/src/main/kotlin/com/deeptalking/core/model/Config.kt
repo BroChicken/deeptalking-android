@@ -17,6 +17,8 @@ data class AppConfig(
     val activeTheme: String = "",
     /** Rolling API usage/cache metrics (legacy `requestMetrics`, capped at 60). */
     val requestMetrics: List<RequestMetric> = emptyList(),
+    /** Latest chat cache-usage snapshot (legacy `cacheStats`). */
+    val cacheStats: CacheStats? = null,
     /** Latest reply debug payload (legacy DEBUG_REPLY_STORAGE_KEY). */
     val lastReplyDebug: String = "",
     /**
@@ -25,6 +27,15 @@ data class AppConfig(
      * key half lives in `:core:security` `SecretStore` (never in this payload).
      */
     val platformSettings: Map<String, PlatformSlot> = emptyMap(),
+    /** On-device read-aloud (CosyVoice3). */
+    val ttsEnabled: Boolean = false,
+    val ttsAutoRead: Boolean = false,
+    /** Path (relative to filesDir) of the active prompt-speech voice profile. */
+    val ttsVoiceFile: String = "",
+    /** Free-form natural-language emotion/style instruction used for read-aloud. */
+    val ttsStyle: String = "",
+    /** CosyVoice3 speech speed multiplier (0.5–2.0). */
+    val ttsSpeed: Float = 1.0f,
 )
 
 /** Non-secret half of a per-platform config slot (legacy `platformSettings[p]`). */
@@ -38,12 +49,25 @@ data class PlatformSlot(
 @Serializable
 data class RequestMetric(
     val at: String = "",
-    val taskType: String = "",
-    val characterId: String = "",
-    val inputTokens: Int = 0,
-    val hitTokens: Int = 0,
-    val missTokens: Int = 0,
-    val hitRate: Double = 0.0,
+    val characterId: String? = null,
+    val taskType: String = "chat",
+    val model: String = "",
+    val platform: String = "",
+    val phase: String = "",
+    val status: String = "completed",
+    val durationMs: Long? = null,
+    val instructionsHash: String? = null,
+    val toolsHash: String? = null,
+    val historyHash: String? = null,
+    val prefixChange: String? = null,
+    val commonHistoryMessages: Int? = null,
+    val contextChars: Int? = null,
+    val inputChars: Int? = null,
+    val inputTokens: Int? = null,
+    val outputTokens: Int? = null,
+    val hitTokens: Int? = null,
+    val missTokens: Int? = null,
+    val hitRate: Double? = null,
 )
 
 @Serializable

@@ -50,7 +50,7 @@ class ChatOrchestratorTest {
         val args = """
             {"reply":"你好呀，今天过得怎么样？","quickReplies":["还不错","有点累"],
              "shortTerm":[{"content":"用户2026-10-04告诉角色今天心情不错","sourceMessageIds":["m1"]}],
-             "longTerm":[{"category":"userProfile","key":"用户姓名","value":"用户叫小明",
+             "longTerm":[{"category":"userProfile","subject":"user","key":"用户姓名","value":"用户叫小明",
                           "sourceMessageIds":["m1"],"evidence":"我叫小明"}]}
         """.trimIndent()
         val orchestrator = ChatOrchestrator(
@@ -72,6 +72,32 @@ class ChatOrchestratorTest {
         assertEquals(listOf("还不错", "有点累"), result.quickReplies)
         assertTrue("long-term memory should be folded", result.updatedCharacter.longTerm.any { it.value.contains("小明") })
         assertTrue("short-term memory should be folded", result.updatedCharacter.shortTerm.isNotEmpty())
+    }
+
+    @Test
+    fun `rejects long-term memory without valid subject and evidence`() = runBlocking {
+        val args = """
+            {"reply":"你好呀","quickReplies":["还不错","有点累"],
+             "longTerm":[{"category":"userProfile","key":"用户姓名","value":"用户叫小明",
+                          "sourceMessageIds":["m1"],"evidence":"我叫小明"}]}
+        """.trimIndent()
+        val orchestrator = ChatOrchestrator(
+            llm = ScriptedLlm(args),
+            tools = ToolRegistry(listOf(NoTools())),
+            memory = MemoryServiceImpl(),
+            config = AppConfig(),
+        )
+
+        val result = orchestrator.run(
+            character = character(),
+            history = listOf(ChatMessage(id = "m1", role = Role.User, content = "我叫小明")),
+            userText = "我叫小明",
+        )
+
+        assertTrue(
+            "a legacy-subject long-term entry must not be folded",
+            result.updatedCharacter.longTerm.isEmpty(),
+        )
     }
 
     @Test

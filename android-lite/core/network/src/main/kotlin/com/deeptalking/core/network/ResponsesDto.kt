@@ -44,6 +44,9 @@ data class ResponsesResponse(
     val id: String? = null,
     val output: List<OutputItem> = emptyList(),
     val usage: UsageDto? = null,
+    val status: String? = null,
+    val error: JsonElement? = null,
+    @SerialName("incomplete_details") val incompleteDetails: JsonElement? = null,
 )
 
 @Serializable

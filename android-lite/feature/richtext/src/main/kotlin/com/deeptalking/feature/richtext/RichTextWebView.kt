@@ -13,12 +13,15 @@ import android.webkit.WebViewClient
  * Lightweight HTML renderer used for rich chat content (math via KaTeX, and
  * messages embedding markdown images).
  *
- * Chat is read-only, so links open in the external browser and image taps are
- * forwarded to the same external viewer instead of navigating the message
- * WebView (which would otherwise hijack the back button). Model-controlled HTML
- * is escaped by [renderMarkdownToHtml] before it reaches [loadDataWithBaseURL].
+ * Chat is read-only, so ordinary links open in the external browser while an
+ * inline `![alt](url)` image tap is forwarded to the host via [onImageClick] so
+ * it can show the in-app lightbox. Model-controlled HTML is escaped by
+ * [renderMarkdownToHtml] before it reaches [loadDataWithBaseURL].
  */
 class RichTextWebView(context: Context) : WebView(context) {
+
+    /** Invoked on the main thread when the user taps an inline markdown image. */
+    var onImageClick: ((String) -> Unit)? = null
 
     init {
         settings.javaScriptEnabled = true
@@ -64,7 +67,7 @@ class RichTextWebView(context: Context) : WebView(context) {
             )
             append(
                 "<script>document.querySelectorAll('img.message-image').forEach(function(img){" +
-                    "img.onclick=function(){DeepTalking.openExternal(img.src);};});</script>"
+                    "img.onclick=function(){DeepTalking.openImage(img.src);};});</script>"
             )
             append("</html>")
         }
@@ -81,6 +84,9 @@ class RichTextWebView(context: Context) : WebView(context) {
 
     private inner class ImageBridge {
         @JavascriptInterface
-        fun openExternal(url: String) = this@RichTextWebView.openExternal(url)
+        fun openImage(url: String) {
+            // JS bridge calls arrive off the UI thread; hop back before touching Compose state.
+            post { onImageClick?.invoke(url) }
+        }
     }
 }

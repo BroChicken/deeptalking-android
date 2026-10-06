@@ -8,14 +8,15 @@ import com.deeptalking.core.model.AppConfig
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.DynamicState
+import com.deeptalking.core.model.DynamicStateMeta
 import com.deeptalking.core.model.GroupMember
 import com.deeptalking.core.model.LongTermMemory
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.LorebookOrigin
 import com.deeptalking.core.model.MemoryCategory
+import com.deeptalking.core.model.MemoryCounters
 import com.deeptalking.core.model.MemorySubject
 import com.deeptalking.core.model.MessageAttachment
-import com.deeptalking.core.model.PendingRecall
 import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.SceneState
@@ -79,11 +80,10 @@ fun interface MediaSource {
  * (legacy-compatible) and written back to local files on import, so a backup
  * restored on another device still shows images.
  *
- * - `apiKey` is intentionally never exported (mirrors `exportAllData`).
- * - `platformSettings`, `cacheStats` and `requestMetrics` are not part of
- *   [com.deeptalking.core.model.AppConfig] and therefore omitted.
- * - `counters` / `lastInjectedRecallIds` and long-term `sourceRoles` /
- *   `conflicts` / `relatedTo` have no native field and are omitted.
+ * - `apiKey` is intentionally never exported (mirrors `exportAllData`); the
+ *   per-platform `apiKey` half is likewise dropped.
+ * - `counters`, `lastInjectedRecallIds`, `pendingRecall`, `dynamicStateMeta`,
+ *   `staticFieldMeta` and full `requestMetrics` round-trip in the legacy shape.
  * - `activeCharacterId` is accepted as a parameter (native stores do not model
  *   an active character); pass the current selection, or omit for `null`.
  */
@@ -134,6 +134,10 @@ class BackupService(
         put("entityType", if (character.isGroup) "group" else "character")
         put("basicInfo", basicInfoToJson(character.name, character.emoji, character.staticProfile))
         put("dynamicState", dynamicStateToJson(character.dynamicState))
+        if (character.dynamicStateMeta.isNotEmpty()) {
+            put("dynamicStateMeta", dynamicStateMetaToJson(character.dynamicStateMeta))
+        }
+        if (character.avatarRepairPending) put("avatarRepairPending", true)
         put(
             "memory",
             memoryToJson(
@@ -143,6 +147,8 @@ class BackupService(
                 scenes = character.scenes,
                 sceneState = character.sceneState,
                 pendingRecall = character.pendingRecall,
+                counters = character.counters,
+                lastInjectedRecallIds = character.lastInjectedRecallIds,
                 revision = character.revision,
             ),
         )
@@ -155,6 +161,9 @@ class BackupService(
             put("timeParseVersion", character.timeParseVersion)
         }
         character.staticFillMeta?.let { put("staticFillMeta", staticFillMetaToJson(it)) }
+        if (character.staticFieldMeta.isNotEmpty()) {
+            put("staticFieldMeta", JsonObject(character.staticFieldMeta))
+        }
         character.lorebookMigratedAt?.let { put("lorebookMigratedAt", it) }
         if (character.isGroup) {
             putJsonObject("groupInfo") {
@@ -172,10 +181,44 @@ class BackupService(
         put("id", member.id)
         put("basicInfo", basicInfoToJson(member.name, member.emoji, member.staticProfile))
         put("dynamicState", dynamicStateToJson(member.dynamicState))
+        if (member.dynamicStateMeta.isNotEmpty()) {
+            put("dynamicStateMeta", dynamicStateMetaToJson(member.dynamicStateMeta))
+        }
+        if (member.avatarRepairPending) put("avatarRepairPending", true)
         put("roleInGroup", member.roleInGroup)
-        put("memory", memoryToJson(emptyList(), member.shortTerm, member.longTerm))
+        put(
+            "memory",
+            memoryToJson(
+                instant = member.instant,
+                shortTerm = member.shortTerm,
+                longTerm = member.longTerm,
+                scenes = member.scenes,
+                sceneState = member.sceneState,
+                pendingRecall = member.pendingRecall,
+                counters = member.counters,
+                revision = member.revision,
+            ),
+        )
         putJsonArray("lorebook") { member.lorebook.forEach { add(lorebookToJson(it)) } }
+        member.staticFillMeta?.let { put("staticFillMeta", staticFillMetaToJson(it)) }
+        if (member.staticFieldMeta.isNotEmpty()) {
+            put("staticFieldMeta", JsonObject(member.staticFieldMeta))
+        }
+        if (member.fieldsMigrationVersion.isNotBlank()) {
+            put("fieldsMigrationVersion", member.fieldsMigrationVersion)
+        }
+        if (member.timeParseVersion > 0) {
+            put("timeParseVersion", member.timeParseVersion)
+        }
+        member.lorebookMigratedAt?.let { put("lorebookMigratedAt", it) }
     }
+
+    private fun dynamicStateMetaToJson(meta: Map<String, DynamicStateMeta>): JsonObject =
+        JsonObject(
+            meta.mapValues { (_, value) ->
+                buildJsonObject { value.updatedAt?.let { put("updatedAt", it) } }
+            },
+        )
 
     private fun basicInfoToJson(name: String, emoji: String, profile: StaticProfile): JsonObject =
         buildJsonObject {
@@ -211,7 +254,9 @@ class BackupService(
         longTerm: List<LongTermMemory>,
         scenes: List<SceneSummary> = emptyList(),
         sceneState: SceneState? = null,
-        pendingRecall: PendingRecall? = null,
+        pendingRecall: List<LongTermMemory> = emptyList(),
+        counters: MemoryCounters = MemoryCounters(),
+        lastInjectedRecallIds: List<String> = emptyList(),
         revision: Int = 0,
     ): JsonObject = buildJsonObject {
         putJsonArray("instant") { instant.forEach { add(instantToJson(it)) } }
@@ -221,8 +266,27 @@ class BackupService(
             putJsonArray("scenes") { scenes.forEach { add(sceneToJson(it)) } }
         }
         sceneState?.let { put("sceneState", sceneStateToJson(it)) }
-        pendingRecall?.let { putJsonArray("pendingRecall") { add(pendingRecallToJson(it)) } }
+        if (pendingRecall.isNotEmpty()) {
+            putJsonArray("pendingRecall") { pendingRecall.forEach { add(longTermToJson(it)) } }
+        }
+        if (lastInjectedRecallIds.isNotEmpty()) {
+            putJsonArray("lastInjectedRecallIds") { lastInjectedRecallIds.forEach { add(it) } }
+        }
+        put("counters", countersToJson(counters))
         if (revision != 0) put("revision", revision)
+    }
+
+    private fun countersToJson(counters: MemoryCounters): JsonObject = buildJsonObject {
+        counters.extractionRetryAt?.let { put("extractionRetryAt", it) }
+        counters.analysisRetryAt?.let { put("analysisRetryAt", it) }
+        counters.sceneRetryAt?.let { put("sceneRetryAt", it) }
+        counters.lorebookRetryAt?.let { put("lorebookRetryAt", it) }
+        put("extractionFailures", counters.extractionFailures)
+        put("analysisFailures", counters.analysisFailures)
+        put("sceneFailures", counters.sceneFailures)
+        put("lorebookFailures", counters.lorebookFailures)
+        put("lorebookScannedCount", counters.lorebookScannedCount)
+        put("messageSequence", counters.messageSequence)
     }
 
     private fun longTermMapToJson(items: List<LongTermMemory>): JsonObject = buildJsonObject {
@@ -267,6 +331,10 @@ class BackupService(
         memory.createdAt?.let { put("timestamp", it) }
         memory.analyzedAt?.let { put("analyzedAt", it) }
         memory.lorebookScannedAt?.let { put("lorebookScannedAt", it) }
+        put("revision", memory.revision)
+        put("analyzedRevision", memory.analyzedRevision)
+        put("lorebookScannedRevision", memory.lorebookScannedRevision)
+        memory.sourceTs?.let { put("_sourceTs", it) }
         memory.eventTime?.let { put("eventTime", it) }
         if (memory.sourceMessageIds.isNotEmpty()) {
             putJsonArray("sourceMessageIds") { memory.sourceMessageIds.forEach { add(it) } }
@@ -281,11 +349,23 @@ class BackupService(
         if (memory.sourceRoles.isNotEmpty()) {
             putJsonArray("sourceRoles") { memory.sourceRoles.forEach { add(it) } }
         }
-        if (memory.userEvidence.isNotEmpty()) put("userEvidence", memory.userEvidence)
+        if (memory.userEvidence.isNotEmpty()) {
+            putJsonArray("userEvidence") {
+                memory.userEvidence.forEach { ev ->
+                    add(
+                        buildJsonObject {
+                            put("sourceMessageId", ev.sourceMessageId)
+                            put("text", ev.text)
+                        },
+                    )
+                }
+            }
+        }
     }
 
     private fun longTermToJson(memory: LongTermMemory): JsonObject = buildJsonObject {
         put("id", memory.id)
+        put("category", categoryKey(memory.category))
         put("key", memory.key)
         put("value", memory.value)
         putJsonArray("tags") { memory.tags.forEach { add(it) } }
@@ -315,7 +395,18 @@ class BackupService(
         memory.arcStage?.let { put("arcStage", it) }
         memory.recordedAt?.let { put("recordedAt", it) }
         if (memory.conflicts.isNotEmpty()) {
-            putJsonArray("conflicts") { memory.conflicts.forEach { add(it) } }
+            putJsonArray("conflicts") {
+                memory.conflicts.forEach { conflict ->
+                    add(
+                        buildJsonObject {
+                            put("value", conflict.value)
+                            put("evidence", conflict.evidence)
+                            putJsonArray("sourceMessageIds") { conflict.sourceMessageIds.forEach { add(it) } }
+                            put("at", conflict.at)
+                        },
+                    )
+                }
+            }
         }
         memory.conflictedAt?.let { put("conflictedAt", it) }
         if (memory.relatedTo.isNotEmpty()) {
@@ -324,29 +415,47 @@ class BackupService(
         if (memory.sourceRoles.isNotEmpty()) {
             putJsonArray("sourceRoles") { memory.sourceRoles.forEach { add(it) } }
         }
-        if (memory.userEvidence.isNotEmpty()) put("userEvidence", memory.userEvidence)
+        if (memory.userEvidence.isNotEmpty()) {
+            putJsonArray("userEvidence") {
+                memory.userEvidence.forEach { ev ->
+                    add(
+                        buildJsonObject {
+                            put("sourceMessageId", ev.sourceMessageId)
+                            put("text", ev.text)
+                        },
+                    )
+                }
+            }
+        }
         if (memory.corrections.isNotEmpty()) {
-            putJsonArray("corrections") { memory.corrections.forEach { add(it) } }
+            putJsonArray("corrections") {
+                memory.corrections.forEach { correction ->
+                    add(
+                        buildJsonObject {
+                            put("at", correction.at)
+                            put("evidence", correction.evidence)
+                            put("before", correction.before)
+                        },
+                    )
+                }
+            }
         }
     }
 
     private fun sceneToJson(scene: SceneSummary): JsonObject = buildJsonObject {
         put("id", scene.id)
+        put("key", scene.key)
         put("content", scene.content)
-        scene.fromMessageId?.let { put("fromMessageId", it) }
-        scene.toMessageId?.let { put("toMessageId", it) }
+        scene.startedAt?.let { put("startedAt", it) }
+        scene.endedAt?.let { put("endedAt", it) }
         scene.createdAt?.let { put("createdAt", it) }
     }
 
     private fun sceneStateToJson(state: SceneState): JsonObject = buildJsonObject {
         put("key", state.key)
-        state.startMessageId?.let { put("startMessageId", it) }
+        put("startCount", state.startCount)
+        state.startSequence?.let { put("startSequence", it) }
         put("messageCount", state.messageCount)
-    }
-
-    private fun pendingRecallToJson(recall: PendingRecall): JsonObject = buildJsonObject {
-        put("category", recall.category)
-        putJsonArray("tags") { recall.tags.forEach { add(it) } }
     }
 
     private fun staticFillMetaToJson(meta: StaticFillMeta): JsonObject = buildJsonObject {
@@ -378,6 +487,7 @@ class BackupService(
         mediaSource?.toDataUri(sticker.fileRef)?.let { put("dataUrl", it) }
         put("fileRef", sticker.fileRef)
         sticker.createdAt?.let { put("createdAt", it) }
+        sticker.updatedAt?.let { put("updatedAt", it) }
     }
 
     private fun categoryKey(category: MemoryCategory): String = when (category) {

@@ -50,6 +50,7 @@ import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.SmartToy
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -118,6 +119,7 @@ fun ChatScreen(
     onDeleteSticker: (String) -> Unit = {},
     onSetStickerTag: (String, String) -> Unit = { _, _ -> },
     onSendSticker: (Sticker, String) -> Unit = { _, _ -> },
+    onReadAloud: (ChatMessage) -> Unit = {},
 ) {
     var input by rememberSaveable(stateSaver = TextFieldValue.Saver) { mutableStateOf(TextFieldValue("")) }
     var imagePreview by rememberSaveable { mutableStateOf<String?>(null) }
@@ -181,6 +183,7 @@ fun ChatScreen(
                                 onEditResend = { editTarget = message },
                                 onRegenerate = { confirmRegenerate = message },
                                 onImageClick = { imagePreview = it },
+                                onReadAloud = { onReadAloud(message) },
                             )
                         }
                     }
@@ -379,6 +382,7 @@ private fun MessageRow(
     onEditResend: () -> Unit,
     onRegenerate: () -> Unit,
     onImageClick: (String) -> Unit,
+    onReadAloud: () -> Unit,
 ) {
     val isUser = message.role == Role.User
     val colors = MaterialTheme.appColors
@@ -412,7 +416,7 @@ private fun MessageRow(
                         TypingIndicator(colors.onAiBubble.copy(alpha = 0.6f))
                     } else {
                         if (message.content.isNotBlank()) {
-                            RichText(source = message.content, isUser = isUser)
+                            RichText(source = message.content, isUser = isUser, onImageClick = onImageClick)
                         }
                         MessageImages(message, onImageClick)
                         message.staticChanges.takeIf { !isUser && it.isNotEmpty() }?.let {
@@ -423,7 +427,7 @@ private fun MessageRow(
                         }
                     }
                     if (!message.isLoading && message.content.isNotBlank()) {
-                        MessageMeta(message, isUser, isSending, onCopy, onEditResend, onRegenerate)
+                        MessageMeta(message, isUser, isSending, onCopy, onEditResend, onRegenerate, onReadAloud)
                     }
                 }
             }
@@ -439,6 +443,7 @@ private fun MessageMeta(
     onCopy: () -> Unit,
     onEditResend: () -> Unit,
     onRegenerate: () -> Unit,
+    onReadAloud: () -> Unit,
 ) {
     val legacy = MaterialTheme.legacy
     Row(
@@ -460,6 +465,9 @@ private fun MessageMeta(
                     Icon(Icons.Default.Edit, contentDescription = "编辑并重发", tint = legacy.textMuted, modifier = Modifier.size(15.dp))
                 }
             } else {
+                IconButton(onClick = onReadAloud, modifier = Modifier.size(30.dp)) {
+                    Icon(Icons.Default.VolumeUp, contentDescription = "朗读", tint = legacy.textMuted, modifier = Modifier.size(15.dp))
+                }
                 IconButton(onClick = onRegenerate, modifier = Modifier.size(30.dp)) {
                     Icon(Icons.Default.Refresh, contentDescription = "重新生成", tint = legacy.textMuted, modifier = Modifier.size(15.dp))
                 }

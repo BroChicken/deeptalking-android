@@ -3,6 +3,12 @@ package com.deeptalking.core.data.legacy
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
+import com.deeptalking.core.model.MemoryConflict
+import com.deeptalking.core.model.MemoryConflictListSerializer
+import com.deeptalking.core.model.MemoryCorrection
+import com.deeptalking.core.model.MemoryCorrectionListSerializer
+import com.deeptalking.core.model.SourceEvidence
+import com.deeptalking.core.model.SourceEvidenceListSerializer
 
 /**
  * Permissive DTOs mirroring the legacy localStorage/backup JSON shape.
@@ -128,22 +134,15 @@ data class LegacyMemory(
     @SerialName("shortTerm") val shortTerm: List<LegacyShortTerm>? = null,
     /** Keyed by category: userProfile / relationship / events / promises / habits. */
     @SerialName("longTerm") val longTerm: Map<String, List<LegacyLongTerm>>? = null,
-    @SerialName("pendingRecall") val pendingRecall: List<LegacyPendingRecall>? = null,
+    /** Legacy `memory.pendingRecall` is a list of full long-term items. */
+    @SerialName("pendingRecall") val pendingRecall: List<LegacyLongTerm>? = null,
     @SerialName("scenes") val scenes: List<LegacyScene>? = null,
     @SerialName("sceneState") val sceneState: LegacySceneState? = null,
+    /** Legacy `memory.counters` (automatic-task retry/failure bookkeeping). */
+    @SerialName("counters") val counters: JsonElement? = null,
+    /** Ids injected by the most recent recall (legacy `memory.lastInjectedRecallIds`). */
+    @SerialName("lastInjectedRecallIds") val lastInjectedRecallIds: List<String>? = null,
     @SerialName("revision") val revision: Int? = null,
-)
-
-/**
- * Legacy `memory.pendingRecall` was a list of full long-term items, but the
- * native [com.deeptalking.core.model.PendingRecall] only keeps the requested
- * `category` + `tags`; the legacy `subject` spelling is accepted as a fallback.
- */
-@Serializable
-data class LegacyPendingRecall(
-    @SerialName("category") val category: String? = null,
-    @SerialName("subject") val subject: String? = null,
-    @SerialName("tags") val tags: List<String>? = null,
 )
 
 @Serializable
@@ -204,7 +203,18 @@ data class LegacyShortTerm(
     @SerialName("location") val location: String? = null,
     @SerialName("timeRef") val timeRef: LegacyTimeRef? = null,
     @SerialName("sourceRoles") val sourceRoles: List<String>? = null,
-    @SerialName("userEvidence") val userEvidence: String? = null,
+    /** Legacy revision counter, min 1. */
+    @SerialName("revision") val revision: Int? = null,
+    /** Revision the analysis consumer last processed. */
+    @SerialName("analyzedRevision") val analyzedRevision: Int? = null,
+    /** Revision the lorebook consumer last processed. */
+    @SerialName("lorebookScannedRevision") val lorebookScannedRevision: Int? = null,
+    /** Source message timestamp used for same-day reconciliation. */
+    @SerialName("_sourceTs") val sourceTs: String? = null,
+    /** Legacy wrote an array of `{sourceMessageId,text}`; an early native build wrote a `String`. */
+    @SerialName("userEvidence")
+    @Serializable(with = SourceEvidenceListSerializer::class)
+    val userEvidence: List<SourceEvidence> = emptyList(),
 )
 
 @Serializable
@@ -215,6 +225,8 @@ data class LegacyTimeRef(
 @Serializable
 data class LegacyLongTerm(
     @SerialName("id") val id: String? = null,
+    /** Only written by native exports for pendingRecall items (legacy store items omit it). */
+    @SerialName("category") val category: String? = null,
     @SerialName("key") val key: String? = null,
     @SerialName("value") val value: String? = null,
     @SerialName("tags") val tags: List<String>? = null,
@@ -239,12 +251,21 @@ data class LegacyLongTerm(
     @SerialName("arcOf") val arcOf: String? = null,
     @SerialName("arcStage") val arcStage: String? = null,
     @SerialName("recordedAt") val recordedAt: String? = null,
-    @SerialName("conflicts") val conflicts: List<String>? = null,
+    /** Legacy array of `{value,evidence,sourceMessageIds,at}` objects. */
+    @SerialName("conflicts")
+    @Serializable(with = MemoryConflictListSerializer::class)
+    val conflicts: List<MemoryConflict> = emptyList(),
     @SerialName("conflictedAt") val conflictedAt: String? = null,
     @SerialName("relatedTo") val relatedTo: List<String>? = null,
     @SerialName("sourceRoles") val sourceRoles: List<String>? = null,
-    @SerialName("userEvidence") val userEvidence: String? = null,
-    @SerialName("corrections") val corrections: List<String>? = null,
+    /** Legacy array of `{sourceMessageId,text}` (also tolerated as a plain string). */
+    @SerialName("userEvidence")
+    @Serializable(with = SourceEvidenceListSerializer::class)
+    val userEvidence: List<SourceEvidence> = emptyList(),
+    /** Legacy array of `{at,evidence,before}` manual-edit history objects. */
+    @SerialName("corrections")
+    @Serializable(with = MemoryCorrectionListSerializer::class)
+    val corrections: List<MemoryCorrection> = emptyList(),
 )
 
 @Serializable
@@ -291,6 +312,10 @@ data class LegacyConfig(
     @SerialName("styleCritique") val styleCritique: Boolean? = null,
     @SerialName("quickReplyRepair") val quickReplyRepair: Boolean? = null,
     @SerialName("platformSettings") val platformSettings: Map<String, LegacyPlatformSlot>? = null,
+    /** Latest chat cache-usage snapshot (legacy `config.cacheStats`). */
+    @SerialName("cacheStats") val cacheStats: JsonElement? = null,
+    /** Rolling API usage/cache metrics (legacy `config.requestMetrics`). */
+    @SerialName("requestMetrics") val requestMetrics: JsonElement? = null,
 )
 
 @Serializable
@@ -307,6 +332,7 @@ data class LegacyCharacter(
     @SerialName("basicInfo") val basicInfo: LegacyBasicInfo? = null,
     @SerialName("dynamicState") val dynamicState: LegacyDynamicState? = null,
     @SerialName("dynamicStateMeta") val dynamicStateMeta: JsonElement? = null,
+    @SerialName("avatarRepairPending") val avatarRepairPending: Boolean? = null,
     @SerialName("stickers") val stickers: List<LegacySticker>? = null,
     @SerialName("lorebook") val lorebook: List<LegacyLorebookEntry>? = null,
     @SerialName("memory") val memory: LegacyMemory? = null,
@@ -342,5 +368,10 @@ data class LegacyGroupMember(
     @SerialName("roleInGroup") val roleInGroup: String? = null,
     @SerialName("lorebook") val lorebook: List<LegacyLorebookEntry>? = null,
     @SerialName("memory") val memory: LegacyMemory? = null,
+    @SerialName("avatarRepairPending") val avatarRepairPending: Boolean? = null,
+    @SerialName("staticFillMeta") val staticFillMeta: LegacyStaticFillMeta? = null,
+    @SerialName("staticFieldMeta") val staticFieldMeta: JsonElement? = null,
+    @SerialName("timeParseVersion") val timeParseVersion: Int? = null,
+    @SerialName("lorebookMigratedAt") val lorebookMigratedAt: String? = null,
     @SerialName("fieldsMigrationVersion") val fieldsMigrationVersion: String? = null,
 )

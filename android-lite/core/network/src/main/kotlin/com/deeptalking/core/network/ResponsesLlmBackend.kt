@@ -99,6 +99,10 @@ class ResponsesLlmBackend(
                 throw IllegalStateException("Responses API HTTP ${response.code}: ${body.take(500)}")
             }
             val parsed = json.decodeFromString(ResponsesResponse.serializer(), body)
+            // Legacy inspects `fullResponse.error` and throws 'API 返回错误'.
+            parsed.error?.let { error ->
+                throw IllegalStateException("API 返回错误: $error")
+            }
             responsesToResult(parsed, body, extractReasoningFromBody(body))
         }
     }
@@ -191,7 +195,7 @@ class ResponsesLlmBackend(
             tools = tools,
             toolChoice = toolChoice,
             temperature = request.temperature,
-            maxOutputTokens = request.maxOutputTokens ?: 8192,
+            maxOutputTokens = request.maxOutputTokens,
             stream = stream,
             reasoning = ReasoningDto(request.reasoningEffort ?: "medium"),
         )

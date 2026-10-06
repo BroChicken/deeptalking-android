@@ -61,7 +61,7 @@ class ListMemoriesTool(private val memory: MemoryService) : AgentTool {
         val payload = buildJsonObject {
             put("ok", true)
             put("category", category.ifEmpty { "all" })
-            put("keyword", if (keyword.isEmpty()) JsonNull else kotlinx.serialization.json.JsonPrimitive(keyword))
+            put("keyword", if (keyword.isEmpty()) JsonNull else kotlinx.serialization.json.JsonPrimitive(keyword.lowercase()))
             put("count", listed.size)
             put("items", items)
         }

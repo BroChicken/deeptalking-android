@@ -162,13 +162,13 @@ class MemoryServiceImplTest {
 
         val updated = service.setPendingRecall(character, category = "userProfile", tags = listOf("饮品"))
 
-        assertEquals("userProfile", updated.pendingRecall?.category)
-        assertEquals(listOf("饮品"), updated.pendingRecall?.tags)
+        assertEquals(MemoryCategory.UserProfile, updated.pendingRecall.single().category)
+        assertEquals(listOf("饮品"), updated.pendingRecall.single().tags)
         assertEquals(1, updated.longTerm.first { it.id == "coffee" }.recallCount)
-        assertNull(character.pendingRecall)
+        assertTrue(character.pendingRecall.isEmpty())
 
         val afterTurn = service.applyTurn(updated, emptyList(), emptyList())
-        assertEquals("userProfile", afterTurn.pendingRecall?.category)
+        assertEquals(MemoryCategory.UserProfile, afterTurn.pendingRecall.single().category)
 
         val retrieved = service.retrieve(updated, "随便聊聊", limit = 5)
         assertEquals("coffee", retrieved.first().id)

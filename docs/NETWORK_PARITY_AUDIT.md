@@ -18,9 +18,8 @@
 | # | 差异 | 旧版 | 原生现状 | 影响 |
 |---|---|---|---|---|
 | 6 | 独立 `cacheStats` 字段（缓存条显示用） | `responses.js:262-301`、`stickers.js:266-288` | 原生用 `requestMetrics` 推算，缺 `cacheStats.hitTokens/missTokens/promptTokens` | 中 |
-| 7 | SSE `response.function_call_arguments.done` 事件 | `conversation.js:620-623` | 未处理 | 低 |
-| 8 | SSE `response.output_text.done` 兜底 | `conversation.js:653-657` | 未处理 | 低 |
-| 9 | SSE `web_search_call.*` 状态提示 | `conversation.js:552-562` | 未处理 | 低（仅状态文案） |
+
+> SSE `response.function_call_arguments.done`（`conversation.js:620-623`）、`response.output_text.done`（`conversation.js:653-657`）、`web_search_call.*`（`conversation.js:552-562`）均已实现：`ResponsesLlmBackend.kt` 处理 `function_call_arguments.done` / `output_text.done` / `web_search_call.*`（含 `web_search_call.completed` → 状态提示），由 `ResponsesSseInterpreterTest` 覆盖。
 
 ## 已核对一致
 

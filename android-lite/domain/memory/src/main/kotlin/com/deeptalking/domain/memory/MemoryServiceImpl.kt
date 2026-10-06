@@ -6,7 +6,6 @@ import com.deeptalking.core.model.GroupMember
 import com.deeptalking.core.model.LongTermMemory
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.MemoryCategory
-import com.deeptalking.core.model.PendingRecall
 import com.deeptalking.core.model.ShortTermMemory
 import java.time.Instant
 
@@ -27,25 +26,13 @@ class MemoryServiceImpl : MemoryService {
 
     override suspend fun retrieve(character: Character, query: String, limit: Int): List<LongTermMemory> {
         if (limit <= 0) return emptyList()
-        val store = character.longTerm
         val now = System.currentTimeMillis()
+        // Legacy `retrieveRelevantMemories`: the persisted pending-recall items are
+        // merged first (score 999) and never crowded out by keyword hits.
         val pending = character.pendingRecall
-        val pendingCategory = categoryFrom(pending?.category)
-        val pendingTags = pending?.tags.orEmpty().map { it.trim().lowercase() }.filter { it.isNotEmpty() }
-
-        return store
-            .map { memory ->
-                var value = score(query, memory, now)
-                if (pending != null && pendingRecallMatches(memory, pendingCategory, pendingTags)) {
-                    // A matching recall request outranks ordinary keyword hits.
-                    value += PENDING_RECALL_BOOST
-                }
-                memory to value
-            }
-            .filter { it.second > 0.0 }
-            .sortedByDescending { it.second }
-            .take(limit)
-            .map { it.first }
+        val pendingIds = pending.map { it.id }.toSet()
+        val scored = topK(query, character.longTerm.filter { it.id !in pendingIds }, limit, now)
+        return (pending + scored).distinctBy { it.id }.take(limit)
     }
 
     override fun listMemories(
@@ -73,7 +60,11 @@ class MemoryServiceImpl : MemoryService {
         if (character.isGroup) {
             character.members.forEach { entries += it.lorebook }
         }
-        return select(entries, recentText, emptyList(), LorebookLimits(), orderOf = { it.order })
+        val recentMessages = character.instant
+            .filter { !it.isLoading }
+            .takeLast(LorebookLimits().scanMessages)
+            .map { it.content }
+        return select(entries, recentText, recentMessages, LorebookLimits(), orderOf = { it.order })
     }
 
     override fun applyTurn(
@@ -118,30 +109,38 @@ class MemoryServiceImpl : MemoryService {
         val store = longTermStoreOf(character, memberName)
         val targetCategory = categoryFrom(category)
         val tagList = tags.map { it.trim().lowercase() }.filter { it.isNotEmpty() }
-        val selected = store.filter { item ->
-            (targetCategory == null || item.category == targetCategory) &&
-                (tagList.isEmpty() || tagList.any { tag -> searchableText(item).contains(tag) })
-        }.sortedByDescending { memorySortScore(it) }
-            .take(AppLimits.Memory.PENDING_RECALL)
-
-        val ids = selected.map { it.id }.toSet()
-        val nowIso = Instant.now().toString()
-        val updated = withLongTermStore(character, memberName) { list ->
-            list.map { item ->
-                if (item.id in ids) {
-                    item.copy(
-                        lastRecalled = nowIso,
-                        recallCount = item.recallCount + 1,
-                        usageCount = item.usageCount + 1,
-                        lastUsageAt = nowIso,
-                    )
-                } else {
-                    item
-                }
-            }
+        // Legacy `handleRecall`: a blank category selects nothing.
+        val selected = if (targetCategory == null) {
+            emptyList()
+        } else {
+            store.filter { item ->
+                item.category == targetCategory &&
+                    (tagList.isEmpty() || tagList.any { tag -> searchableText(item).contains(tag) })
+            }.sortedByDescending { memorySortScore(it) }
+                .take(AppLimits.Memory.PENDING_RECALL)
         }
+        if (selected.isEmpty()) return character
+
+        val nowIso = Instant.now().toString()
+        val ids = selected.map { it.id }.toSet()
+        val bumped = selected.map {
+            it.copy(
+                lastRecalled = nowIso,
+                recallCount = it.recallCount + 1,
+                usageCount = it.usageCount + 1,
+                lastUsageAt = nowIso,
+            )
+        }
+        val updated = withLongTermStore(character, memberName) { list ->
+            list.map { item -> if (item.id in ids) bumped.first { it.id == item.id } else item }
+        }
+        // Legacy persists the full recalled items on the character (or member) store.
+        if (memberName == null) return updated.copy(pendingRecall = bumped)
+        val wanted = memberName.trim().lowercase()
         return updated.copy(
-            pendingRecall = PendingRecall(category = category.orEmpty(), tags = tags),
+            members = updated.members.map { member ->
+                if (member.name.trim().lowercase() == wanted) member.copy(pendingRecall = bumped) else member
+            },
         )
     }
 
@@ -155,25 +154,26 @@ class MemoryServiceImpl : MemoryService {
     }
 
     private fun dedupeShortTerm(items: List<ShortTermMemory>): List<ShortTermMemory> {
-        val seen = mutableSetOf<String>()
+        val indexByIdentity = mutableMapOf<String, Int>()
         val result = mutableListOf<ShortTermMemory>()
         for (item in items) {
-            val identity = item.content.trim().lowercase() + "|" + item.eventTime.orEmpty()
-            if (seen.add(identity)) result += item
+            val identity = item.content.trim().lowercase() + "|" + eventIdentity(item.eventTime)
+            val existingIndex = indexByIdentity[identity]
+            if (existingIndex == null) {
+                indexByIdentity[identity] = result.size
+                result += item
+            } else {
+                val existing = result[existingIndex]
+                result[existingIndex] = existing.copy(
+                    sourceMessageIds = (existing.sourceMessageIds + item.sourceMessageIds).distinct()
+                        .take(AppLimits.Memory.SUMMARY_SOURCES),
+                    sourceRoles = (existing.sourceRoles + item.sourceRoles).distinct(),
+                    userEvidence = (existing.userEvidence + item.userEvidence).distinct()
+                        .take(AppLimits.Memory.SUMMARY_SOURCES),
+                )
+            }
         }
         return result
-    }
-
-    private fun pendingRecallMatches(
-        memory: LongTermMemory,
-        category: MemoryCategory?,
-        tags: List<String>,
-    ): Boolean {
-        // Legacy handleRecall needs a category; blank categories select nothing.
-        if (category == null || memory.category != category) return false
-        if (tags.isEmpty()) return true
-        val searchable = searchableText(memory)
-        return tags.any { searchable.contains(it) }
     }
 
     private fun longTermStoreOf(character: Character, memberName: String?): List<LongTermMemory> {

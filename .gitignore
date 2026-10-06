@@ -23,3 +23,9 @@ tools/.work/
 
 # 本地代码索引（CodeGraph）
 .codegraph/
+
+# Kotlin 编译缓存
+.kotlin/
+
+# 端侧 TTS 原生库（体积大，可由 tools/build-cosyvoice-android.ps1 重建）
+android-lite/engine/cosyvoice/src/main/jniLibs/**/*.so

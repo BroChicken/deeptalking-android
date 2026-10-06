@@ -1,9 +1,11 @@
 package com.deeptalking.domain.agent
 
 import com.deeptalking.core.common.AppLimits
+import com.deeptalking.core.common.trimTo
 import com.deeptalking.core.model.AppConfig
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
+import com.deeptalking.core.model.LongTermMemory
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.Role
@@ -21,12 +23,22 @@ import com.deeptalking.domain.agent.background.dedupeRepeatedEnding
 import com.deeptalking.domain.agent.background.recentReplyTexts
 import com.deeptalking.domain.agent.tools.SubmitResponseTool
 import com.deeptalking.domain.memory.MemoryService
+import com.deeptalking.domain.memory.consumeInjectedRecalls
+import com.deeptalking.domain.memory.SourceRef
+import com.deeptalking.domain.memory.hasStaticEditIntent
+import com.deeptalking.domain.memory.hasValidUserEvidence
+import com.deeptalking.domain.memory.knownSources
+import com.deeptalking.domain.memory.resolveDynamicStateSources
 import com.deeptalking.domain.memory.resolveMemoryConflicts
+import com.deeptalking.domain.memory.upsertLongTermMemory
 import com.deeptalking.engine.ondevice.LlmBackend
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
+import java.time.Instant
 
 /** Result of one user turn. */
 data class OrchestratorResult(
@@ -53,11 +65,13 @@ data class OrchestratorResult(
  * High-level turn orchestrator: assemble prompts, run the tool loop, parse the
  * structured turn, and fold memory updates onto the character.
  *
- * SIMPLIFIED: static/dynamic/member state are applied directly to the
- * [Character] copy here because [MemoryService.applyTurn] only covers memory
- * stores. Promise updates go through [MemoryService.updateMemory]. The legacy
- * background tasks (prose memory extraction, quick-reply repair, style
- * critique) are dispatched through [BackgroundTasks] when one is supplied.
+ * SIMPLIFIED: static/dynamic/member state are applied through the shared
+ * evidence gates ([hasValidUserEvidence], [resolveDynamicStateSources],
+ * [hasStaticEditIntent]) and long-term writes through [upsertLongTermMemory],
+ * mirroring the legacy `applyMemoryUpdate`; promise updates go through
+ * [MemoryService.updateMemory]. The legacy background tasks (prose memory
+ * extraction, quick-reply repair, style critique) are dispatched through
+ * [BackgroundTasks] when one is supplied.
  */
 class ChatOrchestrator(
     private val llm: LlmBackend,
@@ -144,11 +158,26 @@ class ChatOrchestrator(
             if (recent.isNotEmpty()) append(recent).append('\n')
             append(userText)
         }
-        val base = bumpLorebookMentions(
-            outcome.updatedCharacter ?: character,
-            memory.selectLorebook(character, lorebookQuery),
-        ).copy(pendingRecall = null)
-        val updated = applyMemory(base, parsed)
+        val memoryAssistant = ChatMessage(
+            id = "assistant_" + character.id,
+            role = Role.Assistant,
+            content = parsed.reply,
+        )
+        val memoryInstant = (character.instant + history.filter { !it.rejected } + memoryAssistant)
+            .distinctBy { it.id }
+        val recalled = outcome.updatedCharacter ?: character
+        // Legacy `consumeInjectedRecalls`: the volatile context injects the
+        // persisted pending-recall items first, so only those ids are consumed.
+        val injectedRecallIds = recalled.pendingRecall.map { it.id }
+            .take(AppLimits.Agent.TOOL_MEMORY_INJECT_LIMIT)
+        val base = consumeInjectedRecalls(
+            bumpLorebookMentions(
+                recalled,
+                memory.selectLorebook(character, lorebookQuery),
+            ).copy(instant = memoryInstant),
+            injectedRecallIds,
+        )
+        val updated = applyMemory(base, parsed, memoryAssistant)
 
         // The visible reply may be replaced by the style critique before it is shown,
         // matching the legacy flow (critique runs inline; repair + extraction run after).
@@ -229,7 +258,7 @@ class ChatOrchestrator(
         val ids = injected.map { it.id }.toSet()
         val now = java.time.Instant.now().toString()
         fun bump(list: List<LorebookEntry>) = list.map {
-            if (it.id in ids) it.copy(mentions = it.mentions + 1, lastMentionedAt = now) else it
+            if (it.id in ids) it.copy(mentions = it.mentions + 1, lastMentionedAt = now, misses = 0) else it
         }
         return character.copy(
             lorebook = bump(character.lorebook),
@@ -253,24 +282,18 @@ class ChatOrchestrator(
         else -> ""
     }
 
-    private fun applyMemory(character: Character, parsed: ParsedTurn): Character {
-        val shared = parsed.longTerm.filter { it.memberName.isNullOrBlank() }
-        val memberLongTerm = parsed.longTerm
-            .filter { !it.memberName.isNullOrBlank() }
-            .groupBy { it.memberName!! }
-            .mapValues { (_, entries) -> entries.map { it.copy(memberName = null) } }
+    private fun applyMemory(
+        character: Character,
+        parsed: ParsedTurn,
+        assistantMessage: ChatMessage,
+    ): Character {
+        var updated = memory.applyTurn(character, parsed.shortTerm, emptyList())
+        val sources = knownSources(updated)
 
-        var updated = memory.applyTurn(character, parsed.shortTerm, shared, memberLongTerm)
+        updated = applyLongTerm(updated, parsed.longTerm, sources, assistantMessage)
 
         parsed.promiseUpdates.forEach { update ->
-            val status = when (update.status.lowercase()) {
-                "resolved" -> PromiseStatus.Resolved
-                "cancelled" -> PromiseStatus.Cancelled
-                else -> null
-            }
-            if (status != null) {
-                updated = memory.updateMemory(updated, update.promiseId) { it.copy(status = status) }
-            }
+            updated = applyPromiseUpdate(updated, update, sources)
         }
 
         parsed.recall?.let { recall ->
@@ -280,10 +303,14 @@ class ChatOrchestrator(
         parsed.staticFields?.let { fields ->
             var profile = updated.staticProfile
             fields.forEach { (key, element) ->
-                if (STATIC_PROFILE_FIELDS.any { it.first == key }) {
-                    val value = fieldValue(element)
-                    if (value.isNotEmpty()) profile = withStaticField(profile, key, value)
-                }
+                if (STATIC_PROFILE_FIELDS.none { it.first == key }) return@forEach
+                val value = fieldValue(element)
+                if (value.isEmpty()) return@forEach
+                val obj = fieldObject(element)
+                val resolved = hasValidUserEvidence(updated, fieldSourceIds(obj), fieldEvidence(obj), sources)
+                    ?: return@forEach
+                if (!hasStaticEditIntent(key, resolved)) return@forEach
+                profile = withStaticField(profile, key, value)
             }
             updated = updated.copy(staticProfile = profile)
         }
@@ -291,10 +318,14 @@ class ChatOrchestrator(
         parsed.dynamicState?.let { state ->
             var dynamic = updated.dynamicState
             state.forEach { (key, element) ->
-                if (DYNAMIC_STATE_FIELDS.any { it.first == key }) {
-                    val value = fieldValue(element)
-                    if (value.isNotEmpty()) dynamic = withDynamicField(dynamic, key, value)
+                if (DYNAMIC_STATE_FIELDS.none { it.first == key }) return@forEach
+                val value = fieldValue(element)
+                if (value.isEmpty()) return@forEach
+                val obj = fieldObject(element)
+                if (resolveDynamicStateSources(updated, fieldSourceIds(obj), fieldEvidence(obj), assistantMessage, sources) == null) {
+                    return@forEach
                 }
+                dynamic = withDynamicField(dynamic, key, value)
             }
             updated = updated.copy(dynamicState = dynamic)
         }
@@ -306,10 +337,14 @@ class ChatOrchestrator(
                 } ?: return@map member
                 var dynamic = member.dynamicState
                 update.dynamicState.forEach { (key, element) ->
-                    if (DYNAMIC_STATE_FIELDS.any { it.first == key }) {
-                        val value = fieldValue(element)
-                        if (value.isNotEmpty()) dynamic = withDynamicField(dynamic, key, value)
+                    if (DYNAMIC_STATE_FIELDS.none { it.first == key }) return@forEach
+                    val value = fieldValue(element)
+                    if (value.isEmpty()) return@forEach
+                    val obj = fieldObject(element)
+                    if (resolveDynamicStateSources(updated, fieldSourceIds(obj), fieldEvidence(obj), assistantMessage, sources) == null) {
+                        return@forEach
                     }
+                    dynamic = withDynamicField(dynamic, key, value)
                 }
                 member.copy(dynamicState = dynamic)
             }
@@ -319,9 +354,105 @@ class ChatOrchestrator(
         return resolveMemoryConflicts(updated)
     }
 
+    /** Validated long-term writes routed through `upsertLongTermMemory` (legacy `applyMemoryUpdate`). */
+    private fun applyLongTerm(
+        character: Character,
+        entries: List<LongTermMemory>,
+        sources: Map<String, SourceRef>,
+        assistantMessage: ChatMessage,
+    ): Character {
+        var working = character
+        entries.forEach { entry ->
+            if (entry.memberName.isNullOrBlank()) {
+                val store = working.longTerm.filter { it.category == entry.category }
+                val (newStore, ok) = upsertLongTermMemory(
+                    character = working,
+                    item = entry.copy(memberName = null),
+                    store = store,
+                    sources = sources,
+                    assistantMessage = assistantMessage,
+                )
+                if (ok) {
+                    working = working.copy(
+                        longTerm = working.longTerm.filter { it.category != entry.category } + newStore,
+                    )
+                }
+            } else {
+                val index = working.members.indexOfFirst {
+                    it.name.equals(entry.memberName, ignoreCase = true)
+                }
+                if (index < 0) return@forEach
+                val member = working.members[index]
+                val store = member.longTerm.filter { it.category == entry.category }
+                val (newStore, ok) = upsertLongTermMemory(
+                    character = working,
+                    item = entry.copy(memberName = null),
+                    store = store,
+                    sources = sources,
+                    assistantMessage = assistantMessage,
+                )
+                if (ok) {
+                    val members = working.members.toMutableList()
+                    members[index] = member.copy(
+                        longTerm = member.longTerm.filter { it.category != entry.category } + newStore,
+                    )
+                    working = working.copy(members = members)
+                }
+            }
+        }
+        return working
+    }
+
+    /** Validated promise resolution/cancellation (legacy `consumePromiseUpdates`). */
+    private fun applyPromiseUpdate(
+        character: Character,
+        update: PromiseUpdate,
+        sources: Map<String, SourceRef>,
+    ): Character {
+        val status = when (update.status.lowercase()) {
+            "resolved" -> PromiseStatus.Resolved
+            "cancelled" -> PromiseStatus.Cancelled
+            else -> return character
+        }
+        val resolved = hasValidUserEvidence(character, update.sourceMessageIds, update.evidence, sources)
+            ?: return character
+        val shared = character.longTerm.firstOrNull {
+            it.id == update.promiseId && it.status == PromiseStatus.Active
+        }
+        val member = if (shared == null) {
+            character.members.firstOrNull { candidate ->
+                candidate.longTerm.any { it.id == update.promiseId && it.status == PromiseStatus.Active }
+            }
+        } else {
+            null
+        }
+        if (shared == null && member == null) return character
+        val now = Instant.now().toString()
+        return memory.updateMemory(character, update.promiseId, member?.name) { promise ->
+            promise.copy(
+                status = status,
+                sourceMessageIds = resolved.map { it.id }.take(8),
+                sourceRoles = resolved.map { it.role }.distinct(),
+                evidence = update.evidence.trimTo(300),
+                updatedAt = now,
+            )
+        }
+    }
+
+    private fun fieldObject(element: JsonElement): JsonObject? =
+        runCatching { element.jsonObject }.getOrNull()
+
+    private fun fieldSourceIds(obj: JsonObject?): List<String> =
+        (obj?.get("sourceMessageIds") as? JsonArray)
+            ?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
+            .orEmpty()
+
+    private fun fieldEvidence(obj: JsonObject?): String =
+        (obj?.get("evidence") as? JsonPrimitive)?.contentOrNull.orEmpty()
+
     /** Reads `{ "value": "..." }` (or a bare string) from a state-field element. */
-    private fun fieldValue(element: kotlinx.serialization.json.JsonElement): String {
-        val obj = runCatching { element.jsonObject }.getOrNull()
+    private fun fieldValue(element: JsonElement): String {
+        val obj = fieldObject(element)
         val raw = when {
             obj != null -> (obj["value"] as? JsonPrimitive)?.contentOrNull.orEmpty()
             element is JsonPrimitive -> element.contentOrNull.orEmpty()

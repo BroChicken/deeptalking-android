@@ -185,8 +185,9 @@ class MemoryPolicyTest {
         val (list, ok) = upsertLongTermMemory(character, incoming, listOf(existing))
         assertTrue(ok)
         assertEquals(1, list.size)
-        assertTrue(list[0].value.contains("用户喜欢咖啡"))
-        assertTrue(list[0].value.contains("用户害怕打雷"))
+        // Legacy keeps the existing value and records the competitor as a conflict.
+        assertEquals("用户喜欢咖啡", list[0].value)
+        assertTrue(list[0].conflicts.any { it.value == "用户害怕打雷" })
     }
 
     @Test
@@ -212,7 +213,7 @@ class MemoryPolicyTest {
         val second = first.copy(value = "用户害怕打雷", evidence = "用户害怕打雷")
         val merged = dedupeLongTerm(listOf(first, second), MemoryCategory.UserProfile)
         assertEquals(1, merged.size)
-        assertTrue(merged[0].value.contains("用户喜欢咖啡"))
-        assertTrue(merged[0].value.contains("用户害怕打雷"))
+        // Legacy `dedupeLongTermList`: without conflictedAt the later item's value wins.
+        assertEquals("用户害怕打雷", merged[0].value)
     }
 }

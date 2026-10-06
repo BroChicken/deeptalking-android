@@ -30,7 +30,7 @@ import com.deeptalking.feature.richtext.renderMarkdownToHtml
  * `.action-text` colour so they read differently from spoken lines.
  */
 @Composable
-fun RichText(source: String, isUser: Boolean, modifier: Modifier = Modifier) {
+fun RichText(source: String, isUser: Boolean, modifier: Modifier = Modifier, onImageClick: ((String) -> Unit)? = null) {
     val legacy = MaterialTheme.legacy
     val contentColor = if (isUser) legacy.onUserBubble else legacy.onAiBubble
     if (containsMath(source) || containsImageMarkdown(source)) {
@@ -57,6 +57,7 @@ fun RichText(source: String, isUser: Boolean, modifier: Modifier = Modifier) {
                 }
             },
             update = { webView ->
+                webView.onImageClick = onImageClick
                 val stamp = html + "\u0000" + extraCss
                 if (webView.tag != stamp) {
                     webView.tag = stamp

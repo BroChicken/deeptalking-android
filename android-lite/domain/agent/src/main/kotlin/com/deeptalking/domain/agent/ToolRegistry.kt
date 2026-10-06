@@ -18,15 +18,24 @@ class ToolRegistry(private val tools: List<AgentTool>) {
     suspend fun execute(call: ToolCall, context: AgentContext): AgentToolResult {
         val tool = tools.firstOrNull { it.definition.name == call.name }
             ?: return AgentToolResult(
-                contentJson = """{"ok":false,"reason":"unknown tool: ${call.name}"}""",
+                contentJson = """{"ok":false,"reason":"未知工具: ${call.name}"}""",
                 isError = true,
             )
         if (!tool.isEnabled(context)) {
             return AgentToolResult(
-                contentJson = """{"ok":false,"reason":"tool disabled: ${call.name}"}""",
+                contentJson = """{"ok":false,"reason":"工具不可用: ${call.name}"}""",
                 isError = true,
             )
         }
-        return tool.execute(call, context)
+        return try {
+            tool.execute(call, context)
+        } catch (error: Exception) {
+            // Legacy `tool-execution.js`: a throwing tool feeds `{ok:false}` back to
+            // the model instead of aborting the whole turn.
+            AgentToolResult(
+                contentJson = """{"ok":false,"reason":"工具执行异常: ${error.message ?: error}"}""",
+                isError = true,
+            )
+        }
     }
 }

@@ -12,4 +12,5 @@ data class Sticker(
     val tag: String = "",
     val fileRef: String = "",
     val createdAt: String? = null,
+    val updatedAt: String? = null,
 )

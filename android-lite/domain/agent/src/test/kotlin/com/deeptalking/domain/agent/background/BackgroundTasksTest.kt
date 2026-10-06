@@ -6,6 +6,7 @@ import com.deeptalking.core.model.DynamicState
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.SceneState
 import com.deeptalking.core.model.ShortTermMemory
+import com.deeptalking.core.model.SourceEvidence
 import com.deeptalking.core.model.StaticFillMeta
 import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.domain.memory.MemoryServiceImpl
@@ -96,6 +97,7 @@ class BackgroundTasksTest {
                 id = "m$index",
                 role = if (index % 2 == 0) Role.Assistant else Role.User,
                 content = "对话内容$index",
+                sequence = index,
             )
         }
         val character = Character(
@@ -103,7 +105,7 @@ class BackgroundTasksTest {
             name = "小雨",
             instant = messages,
             dynamicState = DynamicState(currentLocation = "咖啡馆"),
-            sceneState = SceneState(key = "图书馆", startMessageId = null, messageCount = 0),
+            sceneState = SceneState(key = "图书馆", startCount = 0, startSequence = 0, messageCount = 0),
         )
         val (status, updated) = background.checkScene(character)
         assertEquals(BackgroundTasks.TaskStatus.Success, status)
@@ -180,6 +182,28 @@ class BackgroundTasksTest {
     }
 
     @Test
+    fun migrateWorldLoreWithExistingEntriesSerializes() = runBlocking {
+        // Regression: a non-empty existing lorebook used to hit a missing
+        // @Serializable serializer for LorebookProposal and throw, which made
+        // every migration report 0 characters migrated and never stamp
+        // lorebookMigratedAt (so the prompt reappeared forever).
+        val (background, _) = tasks(
+            listOf("""{"entries":[{"name":"赤月王国","keywords":["赤月"],"content":"位于大陆西侧"}],"trimmedSource":"旅者。"}"""),
+        )
+        val character = Character(
+            id = "c1",
+            name = "旅者",
+            staticProfile = StaticProfile(background = "赤月王国位于大陆西侧。旅者四处游历。"),
+            lorebook = listOf(
+                com.deeptalking.core.model.LorebookEntry(id = "l1", name = "旧条目", content = "旧内容", keywords = listOf("旧")),
+            ),
+        )
+        val updated = background.migrateWorldLore(character, trimSource = false)
+        assertTrue(updated.lorebook.any { it.name == "赤月王国" })
+        assertTrue(updated.lorebookMigratedAt != null)
+    }
+
+    @Test
     fun remapFieldsAppliesDynamicStateAndBackground() = runBlocking {
         val (background, _) = tasks(listOf("""{"dynamicState":{"currentGoal":"想去看海"},"background":"喜欢旅行。"}"""))
         val character = Character(id = "c1", name = "旅者")
@@ -209,12 +233,15 @@ class BackgroundTasksTest {
     }
 
     private fun analyzableCharacter(): Character {
-        val user = ChatMessage(id = "u1", role = Role.User, content = "用户喜欢喝美式咖啡。")
+        // The source message has already been evicted from `instant`; analysis must
+        // resolve it from the short-term item's captured userEvidence.
         val target = ShortTermMemory(
             id = "s1",
             content = "用户喜欢喝美式咖啡。",
             sourceMessageIds = listOf("u1"),
             eventTime = "2026-08-01T12:00:00Z",
+            sourceRoles = listOf("user"),
+            userEvidence = listOf(SourceEvidence(sourceMessageId = "u1", text = "用户喜欢喝美式咖啡。")),
         )
         val filler = (2..21).map { index ->
             ShortTermMemory(
@@ -225,7 +252,7 @@ class BackgroundTasksTest {
                 analyzedAt = "done",
             )
         }
-        return Character(id = "c1", instant = listOf(user), shortTerm = listOf(target) + filler)
+        return Character(id = "c1", shortTerm = listOf(target) + filler)
     }
 
     @Test
@@ -242,6 +269,39 @@ class BackgroundTasksTest {
         val response = """{"status":"ok","analyzedShortTermIds":["s1"],"longTerm":[{"category":"userProfile","subject":"user","key":"饮品","value":"用户喜欢喝美式咖啡。","sourceShortTermIds":["s1"],"sourceMessageIds":["ghost"],"evidence":"用户喜欢喝美式咖啡。"}]}"""
         val (background, _) = tasks(listOf(response))
         val character = analyzableCharacter()
+        val updated = background.analyzeShortToLongTerm(character)
+        assertTrue(updated.longTerm.isEmpty())
+        assertEquals(null, updated.shortTerm.first { it.id == "s1" }.analyzedAt)
+    }
+
+    @Test
+    fun analyzeRejectsEvidenceNotPresentInUserEvidence() = runBlocking {
+        val response = """{"status":"ok","analyzedShortTermIds":["s1"],"longTerm":[{"category":"userProfile","subject":"user","key":"饮品","value":"用户喜欢喝茶。","sourceShortTermIds":["s1"],"sourceMessageIds":["u1"],"evidence":"用户喜欢喝茶。"}]}"""
+        val (background, _) = tasks(listOf(response))
+        val target = ShortTermMemory(
+            id = "s1",
+            content = "用户喜欢喝美式咖啡。",
+            sourceMessageIds = listOf("u1"),
+            eventTime = "2026-08-01T12:00:00Z",
+            sourceRoles = listOf("user"),
+            userEvidence = listOf(SourceEvidence(sourceMessageId = "u1", text = "用户喜欢喝美式咖啡。")),
+        )
+        val filler = (2..21).map { index ->
+            ShortTermMemory(
+                id = "s$index",
+                content = "占位$index",
+                sourceMessageIds = listOf("u1"),
+                eventTime = "2026-08-01T12:00:00Z",
+                analyzedAt = "done",
+            )
+        }
+        // `instant` still resolves evidence "用户喜欢喝茶。", but no claimed short-term
+        // item carries it in userEvidence, so the analysis must be rejected.
+        val character = Character(
+            id = "c1",
+            instant = listOf(ChatMessage(id = "u1", role = Role.User, content = "用户喜欢喝茶。")),
+            shortTerm = listOf(target) + filler,
+        )
         val updated = background.analyzeShortToLongTerm(character)
         assertTrue(updated.longTerm.isEmpty())
         assertEquals(null, updated.shortTerm.first { it.id == "s1" }.analyzedAt)

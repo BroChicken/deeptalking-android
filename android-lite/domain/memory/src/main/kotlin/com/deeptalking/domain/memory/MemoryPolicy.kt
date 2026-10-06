@@ -6,8 +6,11 @@ import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.LongTermMemory
 import com.deeptalking.core.model.MemoryCategory
+import com.deeptalking.core.model.MemoryConflict
+import com.deeptalking.core.model.MemorySubject
 import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.ShortTermMemory
+import com.deeptalking.core.model.SourceEvidence
 import java.time.Instant
 import java.time.LocalDateTime
 import java.time.OffsetDateTime
@@ -105,14 +108,10 @@ fun trimInstant(
 }
 
 /**
- * Trims short-term memory (legacy `trimShortTermList`): always keep the newest
- * [floor] entries plus any older entry neither analyzed nor lorebook-scanned.
- *
- * SIMPLIFIED: the native [ShortTermMemory] has no `revision` / `analyzedRevision`
- * / `lorebookScannedRevision` counters, so a timestamp means "done for its only
- * revision"; the revision-aware branch cannot be reproduced.
+ * Trims short-term memory (legacy `trimShortTermList`): keep the newest [floor]
+ * entries plus any older entry that either consumer has not yet acknowledged for
+ * its current `revision`.
  */
-@Suppress("UNUSED_PARAMETER")
 fun trimShortTerm(
     items: List<ShortTermMemory>,
     limit: Int = AppLimits.Memory.SHORT_TERM,
@@ -121,10 +120,51 @@ fun trimShortTerm(
     if (items.isEmpty()) return items
     val recentStart = (items.size - floor).coerceAtLeast(0)
     return items.filterIndexed { index, item ->
-        val analyzed = item.analyzedAt != null
-        val scanned = item.lorebookScannedAt != null
+        val revision = if (item.revision == 0) 1 else item.revision
+        val analyzedRevision = if (item.analyzedRevision == 0) 1 else item.analyzedRevision
+        val scannedRevision = if (item.lorebookScannedRevision == 0) 1 else item.lorebookScannedRevision
+        val analyzed = item.analyzedAt != null && analyzedRevision == revision
+        val scanned = item.lorebookScannedAt != null && scannedRevision == revision
         index >= recentStart || !analyzed || !scanned
     }
+}
+
+/**
+ * Legacy `ensureMessageSequences`: assign each instant message a monotonic
+ * `sequence` from `counters.messageSequence` (never decreasing), persist the new
+ * high-water mark, and derive `sceneState.startSequence` when unset.
+ */
+fun ensureMessageSequences(character: Character): Character {
+    var last = 0
+    var next = character.counters.messageSequence.coerceAtLeast(0)
+    val instant = character.instant.map { message ->
+        var sequence = message.sequence
+        if (sequence <= last) sequence = maxOf(last, next) + 1
+        last = sequence
+        next = maxOf(next, sequence)
+        message.copy(sequence = sequence)
+    }
+    var scene = character.sceneState ?: com.deeptalking.core.model.SceneState()
+    if (scene.startSequence == null) {
+        val scenes = character.scenes
+        val end = scenes.lastOrNull()?.endedAt?.let { parseZoned(it)?.toInstant()?.toEpochMilli() }
+        var anchor = 0
+        if (end != null) {
+            character.instant.forEach { message ->
+                val time = parseZoned(message.timestamp)?.toInstant()?.toEpochMilli()
+                if (time != null && time <= end) anchor = message.sequence
+            }
+        } else if (scene.startCount > 0 && scene.startCount <= character.instant.size) {
+            anchor = character.instant[scene.startCount - 1].sequence
+        }
+        scene = scene.copy(startSequence = anchor)
+    }
+    scene = scene.copy(startSequence = scene.startSequence?.coerceIn(0, next) ?: 0)
+    return character.copy(
+        instant = instant,
+        counters = character.counters.copy(messageSequence = next),
+        sceneState = scene,
+    )
 }
 
 /** Logical-day + time-slot identity for an event timestamp. */
@@ -244,32 +284,36 @@ fun mergeLongTerm(
             eventTime = earlierTimestamp(existing.eventTime, incoming.eventTime),
             participants = (existing.participants + incoming.participants).distinct().take(8),
             location = mergeLocations(existing.location, incoming.location),
-            sourceMessageIds = (existing.sourceMessageIds + incoming.sourceMessageIds).distinct().take(8),
         )
     } else if (incomingTime >= existingTime) {
-        // Never silently overwrite a semantically different value: preserve both
-        // so `resolveMemoryConflicts` / the user can reconcile later.
-        val conflict = memoriesSemanticallyDiffer(incoming.value, existing.value)
-        merged = merged.copy(
-            value = if (conflict) mergeConflictValue(existing.value, incoming.value) else incoming.value.ifEmpty { existing.value },
-            subject = if (conflict) existing.subject else incoming.subject,
-            sourceMessageIds = (existing.sourceMessageIds + incoming.sourceMessageIds).distinct().take(8),
-            evidence = if (conflict) mergeEvidenceText(existing.evidence, incoming.evidence) else incoming.evidence.ifEmpty { existing.evidence },
-            status = if (conflict) existing.status else incoming.status,
-            dueAt = incoming.dueAt ?: existing.dueAt,
-            updatedAt = incoming.updatedAt ?: incoming.createdAt ?: existing.updatedAt,
-            arcOf = incoming.arcOf ?: existing.arcOf,
-            arcStage = incoming.arcStage ?: existing.arcStage,
-            conflicts = if (conflict) (existing.conflicts + incoming.value).distinct().take(8) else existing.conflicts,
-            conflictedAt = if (conflict) {
-                incoming.updatedAt ?: incoming.createdAt ?: existing.conflictedAt
-            } else {
-                existing.conflictedAt
-            },
-            relatedTo = (existing.relatedTo + incoming.relatedTo).distinct().take(8),
-            sourceRoles = (existing.sourceRoles + incoming.sourceRoles).distinct(),
-            userEvidence = existing.userEvidence.ifEmpty { incoming.userEvidence },
-        )
+        if (existing.conflictedAt != null || incoming.conflictedAt != null) {
+            val conflicts = existing.conflicts.take(4).toMutableList()
+            if (incoming.value != existing.value && conflicts.none { it.value == incoming.value }) {
+                conflicts += MemoryConflict(
+                    value = incoming.value,
+                    evidence = incoming.evidence,
+                    sourceMessageIds = incoming.sourceMessageIds,
+                    at = incoming.updatedAt ?: incoming.createdAt,
+                )
+            }
+            merged = merged.copy(
+                conflicts = conflicts,
+                conflictedAt = existing.conflictedAt ?: incoming.conflictedAt
+                    ?: incoming.updatedAt ?: existing.updatedAt,
+                sourceMessageIds = (existing.sourceMessageIds + incoming.sourceMessageIds).distinct().take(8),
+            )
+        } else {
+            merged = merged.copy(
+                value = incoming.value.ifEmpty { existing.value },
+                subject = incoming.subject,
+                sourceMessageIds = incoming.sourceMessageIds,
+                sourceRoles = incoming.sourceRoles,
+                evidence = incoming.evidence.ifEmpty { existing.evidence },
+                status = incoming.status,
+                dueAt = incoming.dueAt ?: existing.dueAt,
+                updatedAt = incoming.updatedAt ?: incoming.createdAt ?: existing.updatedAt,
+            )
+        }
     }
     return merged.copy(
         tags = (existing.tags + incoming.tags).distinct().take(8),
@@ -277,17 +321,11 @@ fun mergeLongTerm(
     )
 }
 
-/** Preserves a semantically different incoming value instead of dropping it. */
-private fun mergeConflictValue(existing: String, incoming: String): String {
-    if (incoming.isBlank() || existing.contains(incoming)) return existing
-    return if (existing.isBlank()) incoming.trim() else existing.trim() + "\n" + incoming.trim()
-}
-
-/** Unions two evidence snippets, preserving both on a semantic conflict. */
-private fun mergeEvidenceText(existing: String, incoming: String): String {
-    if (incoming.isBlank() || existing.contains(incoming)) return existing
-    return if (existing.isBlank()) incoming.trim() else existing.trim() + "\n" + incoming.trim()
-}
+/** Unions two user-evidence lists, de-duplicating identical id/text pairs (legacy `mergeUserEvidence`). */
+private fun mergeUserEvidence(
+    existing: List<SourceEvidence>,
+    incoming: List<SourceEvidence>,
+): List<SourceEvidence> = (existing + incoming).distinct().take(8)
 
 private fun mergeLocations(a: String, b: String): String {
     val set = listOf(a.trim().take(160), b.trim().take(160)).filter { it.isNotEmpty() }.distinct()
@@ -346,10 +384,8 @@ data class ShortTermAddResult(val list: List<ShortTermMemory>, val accepted: Boo
  * Adds one short-term entry with the legacy source/evidence/event-identity rules
  * (`addShortTermMemory`): every cited source must resolve, the event identity
  * merges into an existing item, and relative time wording is normalized against
- * the event time.
- *
- * SIMPLIFIED: `sourceRoles` / `userEvidence` / revision counters have no native
- * home, so only the source ids are retained.
+ * the event time. Source roles and verbatim user evidence are captured from the
+ * resolved sources, and merged when the write folds into an existing item.
  */
 fun addShortTermMemory(
     list: List<ShortTermMemory>,
@@ -363,6 +399,11 @@ fun addShortTermMemory(
     val sourceIds = draft.sourceMessageIds.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
         .take(AppLimits.Memory.SUMMARY_SOURCES)
     if (sourceIds.isEmpty() || sourceIds.any { !sources.containsKey(it) }) return ShortTermAddResult(list, false)
+    val sourceRoles = sourceIds.map { sources.getValue(it).role }
+    val userEvidence = sourceIds.mapNotNull { id ->
+        val source = sources.getValue(id)
+        if (source.role == "user") SourceEvidence(sourceMessageId = id, text = source.text.trimTo(300)) else null
+    }
     val nowIso = Instant.ofEpochMilli(nowMillis).toString()
     val eventTime = normalizeTimestampIso(draft.eventTime, timestamp ?: nowIso)
     val base = parseZoned(eventTime) ?: parseZoned(timestamp) ?: parseZoned(nowIso) ?: return ShortTermAddResult(list, false)
@@ -378,9 +419,15 @@ fun addShortTermMemory(
             val existing = list[existingIndex]
             val mergedIds = (existing.sourceMessageIds + sourceIds).distinct()
                 .takeLast(AppLimits.Memory.SUMMARY_SOURCES)
+            val mergedRoles = mergedIds.map { sources[it]?.role.orEmpty() }
+            val mergedEvidence = (existing.userEvidence + userEvidence).distinct()
+                .filter { it.sourceMessageId in mergedIds }
+                .takeLast(AppLimits.Memory.SUMMARY_SOURCES)
             val updated = list.toMutableList()
             updated[existingIndex] = existing.copy(
                 sourceMessageIds = mergedIds,
+                sourceRoles = mergedRoles,
+                userEvidence = mergedEvidence,
                 createdAt = timestamp ?: existing.createdAt,
             )
             return ShortTermAddResult(updated, true)
@@ -395,6 +442,8 @@ fun addShortTermMemory(
         analyzedAt = null,
         participants = participants,
         location = location,
+        sourceRoles = sourceRoles,
+        userEvidence = userEvidence,
     )
     return ShortTermAddResult(trimShortTerm(list + item), true)
 }
@@ -458,12 +507,22 @@ fun upsertLongTermMemory(
     if (index >= 0) {
         val existing = store[index]
         updated[index] = if (memoriesSemanticallyDiffer(value, existing.value)) {
+            // 语义冲突：不静默覆盖，保留双方证据并标记，交由 resolveMemoryConflicts 裁决
+            val conflicts = existing.conflicts.take(4).toMutableList()
+            if (conflicts.none { it.value == value }) {
+                conflicts += MemoryConflict(
+                    value = value,
+                    evidence = item.evidence.trimTo(300),
+                    sourceMessageIds = resolvedIds.take(8),
+                    at = nowIso,
+                )
+            }
             existing.copy(
-                value = mergeConflictValue(existing.value, value),
-                evidence = mergeEvidenceText(existing.evidence, item.evidence.trimTo(300)),
-                sourceMessageIds = (existing.sourceMessageIds + resolvedIds).distinct().take(8),
                 tags = (existing.tags + tags).distinct().take(8),
                 importance = maxOf(existing.importance, importance),
+                sourceMessageIds = (existing.sourceMessageIds + resolvedIds).distinct().take(8),
+                conflicts = conflicts,
+                conflictedAt = existing.conflictedAt ?: nowIso,
                 updatedAt = eventTime.ifBlank { nowIso },
                 arcOf = item.arcOf ?: existing.arcOf,
                 arcStage = item.arcStage ?: existing.arcStage,
@@ -475,6 +534,7 @@ fun upsertLongTermMemory(
                 importance = maxOf(existing.importance, importance),
                 subject = item.subject,
                 sourceMessageIds = resolvedIds,
+                sourceRoles = resolvedSources.map { it.role },
                 evidence = item.evidence.trimTo(300),
                 eventTime = eventTime.ifBlank { existing.eventTime ?: nowIso },
                 participants = if (item.category == MemoryCategory.Events) participants else existing.participants,
@@ -484,6 +544,8 @@ fun upsertLongTermMemory(
                 promisor = if (item.category == MemoryCategory.Promises) item.promisor?.take(40) else existing.promisor,
                 promisee = if (item.category == MemoryCategory.Promises) item.promisee?.take(40) else existing.promisee,
                 updatedAt = eventTime.ifBlank { nowIso },
+                conflictedAt = null,
+                conflicts = emptyList(),
                 arcOf = item.arcOf ?: existing.arcOf,
                 arcStage = item.arcStage ?: existing.arcStage,
             )
@@ -518,6 +580,16 @@ fun upsertLongTermMemory(
 
 // ---- conflict resolution --------------------------------------------------------------
 
+/**
+ * Legacy `consumeInjectedRecalls`: remove ONLY the injected recall ids from the
+ * persisted request and clear the injected-id marker.
+ */
+fun consumeInjectedRecalls(character: Character, injectedIds: List<String>): Character {
+    val ids = injectedIds.toSet()
+    val remaining = if (ids.isEmpty()) character.pendingRecall else character.pendingRecall.filterNot { it.id in ids }
+    return character.copy(pendingRecall = remaining, lastInjectedRecallIds = emptyList())
+}
+
 /** One side of a memory conflict (legacy conflict candidate). */
 data class MemoryConflictCandidate(
     val value: String,
@@ -540,24 +612,35 @@ fun resolveMemoryConflict(candidates: List<MemoryConflictCandidate>): MemoryConf
 
 /**
  * Adjudicates accumulated conflicts (`updates.js:640-673`): for each memory with
- * competing values, keep the winner (newest, then longer evidence, then primary)
- * as `value` and clear the conflict set.
+ * competing values AND a `conflictedAt`, keep the winner (newest, then longer
+ * evidence, then primary) as `value`, union its sources, and clear the conflict set.
  */
-fun resolveMemoryConflicts(character: Character): Character {
+fun resolveMemoryConflicts(character: Character, now: String = Instant.now().toString()): Character {
     fun resolve(list: List<LongTermMemory>): List<LongTermMemory> = list.map { memory ->
-        if (memory.conflicts.isEmpty()) return@map memory
+        if (memory.conflicts.isEmpty() || memory.conflictedAt == null) return@map memory
         val base = memory.updatedAt ?: memory.createdAt ?: ""
         val candidates = buildList {
             add(MemoryConflictCandidate(memory.value, memory.evidence, memory.sourceMessageIds, base, true))
-            memory.conflicts.forEach { value ->
-                add(MemoryConflictCandidate(value, "", emptyList(), memory.conflictedAt ?: base, false))
+            memory.conflicts.forEach { conflict ->
+                add(
+                    MemoryConflictCandidate(
+                        value = conflict.value,
+                        evidence = conflict.evidence,
+                        sourceMessageIds = conflict.sourceMessageIds,
+                        updatedAt = conflict.at ?: "",
+                        isMain = false,
+                    ),
+                )
             }
         }
-        val winner = resolveMemoryConflict(candidates)
+        val winner = resolveMemoryConflict(candidates) ?: return@map memory
         memory.copy(
-            value = winner?.value?.ifBlank { memory.value } ?: memory.value,
+            value = winner.value,
+            evidence = winner.evidence,
+            sourceMessageIds = (memory.sourceMessageIds + winner.sourceMessageIds).distinct().take(8),
             conflicts = emptyList(),
             conflictedAt = null,
+            updatedAt = now,
         )
     }
     return character.copy(

@@ -1,5 +1,6 @@
 package com.deeptalking.domain.agent.tools
 
+import com.deeptalking.core.model.LongTermMemory
 import com.deeptalking.core.model.MemoryCategory
 import com.deeptalking.core.model.MemorySubject
 import com.deeptalking.domain.agent.AgentContext
@@ -131,16 +132,17 @@ class UpdateMemoryTool(private val memory: MemoryService) : AgentTool {
                 dueAt = if (nextDueAt != null) nextDueAt.also { changed += "dueAt" } else old.dueAt,
                 evidence = evidence,
                 sourceMessageIds = (old.sourceMessageIds + sourceIds).distinct().take(8),
+                sourceRoles = (old.sourceRoles + "user").distinct().take(8),
                 updatedAt = updatedAt,
                 // A manual correction settles any accumulated conflict and keeps the
                 // replaced value in the corrections history (legacy `applyMemoryUpdate`).
                 conflicts = emptyList(),
                 conflictedAt = null,
-                corrections = if (nextValue.isNotEmpty() && nextValue != old.value && old.value.isNotBlank()) {
-                    (old.corrections + old.value).distinct().take(8)
-                } else {
-                    old.corrections
-                },
+                corrections = (old.corrections.takeLast(2) + com.deeptalking.core.model.MemoryCorrection(
+                    at = updatedAt,
+                    evidence = evidence,
+                    before = beforeSnapshotJson(old),
+                )).takeLast(3),
             )
             next
         }
@@ -169,4 +171,15 @@ class UpdateMemoryTool(private val memory: MemoryService) : AgentTool {
         "world" -> MemorySubject.World
         else -> null
     }
+
+    /** Legacy `beforeSnapshot`: the pre-correction field values as JSON. */
+    private fun beforeSnapshotJson(old: LongTermMemory): String = buildJsonObject {
+        put("value", old.value)
+        put("subject", old.subject.name.lowercase())
+        put("key", old.key)
+        if (old.promisor != null) put("promisor", old.promisor) else put("promisor", kotlinx.serialization.json.JsonNull)
+        if (old.promisee != null) put("promisee", old.promisee) else put("promisee", kotlinx.serialization.json.JsonNull)
+        if (old.eventTime != null) put("eventTime", old.eventTime) else put("eventTime", kotlinx.serialization.json.JsonNull)
+        if (old.dueAt != null) put("dueAt", old.dueAt) else put("dueAt", kotlinx.serialization.json.JsonNull)
+    }.toString()
 }

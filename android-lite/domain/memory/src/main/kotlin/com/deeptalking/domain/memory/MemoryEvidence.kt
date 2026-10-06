@@ -68,11 +68,15 @@ fun knownSources(character: Character): Map<String, SourceRef> {
         }
     }
     character.shortTerm.forEach { item ->
-        item.sourceMessageIds.forEach { id ->
+        item.sourceMessageIds.forEachIndexed { index, id ->
             if (!sources.containsKey(id)) {
-                // Short-term sources no longer present in the live window keep an
-                // unknown role, so they cannot satisfy a user-evidence check.
-                sources[id] = SourceRef(id, "", item.content)
+                val evidence = item.userEvidence.firstOrNull { it.sourceMessageId == id }
+                val role = when {
+                    evidence != null -> "user"
+                    item.sourceRoles.getOrNull(index) == "assistant" -> "assistant"
+                    else -> ""
+                }
+                sources[id] = SourceRef(id, role, evidence?.text ?: item.content)
             }
         }
     }
@@ -192,10 +196,6 @@ fun resolveDynamicStateSources(
  * (legacy `isValidAutomaticMemory`). Model-authored entries must trace to a real
  * message with the right role; a `legacy`/`character` subject or missing evidence
  * is always rejected.
- *
- * SIMPLIFIED: the legacy `userEvidence`/`sourceRoles` short-term arrays are not
- * stored on [com.deeptalking.core.model.ShortTermMemory], so only sources still
- * present in `character.instant` can satisfy the user-evidence rule.
  */
 fun isValidAutomaticMemory(
     character: Character,

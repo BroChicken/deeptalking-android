@@ -5,10 +5,6 @@ import com.deeptalking.core.model.LongTermMemory
 /**
  * Keyword relevance ranking over the long-term store, ported from
  * `retrieveRelevantMemories` in `src/js/memory/updates.js`.
- *
- * NOTE (SIMPLIFIED): the legacy `arcOf` episodic bonus and `pendingRecall`
- * merge are not part of this pure score; pending recall is handled by
- * [MemoryServiceImpl] on top of [topK].
  */
 
 private val SEARCH_STOP_WORDS: Set<String> = setOf(
@@ -50,6 +46,8 @@ fun score(query: String, memory: LongTermMemory, now: Long = System.currentTimeM
         }
     }
     if (matched == 0) return 0.0
+    // Legacy `retrieveRelevantMemories`: a story-arc memory gets a flat +3 bonus.
+    if (!memory.arcOf.isNullOrBlank()) total += 3.0
     val memoryTime = parseTimestampMillis(memory.eventTime)
         ?: parseTimestampMillis(memory.createdAt)
         ?: 0L

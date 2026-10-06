@@ -30,12 +30,12 @@ import java.util.UUID
  */
 object CharacterParity {
 
-    private const val CHARACTER_QUALITY_RULE =
+    const val CHARACTER_QUALITY_RULE =
         "人设质量要求：①不得使用陈词滥调的名字或模板化人设（如“艾尔德里亚”式的套路奇幻名、“高冷大小姐”“温柔邻家女孩”这类通用模板）；" +
             "②personality 写具体的行为倾向（遇到事情会怎么做、在意什么），不要堆砌形容词；" +
             "③background 只写 3-5 条会影响当下互动的要点，不要写编年史。"
 
-    private const val SPEAKING_STYLE_SAMPLES_RULE =
+    const val SPEAKING_STYLE_SAMPLES_RULE =
         "speakingStyle 必须写成“整体调性描述；示例：<台词1> / <台词2> / <台词3>”：三条示例台词必须是该角色真的会说的口语短句，" +
             "要体现口头禅、句尾助词、标点习惯与对用户的称呼，三条之间差异明显（能看出是同一个人、但场景不同）；" +
             "**禁止换行，三条之间只能用 \" / \" 分隔**，整个字段不超过 200 字。"

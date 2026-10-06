@@ -44,6 +44,7 @@ Write-Host '  static checks OK' -ForegroundColor Green
 
 $testTasks = @(
   ':engine:ondevice:test',
+  ':engine:cosyvoice:testDebugUnitTest',
   ':domain:agent:test',
   ':core:network:test',
   ':domain:memory:test',
@@ -82,7 +83,7 @@ $testExit = Invoke-Gradle -Tasks $testTasks -Label '[2/2] Unit tests'
 Write-Host ''
 Write-Host '== Summary ==' -ForegroundColor Cyan
 $total = 0; $bad = 0
-foreach ($m in @('engine\ondevice','domain\agent','core\network','domain\memory','core\data','feature\richtext')) {
+foreach ($m in @('engine\ondevice','engine\cosyvoice','domain\agent','core\network','domain\memory','core\data','feature\richtext')) {
   $dir = Join-Path $android ($m + '\build\test-results')
   if (-not (Test-Path -LiteralPath $dir)) { continue }
   $modTotal = 0; $modFail = 0

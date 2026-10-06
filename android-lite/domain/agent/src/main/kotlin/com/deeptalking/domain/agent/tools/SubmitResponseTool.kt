@@ -55,7 +55,7 @@ class SubmitResponseTool : AgentTool {
                             put("type", "array")
                             put("minItems", 2)
                             put("maxItems", 2)
-                            put("description", "恰好两条\"用户下一句\"的短句：用户视角，是用户可以原样发给角色的话（其中\"我\"只能指用户）。不得是角色的台词、角色的表态或角色对用户的提问，也不得复述角色刚说过的话。写前先把自己换成用户。")
+                            put("description", "恰好两条\"用户下一句\"的短句：用户视角，是用户可以原样发给角色的话（其中\"我\"只能指用户）。不得是角色的台词、角色的表态或角色对用户的提问（如\"你今天怎么了？\"\"要不要早点休息？\"），也不得复述角色刚说过的话。写前先把自己换成用户。")
                             put("items", buildJsonObject { put("type", "string") })
                         },
                     )
@@ -75,7 +75,7 @@ class SubmitResponseTool : AgentTool {
                         buildJsonObject {
                             put("type", "object")
                             put("additionalProperties", false)
-                            put("description", "谨慎修改的基础设定字段（性别/年龄/种族/外貌特征/性格特征/价值观/恐惧弱点/背景故事/关键过往/说话风格/语言方言/对用户的称呼）。用户明确要求修改时必须更新；无用户要求时仅在有决定性剧情依据时更新。")
+                            put("description", "谨慎修改的基础设定字段（性别/年龄/种族/外貌特征/性格特征/价值观/恐惧弱点/背景故事/关键过往/说话风格/语言方言/对用户的称呼）。用户明确要求修改时必须更新；无用户要求时仅在有决定性剧情依据时更新。value以段落式的陈述句书写（自然完整的陈述句），禁止括号、理由或解释性文字")
                             put("properties", staticProps)
                         },
                     )
@@ -206,7 +206,7 @@ class SubmitResponseTool : AgentTool {
 
     private fun longTermSchema(): JsonElement = buildJsonObject {
         put("type", "array")
-        put("description", "未来仍有价值的稳定事实；category 只能是 userProfile|relationship|events|promises|habits；evidence 逐字摘录用户原话；key与value必须写明主体并写绝对日期；约定必须填promisor与promisee；群组对话中若该事实只属于某位成员，填 memberName 记入其私人记忆")
+        put("description", "未来仍有价值的稳定事实；category 只能是 userProfile|relationship|events|promises|habits；evidence 逐字摘录用户原话；key与value必须写明主体（用户写“用户”，角色写角色名）并写绝对日期，不得写“明晚/上周”这类相对时间词（相对时间改用timeRef）；约定必须填promisor与promisee；群组对话中若该事实只属于某位成员（只有那位成员知道/记得），填 memberName 记入其私人记忆，否则记入群组共享记忆")
         put(
             "items",
             buildJsonObject {
@@ -243,11 +243,23 @@ class SubmitResponseTool : AgentTool {
                         put("sourceMessageIds", stringArraySchema())
                         put("evidence", buildJsonObject { put("type", "string") })
                         put("eventTime", buildJsonObject { put("type", "string") })
-                        put("dueAt", buildJsonObject { put("type", "string") })
-                        put("promisor", buildJsonObject { put("type", "string") })
-                        put("promisee", buildJsonObject { put("type", "string") })
+                        put("dueAt", buildJsonObject {
+                            put("type", "string")
+                            put("description", "可选，约定的截止时间（ISO格式）")
+                        })
+                        put("promisor", buildJsonObject {
+                            put("type", "string")
+                            put("description", "可选但约定必填，承诺方：user（用户）/character（角色自己）/relationship（双方）/群组成员名")
+                        })
+                        put("promisee", buildJsonObject {
+                            put("type", "string")
+                            put("description", "可选但约定必填，受约方：user（用户）/character（角色自己）/relationship（双方）/群组成员名")
+                        })
                         put("timeRef", timeRefSchema())
-                        put("memberName", buildJsonObject { put("type", "string") })
+                        put("memberName", buildJsonObject {
+                            put("type", "string")
+                            put("description", "可选，群组对话中指定记入某位成员的私人记忆（不传则记入群组共享记忆）")
+                        })
                     },
                 )
                 put("required", buildJsonArray { add("category"); add("key"); add("value") })

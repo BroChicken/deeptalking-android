@@ -101,10 +101,13 @@ data class AudioChunk(
 
 interface TtsBackend : InferenceBackend {
     /**
-     * Synthesizes speech. The on-device implementation is added later; the
-     * interface exists now so callers never depend on a concrete model.
+     * Synthesizes speech. [voice] selects a voice profile (implementation
+     * defined; e.g. a prompt-speech file path) and [style] is an optional
+     * free-form natural-language emotion/style instruction (null = neutral).
+     * The on-device implementation is added later; the interface exists now so
+     * callers never depend on a concrete model.
      */
-    suspend fun synthesize(text: String, voice: String? = null): Flow<AudioChunk>
+    suspend fun synthesize(text: String, voice: String? = null, style: String? = null): Flow<AudioChunk>
 }
 
 /* ------------------------------ Registry --------------------------------- */

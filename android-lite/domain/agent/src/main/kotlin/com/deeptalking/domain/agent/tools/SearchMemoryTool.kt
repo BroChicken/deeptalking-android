@@ -37,8 +37,14 @@ class SearchMemoryTool(private val memory: MemoryService) : AgentTool {
         val host = if (member != null) MemoryToolSupport.memberAsCharacter(character, member) else character
 
         val now = System.currentTimeMillis()
-        val candidates = host.longTerm
-            .map { it to memoryScore(query, it, now) }
+        // Legacy `retrieveRelevantMemories`: persisted pending-recall items are
+        // force-included first (score 999) before ordinary keyword hits.
+        val pending = host.pendingRecall
+        val pendingIds = pending.map { it.id }.toSet()
+        val candidates = (
+            pending.map { it to 999.0 } +
+                host.longTerm.filter { it.id !in pendingIds }.map { it to memoryScore(query, it, now) }
+            )
             .filter { it.second > 0.0 }
             .sortedByDescending { it.second }
             .take(MAX_CANDIDATES)

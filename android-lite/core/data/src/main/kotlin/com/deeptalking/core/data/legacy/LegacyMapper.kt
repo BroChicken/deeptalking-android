@@ -1,19 +1,22 @@
 package com.deeptalking.core.data.legacy
 
 import com.deeptalking.core.model.AppConfig
+import com.deeptalking.core.model.CacheStats
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.DynamicState
+import com.deeptalking.core.model.DynamicStateMeta
 import com.deeptalking.core.model.GroupMember
 import com.deeptalking.core.model.LongTermMemory
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.LorebookOrigin
 import com.deeptalking.core.model.MemoryCategory
+import com.deeptalking.core.model.MemoryCounters
 import com.deeptalking.core.model.MemorySubject
 import com.deeptalking.core.model.PlatformSlot
 import com.deeptalking.core.model.MessageAttachment
-import com.deeptalking.core.model.PendingRecall
 import com.deeptalking.core.model.PromiseStatus
+import com.deeptalking.core.model.RequestMetric
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.SceneState
 import com.deeptalking.core.model.SceneSummary
@@ -21,13 +24,17 @@ import com.deeptalking.core.model.ShortTermMemory
 import com.deeptalking.core.model.StaticFillMeta
 import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.core.model.Sticker
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.decodeFromJsonElement
 import java.time.Instant
 import java.time.LocalDateTime
 import java.time.OffsetDateTime
 import java.time.ZoneId
+import java.time.temporal.ChronoUnit
 
 /**
  * Turns a legacy base64/data-URI media payload into a stable local reference
@@ -106,9 +113,9 @@ private fun statusOf(raw: String?): PromiseStatus = when (raw?.trim()) {
     else -> PromiseStatus.Active
 }
 
-/** Maps a legacy long-term memory entry. Category defaults to [MemoryCategory.Events]. */
+/** Maps a legacy long-term memory entry. Category comes from the item or defaults to [MemoryCategory.Events]. */
 fun mapLongTerm(dto: LegacyLongTerm): LongTermMemory =
-    mapLongTerm(dto, MemoryCategory.Events)
+    mapLongTerm(dto, if (dto.category != null) categoryOf(dto.category) else MemoryCategory.Events)
 
 /** Maps a legacy long-term memory entry, taking its category from the enclosing map key. */
 fun mapLongTerm(dto: LegacyLongTerm, category: MemoryCategory): LongTermMemory = LongTermMemory(
@@ -117,10 +124,10 @@ fun mapLongTerm(dto: LegacyLongTerm, category: MemoryCategory): LongTermMemory =
     subject = subjectOf(dto.subject),
     key = dto.key ?: "",
     value = dto.value ?: "",
-    tags = dto.tags ?: emptyList(),
+    tags = (dto.tags ?: emptyList()).take(8),
     importance = (dto.importance ?: 0.0).coerceIn(0.0, 10.0).toInt(),
-    sourceMessageIds = dto.sourceMessageIds ?: emptyList(),
-    evidence = dto.evidence ?: "",
+    sourceMessageIds = (dto.sourceMessageIds ?: emptyList()).take(8),
+    evidence = (dto.evidence ?: "").take(300),
     eventTime = dto.eventTime ?: dto.createdAt,
     dueAt = dto.dueAt,
     promisor = dto.promisor,
@@ -130,7 +137,7 @@ fun mapLongTerm(dto: LegacyLongTerm, category: MemoryCategory): LongTermMemory =
     updatedAt = dto.updatedAt ?: dto.createdAt,
     lastRecalled = dto.lastRecalled,
     recallCount = dto.recallCount ?: 0,
-    participants = dto.participants ?: emptyList(),
+    participants = (dto.participants ?: emptyList()).take(MAX_PARTICIPANTS),
     location = dto.location ?: "",
     learnedBonus = (dto.learnedBonus ?: 0.0).toInt().coerceIn(-3, 3),
     usageCount = (dto.usageCount ?: 0).coerceAtLeast(0),
@@ -138,18 +145,18 @@ fun mapLongTerm(dto: LegacyLongTerm, category: MemoryCategory): LongTermMemory =
     arcOf = dto.arcOf,
     arcStage = dto.arcStage,
     recordedAt = dto.recordedAt,
-    conflicts = dto.conflicts ?: emptyList(),
+    conflicts = dto.conflicts,
     conflictedAt = dto.conflictedAt,
     relatedTo = dto.relatedTo ?: emptyList(),
     sourceRoles = dto.sourceRoles ?: emptyList(),
-    userEvidence = dto.userEvidence ?: "",
-    corrections = dto.corrections ?: emptyList(),
+    userEvidence = dto.userEvidence.take(160),
+    corrections = dto.corrections,
 )
 
 fun mapLorebook(dto: LegacyLorebookEntry): LorebookEntry = LorebookEntry(
     id = dto.id ?: "",
-    name = dto.name ?: "",
-    content = dto.content ?: "",
+    name = (dto.name ?: "").take(60),
+    content = (dto.content ?: "").take(2_000),
     keywords = extractKeywords(dto.keywords),
     enabled = dto.enabled != false,
     alwaysActive = dto.alwaysActive == true,
@@ -166,16 +173,22 @@ fun mapLorebook(dto: LegacyLorebookEntry): LorebookEntry = LorebookEntry(
 private fun mapShortTerm(dto: LegacyShortTerm): ShortTermMemory = ShortTermMemory(
     id = dto.id ?: "",
     content = dto.content ?: "",
-    sourceMessageIds = dto.sourceMessageIds ?: emptyList(),
+    sourceMessageIds = (dto.sourceMessageIds ?: emptyList()).take(160),
     timeRef = dto.timeRef?.anchor,
     eventTime = dto.eventTime,
     createdAt = dto.timestamp,
     analyzedAt = dto.analyzedAt,
     lorebookScannedAt = dto.lorebookScannedAt,
-    participants = dto.participants ?: emptyList(),
+    participants = (dto.participants ?: emptyList()).take(MAX_PARTICIPANTS),
     location = dto.location ?: "",
     sourceRoles = dto.sourceRoles ?: emptyList(),
-    userEvidence = dto.userEvidence ?: "",
+    revision = (dto.revision ?: 1).coerceAtLeast(1),
+    analyzedRevision = (dto.analyzedRevision ?: 0).takeIf { it != 0 }
+        ?: if (dto.analyzedAt != null) 1 else 0,
+    lorebookScannedRevision = (dto.lorebookScannedRevision ?: 0).takeIf { it != 0 }
+        ?: if (dto.lorebookScannedAt != null) 1 else 0,
+    sourceTs = dto.sourceTs,
+    userEvidence = dto.userEvidence.take(160),
 )
 
 private fun mapInstant(dto: LegacyInstantMessage, imageSink: StickerSink?): ChatMessage = ChatMessage(
@@ -217,6 +230,7 @@ fun mapSticker(dto: LegacySticker, stickerSink: StickerSink?): Sticker? {
             // Without a sink the raw data URI is kept so no data is lost.
             fileRef = stickerSink?.refFor(dataUri) ?: dataUri,
             createdAt = dto.createdAt,
+            updatedAt = dto.updatedAt ?: dto.createdAt,
         )
     }
     val existingRef = dto.fileRef?.takeIf { it.isNotBlank() } ?: return null
@@ -225,6 +239,7 @@ fun mapSticker(dto: LegacySticker, stickerSink: StickerSink?): Sticker? {
         tag = normalizeStickerTag(dto.tag),
         fileRef = existingRef,
         createdAt = dto.createdAt,
+        updatedAt = dto.updatedAt ?: dto.createdAt,
     )
 }
 
@@ -321,7 +336,7 @@ private fun mapDynamicState(dto: LegacyCharacter): DynamicState {
     )
 }
 
-private fun mapMembers(dto: LegacyCharacter): List<GroupMember> =
+private fun mapMembers(dto: LegacyCharacter, stickerSink: StickerSink?): List<GroupMember> =
     (dto.members ?: emptyList()).map { member ->
         val memory = member.memory
         GroupMember(
@@ -336,21 +351,40 @@ private fun mapMembers(dto: LegacyCharacter): List<GroupMember> =
                     basicInfo = member.basicInfo,
                 )
             ),
-            shortTerm = (memory?.shortTerm ?: emptyList()).map { mapShortTerm(it) },
+            dynamicStateMeta = mapDynamicStateMeta(member.dynamicStateMeta),
+            shortTerm = (memory?.shortTerm ?: emptyList()).map { mapShortTerm(it) }.takeLast(80),
             longTerm = memory?.longTerm?.flatMap { (category, items) ->
                 items.map { mapLongTerm(it, categoryOf(category)) }
             } ?: emptyList(),
-            lorebook = (member.lorebook ?: emptyList()).map { mapLorebook(it) },
+            lorebook = (member.lorebook ?: emptyList()).map { mapLorebook(it) }.take(200),
+            instant = (memory?.instant ?: emptyList())
+                .filter { it.isLoading != true }
+                .map { mapInstant(it, stickerSink) }
+                .takeLast(160),
+            pendingRecall = memory?.pendingRecall?.map { mapLongTerm(it) }.orEmpty().take(6),
+            scenes = (memory?.scenes ?: emptyList())
+                .filter { !it.content.isNullOrBlank() }
+                .map { mapScene(it) }
+                .takeLast(8),
+            sceneState = memory?.sceneState?.let { mapSceneState(it) },
+            counters = mapCounters(memory?.counters),
+            revision = (memory?.revision ?: 0).coerceAtLeast(0),
+            avatarRepairPending = member.avatarRepairPending == true,
+            staticFillMeta = member.staticFillMeta?.let { mapStaticFillMeta(it) },
+            staticFieldMeta = mapStaticFieldMeta(member.staticFieldMeta),
+            fieldsMigrationVersion = member.fieldsMigrationVersion ?: "",
+            timeParseVersion = (member.timeParseVersion ?: 0).coerceAtLeast(0),
+            lorebookMigratedAt = member.lorebookMigratedAt,
         )
     }
 
 /**
  * Maps one legacy character (single or group) into the native [Character].
  *
- * Fields the native model has no home for are skipped: `basicInfo.avatarPixel`,
- * `memory.scenes[].key` / `startedAt` / `endedAt`, `sceneState.startCount` /
- * `startSequence`, long-term `sourceRoles` / `conflicts` / `relatedTo`, and
- * group-member-level `staticFillMeta` / `timeParseVersion` / `lorebookMigratedAt`.
+ * Every legacy memory field now has a native home, including `counters`,
+ * `lastInjectedRecallIds`, `dynamicStateMeta`, `staticFieldMeta`, per-scene
+ * `key`/`startedAt`/`endedAt` and `sceneState.startCount`/`startSequence`.
+ * Only `basicInfo.avatarPixel` (deprecated grid) has no native field.
  */
 fun mapCharacter(dto: LegacyCharacter, stickerSink: StickerSink?): Character {
     val isGroup = dto.entityType == "group"
@@ -395,26 +429,34 @@ fun mapCharacter(dto: LegacyCharacter, stickerSink: StickerSink?): Character {
         interactionRules = groupInfo?.interactionRules ?: "",
         staticProfile = staticProfile,
         dynamicState = effectiveDynamic,
-        shortTerm = (memory?.shortTerm ?: emptyList()).map { mapShortTerm(it) },
+        shortTerm = (memory?.shortTerm ?: emptyList()).map { mapShortTerm(it) }.takeLast(80),
         longTerm = memory?.longTerm?.flatMap { (category, items) ->
             items.map { mapLongTerm(it, categoryOf(category)) }
         } ?: emptyList(),
-        lorebook = (dto.lorebook ?: emptyList()).map { mapLorebook(it) },
+        lorebook = (dto.lorebook ?: emptyList()).map { mapLorebook(it) }.take(200),
         stickers = mapStickers(dto.stickers, stickerSink),
         instant = (memory?.instant ?: emptyList())
             .filter { it.isLoading != true }
-            .map { mapInstant(it, stickerSink) },
+            .map { mapInstant(it, stickerSink) }
+            .takeLast(160),
+        dynamicStateMeta = mapDynamicStateMeta(dto.dynamicStateMeta),
+        avatarRepairPending = dto.avatarRepairPending == true,
         groupSharedDynamic = if (isGroup) sharedDynamic else DynamicState(),
-        members = if (isGroup) mapMembers(dto) else emptyList(),
+        members = if (isGroup) mapMembers(dto, stickerSink) else emptyList(),
         fieldsMigrationVersion = dto.fieldsMigrationVersion ?: "",
-        pendingRecall = memory?.pendingRecall?.firstOrNull()?.let { recall ->
-            PendingRecall(category = pick(recall.category, recall.subject), tags = recall.tags ?: emptyList())
-        },
+        pendingRecall = memory?.pendingRecall?.map { mapLongTerm(it) }.orEmpty().take(6),
+        lastInjectedRecallIds = (memory?.lastInjectedRecallIds ?: emptyList())
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .take(6),
+        counters = mapCounters(memory?.counters),
         scenes = (memory?.scenes ?: emptyList())
             .filter { !it.content.isNullOrBlank() }
-            .map { mapScene(it) },
+            .map { mapScene(it) }
+            .takeLast(8),
         sceneState = memory?.sceneState?.let { mapSceneState(it) },
         staticFillMeta = dto.staticFillMeta?.let { mapStaticFillMeta(it) },
+        staticFieldMeta = mapStaticFieldMeta(dto.staticFieldMeta),
         timeParseVersion = (dto.timeParseVersion ?: 0).coerceAtLeast(0),
         lorebookMigratedAt = dto.lorebookMigratedAt,
         revision = (memory?.revision ?: 0).coerceAtLeast(0),
@@ -423,17 +465,104 @@ fun mapCharacter(dto: LegacyCharacter, stickerSink: StickerSink?): Character {
 
 private fun mapScene(dto: LegacyScene): SceneSummary = SceneSummary(
     id = dto.id ?: "",
+    key = dto.key ?: "",
     content = dto.content ?: "",
-    fromMessageId = dto.fromMessageId,
-    toMessageId = dto.toMessageId,
+    startedAt = dto.startedAt,
+    endedAt = dto.endedAt,
     createdAt = dto.createdAt,
 )
 
 private fun mapSceneState(dto: LegacySceneState): SceneState = SceneState(
     key = dto.key ?: "",
-    startMessageId = dto.startMessageId,
+    startCount = (dto.startCount ?: 0).coerceAtLeast(0),
+    startSequence = dto.startSequence,
     messageCount = (dto.messageCount ?: 0).coerceAtLeast(0),
 )
+
+private fun mapDynamicStateMeta(element: JsonElement?): Map<String, DynamicStateMeta> {
+    val obj = element as? JsonObject ?: return emptyMap()
+    return obj.entries.associate { (key, value) ->
+        val meta = value as? JsonObject
+        key to DynamicStateMeta(updatedAt = meta?.stringOrNull("updatedAt"))
+    }
+}
+
+private fun mapStaticFieldMeta(element: JsonElement?): Map<String, JsonElement> {
+    val obj = element as? JsonObject ?: return emptyMap()
+    return obj.toMap()
+}
+
+/** Legacy `memory.counters`; retry timestamps in the past are dropped like `normalizeRetryAt`. */
+private fun mapCounters(element: JsonElement?): MemoryCounters {
+    val obj = element as? JsonObject ?: return MemoryCounters()
+    return MemoryCounters(
+        extractionRetryAt = normalizeRetryAt(obj.stringOrNull("extractionRetryAt")),
+        analysisRetryAt = normalizeRetryAt(obj.stringOrNull("analysisRetryAt")),
+        sceneRetryAt = normalizeRetryAt(obj.stringOrNull("sceneRetryAt")),
+        lorebookRetryAt = normalizeRetryAt(obj.stringOrNull("lorebookRetryAt")),
+        extractionFailures = (obj.intLenient("extractionFailures") ?: 0).coerceAtLeast(0),
+        analysisFailures = (obj.intLenient("analysisFailures") ?: 0).coerceAtLeast(0),
+        sceneFailures = (obj.intLenient("sceneFailures") ?: 0).coerceAtLeast(0),
+        lorebookFailures = (obj.intLenient("lorebookFailures") ?: 0).coerceAtLeast(0),
+        lorebookScannedCount = (obj.intLenient("lorebookScannedCount") ?: 0).coerceAtLeast(0),
+        messageSequence = (obj.intLenient("messageSequence") ?: 0).coerceAtLeast(0),
+    )
+}
+
+private fun JsonObject.stringOrNull(key: String): String? =
+    (this[key] as? JsonPrimitive)?.takeIf { it.isString }?.content
+
+/** Lenient number read (`Number(...)`): numeric strings are accepted. */
+private fun JsonObject.intLenient(key: String): Int? =
+    (this[key] as? JsonPrimitive)?.content?.trim()?.toDoubleOrNull()?.toInt()
+
+/** Strict `typeof === 'number'` read (used by `normalizeCacheStats`). */
+private fun JsonObject.numberOnly(key: String): Int? =
+    (this[key] as? JsonPrimitive)
+        ?.takeIf { !it.isString && it.content.toDoubleOrNull() != null }
+        ?.content?.toDoubleOrNull()?.toInt()
+
+private fun nowIso(): String = Instant.now().truncatedTo(ChronoUnit.MILLIS).toString()
+
+/** Legacy `normalizeRetryAt`: keep only a future timestamp, else null. */
+private fun normalizeRetryAt(value: String?): String? {
+    val text = value?.trim().orEmpty()
+    if (text.isEmpty()) return null
+    val ts = parseInstant(text) ?: return null
+    return if (ts.toEpochMilli() > System.currentTimeMillis()) {
+        ts.truncatedTo(ChronoUnit.MILLIS).toString()
+    } else {
+        null
+    }
+}
+
+private val metricCodec = Json { ignoreUnknownKeys = true; isLenient = true }
+
+/** Legacy `normalizeCacheStats`. */
+private fun mapCacheStats(element: JsonElement?): CacheStats? {
+    val obj = element as? JsonObject ?: return null
+    val hitTokens = obj.numberOnly("hitTokens")
+    val missTokens = obj.numberOnly("missTokens")
+    val promptTokens = obj.numberOnly("promptTokens")
+    val hasCacheFields = hitTokens != null && missTokens != null
+    if (!hasCacheFields && promptTokens == null) return null
+    return CacheStats(
+        hitTokens = if (hasCacheFields) hitTokens!!.coerceAtLeast(0) else null,
+        missTokens = if (hasCacheFields) missTokens!!.coerceAtLeast(0) else null,
+        promptTokens = promptTokens?.takeIf { it >= 0 },
+        updatedAt = parseInstant(obj.stringOrNull("updatedAt"))
+            ?.truncatedTo(ChronoUnit.MILLIS)?.toString() ?: nowIso(),
+    )
+}
+
+/** Legacy `requestMetrics` (`filter(isPlainObject).slice(-60)`). */
+private fun mapRequestMetrics(element: JsonElement?): List<RequestMetric> {
+    val arr = element as? JsonArray ?: return emptyList()
+    return arr.mapNotNull { item ->
+        if (item !is JsonObject) return@mapNotNull null
+        runCatching { metricCodec.decodeFromJsonElement(RequestMetric.serializer(), item) }.getOrNull()
+    }.takeLast(60)
+}
 
 private fun mapStaticFillMeta(dto: LegacyStaticFillMeta): StaticFillMeta = StaticFillMeta(
     attemptedAt = dto.attemptedAt,
@@ -465,6 +594,8 @@ fun mapConfig(dto: LegacyConfig?): AppConfig {
         proactiveEnabled = dto.proactiveEnabled ?: true,
         styleCritique = dto.styleCritique ?: true,
         quickReplyRepair = dto.quickReplyRepair ?: true,
+        cacheStats = mapCacheStats(dto.cacheStats),
+        requestMetrics = mapRequestMetrics(dto.requestMetrics),
         platformSettings = dto.platformSettings.orEmpty().mapValues { (_, slot) ->
             PlatformSlot(
                 baseUrl = slot.baseUrl?.trim()?.trimEnd('/').orEmpty(),
@@ -513,6 +644,8 @@ fun reconcileLegacyMemories(character: Character): MemoryReconciliation {
             participants = mergeParticipants(old.participants, item.participants),
             location = mergeLocations(old.location, item.location),
             lorebookScannedAt = null,
+            sourceRoles = (old.sourceRoles + item.sourceRoles).distinct(),
+            userEvidence = (old.userEvidence + item.userEvidence).distinctBy { it.sourceMessageId to it.text },
         )
         short[primary.first] = merged
         seen[identity] = primary.first to merged
@@ -546,6 +679,8 @@ fun reconcileLegacyMemories(character: Character): MemoryReconciliation {
                 participants = mergeParticipants(old.participants, newer.participants),
                 location = mergeLocations(old.location, newer.location),
                 updatedAt = newer.updatedAt ?: old.updatedAt,
+                sourceRoles = (old.sourceRoles + newer.sourceRoles).distinct(),
+                userEvidence = (old.userEvidence + newer.userEvidence).distinctBy { it.sourceMessageId to it.text },
             )
             droppedLong += entryIndex
             repaired++
@@ -562,9 +697,7 @@ fun reconcileLegacyMemories(character: Character): MemoryReconciliation {
 /**
  * Legacy `ensureMessageSequences` (src/js/memory/policy.js) assigned a stored
  * monotonic `sequence` per instant message, a `counters.messageSequence` high
- * water mark and a `sceneState.startSequence` anchor. The native model has no
- * per-message `sequence` or counters and anchors scenes by
- * [SceneState.startMessageId] instead, so the closest safe behavior is to derive
+ * water mark and a `sceneState.startSequence` anchor. The mapper only derives
  * the sequence each message would get from list order (matching the legacy
  * fresh-store case, where the first message is 1). Nothing is mutated.
  */

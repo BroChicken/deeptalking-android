@@ -27,8 +27,8 @@ android {
         applicationId = "com.deeptalking.lite"
         minSdk = 26
         targetSdk = 35
-        versionCode = 41
-        versionName = "1.4.9"
+        versionCode = 47
+        versionName = "1.5.5"
     }
 
     compileOptions {
@@ -67,6 +67,10 @@ android {
             }
         }
     }
+
+    packaging {
+        jniLibs { useLegacyPackaging = true }
+    }
 }
 
 dependencies {
@@ -78,6 +82,7 @@ dependencies {
     implementation(project(":core:notifications"))
     implementation(project(":core:designsystem"))
     implementation(project(":engine:ondevice"))
+    implementation(project(":engine:cosyvoice"))
     implementation(project(":domain:agent"))
     implementation(project(":domain:memory"))
     implementation(project(":feature:chat"))

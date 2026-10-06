@@ -20,6 +20,8 @@ import com.deeptalking.domain.agent.background.detectStyleViolations
 import com.deeptalking.domain.agent.background.extractReplyEnding
 import com.deeptalking.domain.agent.background.getLastStyleViolations
 import com.deeptalking.domain.memory.MemoryService
+import com.deeptalking.domain.memory.formatAbsoluteDate
+import com.deeptalking.domain.memory.logicalDay
 import com.deeptalking.engine.ondevice.LlmRequest
 import com.deeptalking.engine.ondevice.ToolChoice
 import com.deeptalking.engine.ondevice.ToolDefinition
@@ -135,11 +137,17 @@ internal fun normalizeUserAddress(value: String?): String =
     value.orEmpty().replace(Regex("\\s+"), "").take(20)
 
 /** Never send the literal word “用户” to the model. */
-internal fun maskUserWord(character: Character?, text: String?): String {
+internal fun maskUserWord(character: Character?, text: String?): String =
+    maskUserWord(character?.staticProfile?.userAddress, text)
+
+/** Member variant of [maskUserWord]; uses the member's own address. */
+internal fun maskUserWord(member: GroupMember?, text: String?): String =
+    maskUserWord(member?.staticProfile?.userAddress, text)
+
+private fun maskUserWord(address: String?, text: String?): String {
     val raw = text.orEmpty()
     if (raw.isEmpty() || !raw.contains("用户")) return raw
-    val address = normalizeUserAddress(character?.staticProfile?.userAddress)
-    val replacement = address.replace("用户", "").ifBlank { "对方" }
+    val replacement = normalizeUserAddress(address).replace("用户", "").ifBlank { "对方" }
     return raw.replace("用户", replacement)
 }
 
@@ -184,7 +192,7 @@ internal object TimeContext {
                 val abs = kotlin.math.abs(total)
                 "UTC$sign%02d:%02d".format(abs / 3600, (abs % 3600) / 60)
             },
-            day = zdt.format(DateTimeFormatter.ofPattern("yyyy-MM-dd")),
+            day = formatAbsoluteDate(logicalDay(zdt)),
             slot = timeSlot(zdt),
         )
     }
@@ -210,33 +218,35 @@ internal object TimeContext {
 // Role / member context (port of buildRoleContext / buildDynamicStateContext).
 // ---------------------------------------------------------------------------
 
-internal fun buildDynamicStateContext(profile: DynamicState): String {
-    val lines = DYNAMIC_STATE_FIELDS.map { (key, label) ->
+internal fun buildDynamicStateContext(
+    profile: DynamicState,
+    fields: List<Pair<String, String>> = DYNAMIC_STATE_FIELDS,
+): String {
+    val lines = fields.map { (key, label) ->
         val value = trimText(dynamicStateValue(profile, key), 700)
         label + ": " + value.ifBlank { "(未设置)" }
     }
     return lines.joinToString("\n")
 }
 
-// SIMPLIFIED: legacy `roleInGroup` and member-level dynamic state are not part
-// of the Kotlin GroupMember model; only static profile fields are injected here.
 internal fun buildMemberContext(member: GroupMember, staticOnly: Boolean): String {
     val lines = mutableListOf<String>()
-    lines += "- " + trimText(member.name, 100)
-    if (member.roleInGroup.isNotBlank()) lines += "  群内定位: " + trimText(member.roleInGroup, 200)
+    val roleSuffix = if (member.roleInGroup.trim().isNotEmpty()) {
+        "（群内定位: " + trimText(member.roleInGroup, 180) + "）"
+    } else {
+        ""
+    }
+    lines += "- " + trimText(member.name, 100) + roleSuffix
     STATIC_PROFILE_FIELDS.forEach { (key, label) ->
         val value = trimText(staticProfileValue(member.staticProfile, key), if (key == "background" || key == "keyEvents") 600 else 400)
-        if (value.isNotEmpty()) lines += "  $label: " + maskUserWordName(member.name, value)
+        if (value.isNotEmpty()) lines += "  $label: " + maskUserWord(member, value)
     }
     if (!staticOnly) {
         val stateText = buildDynamicStateContext(member.dynamicState)
-        if (stateText.isNotEmpty()) lines += "  当前状态:\n" + trimText(stateText, 700)
+        if (stateText.isNotEmpty()) lines += "  当前状态:\n" + trimText(maskUserWord(member, stateText), 700)
     }
     return lines.joinToString("\n")
 }
-
-// Member mode has no Character to derive the user address from; keep the raw word.
-private fun maskUserWordName(@Suppress("UNUSED_PARAMETER") name: String, text: String): String = text
 
 internal fun buildRoleContext(character: Character, staticOnly: Boolean): String {
     if (character.isGroup) {
@@ -249,14 +259,8 @@ internal fun buildRoleContext(character: Character, staticOnly: Boolean): String
         )
         groupLines += "互动规则: " + maskUserWord(character, trimText(character.interactionRules, 700))
         if (!staticOnly) {
-            val shared = character.groupSharedDynamic.copy(
-                currentMood = "",
-                currentOccupation = "",
-                currentGoal = "",
-                currentRelationship = "",
-                currentImportantOthers = "",
-            )
-            val groupStateText = buildDynamicStateContext(shared)
+            val sharedFields = DYNAMIC_STATE_FIELDS.filter { it.first in GROUP_SHARED_DYNAMIC_FIELDS }
+            val groupStateText = buildDynamicStateContext(character.groupSharedDynamic, sharedFields)
             groupLines += "群组当前状态（全员共用）:\n" + trimText(maskUserWord(character, groupStateText), 1100)
         }
         val memberTexts = character.members.map { trimText(buildMemberContext(it, staticOnly), AppLimits.Prompt.MEMBER_CHARS) }
@@ -271,7 +275,7 @@ internal fun buildRoleContext(character: Character, staticOnly: Boolean): String
         val value = trimText(staticProfileValue(character.staticProfile, key), if (key == "background" || key == "keyEvents") 800 else 600)
         if (value.isNotEmpty()) lines += "$label: " + maskUserWord(character, value)
     }
-    return lines.joinToString("\n")
+    return trimText(lines.joinToString("\n"), AppLimits.Prompt.ROLE_CHARS)
 }
 
 // ---------------------------------------------------------------------------
@@ -508,12 +512,15 @@ private fun detectTopicSwitch(character: Character, query: String): Boolean {
 /** Legacy `buildMemoryQuery`: expand correction-style queries with recent context. */
 private fun buildMemoryQuery(character: Character, query: String): String {
     val text = query.trim()
-    if (text.isEmpty() || !Regex("(填过|记错|记反|不是|不止|那件|那个|之前|刚才)").containsMatchIn(text)) return text
-    val messages = character.instant.filter { !it.isLoading }
+    if (text.isEmpty() || !Regex("(填过|记错|记反|不是|不止|那件|那个|之前|刚才|it\\b|that\\b)", RegexOption.IGNORE_CASE).containsMatchIn(text)) return text
+    val messages = character.instant.filter { !it.isLoading && !it.internalOnly }.toMutableList()
+    if (messages.isNotEmpty() && messages.last().role == Role.User && messages.last().content == text) {
+        messages.removeAt(messages.size - 1)
+    }
     val context = messages.takeLast(2)
         .map { trimText(it.content.replace(Regex("[（(][^）)]*[）)]"), ""), 600) }
         .joinToString("\n")
-    return if (context.isEmpty()) text else text + "\n" + context
+    return text + "\n" + context
 }
 
 private fun formatContextTime(iso: String?): String {
@@ -523,10 +530,16 @@ private fun formatContextTime(iso: String?): String {
 }
 
 /** Legacy `getPromiseContext`: active promises, overdue first, capped at 3. */
-private fun getPromiseContext(character: Character): String {
+private fun getPromiseContext(character: Character, selectedIds: Set<String>?): String {
     val now = Instant.now().toEpochMilli()
     val selected = character.longTerm
         .filter { it.category == MemoryCategory.Promises && it.status == PromiseStatus.Active }
+        .filter { item ->
+            if (selectedIds == null || item.id in selectedIds) return@filter true
+            val due = item.dueAt?.let { runCatching { Instant.parse(it).toEpochMilli() }.getOrNull() }
+                ?: return@filter false
+            due >= now - 86400000L && due <= now + 7 * 86400000L
+        }
         .map { item ->
             val dueTime = item.dueAt?.let { runCatching { Instant.parse(it).toEpochMilli() }.getOrNull() } ?: 0L
             Triple(item, dueTime, dueTime > 0 && dueTime < now)
@@ -672,6 +685,11 @@ suspend fun buildVolatileContext(
     val injected = runCatching {
         memory.retrieve(character, memoryQuery, AppLimits.Agent.TOOL_MEMORY_INJECT_LIMIT)
     }.getOrDefault(emptyList())
+    val selectedPromiseIds = if (memoryQuery.isEmpty()) {
+        null
+    } else {
+        runCatching { memory.retrieve(character, memoryQuery, 12).map { it.id }.toSet() }.getOrDefault(emptySet())
+    }
     val memoryLines = mutableListOf<String>()
     injected.forEach { item ->
         appendWithinLimit(
@@ -758,18 +776,6 @@ suspend fun buildVolatileContext(
 
     add("【近期摘要记忆】\n" + (shortLines.joinToString("\n").ifBlank { "无" }), summaryBudget + 30)
 
-    character.pendingRecall?.let { recall ->
-        val parts = mutableListOf<String>()
-        if (recall.category.isNotBlank()) parts += "分类: ${recall.category}"
-        if (recall.tags.isNotEmpty()) parts += "关键词: " + recall.tags.joinToString("、")
-        add(
-            "【本轮主动召回】\n角色本轮请求主动回忆" +
-                (if (parts.isNotEmpty()) "（" + parts.joinToString("；") + "）" else "") +
-                "；下方相关记忆即为召回结果，请自然地用于回复。",
-            300,
-        )
-    }
-
     add(
         "【本轮主动召回的相关长期记忆】\n" + (memoryLines.joinToString("\n").ifBlank { "无相关长期记忆" }) +
             "\n【记忆取用说明】以上条目是按关键词与时间粗略召回的，可能只有部分相关，也可能已经过时；仅在与当前话题自然相关时提及，不要硬提旧事，也不要把它们当成用户刚刚说过的话。" +
@@ -788,7 +794,7 @@ suspend fun buildVolatileContext(
         )
     }
 
-    val promises = getPromiseContext(character)
+    val promises = getPromiseContext(character, selectedPromiseIds)
     if (promises.isNotEmpty()) add("【待跟进承诺】\n$promises", 500)
 
     if (character.isGroup) {
@@ -839,6 +845,10 @@ suspend fun buildVolatileContext(
 
 enum class RequestPhase { AUTO, SUBMIT }
 
+/** Legacy `normalizeTemperature`: clamp to [0, 2]; non-finite falls back. */
+internal fun normalizeTemperature(value: Double, fallback: Double = 0.8): Double =
+    if (value.isNaN() || value.isInfinite()) fallback else value.coerceIn(0.0, 2.0)
+
 /**
  * Builds an [LlmRequest] from an assembled system prompt and message list.
  * Only the first system message maps to `instructions`; conversation history
@@ -849,8 +859,7 @@ class RequestBuilder(
     private val imageResolver: ((String) -> String?)? = null,
 ) {
 
-    fun normalizeTemperature(value: Double): Double =
-        if (value.isNaN() || value.isInfinite()) config.temperature else value.coerceIn(0.0, 2.0)
+    fun normalizeTemperature(value: Double): Double = normalizeTemperature(value, config.temperature)
 
     fun build(
         phase: RequestPhase,

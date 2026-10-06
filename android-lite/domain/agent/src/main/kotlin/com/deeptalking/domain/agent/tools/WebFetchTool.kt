@@ -16,7 +16,8 @@ class WebFetchTool(private val web: WebContentProvider?) : AgentTool {
         parametersJson = """{"type":"object","properties":{"url":{"type":"string","description":"要抓取的 http(s) 链接（必须是上下文里真实存在的链接）"},"keyword":{"type":"string","description":"B站视频搜索关键词（从用户意图提取，如\"火影忍者\"）"}},"additionalProperties":false}""",
     )
 
-    override fun isEnabled(context: AgentContext): Boolean = web != null
+    // Legacy always registers `web_fetch`; unavailability is reported at execution.
+    override fun isEnabled(context: AgentContext): Boolean = true
 
     override suspend fun execute(call: ToolCall, context: AgentContext): AgentToolResult {
         val provider = web ?: return AgentToolResult(errorJson("联网功能不可用"))

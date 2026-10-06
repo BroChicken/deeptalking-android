@@ -23,6 +23,7 @@ dependencies {
     implementation(project(":core:security"))
     implementation(project(":core:notifications"))
     implementation(project(":engine:ondevice"))
+    implementation(libs.androidx.activity.compose)
     implementation(platform(libs.compose.bom))
     implementation(libs.compose.ui)
     implementation(libs.compose.material3)

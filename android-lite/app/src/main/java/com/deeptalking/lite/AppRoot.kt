@@ -103,6 +103,7 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
     val generating by vm.isGenerating.collectAsState()
     val fieldMigrationCount by vm.fieldMigrationPrompt.collectAsState()
     val lorebookMigrationCount by vm.lorebookMigrationPrompt.collectAsState()
+    val tts by vm.tts.collectAsState()
 
     val activeCharacter = characters.firstOrNull { it.id == activeId }
 
@@ -215,6 +216,30 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                         onSave = vm::saveSettings,
                         onTestReminder = vm::testReminder,
                         onTestConnection = { cfg, key -> vm.testApiConnection(cfg, key) },
+                        ttsEnabled = tts.enabled,
+                        ttsAutoRead = tts.autoRead,
+                        ttsModelReady = tts.modelReady,
+                        ttsDownloading = tts.downloading,
+                        ttsProgress = tts.progress,
+                        ttsProgressLabel = tts.progressLabel,
+                        ttsVoices = tts.voices.map {
+                            com.deeptalking.feature.settings.VoiceOption(it.file, it.name, it.builtin)
+                        },
+                        ttsActiveVoice = tts.activeVoice,
+                        ttsStyle = tts.style,
+                        ttsStatus = tts.status,
+                        ttsSpeaking = tts.speaking,
+                        ttsBusy = tts.busy,
+                        onToggleTtsEnabled = vm::setTtsEnabled,
+                        onToggleTtsAutoRead = vm::setTtsAutoRead,
+                        onDownloadTtsModel = vm::downloadVoiceModel,
+                        onImportTtsVoice = vm::importVoice,
+                        onSelectTtsVoice = vm::selectVoice,
+                        onRenameTtsVoice = vm::renameVoice,
+                        onDeleteTtsVoice = vm::deleteVoice,
+                        onTtsStyleChange = vm::setTtsStyle,
+                        onTestTtsSpeak = vm::speakText,
+                        onStopTts = vm::stopSpeaking,
                     )
                 }
             }
@@ -253,6 +278,7 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                     onDeleteSticker = { id -> activeCharacter?.let { vm.deleteSticker(it, id) } },
                     onSetStickerTag = { id, tag -> activeCharacter?.let { vm.setStickerTag(it, id, tag) } },
                     onSendSticker = { sticker, text -> vm.sendSticker(sticker, text) },
+                    onReadAloud = { msg -> vm.speakText(msg.content) },
                 )
             }
         }
@@ -472,13 +498,14 @@ private fun CachePill(config: com.deeptalking.core.model.AppConfig, modifier: Mo
     val metrics = config.requestMetrics
     if (metrics.isEmpty()) return
     val text = when {
-        metrics.none { it.inputTokens > 0 } -> "缓存未返回命中数据"
+        metrics.none { (it.inputTokens ?: 0) > 0 } -> "缓存未返回命中数据"
         else -> {
-            val recent = metrics.takeLast(12).filter { it.inputTokens > 0 }
+            val recent = metrics.takeLast(12).filter { (it.inputTokens ?: 0) > 0 }
             val last = recent.lastOrNull()?.hitRate ?: 0.0
-            val avg = if (recent.isEmpty()) 0.0 else recent.map { it.hitRate }.average()
+            val rates = recent.mapNotNull { it.hitRate }
+            val avg = if (rates.isEmpty()) 0.0 else rates.average()
             val tokens = recent.lastOrNull()?.let { m ->
-                " · " + formatCompactNumber(m.hitTokens) + "/" + formatCompactNumber(m.missTokens)
+                " · " + formatCompactNumber(m.hitTokens ?: 0) + "/" + formatCompactNumber(m.missTokens ?: 0)
             } ?: ""
             "缓存命中 ${(last * 100).toInt()}% · 近${recent.size}轮均值 ${(avg * 100).toInt()}%$tokens"
         }

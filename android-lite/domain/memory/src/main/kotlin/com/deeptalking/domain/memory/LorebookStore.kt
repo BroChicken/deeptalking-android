@@ -6,6 +6,7 @@ import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.LorebookOrigin
 import java.time.Instant
+import kotlinx.serialization.Serializable
 
 /**
  * Lorebook write helpers ported from `src/js/memory/lorebook.js`
@@ -25,6 +26,7 @@ data class LorebookUpsertResult(
 )
 
 /** A proposed lorebook entry (model output) before validation/merge. */
+@Serializable
 data class LorebookProposal(
     val name: String,
     val content: String,

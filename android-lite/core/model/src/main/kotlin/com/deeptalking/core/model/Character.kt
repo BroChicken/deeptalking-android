@@ -38,9 +38,25 @@ data class GroupMember(
     val roleInGroup: String = "",
     val staticProfile: StaticProfile = StaticProfile(),
     val dynamicState: DynamicState = DynamicState(),
+    val dynamicStateMeta: Map<String, DynamicStateMeta> = emptyMap(),
     val shortTerm: List<ShortTermMemory> = emptyList(),
     val longTerm: List<LongTermMemory> = emptyList(),
     val lorebook: List<LorebookEntry> = emptyList(),
+    /** Member conversation window (legacy `member.memory.instant`). */
+    val instant: List<ChatMessage> = emptyList(),
+    /** Member pending recall items (legacy `member.memory.pendingRecall`). */
+    @Serializable(with = PendingRecallListSerializer::class)
+    val pendingRecall: List<LongTermMemory> = emptyList(),
+    val scenes: List<SceneSummary> = emptyList(),
+    val sceneState: SceneState? = null,
+    val counters: MemoryCounters = MemoryCounters(),
+    val revision: Int = 0,
+    val avatarRepairPending: Boolean = false,
+    val staticFillMeta: StaticFillMeta? = null,
+    val staticFieldMeta: Map<String, kotlinx.serialization.json.JsonElement> = emptyMap(),
+    val fieldsMigrationVersion: String = "",
+    val timeParseVersion: Int = 0,
+    val lorebookMigratedAt: String? = null,
 )
 
 /** Character or group entity. Groups set [isGroup] and populate [members]. */
@@ -64,14 +80,25 @@ data class Character(
     val groupSharedDynamic: DynamicState = DynamicState(),
     val members: List<GroupMember> = emptyList(),
     val fieldsMigrationVersion: String = "",
-    /** Persisted pending recall request, if any (legacy `memory.pendingRecall`). */
-    val pendingRecall: PendingRecall? = null,
+    /** Per-field dynamic-state bookkeeping (legacy `dynamicStateMeta`). */
+    val dynamicStateMeta: Map<String, DynamicStateMeta> = emptyMap(),
+    /** True when the avatar was detected damaged and awaits AI repair (legacy `avatarRepairPending`). */
+    val avatarRepairPending: Boolean = false,
+    /** Persisted pending-recall items (legacy `memory.pendingRecall`, up to 6 full items). */
+    @Serializable(with = PendingRecallListSerializer::class)
+    val pendingRecall: List<LongTermMemory> = emptyList(),
+    /** Ids injected by the last recall, for precise clearing (legacy `memory.lastInjectedRecallIds`). */
+    val lastInjectedRecallIds: List<String> = emptyList(),
+    /** Automatic-memory-task retry/failure counters (legacy `memory.counters`). */
+    val counters: MemoryCounters = MemoryCounters(),
     /** Stored scene summaries used by the volatile context (legacy `memory.scenes`). */
     val scenes: List<SceneSummary> = emptyList(),
     /** Cursor for the scene-summary task (legacy `memory.sceneState`). */
     val sceneState: SceneState? = null,
     /** Retry bookkeeping for automatic static-field completion (legacy `staticFillMeta`). */
     val staticFillMeta: StaticFillMeta? = null,
+    /** Per-field static-fill bookkeeping (legacy `staticFieldMeta`). */
+    val staticFieldMeta: Map<String, kotlinx.serialization.json.JsonElement> = emptyMap(),
     /** Guards the one-time relative-time migration (legacy `timeParseVersion`). */
     val timeParseVersion: Int = 0,
     /** When the one-time world-book migration ran (legacy `lorebookMigratedAt`). */
@@ -85,7 +112,10 @@ data class Character(
 @Serializable
 data class SceneState(
     val key: String = "",
-    val startMessageId: String? = null,
+    /** Logical message count when the current scene started (legacy `startCount`). */
+    val startCount: Int = 0,
+    /** Message sequence when the current scene started (legacy `startSequence`). */
+    val startSequence: Int? = null,
     val messageCount: Int = 0,
 )
 
@@ -97,16 +127,12 @@ data class StaticFillMeta(
 )
 
 @Serializable
-data class PendingRecall(
-    val category: String = "",
-    val tags: List<String> = emptyList(),
-)
-
-@Serializable
 data class SceneSummary(
     val id: String = "",
+    /** Location key the scene belongs to (legacy `key`). */
+    val key: String = "",
     val content: String = "",
-    val fromMessageId: String? = null,
-    val toMessageId: String? = null,
+    val startedAt: String? = null,
+    val endedAt: String? = null,
     val createdAt: String? = null,
 )

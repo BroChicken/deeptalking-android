@@ -301,8 +301,13 @@ class AgentLoop(
             failure = error
         }
         val finished = completed
-        if (finished != null && (finished.text.isNotBlank() || finished.toolCalls.isNotEmpty())) {
-            return TurnResult(finished, salvaged)
+        if (finished != null) {
+            // Legacy uses the assembled function calls regardless of any trailing
+            // text; never drop tool calls assembled from streaming deltas.
+            val calls = if (finished.toolCalls.isNotEmpty()) finished.toolCalls else pending.values.toList()
+            if (finished.text.isNotBlank() || calls.isNotEmpty()) {
+                return TurnResult(finished.copy(toolCalls = calls), salvaged)
+            }
         }
         // Nothing usable accumulated: surface transient transport failures so the
         // caller can retry (legacy `performChatRequestWithRetry`). When partial
@@ -328,7 +333,7 @@ class AgentLoop(
                 "quickReplies",
                 buildJsonArray {
                     add("嗯，我明白")
-                    add("稍等，我想一想")
+                    add("稍等，我想一下")
                 },
             )
         }

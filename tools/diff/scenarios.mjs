@@ -165,4 +165,58 @@ export const SCENARIOS = [
     query: '继续。',
     phase: 'submit',
   },
+  {
+    id: 'promise-out-of-window',
+    description: '存在一条与查询无关且到期日超出 ±(1d/7d) 窗口的承诺：不得注入 volatile 的承诺区',
+    config: { apiPlatform: 'deepseek', modelName: 'deepseek-flash', temperature: 0.8, stream: true, reasoningEffort: 'medium', proactiveEnabled: false, styleCritique: false, quickReplyRepair: false },
+    character: baseCharacter({
+      memory: {
+        instant: [{ id: 'm1', role: 'user', content: '今天想吃点甜的。', timestamp: '2026-10-04T09:58:00.000Z' }],
+        shortTerm: [],
+        longTerm: {
+          userProfile: [], relationship: [], events: [], habits: [],
+          promises: [{ id: 'p9', category: 'promises', key: '遥远旅行', value: '用户与角色约定很久以后去旅行', tags: ['约定'], importance: 5, subject: 'relationship', promisor: 'relationship', promisee: 'relationship', dueAt: '2027-06-01T02:00:00.000Z', status: 'active', createdAt: '2026-10-01T00:00:00.000Z', updatedAt: '2026-10-01T00:00:00.000Z' }],
+        },
+        pendingRecall: null,
+      },
+    }),
+    query: '今天天气怎么样？',
+    phase: 'auto',
+  },
+  {
+    id: 'lorebook-recent-only',
+    description: '世界书关键词只出现在最近一条消息、不在本轮 query：仍应注入相关条目',
+    config: { apiPlatform: 'deepseek', modelName: 'deepseek-flash', temperature: 0.8, stream: true, reasoningEffort: 'medium', proactiveEnabled: false, styleCritique: false, quickReplyRepair: false },
+    character: baseCharacter({
+      memory: {
+        instant: [
+          { id: 'm1', role: 'assistant', content: '我们刚才路过了那座灯塔。', timestamp: '2026-10-04T09:57:00.000Z' },
+          { id: 'm2', role: 'user', content: '嗯，风很大。', timestamp: '2026-10-04T09:58:00.000Z' },
+        ],
+        shortTerm: [],
+        longTerm: { userProfile: [], relationship: [], events: [], promises: [], habits: [] },
+        pendingRecall: null,
+      },
+      lorebook: [
+        { id: 'lb3', name: '灯塔', content: '海边的灯塔每到夜里会亮起。', keywords: ['灯塔'], alwaysActive: false, origin: 'user', misses: 0 },
+      ],
+    }),
+    query: '接下来去哪儿？',
+    phase: 'auto',
+  },
+  {
+    id: 'role-char-cap',
+    description: '超长角色设定：非群角色上下文应被裁剪到 8000 字上限',
+    config: { apiPlatform: 'deepseek', modelName: 'deepseek-flash', temperature: 0.8, stream: true, reasoningEffort: 'medium', proactiveEnabled: false, styleCritique: false, quickReplyRepair: false },
+    character: baseCharacter({
+      basicInfo: {
+        name: '林晚',
+        avatar: '🌙',
+        background: '背'.repeat(9000),
+      },
+    }),
+    query: '在吗？',
+    phase: 'auto',
+  },
 ];
+

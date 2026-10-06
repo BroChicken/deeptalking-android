@@ -41,7 +41,9 @@ object AppLimits {
     }
 
     object Scene {
-        /** Max scene summaries retained (legacy CONTEXT_BUDGET.sceneSummaries). */
+        /** Max scene summaries retained (legacy `slice(-8)`). */
+        const val RETAIN = 8
+        /** Max scene summaries injected (legacy `CONTEXT_BUDGET.sceneSummaries`). */
         const val SUMMARIES = 2
         /** Messages after the scene cursor needed to summarize. */
         const val SPAN = 24

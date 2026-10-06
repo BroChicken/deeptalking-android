@@ -344,7 +344,7 @@ object ResponseParser {
     private val keyPattern = Regex("\"(${FREE_TEXT_KEYS.joinToString("|")})\"\\s*:")
 
     /** Port of repairFreetextFieldsByScan: re-escape quotes/newlines inside free-text values. */
-    internal fun repairFreetextFields(raw: String): String {
+    internal fun repairFreetextFieldsByScan(raw: String): String {
         if (raw.isEmpty()) return raw
         val source = repairStringArrayField(raw, "quickReplies")
         val out = StringBuilder()
@@ -398,6 +398,48 @@ object ResponseParser {
         out.append(source, cursor, source.length)
         return out.toString()
     }
+
+    /** Legacy `repairFreetextFieldsLegacy`: regex-based quote re-escaping of free-text fields. */
+    internal fun repairFreetextFieldsLegacy(raw: String): String {
+        if (raw.isEmpty()) return raw
+        val keys = FREE_TEXT_KEYS.joinToString("|")
+        val pattern = Regex(
+            "(\"(?:$keys)\"\\s*:\\s*\")([\\s\\S]*?)(\"(?:\\s*,\\s*\"[A-Za-z_][A-Za-z0-9_]*\"\\s*:|\\s*[}\\]]))",
+        )
+        return pattern.replace(raw) { match ->
+            val head = match.groupValues[1]
+            val body = match.groupValues[2]
+            val tail = match.groupValues[3]
+            head + encodeJsonStringBody(decodeJsonEscapes(body)) + tail
+        }
+    }
+
+    /**
+     * Legacy `repairFreetextFields`: try the scan strategy, the legacy strategy and
+     * the combined strategy, returning the first candidate that whole-parses
+     * (tolerating a trailing comma), else the scan result as a floor.
+     */
+    internal fun repairFreetextFields(raw: String): String {
+        if (raw.isEmpty()) return raw
+        val attempts = mutableListOf<String>()
+        runCatching { attempts += repairStringArrayField(raw, "quickReplies") }
+        runCatching { attempts += repairFreetextFieldsByScan(raw) }
+        runCatching { attempts += repairFreetextFieldsLegacy(raw) }
+        runCatching {
+            val combined = repairStringArrayField(raw, "quickReplies")
+            attempts += repairFreetextFieldsByScan(combined)
+        }
+        for (candidate in attempts) {
+            if (candidate.isEmpty()) continue
+            if (wholeParses(candidate)) return candidate
+            val loose = candidate.replace(Regex(",\\s*([}\\]])"), "$1")
+            if (wholeParses(loose)) return candidate
+        }
+        return attempts.firstOrNull().orEmpty().ifEmpty { raw }
+    }
+
+    private fun wholeParses(text: String): Boolean =
+        runCatching { Json.parseToJsonElement(text) }.isSuccess
 
     private fun looksLikeJsonContinuation(text: String, index: Int): Boolean {
         var i = skipWs(text, index)

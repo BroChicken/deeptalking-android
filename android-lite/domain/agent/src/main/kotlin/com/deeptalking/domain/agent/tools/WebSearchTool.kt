@@ -16,7 +16,8 @@ class WebSearchTool(private val web: WebContentProvider?) : AgentTool {
         parametersJson = """{"type":"object","properties":{"query":{"type":"string","description":"搜索关键词"}},"required":["query"],"additionalProperties":false}""",
     )
 
-    override fun isEnabled(context: AgentContext): Boolean = web != null
+    // Legacy always registers `web_search`; unavailability is reported at execution.
+    override fun isEnabled(context: AgentContext): Boolean = true
 
     override suspend fun execute(call: ToolCall, context: AgentContext): AgentToolResult {
         val provider = web ?: return AgentToolResult(errorJson("联网功能不可用"))

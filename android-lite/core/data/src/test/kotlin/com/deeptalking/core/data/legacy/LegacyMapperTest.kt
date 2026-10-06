@@ -17,7 +17,6 @@ import com.deeptalking.core.model.LongTermMemory
 import com.deeptalking.core.model.LorebookOrigin
 import com.deeptalking.core.model.MemoryCategory
 import com.deeptalking.core.model.MemorySubject
-import com.deeptalking.core.model.PendingRecall
 import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.SceneState
@@ -508,10 +507,12 @@ class LegacyMapperTest {
                     ),
                 ),
                 scenes = listOf(
-                    SceneSummary(id = "sc1", content = "scene one", fromMessageId = "m1", toMessageId = "m1", createdAt = "2026-01-02T00:00:00Z"),
+                    SceneSummary(id = "sc1", key = "forest", content = "scene one", startedAt = "2026-01-02T00:00:00Z", endedAt = "2026-01-02T00:05:00Z", createdAt = "2026-01-02T00:05:00Z"),
                 ),
-                sceneState = SceneState(key = "forest", startMessageId = "m1", messageCount = 5),
-                pendingRecall = PendingRecall(category = "userProfile", tags = listOf("tea")),
+                sceneState = SceneState(key = "forest", startCount = 3, startSequence = 5, messageCount = 5),
+                pendingRecall = listOf(
+                    LongTermMemory(id = "pr1", category = MemoryCategory.UserProfile, key = "tea", value = "user likes tea", tags = listOf("tea")),
+                ),
                 staticFillMeta = StaticFillMeta(attemptedAt = "2026-01-01T00:00:00Z", failures = 2, retryAt = "2026-01-05T00:00:00Z"),
                 timeParseVersion = 1,
                 lorebookMigratedAt = "2026-01-03T00:00:00Z",
@@ -543,13 +544,140 @@ class LegacyMapperTest {
         val restored = CharacterRepository(freshDao).get("c1")!!
         assertEquals(1, restored.timeParseVersion)
         assertEquals("2026-01-03T00:00:00Z", restored.lorebookMigratedAt)
-        assertEquals("userProfile", restored.pendingRecall?.category)
-        assertEquals(listOf("tea"), restored.pendingRecall?.tags)
+        assertEquals(MemoryCategory.UserProfile, restored.pendingRecall.single().category)
+        assertEquals(listOf("tea"), restored.pendingRecall.single().tags)
         assertEquals("forest", restored.sceneState?.key)
-        assertEquals("m1", restored.sceneState?.startMessageId)
+        assertEquals(5, restored.sceneState?.startSequence)
+        assertEquals(3, restored.sceneState?.startCount)
         assertEquals(1, restored.scenes.size)
+        assertEquals("forest", restored.scenes.single().key)
         assertEquals("2026-01-02T00:00:00Z", restored.instant.single().extractedAt)
         assertEquals(2, restored.staticFillMeta?.failures)
+    }
+
+    @Test
+    fun legacyArrayUserEvidenceAndObjectConflictsImportInsteadOfBeingDropped() = runTest {
+        val legacy = """
+        {
+          "config": { "apiPlatform": "deepseek" },
+          "characters": {
+            "c1": {
+              "id": "c1",
+              "entityType": "character",
+              "basicInfo": { "name": "Aria" },
+              "memory": {
+                "shortTerm": [
+                  { "id": "st1", "content": "they met", "timestamp": "2026-01-01T00:01:00.000Z",
+                    "sourceMessageIds": ["m1"], "sourceRoles": ["user"],
+                    "userEvidence": [ { "sourceMessageId": "m1", "text": "we met yesterday" } ] }
+                ],
+                "longTerm": {
+                  "userProfile": [
+                    { "id": "lt1", "key": "name", "value": "Aria likes tea", "subject": "user",
+                      "sourceMessageIds": ["m1"], "evidence": "I like tea",
+                      "userEvidence": [ { "sourceMessageId": "m1", "text": "I like tea" } ],
+                      "conflicts": [ { "value": "Aria hates tea", "evidence": "no", "sourceMessageIds": ["m1"], "at": "2026-01-01T00:00:00.000Z" } ] }
+                  ]
+                }
+              }
+            }
+          }
+        }
+        """.trimIndent()
+
+        val dao = FakeCharacterDao()
+        val service = LegacyImportService(
+            CharacterRepository(dao),
+            ChatRepository(FakeMessageDao()),
+            ConfigRepository(FakeConfigDao()),
+            null,
+        )
+        val summary = service.importJson(legacy)
+
+        assertEquals(0, summary.skipped)
+        assertEquals(1, summary.characters)
+        val stored = CharacterRepository(dao).get("c1")!!
+        assertEquals("we met yesterday", stored.shortTerm.single().userEvidence.single().text)
+        assertEquals(listOf("Aria hates tea"), stored.longTerm.single().conflicts.map { it.value })
+        assertEquals("no", stored.longTerm.single().conflicts.single().evidence)
+        assertEquals("I like tea", stored.longTerm.single().userEvidence.single().text)
+    }
+
+    @Test
+    fun legacyStringUserEvidenceStillDecodes() {
+        val dto = parse(
+            """{ "characters": { "c1": { "memory": { "shortTerm": [ { "id": "st1", "userEvidence": "legacy string" } ] } } } }""",
+        )
+        val st = dto.characters!!.getValue("c1").memory!!.shortTerm!!.single()
+        assertEquals("legacy string", st.userEvidence.single().text)
+    }
+
+    @Test
+    fun importPreservesNativeOnlyConfigFields() = runTest {
+        val configDao = FakeConfigDao()
+        val config = ConfigRepository(configDao)
+        config.update(
+            AppConfig(
+                ttsEnabled = true,
+                ttsVoiceFile = "builtin_1.gguf",
+                ttsStyle = "温柔",
+                lastReplyDebug = "dbg",
+            ),
+        )
+        val service = LegacyImportService(
+            CharacterRepository(FakeCharacterDao()),
+            ChatRepository(FakeMessageDao()),
+            config,
+            null,
+        )
+        service.importJson("""{ "config": { "apiPlatform": "deepseek", "temperature": 1.1 } }""")
+
+        val stored = config.current()
+        assertTrue(stored.ttsEnabled)
+        assertEquals("builtin_1.gguf", stored.ttsVoiceFile)
+        assertEquals("温柔", stored.ttsStyle)
+        assertEquals("dbg", stored.lastReplyDebug)
+        assertEquals(1.1, stored.temperature, 0.0001)
+    }
+
+    @Test
+    fun importReportsSkippedCharactersInsteadOfSilentlyDropping() = runTest {
+        val json = """{ "characters": { "ok": { "id": "ok", "basicInfo": { "name": "A" } }, "bad": { "id": "bad", "basicInfo": 5 } } }"""
+        val service = LegacyImportService(
+            CharacterRepository(FakeCharacterDao()),
+            ChatRepository(FakeMessageDao()),
+            ConfigRepository(FakeConfigDao()),
+            null,
+        )
+        val summary = service.importJson(json)
+        assertEquals(1, summary.characters)
+        assertEquals(1, summary.skipped)
+    }
+
+    @Test
+    fun importsRealLegacyBackupWithArrayUserEvidence() = runTest {
+        // A real character captured from save/deeptalking_backup_2026-10-02.json;
+        // every short-term item carries the legacy array-shaped `userEvidence`
+        // that used to make the whole character fail to decode and be dropped.
+        val json = javaClass.classLoader
+            .getResourceAsStream("legacy-character-user-evidence.json")
+            ?.bufferedReader()?.readText()
+            ?: error("missing test resource: legacy-character-user-evidence.json")
+
+        val dao = FakeCharacterDao()
+        val summary = LegacyImportService(
+            CharacterRepository(dao),
+            ChatRepository(FakeMessageDao()),
+            ConfigRepository(FakeConfigDao()),
+            null,
+        ).importJson(json)
+
+        assertEquals(0, summary.skipped)
+        assertEquals(1, summary.characters)
+        val stored = CharacterRepository(dao).get(summary.activeCharacterId!!)!!
+        assertEquals("瑟瑞斯", stored.name)
+        assertTrue(stored.shortTerm.isNotEmpty())
+        assertTrue(stored.shortTerm.any { it.userEvidence.any { ev -> ev.text.isNotBlank() } })
     }
 
     private class FakeCharacterDao : CharacterDao {

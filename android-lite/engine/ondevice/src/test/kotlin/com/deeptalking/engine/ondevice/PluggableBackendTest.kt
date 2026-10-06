@@ -30,7 +30,7 @@ class PluggableBackendTest {
     }
 
     private class FakeTts(override val id: String = "fake-tts") : TtsBackend {
-        override suspend fun synthesize(text: String, voice: String?): Flow<AudioChunk> =
+        override suspend fun synthesize(text: String, voice: String?, style: String?): Flow<AudioChunk> =
             flowOf(AudioChunk(ShortArray(0), 16_000, isLast = true))
     }
 

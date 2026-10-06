@@ -169,7 +169,7 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 | `instant` | 最近原始消息 | 160 条（截断保底 40） |
 | `shortTerm` | 事件流程摘要 | 80 条（截断保底 20） |
 | `longTerm` | 分类长期记忆 | 每类 40 条 |
-| `scenes` | 场景概要 | 8 条，注入最近 2 条 |
+| `scenes` | 场景概要 | 保留最近 8 条（`AppLimits.Scene.RETAIN`），注入最近 2 条 |
 
 ### longTerm 五类
 
@@ -177,6 +177,8 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 
 - subject 仅限 `user` / `relationship` / `world` / `character`（`MEMORY_SUBJECTS` src/js/core/config.js:117；`legacy` 仅作历史兼容，不再写入）。
 - `isValidAutomaticMemory()` 校验来源引用与证据逐字摘录，防止模型编造记忆。
+- 短期记忆在捕获时写入 `sourceRoles` 与 `userEvidence`（用户消息逐字摘录，`[{sourceMessageId,text}]`），短期→长期分析据此在源消息滚出 `instant` 后仍能校验 `evidence` 逐字来自声明的用户消息（对齐 `tasks.js:424` 的 `allowedUserEvidence`）。
+- 主对话的结构化写入（`submit_response` 的 `longTerm`/`staticFields`/`dynamicState`/`promiseUpdates`）同样过证据/意图校验（`ChatOrchestrator.applyMemory` → `upsertLongTermMemory` / `hasValidUserEvidence` / `hasStaticEditIntent` / `resolveDynamicStateSources`）。
 
 ### 相关度检索
 
@@ -202,7 +204,7 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 
 `scheduleMemoryRetry()` 统一指数退避（5 分钟 → 30 分钟封顶）；`resetMemoryRetry()` 成功后清零。`checkMemoryTriggers()` — src/js/memory/tasks.js:199 依次调度这四个任务。
 
-**摘要生命周期（`revision` 标记）**：每条短期摘要带 `revision` / `analyzedRevision` / `lorebookScannedRevision`。长期分析只标记 `analyzedRevision`、世界书整理只标记 `lorebookScannedRevision`；`trimShortTermList()` 只有在**两个消费者都处理过同一 revision**、且超出 `shortTermTrimFloor` 时才允许裁剪，避免"世界书还没读到摘要就被删掉"（历史 bug）。摘要被改写时 `revision + 1`，两个标记同时失效、重新排队。`summarizeScene()` 跳过 `sequence ≤ sceneState.startSequence` 的旧消息，裁剪后仍能稳定统计"距上次场景已过多少条"。
+**摘要生命周期（`revision` 标记）**：每条短期摘要带 `revision` / `analyzedRevision` / `lorebookScannedRevision`。长期分析只标记 `analyzedRevision`、世界书整理只标记 `lorebookScannedRevision`；`trimShortTermList()` 只有在**两个消费者都处理过同一 revision**、且超出 `shortTermTrimFloor` 时才允许裁剪，避免"世界书还没读到摘要就被删掉"（历史 bug）。摘要被改写时 `revision + 1`，两个标记同时失效、重新排队。`summarizeScene()` 跳过 `sequence ≤ sceneState.startSequence` 的旧消息，裁剪后仍能稳定统计"距上次场景已过多少条"。（原生 `ShortTermMemory` 与 `SceneState` 已带同名字段，行为一致。）
 
 **证据与时间精度**：`evidenceMatchesSummary()` 要求证据与实际回复有 ≥2 个双字片段重叠（≥35%），不再"满 8 字即采信"，防止无关文本改写情绪/静态设定；`applyStaticFieldUpdates` 与 `update_character_field` 都额外要求 `hasStaticEditIntent()`（用户原话提到该字段且是修改意图）。`resolveTimeRef` 对带时分秒的 explicit ISO 原样保留（含时区偏移），只给"仅日期有理"的结果补时段起点，不再把明确时刻改写成"当天 12:00"。
 

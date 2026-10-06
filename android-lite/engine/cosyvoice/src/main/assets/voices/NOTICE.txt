@@ -1,0 +1,10 @@
+Bundled reference voice clips
+=============================
+
+sample_1.wav, sample_2.wav are the reference prompts shipped with the
+CosyVoice project (FunAudioLLM/CosyVoice, Apache-2.0):
+  https://github.com/FunAudioLLM/CosyVoice/blob/main/asset/zero_shot_prompt.wav
+  https://github.com/FunAudioLLM/CosyVoice/blob/main/asset/cross_lingual_prompt.wav
+
+They are used only as the on-device reference audio for the built-in
+"内置音色 1/2" voices and are redistributed under the Apache-2.0 license.

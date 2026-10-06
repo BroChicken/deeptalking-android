@@ -144,6 +144,7 @@ fun mergeLorebookEntry(
     content = mergeLorebookContent(existing.content, incoming.content, limits),
     keywords = (existing.keywords + incoming.keywords).distinct().take(limits.keywordsPerEntry),
     alwaysActive = existing.alwaysActive || incoming.alwaysActive,
+    enabled = true,
     misses = 0,
     updatedAt = incoming.updatedAt ?: existing.updatedAt,
 )

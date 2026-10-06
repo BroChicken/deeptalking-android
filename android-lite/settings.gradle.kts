@@ -34,6 +34,7 @@ include(":domain:memory")
 
 // On-device inference interfaces
 include(":engine:ondevice")
+include(":engine:cosyvoice")
 
 // Features
 include(":feature:chat")

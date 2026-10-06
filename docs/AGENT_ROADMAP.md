@@ -8,7 +8,7 @@
 | 功能 | 状态 | 结论 |
 |---|---|---|
 | **像素头像**（`avatarPixel` 16×16 网格 + `requestPixelAvatar` / "生成像素头像"按钮） | 已弃用，2026-08 起移除展示与自动修复入口 | 试验失败品：模型输出网格常缺行/缺色/尺寸错误，不稳定；代码仅保留 `normalizePixelAvatar` 做历史数据兼容，不再渲染；头像统一走 emoji |
-| **TTS 语音合成**（`tts/` 目录、`android-app` 的 sherpa-onnx 方案） | 已弃用 | 试验失败品：模型体积大、合成不稳定、体验差；轻量 APK（android-lite）不再包含 TTS |
+| **TTS 语音合成**（早期 `tts/` 目录、`android-app` 的 sherpa-onnx 方案） | 已弃用 → **已重新立项** | 旧方案为试验失败品（模型体积大、合成不稳定、体验差）。现已改用端侧 `Fun-CosyVoice3-0.5B`（`:engine:cosyvoice`，社区 `cosyvoice.cpp`/GGML），模型按需下载，支持中文+中英混读、零样本音色克隆与自由情绪指令；v1.5.0 起提供朗读 AI 回复 |
 
 **当前头像方案**：emoji（角色/群组各一个字符）。损坏/缺失的 emoji 头像由 AI 自动生成贴切 emoji（`requestEmojiAvatar` / `autoRepairAvatars`），编辑器提供"AI 生成 emoji 头像"按钮。
 

@@ -16,6 +16,7 @@ import com.deeptalking.core.network.ResponsesLlmBackend
 import com.deeptalking.core.security.SecretStore
 import com.deeptalking.engine.ondevice.InferenceRegistry
 import com.deeptalking.engine.ondevice.LlmRequest
+import com.deeptalking.engine.cosyvoice.CosyVoiceController
 import com.deeptalking.domain.agent.ChatOrchestrator
 import com.deeptalking.domain.agent.ToolRegistry
 import com.deeptalking.domain.agent.background.BackgroundTaskQueue
@@ -69,9 +70,13 @@ class NativeCore(context: Context) {
      */
     private val characterMaintenanceMutex = Mutex()
 
-    /** Only LLM is wired today; embedding/asr/tts stay null until their milestones. */
+    /** On-device CosyVoice3 read-aloud engine (model downloaded on demand). */
+    val cosyVoice: CosyVoiceController = CosyVoiceController(appContext)
+
+    /** LLM is remote; the read-aloud TTS backend is on-device. embedding/asr stay null. */
     val inference: InferenceRegistry = InferenceRegistry(
         llm = ResponsesLlmBackend(apiKeyProvider = { secrets.getApiKey() }, userAgent = userAgent),
+        tts = cosyVoice.backend,
     )
 
     val stickerSink: FileStickerSink = FileStickerSink(appContext)
@@ -99,6 +104,7 @@ class NativeCore(context: Context) {
             config.modelName,
             config.apiPlatform,
             backgroundQueue,
+            config,
         )
 
     /**
@@ -160,15 +166,16 @@ class NativeCore(context: Context) {
     }
 
     /** One-time world-book migration for characters whose background has not been migrated. */
-    suspend fun runWorldLoreMigration(config: AppConfig, trimSource: Boolean): Int {
-        if (apiKeyFor(config.apiPlatform).isNullOrBlank()) return 0
+    suspend fun runWorldLoreMigration(config: AppConfig, trimSource: Boolean): LorebookMigrationOutcome {
+        if (apiKeyFor(config.apiPlatform).isNullOrBlank()) return LorebookMigrationOutcome(0, 0)
         return characterMaintenanceMutex.withLock {
-            runCatching {
-                val tasks = backgroundTasks(config)
-                var count = 0
-                data.characters.all().forEach { character ->
-                    val source = migrationSourceText(character)
-                    if (character.lorebookMigratedAt != null || source.trim().length < 40) return@forEach
+            val tasks = backgroundTasks(config)
+            var success = 0
+            var failed = 0
+            data.characters.all().forEach { character ->
+                val source = migrationSourceText(character)
+                if (character.lorebookMigratedAt != null || source.trim().length < 40) return@forEach
+                try {
                     val latest = data.characters.get(character.id) ?: character
                     if (latest.lorebookMigratedAt != null) return@forEach
                     val updated = tasks.migrateWorldLore(latest, trimSource)
@@ -183,11 +190,16 @@ class NativeCore(context: Context) {
                                 description = updated.description,
                             ),
                         )
-                        count++
+                        success++
                     }
+                } catch (t: Throwable) {
+                    // Isolate per character: one failure must not abort the batch
+                    // (a thrown LLM/serialization error used to zero out all rows).
+                    failed++
+                    DeepTalkingApp.recordError(t)
                 }
-                count
-            }.getOrDefault(0)
+            }
+            LorebookMigrationOutcome(success, failed)
         }
     }
 
@@ -300,14 +312,26 @@ class NativeCore(context: Context) {
     }
 
     /** Generates a single emoji avatar from a character's description. */
-    suspend fun generateEmojiAvatar(config: AppConfig, character: Character): String? {
+    suspend fun generateEmojiAvatar(config: AppConfig, character: Character): String? =
+        requestEmojiAvatar(
+            config,
+            com.deeptalking.feature.characters.CharacterParity.buildAvatarDescription(character),
+        )
+
+    /** Generates a group member's emoji, including `roleInGroup` in the description. */
+    suspend fun generateEmojiAvatar(config: AppConfig, member: GroupMember, parent: Character?): String? =
+        requestEmojiAvatar(
+            config,
+            com.deeptalking.feature.characters.CharacterParity.buildAvatarDescription(member, parent),
+        )
+
+    private suspend fun requestEmojiAvatar(config: AppConfig, description: String): String? {
         val backend = ResponsesLlmBackend(apiKeyProvider = { apiKeyFor(config.apiPlatform) }, baseUrl = config.apiBaseUrl, userAgent = userAgent)
-        val description = com.deeptalking.feature.characters.CharacterParity.buildAvatarDescription(character)
         val result = backend.complete(
             LlmRequest(
                 model = config.modelName,
                 instructions = "你是角色头像助手。只输出一个最能代表该角色的 emoji 字符，不要任何文字、标点或解释。",
-                input = listOf(ChatMessage(role = Role.User, content = description.ifBlank { character.name })),
+                input = listOf(ChatMessage(role = Role.User, content = description.ifBlank { "一个神秘角色" })),
                 temperature = 1.2,
                 maxOutputTokens = 16,
                 reasoningEffort = "none",
@@ -348,8 +372,8 @@ class NativeCore(context: Context) {
         val result = backend.complete(
             LlmRequest(
                 model = config.modelName,
-                instructions = "你是表情包打标签助手。从这些标签里选一个最贴切的：" + STICKER_TAGS.joinToString("、") +
-                    "。只回复一个词，不要标点、不要解释。",
+                instructions = "你是表情包分类助手。看这张表情包或图片，从下列标签中选一个最贴切的：" + STICKER_TAGS.joinToString("、") +
+                    "。若都不贴切，就给出一个 1 到 6 字的中文短词。只输出这一个词，不要标点、解释或其它文字。",
                 input = listOf(message),
                 temperature = 0.2,
                 maxOutputTokens = 8,
@@ -445,7 +469,7 @@ class NativeCore(context: Context) {
             baseUrl = config.apiBaseUrl,
             userAgent = userAgent,
         )
-        val background = BackgroundTasks(llm, memory, config.modelName, config.apiPlatform, backgroundQueue)
+        val background = BackgroundTasks(llm, memory, config.modelName, config.apiPlatform, backgroundQueue, config)
         return ChatOrchestrator(
             llm = llm,
             tools = tools,
@@ -492,3 +516,6 @@ class NativeCore(context: Context) {
         """.trimIndent()
     }
 }
+
+/** Outcome of a world-book migration batch. */
+data class LorebookMigrationOutcome(val success: Int, val failed: Int)
