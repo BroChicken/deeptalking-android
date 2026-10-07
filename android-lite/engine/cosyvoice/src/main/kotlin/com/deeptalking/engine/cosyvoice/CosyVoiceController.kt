@@ -163,7 +163,27 @@ class CosyVoiceController(private val context: Context) {
 
     /** Synthesizes and plays [text] on the speaker; blocks until finished. */
     suspend fun speak(text: String, style: String? = null) = withContext(Dispatchers.Default) {
-        val (pcm, rate) = synthesize(text, style, voiceFile?.absolutePath)
+        if (!engine.isModelLoaded) engine.loadModel(models.modelFile.absolutePath)
+        val path = voiceFile?.absolutePath ?: error("尚未选择音色，请先导入参考音频")
+        val rate = engine.sampleRate
+        var delivered = 0
+        player.begin(rate)
+        runCatching {
+            engine.synthesizeStream(text, path, style, 1.0f) { chunk ->
+                delivered += chunk.size
+                player.write(chunk)
+                !player.isStopped
+            }
+        }
+        if (delivered > 0) {
+            // Streaming started: let the queued audio drain and return.
+            player.finish()
+            return@withContext
+        }
+        // Streaming produced nothing (unsupported runtime / failure): fall back
+        // to whole-buffer synthesis so read-aloud still works.
+        player.stop()
+        val pcm = engine.synthesize(text, path, style, 1.0f)
         player.play(pcm, rate)
     }
 
