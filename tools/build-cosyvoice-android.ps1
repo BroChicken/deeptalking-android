@@ -59,6 +59,20 @@ if (-not (Test-Path (Join-Path $src 'CMakeLists.txt'))) {
   git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/Lourdle/cosyvoice.cpp.git $src
 }
 
+# Performance patch: the app loads the model through the high-level API
+# (context params v1), so the authors' streaming optimizations live in the
+# defaults. Turn on the DiT KV cache (2 fixed slots, "balanced speed/memory")
+# and the dedicated inference buffer policy (recommended for streaming).
+function Patch-File([string]$path, [string]$from, [string]$to) {
+  $txt = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+  if (-not $txt.Contains($from)) { return $false }
+  [System.IO.File]::WriteAllText($path, $txt.Replace($from, $to), (New-Object System.Text.UTF8Encoding($false)))
+  return $true
+}
+$p1 = Patch-File (Join-Path $src 'src\cosyvoice-model.cpp') 'COSYVOICE_INFERENCE_BUFFER_POLICY_BALANCED' 'COSYVOICE_INFERENCE_BUFFER_POLICY_DEDICATED'
+$p2 = Patch-File (Join-Path $src 'src\cosyvoice.cpp') 'params_v3.dit_kv_fixed_slots = 0;' 'params_v3.dit_kv_fixed_slots = 2;'
+if (-not ($p1 -and $p2)) { Write-Warning "cosyvoice perf patch matched buffer=$p1 dit=$p2 (upstream source changed?)" }
+
 $build = Join-Path $work 'build-android-fe'
 cmake -S $src -B $build -G Ninja `
   "-DCMAKE_TOOLCHAIN_FILE=$(Join-Path $ndk 'build\cmake\android.toolchain.cmake')" `
