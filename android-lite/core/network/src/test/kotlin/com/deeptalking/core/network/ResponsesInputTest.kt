@@ -102,4 +102,28 @@ class ResponsesInputTest {
         assertTrue(input.isEmpty())
         assertNull(input.firstOrNull())
     }
+
+    @Test
+    fun imageToolOutputIsPassedThroughAsInputPartsArray() {
+        val content =
+            """[{"type":"input_text","text":"封面"},{"type":"input_image","image_url":"https://x/cover.jpg","detail":"low"}]"""
+        val input = buildResponsesInput(
+            listOf(ChatMessage(role = Role.Tool, content = content, toolCallId = "call_img")),
+        )
+        val output = (input.single() as JsonObject)["output"]
+        assertTrue(output is kotlinx.serialization.json.JsonArray)
+        val parts = output as kotlinx.serialization.json.JsonArray
+        assertEquals(2, parts.size)
+        assertEquals("input_image", ((parts[1] as JsonObject)["type"] as JsonPrimitive).content)
+        assertEquals("https://x/cover.jpg", ((parts[1] as JsonObject)["image_url"] as JsonPrimitive).content)
+    }
+
+    @Test
+    fun plainToolOutputStaysString() {
+        val input = buildResponsesInput(
+            listOf(ChatMessage(role = Role.Tool, content = "{\"ok\":true}", toolCallId = "call_1")),
+        )
+        val output = (input.single() as JsonObject)["output"]
+        assertEquals("{\"ok\":true}", (output as JsonPrimitive).content)
+    }
 }

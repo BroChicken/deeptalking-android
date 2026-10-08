@@ -72,7 +72,7 @@ private val STATIC_FIELDS = listOf(
     "values" to "价值观",
     "fears" to "恐惧/弱点",
     "background" to "个人背景",
-    "keyEvents" to "关键过往",
+    "keyEvents" to "关键过往（里程碑）",
     "speakingStyle" to "说话风格",
     "language" to "语言/方言",
     "userAddress" to "对用户的称呼",
@@ -631,12 +631,6 @@ private fun BasicTab(
 
         if (draft.isGroup && member == null) {
             LegacyField(value = draft.description, onValueChange = { onDraft(draft.copy(description = it)) }, label = "群组前提", minLines = 2)
-            LegacyField(
-                value = draft.groupSharedDynamic.currentLocation,
-                onValueChange = { onDraft(draft.copy(groupSharedDynamic = draft.groupSharedDynamic.copy(currentLocation = it))) },
-                label = "共同场景",
-                minLines = 2,
-            )
             LegacyField(value = draft.interactionRules, onValueChange = { onDraft(draft.copy(interactionRules = it)) }, label = "成员互动规则", minLines = 3)
             Text("成员：" + draft.members.joinToString("、") { it.name }, fontSize = 12.sp, color = MaterialTheme.legacy.textMuted)
         } else {
@@ -679,16 +673,24 @@ private fun BasicTab(
 @Composable
 private fun StateTab(draft: Character, memberIndex: Int?, onDraft: (Character) -> Unit) {
     val member = memberIndex?.let { draft.members.getOrNull(it) }
-    val state = member?.dynamicState ?: draft.dynamicState
-    val fields = if (draft.isGroup && member == null) {
+    val isGroupEntity = draft.isGroup && member == null
+    val state = when {
+        member != null -> member.dynamicState
+        isGroupEntity -> draft.groupSharedDynamic
+        else -> draft.dynamicState
+    }
+    val fields = if (isGroupEntity) {
         DYNAMIC_FIELDS.filter { it.first == "currentSituation" || it.first == "currentLocation" }
     } else {
         DYNAMIC_FIELDS
     }
 
     fun update(newState: com.deeptalking.core.model.DynamicState) {
-        if (member == null) onDraft(draft.copy(dynamicState = newState))
-        else onDraft(draft.copy(members = draft.members.toMutableList().also { it[memberIndex] = member.copy(dynamicState = newState) }))
+        when {
+            member != null -> onDraft(draft.copy(members = draft.members.toMutableList().also { it[memberIndex] = member.copy(dynamicState = newState) }))
+            isGroupEntity -> onDraft(draft.copy(groupSharedDynamic = newState))
+            else -> onDraft(draft.copy(dynamicState = newState))
+        }
     }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {

@@ -3,6 +3,8 @@ package com.deeptalking.lite
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Color
 import android.net.Uri
 import com.deeptalking.core.common.AppLimits
 import java.io.ByteArrayOutputStream
@@ -26,7 +28,7 @@ class MediaStore(private val context: Context) {
             directoryName = "images",
             maxDimension = AppLimits.Media.MAX_IMAGE_DIMENSION,
             maxBytes = AppLimits.Media.MAX_IMAGE_BYTES,
-            qualities = intArrayOf(82, 72, 62, 52, 44),
+            qualities = QUALITIES,
         )
     }
 
@@ -36,7 +38,7 @@ class MediaStore(private val context: Context) {
             directoryName = "stickers",
             maxDimension = AppLimits.Sticker.MAX_DIMENSION,
             maxBytes = AppLimits.Sticker.TARGET_BYTES,
-            qualities = intArrayOf(80, 70, 60, 50, 40),
+            qualities = QUALITIES,
         )
     }
 
@@ -52,12 +54,17 @@ class MediaStore(private val context: Context) {
         }.getOrNull() ?: return null
 
         val scaled = scaleDown(original, maxDimension)
-        var bytes = encodeJpeg(scaled, qualities.first())
+        val flattened = flattenOnWhite(scaled)
+        var bytes = encodeJpeg(flattened, qualities.first())
         for (quality in qualities.drop(1)) {
             if (bytes.size <= maxBytes) break
-            bytes = encodeJpeg(scaled, quality)
+            bytes = encodeJpeg(flattened, quality)
         }
-        if (scaled !== original) original.recycle()
+        flattened.recycle()
+        if (scaled !== original) {
+            scaled.recycle()
+            original.recycle()
+        }
 
         val directory = File(context.filesDir, directoryName).apply { mkdirs() }
         val file = File(directory, sha256Hex(bytes) + ".jpg")
@@ -77,6 +84,15 @@ class MediaStore(private val context: Context) {
         return Bitmap.createScaledBitmap(bitmap, width, height, true)
     }
 
+    /** Legacy `ctx.fillStyle = '#ffffff'; fillRect(...)` before drawing the scaled image. */
+    private fun flattenOnWhite(bitmap: Bitmap): Bitmap {
+        val out = Bitmap.createBitmap(bitmap.width, bitmap.height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(out)
+        canvas.drawColor(Color.WHITE)
+        canvas.drawBitmap(bitmap, 0f, 0f, null)
+        return out
+    }
+
     private fun encodeJpeg(bitmap: Bitmap, quality: Int): ByteArray {
         val stream = ByteArrayOutputStream()
         bitmap.compress(Bitmap.CompressFormat.JPEG, quality, stream)
@@ -86,5 +102,10 @@ class MediaStore(private val context: Context) {
     private fun sha256Hex(bytes: ByteArray): String {
         val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
         return buildString(digest.size * 2) { for (b in digest) append("%02x".format(b)) }
+    }
+
+    private companion object {
+        /** Legacy quality ramp: 0.82, then −0.12 while > 0.4 (`images.js:39-44`). */
+        val QUALITIES = intArrayOf(82, 70, 58, 46, 34)
     }
 }

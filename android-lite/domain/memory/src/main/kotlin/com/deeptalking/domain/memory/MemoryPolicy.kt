@@ -74,14 +74,20 @@ fun memorySortScore(memory: LongTermMemory, now: Long = System.currentTimeMillis
     return importance * 1_000_000_000_000.0 + recallCount * 100_000_000_000.0 + updatedAt
 }
 
-/** Keeps at most [limit] items, highest [memorySortScore] first. */
+/**
+ * Trims a long-term list to at most [limit] items (highest [memorySortScore]
+ * first) and then adjudicates any accumulated conflicts. Embedding the
+ * adjudication here mirrors legacy `trimCharacterMemory`, which called
+ * `resolveMemoryConflicts` after every trim — so background trimming resolves
+ * conflicts too, not only the main turn.
+ */
 fun pruneLongTerm(
     items: List<LongTermMemory>,
     limit: Int = AppLimits.Memory.LONG_TERM_PER_CATEGORY,
     now: Long = System.currentTimeMillis(),
 ): List<LongTermMemory> {
-    if (items.size <= limit) return items
-    return items.sortedByDescending { memorySortScore(it, now) }.take(limit)
+    val trimmed = if (items.size <= limit) items else items.sortedByDescending { memorySortScore(it, now) }.take(limit)
+    return resolveMemoryConflicts(trimmed)
 }
 
 /**
@@ -615,8 +621,8 @@ fun resolveMemoryConflict(candidates: List<MemoryConflictCandidate>): MemoryConf
  * competing values AND a `conflictedAt`, keep the winner (newest, then longer
  * evidence, then primary) as `value`, union its sources, and clear the conflict set.
  */
-fun resolveMemoryConflicts(character: Character, now: String = Instant.now().toString()): Character {
-    fun resolve(list: List<LongTermMemory>): List<LongTermMemory> = list.map { memory ->
+fun resolveMemoryConflicts(items: List<LongTermMemory>, now: String = Instant.now().toString()): List<LongTermMemory> =
+    items.map { memory ->
         if (memory.conflicts.isEmpty() || memory.conflictedAt == null) return@map memory
         val base = memory.updatedAt ?: memory.createdAt ?: ""
         val candidates = buildList {
@@ -643,8 +649,10 @@ fun resolveMemoryConflicts(character: Character, now: String = Instant.now().toS
             updatedAt = now,
         )
     }
-    return character.copy(
-        longTerm = resolve(character.longTerm),
-        members = character.members.map { it.copy(longTerm = resolve(it.longTerm)) },
+
+/** Character-level conflict adjudication across the shared store and every member store. */
+fun resolveMemoryConflicts(character: Character, now: String = Instant.now().toString()): Character =
+    character.copy(
+        longTerm = resolveMemoryConflicts(character.longTerm, now),
+        members = character.members.map { it.copy(longTerm = resolveMemoryConflicts(it.longTerm, now)) },
     )
-}

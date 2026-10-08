@@ -144,6 +144,81 @@ class ChatOrchestratorTest {
     }
 
     @Test
+    fun `main-turn short-term memory goes through source validation`() = runBlocking {
+        val args = """
+            {"reply":"好","quickReplies":["一","二"],
+             "shortTerm":[{"content":"用户2026-10-04说喜欢咖啡","sourceMessageIds":["ghost"]}]}
+        """.trimIndent()
+        val orchestrator = ChatOrchestrator(
+            llm = ScriptedLlm(args),
+            tools = ToolRegistry(listOf(NoTools())),
+            memory = MemoryServiceImpl(),
+            config = AppConfig(),
+        )
+        val result = orchestrator.run(
+            character = character(),
+            history = listOf(ChatMessage(id = "m1", role = Role.User, content = "我喜欢咖啡")),
+            userText = "我喜欢咖啡",
+        )
+        assertTrue(
+            "an unresolvable source id must reject the short-term write",
+            result.updatedCharacter.shortTerm.isEmpty(),
+        )
+    }
+
+    @Test
+    fun `main-turn short-term memory resolves timeRef into eventTime`() = runBlocking {
+        val args = """
+            {"reply":"好","quickReplies":["一","二"],
+             "shortTerm":[{"content":"用户要去面试","sourceMessageIds":["m1"],
+                           "timeRef":{"anchor":"day_after_tomorrow","slot":"下午"}}]}
+        """.trimIndent()
+        val orchestrator = ChatOrchestrator(
+            llm = ScriptedLlm(args),
+            tools = ToolRegistry(listOf(NoTools())),
+            memory = MemoryServiceImpl(),
+            config = AppConfig(),
+        )
+        val result = orchestrator.run(
+            character = character(),
+            history = listOf(ChatMessage(id = "m1", role = Role.User, content = "我后天下午面试")),
+            userText = "我后天下午面试",
+        )
+        assertEquals(1, result.updatedCharacter.shortTerm.size)
+        assertTrue(result.updatedCharacter.shortTerm.first().eventTime != null)
+    }
+
+    @Test
+    fun `prose turn applies a MEM_UPDATE block`() = runBlocking {
+        val llm = object : LlmBackend {
+            override val id = "prose"
+            override fun stream(request: LlmRequest): Flow<LlmChunk> = flow {
+                emit(
+                    LlmChunk.Completed(
+                        LlmResult(
+                            text = "正文\n<MEM_UPDATE>{\"shortTerm\":[{\"content\":\"用户喜欢咖啡\",\"sourceMessageIds\":[\"m1\"]}]}</MEM_UPDATE>",
+                        ),
+                    ),
+                )
+            }
+            override suspend fun complete(request: LlmRequest) = LlmResult()
+        }
+        val orchestrator = ChatOrchestrator(
+            llm = llm,
+            tools = ToolRegistry(listOf(NoTools())),
+            memory = MemoryServiceImpl(),
+            config = AppConfig(),
+        )
+        val result = orchestrator.run(
+            character = character(),
+            history = listOf(ChatMessage(id = "m1", role = Role.User, content = "我喜欢咖啡")),
+            userText = "我喜欢咖啡",
+        )
+        assertEquals("正文", result.reply)
+        assertEquals(1, result.updatedCharacter.shortTerm.size)
+    }
+
+    @Test
     fun `non-stream config drives complete instead of stream`() = runBlocking {
         val args = """{"reply":"非流式","quickReplies":["一","二"]}"""
         var completeCalled = false

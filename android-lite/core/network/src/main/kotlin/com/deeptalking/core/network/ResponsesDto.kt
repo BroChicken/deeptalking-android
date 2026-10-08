@@ -71,9 +71,11 @@ data class UsageDto(
     @SerialName("input_tokens") val inputTokens: Int = 0,
     @SerialName("output_tokens") val outputTokens: Int = 0,
     @SerialName("input_tokens_details") val inputTokensDetails: InputTokensDetails? = null,
+    @SerialName("prompt_cache_hit_tokens") val promptCacheHitTokens: Int? = null,
+    @SerialName("prompt_cache_miss_tokens") val promptCacheMissTokens: Int? = null,
 )
 
 @Serializable
 data class InputTokensDetails(
-    @SerialName("cached_tokens") val cachedTokens: Int = 0,
+    @SerialName("cached_tokens") val cachedTokens: Int? = null,
 )

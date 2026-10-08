@@ -2,7 +2,9 @@ package com.deeptalking.feature.characters
 
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.DynamicState
+import com.deeptalking.core.model.DynamicStateMeta
 import com.deeptalking.core.model.GroupMember
+import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.LorebookOrigin
 import com.deeptalking.core.model.StaticProfile
 import org.junit.Assert.assertEquals
@@ -144,6 +146,75 @@ class CharacterParityTest {
         val normalized = CharacterParity.normalizeEditedDraft(character, null, base, zone)
         assertEquals("明明", normalized.staticProfile.userAddress)
         assertEquals("2026-10-06 晚上", normalized.dynamicState.currentLocation)
+    }
+
+    @Test
+    fun normalizeEditedDraftClearsDynamicStateMeta() {
+        val character = Character(
+            id = "c",
+            name = "林晚",
+            dynamicState = DynamicState(currentLocation = "明天"),
+            dynamicStateMeta = mapOf(
+                "currentLocation" to DynamicStateMeta("2026-10-01T00:00:00Z"),
+                "currentMood" to DynamicStateMeta("2026-10-01T00:00:00Z"),
+            ),
+        )
+        val normalized = CharacterParity.normalizeEditedDraft(character, null, base, zone)
+        assertTrue(normalized.dynamicStateMeta.isEmpty())
+    }
+
+    @Test
+    fun normalizeGroupEditedDraftUsesSharedDynamicAndClearsSharedMeta() {
+        val group = Character(
+            id = "g",
+            isGroup = true,
+            groupSharedDynamic = DynamicState(currentSituation = "后天在营地"),
+            dynamicStateMeta = mapOf(
+                "currentLocation" to DynamicStateMeta("x"),
+                "currentMood" to DynamicStateMeta("y"),
+            ),
+            members = listOf(GroupMember(id = "m", name = "阿黎")),
+        )
+        val normalized = CharacterParity.normalizeEditedDraft(group, null, base, zone)
+        assertEquals("2026-10-07在营地", normalized.groupSharedDynamic.currentSituation)
+        assertEquals(setOf("currentMood"), normalized.dynamicStateMeta.keys)
+    }
+
+    @Test
+    fun normalizeMemberEditedDraftClearsMemberDynamicStateMeta() {
+        val member = GroupMember(
+            id = "m",
+            name = "阿黎",
+            dynamicState = DynamicState(currentMood = "开心"),
+            dynamicStateMeta = mapOf("currentMood" to DynamicStateMeta("x")),
+        )
+        val group = Character(id = "g", isGroup = true, members = listOf(member))
+        val normalized = CharacterParity.normalizeEditedDraft(group, 0, base, zone)
+        assertTrue(normalized.members[0].dynamicStateMeta.isEmpty())
+    }
+
+    @Test
+    fun dedupeGeneratedLorebookMergesSameNameModelEntriesAndKeepsUserEntries() {
+        val first = LorebookEntry(
+            name = "赤月王国",
+            content = "古老王国",
+            keywords = listOf("赤月"),
+            origin = LorebookOrigin.Model,
+        )
+        val duplicate = LorebookEntry(
+            name = "赤月王国 ",
+            content = "银月商会旧址",
+            keywords = listOf("王都"),
+            origin = LorebookOrigin.Model,
+        )
+        val user = LorebookEntry(name = "赤月王国", content = "用户手写", origin = LorebookOrigin.User)
+        val deduped = CharacterParity.dedupeGeneratedLorebook(listOf(first, duplicate, user))
+        assertEquals(2, deduped.size)
+        val merged = deduped.first { it.origin == LorebookOrigin.Model }
+        assertTrue(merged.content.contains("古老王国"))
+        assertTrue(merged.content.contains("银月商会旧址"))
+        assertEquals(listOf("赤月", "王都"), merged.keywords)
+        assertTrue(deduped.any { it.origin == LorebookOrigin.User })
     }
 
     @Test

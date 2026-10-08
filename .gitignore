@@ -27,5 +27,6 @@ tools/.work/
 # Kotlin 编译缓存
 .kotlin/
 
-# 端侧 TTS 原生库（体积大，可由 tools/build-cosyvoice-android.ps1 重建）
-android-lite/engine/cosyvoice/src/main/jniLibs/**/*.so
+# 端侧 TTS 原生库（~50MB，vendored 并纳入版本控制：缺一次就会让 TTS 静默失效）。
+# 可用 tools/build-cosyvoice-android.ps1 重建；构建期由 :engine:cosyvoice 的
+# verifyCosyVoiceNativeLibs 任务做 fail-closed 校验，绝不会产出缺 .so 的 APK。

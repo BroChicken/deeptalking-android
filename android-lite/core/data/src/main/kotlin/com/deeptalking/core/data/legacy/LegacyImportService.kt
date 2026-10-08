@@ -7,6 +7,7 @@ import com.deeptalking.core.model.Character
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 
 /** Result of one legacy import pass. */
@@ -61,17 +62,23 @@ class LegacyImportService(
             }
         }
 
-        // Legacy global stickers were folded into the active (first) character.
+        // Legacy `normalizeAppData` folds the global stickers into the active
+        // character (falling back to the first when the id is missing/invalid),
+        // and only when that character has no stickers of its own.
         val globalStickerDtos = (root["stickers"] as? JsonArray)
             .orEmpty()
             .mapNotNull { element ->
                 runCatching { codec.decodeFromJsonElement(LegacySticker.serializer(), element) }.getOrNull()
             }
         val globalStickers = mapStickers(globalStickerDtos, stickerSink)
+        val requestedActiveId = (root["activeCharacterId"] as? JsonPrimitive)?.contentOrNull
+            ?.takeIf { it.isNotBlank() }
+        val activeStickerHostId = requestedActiveId?.takeIf { id -> mapped.any { it.id == id } }
+            ?: mapped.firstOrNull()?.id
         val imported = if (globalStickers.isEmpty()) {
             mapped
         } else {
-            val host = mapped.firstOrNull { it.stickers.isEmpty() }
+            val host = mapped.firstOrNull { it.id == activeStickerHostId && it.stickers.isEmpty() }
             if (host == null) mapped else mapped.map { if (it === host) it.copy(stickers = globalStickers) else it }
         }
 
@@ -79,8 +86,7 @@ class LegacyImportService(
         // duplicate event memories before persisting.
         val reconciled = imported.map { reconcileLegacyMemories(it).character }
 
-        val activeCharacterId = (root["activeCharacterId"] as? kotlinx.serialization.json.JsonPrimitive)?.contentOrNull
-            ?.takeIf { it.isNotBlank() }
+        val activeCharacterId = requestedActiveId
 
         var characterCount = 0
         var messageCount = 0
@@ -104,7 +110,7 @@ class LegacyImportService(
         val configDto = root["config"]?.let { element ->
             runCatching { codec.decodeFromJsonElement(LegacyConfig.serializer(), element) }.getOrNull()
         }
-        val exportedTheme = (root["activeTheme"] as? kotlinx.serialization.json.JsonPrimitive)?.contentOrNull
+        val exportedTheme = (root["activeTheme"] as? JsonPrimitive)?.contentOrNull
         val configUpdated = configDto != null || exportedTheme != null
         if (configUpdated) {
             runCatching {
@@ -122,7 +128,10 @@ class LegacyImportService(
                     requestMetrics = current.requestMetrics,
                     platformSettings = mapped.platformSettings.ifEmpty { current.platformSettings },
                 )
-                if (exportedTheme != null) mapped = mapped.copy(activeTheme = exportedTheme)
+                if (exportedTheme != null) {
+                    // Legacy whitelists the built-in themes; anything else clears.
+                    mapped = mapped.copy(activeTheme = exportedTheme.takeIf { it in LEGACY_THEMES } ?: "")
+                }
                 config.update(mapped)
             }
         }

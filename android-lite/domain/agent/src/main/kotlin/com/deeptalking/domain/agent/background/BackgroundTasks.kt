@@ -15,6 +15,7 @@ import com.deeptalking.core.model.SceneSummary
 import com.deeptalking.core.model.SourceEvidence
 import com.deeptalking.core.model.StaticFillMeta
 import com.deeptalking.domain.agent.ResponseParser
+import com.deeptalking.domain.agent.tools.MemoryToolSupport
 import com.deeptalking.domain.agent.prompts.DYNAMIC_STATE_FIELDS
 import com.deeptalking.domain.agent.prompts.GROUP_SHARED_DYNAMIC_FIELDS
 import com.deeptalking.domain.agent.prompts.STATIC_PROFILE_FIELDS
@@ -42,7 +43,10 @@ import com.deeptalking.domain.memory.logicalDay
 import com.deeptalking.domain.memory.parseZoned
 import com.deeptalking.domain.memory.resolveDynamicStateSources
 import com.deeptalking.domain.memory.selfLearnMemoryImportance
+import com.deeptalking.domain.memory.parseRelativeText
+import com.deeptalking.domain.memory.resolveTimeRef
 import com.deeptalking.domain.memory.shouldCaptureUserTurn
+import com.deeptalking.domain.memory.TimeRef
 import com.deeptalking.domain.memory.trimInstant
 import com.deeptalking.domain.memory.trimShortTerm
 import com.deeptalking.domain.memory.upsertLongTermMemory
@@ -50,6 +54,7 @@ import com.deeptalking.domain.memory.upsertLorebookEntry
 import com.deeptalking.domain.memory.upsertLorebookEntryForCharacter
 import com.deeptalking.engine.ondevice.LlmBackend
 import com.deeptalking.engine.ondevice.LlmRequest
+import com.deeptalking.engine.ondevice.TokenUsage
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.serialization.Serializable
@@ -65,6 +70,7 @@ import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.put
 import java.time.Instant
 import java.time.ZoneId
+import java.time.ZonedDateTime
 import kotlin.random.Random
 
 @Serializable
@@ -265,6 +271,13 @@ fun canRunMemoryTask(
     return at <= nowMillis
 }
 
+/** Snapshot used to abort a background memory task that a newer turn has superseded (legacy `captureMemoryTask`). */
+data class MemoryTaskGuard(
+    val characterId: String,
+    val revision: Int,
+    val lastMessageId: String?,
+)
+
 class BackgroundTasks(
     private val llm: LlmBackend,
     private val memory: MemoryService,
@@ -273,6 +286,16 @@ class BackgroundTasks(
     /** Shared app-lifetime queue; defaults to a private one (tests). */
     val queue: BackgroundTaskQueue = BackgroundTaskQueue(),
     private val config: AppConfig = AppConfig(),
+    /**
+     * Live character lookup for the stale-task guard (legacy `state.characters[id]`).
+     * Returns null when the caller has no registry; a null result is treated as
+     * "still current" so behaviour is unchanged until the app wires this in.
+     */
+    private val liveCharacter: suspend (String) -> Character? = { null },
+    /** Status text emitted by the app while a background task runs (legacy `setActivity`). */
+    private val onStatus: (String) -> Unit = {},
+    /** Token usage of auxiliary calls, for the app's usage meter (legacy `recordCacheUsage`). */
+    private val onAuxiliaryUsage: (String, TokenUsage) -> Unit = { _, _ -> },
 ) {
 
     private val json = Json {
@@ -334,6 +357,13 @@ class BackgroundTasks(
         return if (status == TaskStatus.Success) updated else character
     }
 
+    /** Extraction with an explicit status (legacy `extractInstantToShortTerm`), including `Stale`. */
+    suspend fun extractMemoryStatus(
+        character: Character,
+        messages: List<ChatMessage>,
+        migration: Boolean = false,
+    ): Pair<TaskStatus, Character> = extractInstantToShortTermTask(character, migration)
+
     /** Extraction with an explicit status (legacy `extractInstantToShortTerm`). */
     private suspend fun extractInstantToShortTermTask(
         character: Character,
@@ -369,7 +399,10 @@ class BackgroundTasks(
         val prompt = EXTRACTION_PROMPT_HEAD + countClause + EXTRACTION_PROMPT_TAIL +
             json.encodeToString(recentIdentities) + "\n对话内容:\n" + json.encodeToString(payload)
 
-        val raw = complete(EXTRACTION_SYSTEM, prompt, sessionId = sessionIdFor(character))
+        val guard = captureGuard(character)
+        onStatus("正在提取短期记忆…")
+        val raw = complete(EXTRACTION_SYSTEM, prompt, sessionId = sessionIdFor(character), taskType = "extraction")
+        if (!isGuardCurrent(guard)) return TaskStatus.Stale to character
         if (raw.isBlank()) return TaskStatus.Failure to character
 
         val root = ResponseParser.parseJsonLenient(raw)
@@ -462,6 +495,10 @@ class BackgroundTasks(
         return if (status == TaskStatus.Success) updated else character
     }
 
+    /** Analysis with an explicit status (legacy `analyzeShortToLongTerm`), including `Stale`. */
+    suspend fun analyzeShortToLongTermStatus(character: Character): Pair<TaskStatus, Character> =
+        analyzeShortToLongTermTask(character)
+
     private suspend fun analyzeShortToLongTermTask(character: Character): Pair<TaskStatus, Character> {
         val analyzeLimit = (character.shortTerm.size - AppLimits.Memory.SHORT_TERM_TRIM_FLOOR).coerceAtLeast(0)
         val items = character.shortTerm.take(analyzeLimit)
@@ -481,7 +518,10 @@ class BackgroundTasks(
             )
         }
         val prompt = ANALYSIS_PROMPT_HEAD + json.encodeToString(inputs) + ANALYSIS_PROMPT_TAIL
-        val raw = complete(ANALYSIS_SYSTEM, prompt, sessionId = sessionIdFor(character))
+        val guard = captureGuard(character)
+        onStatus("正在分析长期记忆…")
+        val raw = complete(ANALYSIS_SYSTEM, prompt, sessionId = sessionIdFor(character), taskType = "analysis")
+        if (!isGuardCurrent(guard)) return TaskStatus.Stale to character
         if (raw.isBlank()) return TaskStatus.Failure to character
         val root = ResponseParser.parseJsonLenient(raw) as? JsonObject ?: return TaskStatus.Failure to character
         if (root.string("status") != "ok") return TaskStatus.Failure to character
@@ -569,6 +609,22 @@ class BackgroundTasks(
         shortTerm = trimShortTerm(character.shortTerm),
     )
 
+    /** Captures the revision/last-message snapshot for the stale guard (legacy `captureMemoryTask`). */
+    private fun captureGuard(character: Character): MemoryTaskGuard = MemoryTaskGuard(
+        characterId = character.id,
+        revision = character.revision,
+        lastMessageId = character.instant.lastOrNull()?.id,
+    )
+
+    /**
+     * True when [guard] has not been superseded by a newer turn (legacy `isMemoryTaskCurrent`).
+     * When no live registry is wired ([liveCharacter] returns null) the task is assumed current.
+     */
+    private suspend fun isGuardCurrent(guard: MemoryTaskGuard): Boolean {
+        val live = liveCharacter(guard.characterId) ?: return true
+        return live.revision == guard.revision && live.instant.lastOrNull()?.id == guard.lastMessageId
+    }
+
     /** Current scene key = trimmed current location, or "未说明" (legacy `getSceneKey`). */
     fun sceneKey(character: Character): String =
         trimText(character.dynamicState.currentLocation.trim().ifEmpty { "未说明" }, 80)
@@ -623,7 +679,10 @@ class BackgroundTasks(
             "[" + (index + 1) + "] " + (if (message.role == Role.User) "用户" else speakerName) +
                 ": " + trimText(message.content, 500)
         }.joinToString("\n")
-        val raw = complete(SCENE_SYSTEM, SCENE_PROMPT + transcript, sessionId = sessionIdFor(character))
+        val guard = captureGuard(character)
+        onStatus("正在整理场景概要…")
+        val raw = complete(SCENE_SYSTEM, SCENE_PROMPT + transcript, sessionId = sessionIdFor(character), taskType = "scene")
+        if (!isGuardCurrent(guard)) return TaskStatus.Stale to character
         val summary = raw.trim()
         if (summary.length < 8) return TaskStatus.Failure to character
         val scene = SceneSummary(
@@ -667,7 +726,10 @@ class BackgroundTasks(
         val prompt = LOREBOOK_PROMPT_HEAD + (existingLines.joinToString("\n").ifEmpty { "（空）" }) +
             LOREBOOK_PROMPT_TAIL + "（角色名：" + speakerName + "）：\n" + sourceLines.joinToString("\n")
 
-        val raw = complete(LOREBOOK_SYSTEM, prompt, sessionId = sessionIdFor(character))
+        val guard = captureGuard(character)
+        onStatus("正在整理世界书…")
+        val raw = complete(LOREBOOK_SYSTEM, prompt, sessionId = sessionIdFor(character), taskType = "lorebook")
+        if (!isGuardCurrent(guard)) return TaskStatus.Stale to character
         if (raw.isBlank()) return TaskStatus.Failure to character
         val root = ResponseParser.parseJsonLenient(raw) as? JsonObject ?: return TaskStatus.Failure to character
         val entries = root["entries"] as? JsonArray ?: return TaskStatus.Failure to character
@@ -768,6 +830,7 @@ class BackgroundTasks(
         allowedSourceIds: Set<String>? = null,
     ): Character {
         var working = character
+        val nowBase = ZonedDateTime.now()
         (update["shortTerm"] as? JsonArray)?.forEach { element ->
             val obj = element as? JsonObject ?: return@forEach
             val rawIds = stringList(obj["sourceMessageIds"])
@@ -775,7 +838,11 @@ class BackgroundTasks(
             val draft = ShortTermDraft(
                 content = obj.string("content"),
                 sourceMessageIds = ids,
-                eventTime = (obj["eventTime"] as? JsonPrimitive)?.contentOrNull,
+                eventTime = resolveEventTime(
+                    (obj["eventTime"] as? JsonPrimitive)?.contentOrNull,
+                    ResponseParser.parseTimeRef(obj),
+                    nowBase,
+                ),
                 participants = stringList(obj["participants"]),
                 location = obj.string("location"),
             )
@@ -784,7 +851,7 @@ class BackgroundTasks(
         }
         (update["longTerm"] as? JsonArray)?.forEach { element ->
             val obj = element as? JsonObject ?: return@forEach
-            var item = parseLongTerm(obj)
+            var item = resolveLongTermTimeRef(parseLongTerm(obj), ResponseParser.parseTimeRef(obj), nowBase)
             if (allowedSourceIds != null) {
                 val ids = item.sourceMessageIds.filter { it in allowedSourceIds }
                 if (ids.isEmpty()) return@forEach
@@ -806,16 +873,41 @@ class BackgroundTasks(
     ): Character {
         var state = character.dynamicState
         val sources = knownSources(character)
+        val nowBase = ZonedDateTime.now()
         DYNAMIC_STATE_FIELDS.forEach { (key, _) ->
             val obj = dynamic[key] as? JsonObject ?: return@forEach
-            val value = obj.string("value").trim()
+            val raw = obj.string("value").trim()
+            if (raw.isEmpty()) return@forEach
+            val value = MemoryToolSupport.cleanFieldValue(key, parseRelativeText(raw, resolveFieldBase(obj, nowBase)))
             if (value.isEmpty()) return@forEach
             val ids = stringList(obj["sourceMessageIds"])
             val evidence = obj.string("evidence")
             resolveDynamicStateSources(character, ids, evidence, assistantMessage, sources) ?: return@forEach
-            state = withDynamicField(state, key, trimText(value, 700))
+            state = withDynamicField(state, key, value)
         }
         return character.copy(dynamicState = state)
+    }
+
+    /** Resolves a memory-update `timeRef` to an ISO event time, falling back to the raw/now value. */
+    private fun resolveEventTime(eventTime: String?, timeRef: TimeRef?, nowBase: ZonedDateTime): String {
+        val base = parseZoned(eventTime) ?: nowBase
+        resolveTimeRef(timeRef, base)?.iso?.let { return it }
+        return parseZoned(eventTime)?.toInstant()?.toString() ?: nowBase.toInstant().toString()
+    }
+
+    /** Resolves a long-term `timeRef` to an absolute `eventTime`. */
+    private fun resolveLongTermTimeRef(item: LongTermMemory, timeRef: TimeRef?, nowBase: ZonedDateTime): LongTermMemory {
+        if (timeRef == null) return item
+        val base = parseZoned(item.eventTime) ?: nowBase
+        val iso = resolveTimeRef(timeRef, base)?.iso ?: return item
+        return item.copy(eventTime = iso)
+    }
+
+    /** Base instant for a state update: its `timeRef` resolved against now, else now. */
+    private fun resolveFieldBase(obj: JsonObject, nowBase: ZonedDateTime): ZonedDateTime {
+        val ref = ResponseParser.parseTimeRef(obj) ?: return nowBase
+        val resolved = resolveTimeRef(ref, nowBase) ?: return nowBase
+        return resolved.iso?.let { parseZoned(it) } ?: nowBase
     }
 
     /**
@@ -931,7 +1023,11 @@ class BackgroundTasks(
             if (com.deeptalking.domain.agent.prompts.staticProfileValue(profile, key).isNotBlank()) return@forEach
             val value = data?.string(key)?.trim().orEmpty()
             if (value.isEmpty()) return@forEach
-            val cleaned = if (key == "userAddress") normalizeUserAddress(value) else trimText(value, 700)
+            val cleaned = if (key == "userAddress") {
+                normalizeUserAddress(value)
+            } else {
+                MemoryToolSupport.cleanFieldValue(key, parseRelativeText(value, ZonedDateTime.now()))
+            }
             if (cleaned.isEmpty()) return@forEach
             profile = withStaticField(profile, key, cleaned)
             filled++
@@ -1015,7 +1111,13 @@ class BackgroundTasks(
             if (com.deeptalking.domain.agent.prompts.staticProfileValue(profile, key).isNotBlank()) return@forEach
             val value = data?.string(key)?.trim().orEmpty()
             if (value.isEmpty()) return@forEach
-            profile = withStaticField(profile, key, trimText(value, 700))
+            val cleaned = if (key == "userAddress") {
+                normalizeUserAddress(value)
+            } else {
+                MemoryToolSupport.cleanFieldValue(key, parseRelativeText(value, ZonedDateTime.now()))
+            }
+            if (cleaned.isEmpty()) return@forEach
+            profile = withStaticField(profile, key, cleaned)
         }
         return member.copy(staticProfile = profile)
     }
@@ -1127,11 +1229,17 @@ class BackgroundTasks(
             if (background.isNotEmpty()) {
                 updated = updated.copy(staticProfile = updated.staticProfile.copy(background = trimText(background, 800)))
             }
+        } else {
+            val description = data?.string("description")?.trim().orEmpty()
+            val cleaned = MemoryToolSupport.cleanFieldValue("description", description)
+            if (cleaned.isNotEmpty()) updated = updated.copy(description = trimText(cleaned, 1200))
         }
         return updated
     }
 
-    suspend fun critiqueStyle(character: Character, reply: String): String {        val original = reply
+    suspend fun critiqueStyle(character: Character, reply: String): String {
+        onStatus("正在校正文风…")
+        val original = reply
         if (original.trim().isEmpty()) return original
         val violations = detectStyleViolations(
             original,
@@ -1198,10 +1306,14 @@ class BackgroundTasks(
         quickReplyRepairEnabled: Boolean,
         onCharacterUpdated: (Character) -> Unit,
         onQuickRepliesRepaired: (List<String>) -> Unit = {},
+        styleViolations: List<String> = emptyList(),
         proseFallback: Boolean = false,
     ): Job = queue.enqueue {
         var working = character
 
+        if (styleViolations.isNotEmpty()) {
+            working = updateReplyMessage(working, reply) { it.copy(styleViolations = styleViolations) }
+        }
         val issues = detectQuickReplyIssues(currentQuickReplies, working, reply)
         if (quickReplyRepairEnabled && (currentQuickReplies.size < 2 || issues.isNotEmpty())) {
             val repaired = repairQuickReplies(working, reply, userText, currentQuickReplies)
@@ -1218,13 +1330,15 @@ class BackgroundTasks(
         if (working.instant.size >= AppLimits.Memory.INSTANT &&
             canRunMemoryTask(counters, MemoryTaskKind.Extraction, nowMillis)
         ) {
-            val extracted = extractMemory(working, messages)
-            if (extracted != working) {
-                working = extracted
-                extractedSomething = true
-                counters = resetMemoryRetry(counters, MemoryTaskKind.Extraction)
-            } else {
-                counters = scheduleMemoryRetry(counters, MemoryTaskKind.Extraction, nowMillis)
+            val (extractStatus, extracted) = extractMemoryStatus(working, messages)
+            when (extractStatus) {
+                TaskStatus.Success -> {
+                    working = extracted
+                    extractedSomething = true
+                    counters = resetMemoryRetry(counters, MemoryTaskKind.Extraction)
+                }
+                TaskStatus.Failure -> counters = scheduleMemoryRetry(counters, MemoryTaskKind.Extraction, nowMillis)
+                TaskStatus.Stale -> Unit
             }
         }
 
@@ -1261,12 +1375,14 @@ class BackgroundTasks(
         val hasAnalyzable = working.shortTerm.size >= AppLimits.Memory.SHORT_TERM &&
             unanalyzedCount >= (AppLimits.Memory.SHORT_TERM - AppLimits.Memory.SHORT_TERM_TRIM_FLOOR)
         if (hasAnalyzable && canRunMemoryTask(counters, MemoryTaskKind.Analysis, nowMillis)) {
-            val analyzed = analyzeShortToLongTerm(working)
-            if (analyzed != working) {
-                working = analyzed
-                counters = resetMemoryRetry(counters, MemoryTaskKind.Analysis)
-            } else {
-                counters = scheduleMemoryRetry(counters, MemoryTaskKind.Analysis, nowMillis)
+            val (analysisStatus, analyzed) = analyzeShortToLongTermStatus(working)
+            when (analysisStatus) {
+                TaskStatus.Success -> {
+                    working = analyzed
+                    counters = resetMemoryRetry(counters, MemoryTaskKind.Analysis)
+                }
+                TaskStatus.Failure -> counters = scheduleMemoryRetry(counters, MemoryTaskKind.Analysis, nowMillis)
+                TaskStatus.Stale -> Unit
             }
         }
         working = working.withCounters(counters)
@@ -1276,6 +1392,7 @@ class BackgroundTasks(
         if (maintained != working) working = maintained
 
         if (working != character) onCharacterUpdated(working)
+        onStatus("")
     }
 
     private fun updateReplyMessage(
@@ -1319,6 +1436,7 @@ class BackgroundTasks(
         system: String,
         user: String,
         sessionId: String? = null,
+        taskType: String = "auxiliary",
     ): String {
         val request = LlmRequest(
             model = model,
@@ -1332,7 +1450,9 @@ class BackgroundTasks(
             sessionId = sessionId ?: "deeptalking-general",
         )
         return try {
-            llm.complete(request).text
+            val result = llm.complete(request)
+            result.usage?.let { onAuxiliaryUsage(taskType, it) }
+            result.text
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Throwable) {

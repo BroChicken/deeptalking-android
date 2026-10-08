@@ -5,6 +5,7 @@ import com.deeptalking.core.model.MemoryCategory
 import com.deeptalking.core.model.MemorySubject
 import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.ShortTermMemory
+import com.deeptalking.domain.memory.TimeRef
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -38,7 +39,11 @@ data class ParsedTurn(
     val reply: String,
     val quickReplies: List<String> = emptyList(),
     val shortTerm: List<ShortTermMemory> = emptyList(),
+    /** `timeRef` token for each short-term item, aligned by index with [shortTerm]. */
+    val shortTermTimeRefs: List<TimeRef?> = emptyList(),
     val longTerm: List<LongTermMemory> = emptyList(),
+    /** `timeRef` token for each long-term item, aligned by index with [longTerm]. */
+    val longTermTimeRefs: List<TimeRef?> = emptyList(),
     val dynamicState: JsonObject? = null,
     val staticFields: JsonObject? = null,
     val memberDynamicState: List<MemberDynamicStateUpdate> = emptyList(),
@@ -67,6 +72,11 @@ object ResponseParser {
 
     private val trailingCommaRegex = Regex(TRAILING_COMMA)
 
+    private val MEM_UPDATE_REGEX = Regex(
+        "<\\s*MEM_UPDATE\\s*>([\\s\\S]*?)</\\s*MEM_UPDATE\\s*>",
+        RegexOption.IGNORE_CASE,
+    )
+
     private val JSON_SHAPES = listOf('{' to '}', '[' to ']')
 
     // ---------------------------------------------------------------- entry points
@@ -83,24 +93,45 @@ object ResponseParser {
         if (root != null && !root.string("reply").orEmpty().isBlank()) {
             return buildTurn(root)
         }
-        return ParsedTurn(reply = unescapeLiteralNewlines(text))
+        return ParsedTurn(reply = StreamText.getDisplayText(text))
+    }
+
+    /**
+     * Legacy `parseMemoryFromText`: extracts a `<MEM_UPDATE>...</MEM_UPDATE>` block
+     * from a prose reply and parses it as a memory-update turn (no reply).
+     * Returns null when the tag is absent or the payload is unparseable.
+     */
+    fun parseMemoryFromText(text: String): ParsedTurn? {
+        val match = MEM_UPDATE_REGEX.find(text) ?: return null
+        val root = parseJsonLenient(match.groupValues[1]) as? JsonObject ?: return null
+        return buildTurn(root)
     }
 
     fun buildTurn(root: JsonObject): ParsedTurn {
         val reply = unescapeLiteralNewlines(root.string("reply").orEmpty())
         val quickReplies = parseQuickReplyList(root["quickReplies"])
-        val shortTerm = (root["shortTerm"] as? JsonArray)?.mapNotNull { item ->
-            val obj = item as? JsonObject ?: return@mapNotNull null
+        val shortTerm = mutableListOf<ShortTermMemory>()
+        val shortTermTimeRefs = mutableListOf<TimeRef?>()
+        (root["shortTerm"] as? JsonArray)?.forEach { item ->
+            val obj = item as? JsonObject ?: return@forEach
             val content = obj.string("content").orEmpty()
-            if (content.isBlank()) return@mapNotNull null
-            ShortTermMemory(
+            if (content.isBlank()) return@forEach
+            shortTerm += ShortTermMemory(
                 content = content,
                 sourceMessageIds = stringList(obj["sourceMessageIds"]),
+                eventTime = obj.string("eventTime")?.takeIf { it.isNotBlank() },
+                participants = stringList(obj["participants"]),
+                location = obj.string("location").orEmpty(),
             )
-        }.orEmpty()
-        val longTerm = (root["longTerm"] as? JsonArray)?.mapNotNull { item ->
-            (item as? JsonObject)?.let(::parseLongTerm)
-        }.orEmpty()
+            shortTermTimeRefs += parseTimeRef(obj)
+        }
+        val longTerm = mutableListOf<LongTermMemory>()
+        val longTermTimeRefs = mutableListOf<TimeRef?>()
+        (root["longTerm"] as? JsonArray)?.forEach { item ->
+            val obj = item as? JsonObject ?: return@forEach
+            longTerm += parseLongTerm(obj)
+            longTermTimeRefs += parseTimeRef(obj)
+        }
         val memberDynamicState = (root["memberDynamicState"] as? JsonArray)?.mapNotNull { item ->
             val obj = item as? JsonObject ?: return@mapNotNull null
             val name = obj.string("memberName")
@@ -122,7 +153,9 @@ object ResponseParser {
             reply = reply,
             quickReplies = quickReplies,
             shortTerm = shortTerm,
+            shortTermTimeRefs = shortTermTimeRefs,
             longTerm = longTerm,
+            longTermTimeRefs = longTermTimeRefs,
             dynamicState = root["dynamicState"] as? JsonObject,
             staticFields = root["staticFields"] as? JsonObject,
             memberDynamicState = memberDynamicState,
@@ -644,6 +677,23 @@ object ResponseParser {
             promisee = obj.string("promisee")?.takeIf { it.isNotBlank() },
             status = status,
             memberName = obj.string("memberName")?.takeIf { it.isNotBlank() },
+            participants = stringList(obj["participants"]).map { it.trim() }.filter { it.isNotEmpty() }.take(8).sorted(),
+            location = obj.string("location").orEmpty().trim(),
+            arcOf = obj.string("arcOf")?.takeIf { it.isNotBlank() },
+            arcStage = obj.string("arcStage")?.takeIf { it.isNotBlank() },
+        )
+    }
+
+    /** Parses the optional `timeRef` token object (`buildTimeRefSchema` shape). */
+    internal fun parseTimeRef(obj: JsonObject?, key: String = "timeRef"): TimeRef? {
+        val ref = obj?.get(key) as? JsonObject ?: return null
+        if (ref.isEmpty()) return null
+        return TimeRef(
+            explicit = ref.string("explicit")?.trim()?.takeIf { it.isNotEmpty() },
+            anchor = ref.string("anchor")?.trim()?.takeIf { it.isNotEmpty() },
+            offsetDays = (ref["offsetDays"] as? JsonPrimitive)?.intOrNull,
+            slot = ref.string("slot")?.trim()?.takeIf { it.isNotEmpty() },
+            weekday = ref.string("weekday")?.trim()?.takeIf { it.isNotEmpty() },
         )
     }
 

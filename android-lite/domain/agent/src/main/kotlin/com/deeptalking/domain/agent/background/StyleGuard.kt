@@ -10,7 +10,7 @@ object STYLE_GUARD {
     const val reviewEveryTurns = 3
     const val lookbackReplies = 2
     const val anchorStyleChars = 300
-    const val anchorSamples = 2
+    const val anchorSamples = 3
     const val reusePhraseChars = 8
     const val critiqueMaxChars = 1600
     const val critiqueMinRatio = 0.5
@@ -70,21 +70,68 @@ fun extractSpeakingSamples(style: String?): List<String> {
         .take(3)
 }
 
+/** Descriptive part of a speaking style, before the "示例" clause. */
+private fun speakingStyleSummary(style: String): String {
+    val idx = style.indexOf("示例")
+    val head = if (idx >= 0) style.substring(0, idx) else style
+    return trimText(head.trim().trimEnd('；', ';', '，', ','), STYLE_GUARD.anchorStyleChars)
+}
+
+/**
+ * Per-character voice contract, placed last in the volatile context. It names
+ * the signature markers (口癖/句尾/称呼/标点) the reply must surface and forbids
+ * the model's default assistant voice, so different characters stop sounding
+ * alike. A blank speaking style contributes nothing (自动补全字段 later fills it).
+ */
 fun buildStyleAnchor(character: Character?): String {
-    val profile = character?.staticProfile
-    val style = trimText(profile?.speakingStyle, STYLE_GUARD.anchorStyleChars)
-    if (style.isEmpty()) return ""
+    val profile = character?.staticProfile ?: return ""
+    val style = profile.speakingStyle
+    if (style.isBlank()) return ""
     val samples = extractSpeakingSamples(style).take(STYLE_GUARD.anchorSamples)
-    val address = normalizeUserAddress(profile?.userAddress)
+    val summary = speakingStyleSummary(style)
+    val address = normalizeUserAddress(profile.userAddress)
     val lines = mutableListOf<String>()
-    lines += "【本轮语气锚（离生成最近，优先级高于一切风格偏好）】"
-    lines += "说话风格：$style"
+    lines += "【本轮声音契约（离生成最近，优先级高于一切风格偏好）】"
+    if (summary.isNotEmpty()) lines += "说话风格：$summary"
     if (samples.isNotEmpty()) {
         lines += "照此口吻说话（只借用语气，不要照抄内容）：" + samples.joinToString(" ") { "「$it」" }
     }
     if (address.isNotEmpty()) lines += "对用户的称呼：$address"
-    lines += "本轮必须：用自己的口吻说话；不复述设定、不解释自己在怎么做；不替用户说话或行动；收尾不与上一轮雷同。"
+    lines += "本轮必须：用你自己的口吻说话；至少自然带出你的口头禅、句尾助词、称呼共 2 处，并保持你的标点习惯；" +
+        "**禁止通用书面语与默认 AI 助手腔，不得把语气中和成标准普通话**；不复述设定、不解释自己在怎么做；" +
+        "不替用户说话或行动；收尾不与上一轮雷同。"
     return lines.joinToString("\n") + "\n\n"
+}
+
+/**
+ * Voice contract for a group turn: one block per member that actually has a
+ * speaking style, so each member's lines keep their own voice. Members with a
+ * blank style are skipped (field completion fills them in later); the number of
+ * blocks scales with the member count -- there is no cap.
+ */
+fun buildGroupVoiceContract(character: Character?): String {
+    if (character == null || !character.isGroup) return ""
+    val blocks = character.members.mapNotNull { member ->
+        val style = member.staticProfile.speakingStyle
+        if (style.isBlank()) return@mapNotNull null
+        val samples = extractSpeakingSamples(style).take(STYLE_GUARD.anchorSamples)
+        val summary = speakingStyleSummary(style)
+        val address = normalizeUserAddress(member.staticProfile.userAddress)
+        val lines = mutableListOf<String>()
+        lines += "【成员声音·${member.name.trim()}】"
+        if (summary.isNotEmpty()) lines += "说话风格：$summary"
+        if (samples.isNotEmpty()) {
+            lines += "照此口吻说话（只借用语气，不要照抄内容）：" + samples.joinToString(" ") { "「$it」" }
+        }
+        if (address.isNotEmpty()) lines += "对用户的称呼：$address"
+        lines += "该成员本轮台词必须体现以上口头禅、句尾助词与称呼，且与其他成员明显不同。"
+        lines.joinToString("\n")
+    }
+    if (blocks.isEmpty()) return ""
+    val header = "【群聊声音锁定（离生成最近，优先级高于一切风格偏好）】\n" +
+        "群内每位成员的语气必须显著不同——同一句话换到另一个人嘴里要像另一个人说的；" +
+        "不得让任何成员的语气向默认 AI 助手腔靠拢，也不得让成员之间互换语气。"
+    return header + "\n" + blocks.joinToString("\n") + "\n\n"
 }
 
 fun isSentenceLengthUniform(text: String?): Boolean {
@@ -196,7 +243,7 @@ fun buildStyleReview(character: Character?): String {
     val assistantTurnCount = character?.instant.orEmpty()
         .count { it.role == Role.Assistant && !it.isLoading }
     if (assistantTurnCount == 0 || assistantTurnCount % STYLE_GUARD.reviewEveryTurns != 0) return ""
-    val labels = collectRecentStyleViolations(character, STYLE_GUARD.reviewEveryTurns)
+    val labels = collectRecentStyleViolations(character, STYLE_GUARD.lookbackReplies)
     val lines = mutableListOf<String>()
     lines += "【语气回顾（每 ${STYLE_GUARD.reviewEveryTurns} 轮一次，内部提醒）】"
     lines += "语气永远以角色设定的说话风格为准，优先级高于你的默认文风与最近的写法。"

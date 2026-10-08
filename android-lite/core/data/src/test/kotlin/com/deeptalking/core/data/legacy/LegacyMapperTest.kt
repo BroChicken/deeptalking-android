@@ -503,6 +503,7 @@ class LegacyMapperTest {
                         role = Role.User,
                         content = "hi",
                         timestamp = "2026-01-01T00:00:00Z",
+                        sequence = 5,
                         extractedAt = "2026-01-02T00:00:00Z",
                     ),
                 ),
@@ -678,6 +679,227 @@ class LegacyMapperTest {
         assertEquals("瑟瑞斯", stored.name)
         assertTrue(stored.shortTerm.isNotEmpty())
         assertTrue(stored.shortTerm.any { it.userEvidence.any { ev -> ev.text.isNotBlank() } })
+    }
+
+    @Test
+    fun ensureMessageSequencesPreservesIncreasingStoredValues() {
+        val messages = listOf(
+            ChatMessage(id = "1", role = Role.User, sequence = 3),
+            ChatMessage(id = "2", role = Role.User, sequence = 0),
+            ChatMessage(id = "3", role = Role.User, sequence = 1),
+            ChatMessage(id = "4", role = Role.User, sequence = 9),
+        )
+        assertEquals(listOf(3, 4, 5, 9), ensureMessageSequences(messages))
+        assertEquals(listOf(3, 11, 12, 13), ensureMessageSequences(messages, 10))
+    }
+
+    @Test
+    fun mapCharacterRepairsSequencesAndResetsSceneMessageCount() {
+        val json = """
+            {
+              "characters": {
+                "c": {
+                  "id": "c", "basicInfo": { "name": "A" },
+                  "memory": {
+                    "instant": [
+                      { "id": "m1", "role": "user", "content": "a", "sequence": 2 },
+                      { "id": "m2", "role": "assistant", "content": "b", "sequence": 1 }
+                    ],
+                    "counters": { "messageSequence": 7 },
+                    "sceneState": { "key": "k", "startCount": 1, "messageCount": 42 }
+                  }
+                }
+              }
+            }
+        """.trimIndent()
+        val character = mapCharacter(parse(json).characters!!.getValue("c"), null)
+        assertEquals(listOf(2, 8), character.instant.map { it.sequence })
+        assertEquals(8, character.counters.messageSequence)
+        assertEquals(2, character.sceneState?.startSequence)
+        assertEquals(0, character.sceneState?.messageCount)
+    }
+
+    @Test
+    fun mapLongTermDedupesNonEventsByKeyKeepingNewest() {
+        val json = """
+            {
+              "characters": {
+                "c": {
+                  "id": "c", "basicInfo": { "name": "A" },
+                  "memory": {
+                    "longTerm": {
+                      "userProfile": [
+                        { "id": "a", "key": "Fav", "value": "tea", "tags": ["drink"], "importance": 3,
+                          "updatedAt": "2026-01-01T00:00:00Z", "createdAt": "2026-01-01T00:00:00Z" },
+                        { "id": "b", "key": "fav", "value": "coffee", "tags": ["warm"], "importance": 7,
+                          "updatedAt": "2026-02-01T00:00:00Z", "createdAt": "2026-02-01T00:00:00Z" }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+        """.trimIndent()
+        val character = mapCharacter(parse(json).characters!!.getValue("c"), null)
+        assertEquals(1, character.longTerm.size)
+        val item = character.longTerm.single()
+        assertEquals("a", item.id)
+        assertEquals("coffee", item.value)
+        assertEquals(7, item.importance)
+        assertEquals(setOf("drink", "warm"), item.tags.toSet())
+    }
+
+    @Test
+    fun mapMembersFiltersBlankNamesAndCapsAtEight() {
+        val members = (1..10).joinToString(",") { i ->
+            val name = if (i <= 9) "\"M$i\"" else "\"\""
+            """{ "id": "m$i", "basicInfo": { "name": $name, "avatar": "🐱" } }"""
+        }
+        val json = """
+            {
+              "characters": {
+                "g": {
+                  "id": "g", "entityType": "group",
+                  "basicInfo": { "name": "G", "avatar": "👥" },
+                  "members": [$members]
+                }
+              }
+            }
+        """.trimIndent()
+        val character = mapCharacter(parse(json).characters!!.getValue("g"), null)
+        assertEquals(8, character.members.size)
+        assertTrue(character.members.all { it.name.isNotBlank() })
+    }
+
+    @Test
+    fun mapCharacterSanitizesDamagedAvatarAndFlagsRepair() {
+        val damaged = mapCharacter(
+            parse("""{ "characters": { "c": { "id": "c", "basicInfo": { "name": "A", "avatar": "ascii" } } } }""")
+                .characters!!.getValue("c"),
+            null,
+        )
+        assertEquals("👤", damaged.emoji)
+        assertTrue(damaged.avatarRepairPending)
+
+        val good = mapCharacter(
+            parse("""{ "characters": { "c": { "id": "c", "basicInfo": { "name": "A", "avatar": "🦊" } } } }""")
+                .characters!!.getValue("c"),
+            null,
+        )
+        assertEquals("🦊", good.emoji)
+        assertFalse(good.avatarRepairPending)
+    }
+
+    @Test
+    fun mapInstantFiltersLabelsAndNormalizesExtractedAt() {
+        val json = """
+            {
+              "characters": {
+                "c": {
+                  "id": "c", "basicInfo": { "name": "A" },
+                  "memory": {
+                    "instant": [
+                      { "id": "m1", "role": "assistant", "content": "x", "extractedAt": "not-a-date",
+                        "styleViolations": ["metaTalk", "bogus"], "quickReplyIssues": ["missing", "nope"] },
+                      { "id": "m2", "role": "assistant", "content": "y", "extractedAt": "2026-01-01T00:00:00Z" }
+                    ]
+                  }
+                }
+              }
+            }
+        """.trimIndent()
+        val character = mapCharacter(parse(json).characters!!.getValue("c"), null)
+        val m1 = character.instant.first { it.id == "m1" }
+        assertNull(m1.extractedAt)
+        assertEquals(listOf("metaTalk"), m1.styleViolations)
+        assertEquals(listOf("missing"), m1.quickReplyIssues)
+        val m2 = character.instant.first { it.id == "m2" }
+        assertEquals("2026-01-01T00:00:00Z", m2.extractedAt)
+    }
+
+    @Test
+    fun mapConfigNormalizesPlatformAndRebuildsAllSlots() {
+        val unknown = mapConfig(parse("""{ "config": { "apiPlatform": "weird", "apiBaseUrl": "https://x/v1/" } }""").config)
+        assertEquals("custom", unknown.apiPlatform)
+        assertEquals("https://x/v1", unknown.apiBaseUrl)
+        assertEquals(setOf("deepseek", "opencode", "custom"), unknown.platformSettings.keys)
+        assertEquals("https://api.deepseek.com/v1", unknown.platformSettings.getValue("deepseek").baseUrl)
+        assertEquals("deepseek-flash", unknown.platformSettings.getValue("deepseek").modelName)
+        assertEquals("https://x/v1", unknown.platformSettings.getValue("custom").baseUrl)
+
+        val blank = mapConfig(parse("""{ "config": { "apiPlatform": "" } }""").config)
+        assertEquals("custom", blank.apiPlatform)
+
+        val opencode = mapConfig(parse("""{ "config": { "apiPlatform": "opencode" } }""").config)
+        assertEquals("https://opencode.ai/zen/go/v1", opencode.apiBaseUrl)
+        assertEquals("https://opencode.ai/zen/go/v1", opencode.platformSettings.getValue("opencode").baseUrl)
+    }
+
+    @Test
+    fun importFoldsGlobalStickersIntoActiveCharacter() = runTest {
+        val json = """
+            {
+              "characters": {
+                "a": { "id": "a", "basicInfo": { "name": "A" },
+                  "stickers": [ { "id": "s", "dataUrl": "data:image/png;base64,AAAA", "tag": "x" } ] },
+                "b": { "id": "b", "basicInfo": { "name": "B" } }
+              },
+              "activeCharacterId": "b",
+              "stickers": [ { "id": "g", "dataUrl": "data:image/png;base64,BBBB", "tag": "y" } ]
+            }
+        """.trimIndent()
+        val dao = FakeCharacterDao()
+        LegacyImportService(
+            CharacterRepository(dao),
+            ChatRepository(FakeMessageDao()),
+            ConfigRepository(FakeConfigDao()),
+            null,
+        ).importJson(json)
+        val repo = CharacterRepository(dao)
+        assertTrue(repo.get("b")!!.stickers.isNotEmpty())
+        assertEquals(1, repo.get("a")!!.stickers.size)
+    }
+
+    @Test
+    fun importWhitelistsActiveTheme() = runTest {
+        val config = ConfigRepository(FakeConfigDao())
+        val service = LegacyImportService(
+            CharacterRepository(FakeCharacterDao()),
+            ChatRepository(FakeMessageDao()),
+            config,
+            null,
+        )
+        service.importJson("""{ "activeTheme": "theme-black" }""")
+        assertEquals("theme-black", config.current().activeTheme)
+
+        service.importJson("""{ "activeTheme": "theme-neon" }""")
+        assertEquals("", config.current().activeTheme)
+    }
+
+    @Test
+    fun exportWritesInjectedAppVersion() = runTest {
+        val backup = BackupService(
+            CharacterRepository(FakeCharacterDao()),
+            ChatRepository(FakeMessageDao()),
+            ConfigRepository(FakeConfigDao()),
+            appVersion = "1.3.6",
+        )
+        val root = Json { ignoreUnknownKeys = true }.parseToJsonElement(backup.exportJson()) as JsonObject
+        assertEquals("\"1.3.6\"", root["version"].toString())
+    }
+
+    @Test
+    fun characterRepositoryReportsCorruptRowsOnce() = runTest {
+        val dao = FakeCharacterDao()
+        dao.rows["bad"] = CharacterEntity(id = "bad", updatedAt = "2026-01-01T00:00:00Z", payload = "{not json")
+        val reported = mutableListOf<Pair<String, String>>()
+        val repo = CharacterRepository(dao) { id, payload -> reported += id to payload }
+
+        assertNull(repo.get("bad"))
+        assertNull(repo.get("bad"))
+        assertEquals(1, reported.size)
+        assertEquals("bad", reported.single().first)
+        assertEquals("{not json", reported.single().second)
     }
 
     private class FakeCharacterDao : CharacterDao {

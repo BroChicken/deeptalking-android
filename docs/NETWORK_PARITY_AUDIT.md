@@ -12,14 +12,16 @@
 | 3 | 端点未按平台处理 `/v1` | `src/js/prompts/request.js:207-216` `getResponsesEndpoint` | `ResponsesLlmBackend.responsesEndpoint`（deepseek 去 `/v1`，opencode 保留） |
 | 4 | 无请求级重试 | `src/js/api/retry.js:1-31` | `domain/agent/ApiRetry.kt` + `AgentLoop.collectStreamWithRetry`（3 次 / 1s,2s,4s；瞬时错误 network/abort/429/5xx） |
 | 5 | 每平台独立配置槽 `platformSettings`（baseUrl/apiKey/modelName 互不覆盖） | `src/js/storage/schema.js:353-368`、`status-settings.js:151-174` | `core/model/Config.kt`（`AppConfig.platformSettings` + `PlatformSlot`）+ `feature/settings/SettingsScreen.kt`（`switchPlatform`）+ `SecretStore` 按平台键 + `NativeCore.apiKeyFor(platform)` |
+| 6 | 独立 `cacheStats` 字段（缓存条显示用） | `responses.js:262-301`、`stickers.js:266-288` | `AppViewModel.recordMetrics` 每次成功 chat 写 `CacheStats`，`AppRoot.CachePill` 读 `config.cacheStats`（空态 `缓存 --`，近 10 次均值） |
+| 7 | 缓存字段回退与用量来源 | `responses.js:271-279` | `ResponsesLlmBackend`/`ResponsesDto` 同时解析 `prompt_cache_hit/miss_tokens` 与 `input_tokens_details.cached_tokens` |
+| 8 | 缺 Key 抛错 / `reasoningEffort` 校验 / Chat-Completions 兜底 | `normalization.js:31-33,63`、`responses.js:221-226` | `ResponsesLlmBackend.authorizationHeader`（缺 Key 抛错）、`normalizeReasoningEffort`（白名单兜底）、SSE `else` 分支读 `choices[0].delta.content` |
+| 9 | 抓取图片作为多模态输入 | `web-content.js:139/170/184` | `buildResponsesInput.toolOutputElement` 识别 `[{input_text},{input_image}]` 数组并原样作为 `function_call_output` 下发 |
 
 ## 待补（已确认缺失）
 
-| # | 差异 | 旧版 | 原生现状 | 影响 |
-|---|---|---|---|---|
-| 6 | 独立 `cacheStats` 字段（缓存条显示用） | `responses.js:262-301`、`stickers.js:266-288` | 原生用 `requestMetrics` 推算，缺 `cacheStats.hitTokens/missTokens/promptTokens` | 中 |
+_无。_
 
-> SSE `response.function_call_arguments.done`（`conversation.js:620-623`）、`response.output_text.done`（`conversation.js:653-657`）、`web_search_call.*`（`conversation.js:552-562`）均已实现：`ResponsesLlmBackend.kt` 处理 `function_call_arguments.done` / `output_text.done` / `web_search_call.*`（含 `web_search_call.completed` → 状态提示），由 `ResponsesSseInterpreterTest` 覆盖。
+> SSE `response.function_call_arguments.done`（`conversation.js:620-623`）、`response.output_text.done`（`conversation.js:653-657`）、`web_search_call.*`（`conversation.js:552-562`）均已实现：`ResponsesLlmBackend.kt` 处理 `function_call_arguments.done` / `output_text.done` / `web_search_call.*`（`in_progress` 发「正在联网搜索…」，`completed` 按旧版不设状态；`reasoning_summary_text.delta` 按旧版忽略），由 `ResponsesSseInterpreterTest` 覆盖。
 
 ## 已核对一致
 

@@ -76,6 +76,7 @@ class AgentLoop(
         var lastReasoning: List<String> = emptyList()
         var phase = RequestPhase.AUTO
         var submitAttempted = false
+        var emptyAttempts = 0
 
         while (true) {
             val tools = if (phase == RequestPhase.AUTO) autoTools else listOf(submitTool)
@@ -184,6 +185,13 @@ class AgentLoop(
             if (usable.isNotBlank()) {
                 return LoopOutcome(usable, null, rounds, executedCalls, latestCharacter, latestSticker, lastUsage)
             }
+            // Legacy `chatStageDecision('empty')`: an empty turn is retried up to twice
+            // within the same loop, keeping the accumulated tool round-trips.
+            if (emptyAttempts < 2) {
+                emptyAttempts++
+                onToolActivity("正在重新生成…")
+                continue
+            }
             break
         }
         return LoopOutcome("", null, rounds, executedCalls, latestCharacter, latestSticker, lastUsage)
@@ -254,6 +262,7 @@ class AgentLoop(
             } catch (error: Throwable) {
                 if (attempt >= ApiRetry.MAX_API_RETRIES || !isTransientApiError(error)) throw error
                 attempt++
+                onToolActivity("连接中断，正在重试（$attempt/${ApiRetry.MAX_API_RETRIES}）…")
                 kotlinx.coroutines.delay(ApiRetry.delayFor(attempt))
             }
         }
@@ -309,12 +318,10 @@ class AgentLoop(
                 return TurnResult(finished.copy(toolCalls = calls), salvaged)
             }
         }
-        // Nothing usable accumulated: surface transient transport failures so the
-        // caller can retry (legacy `performChatRequestWithRetry`). When partial
-        // content exists we keep it instead of throwing it away.
-        if (failure != null && text.isEmpty() && pending.isEmpty()) {
-            throw failure
-        }
+        // A stream that failed mid-way is retried as a whole request (legacy
+        // `performChatRequestWithRetry` + retry.js), so a half-finished partial
+        // must not be accepted as the turn's output.
+        if (failure != null) throw failure
         return TurnResult(LlmResult(text = text.toString(), toolCalls = pending.values.toList()), salvaged)
     }
 

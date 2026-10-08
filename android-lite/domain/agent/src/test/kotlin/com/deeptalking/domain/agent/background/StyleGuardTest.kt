@@ -1,7 +1,10 @@
 package com.deeptalking.domain.agent.background
 
 import com.deeptalking.core.model.Character
+import com.deeptalking.core.model.ChatMessage
+import com.deeptalking.core.model.GroupMember
 import com.deeptalking.core.model.LorebookEntry
+import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.StaticProfile
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -106,5 +109,82 @@ class StyleGuardTest {
                 listOf("他喜欢吃苹果喝牛奶"),
             ),
         )
+    }
+
+    @Test
+    fun buildStyleReviewReportsStoredViolations() {
+        val messages = (1..3).map { index ->
+            ChatMessage(
+                id = "m$index",
+                role = Role.Assistant,
+                content = "回复$index",
+                styleViolations = if (index == 2) listOf("cliche") else emptyList(),
+            )
+        }
+        val review = buildStyleReview(character.copy(instant = messages))
+        assertTrue(review.contains("陈词滥调"))
+    }
+
+    @Test
+    fun buildStyleAnchorSkipsBlankStyle() {
+        assertTrue(buildStyleAnchor(character).isEmpty())
+        assertTrue(buildStyleAnchor(null).isEmpty())
+    }
+
+    @Test
+    fun buildStyleAnchorExtractsSamplesFromFullStyle() {
+        val longHead = "说话风格描述".repeat(80)
+        val styled = Character(
+            id = "c1",
+            name = "小雨",
+            staticProfile = StaticProfile(speakingStyle = "$longHead；示例：「阿这」 / 「懂了懂了」 / 「行吧行吧」"),
+        )
+        val anchor = buildStyleAnchor(styled)
+        assertTrue(anchor.contains("声音契约"))
+        assertTrue(anchor.contains("阿这"))
+        assertTrue(anchor.contains("行吧行吧"))
+    }
+
+    @Test
+    fun buildStyleAnchorRequiresSignatureMarkers() {
+        val styled = Character(
+            id = "c1",
+            name = "小雨",
+            staticProfile = StaticProfile(speakingStyle = "慵懒；示例：「困了」 / 「再说吧」"),
+        )
+        val anchor = buildStyleAnchor(styled)
+        assertTrue(anchor.contains("至少自然带出"))
+        assertTrue(anchor.contains("默认 AI 助手腔"))
+    }
+
+    @Test
+    fun buildGroupVoiceContractOneBlockPerStyledMember() {
+        val group = Character(
+            id = "g1",
+            name = "茶话会",
+            isGroup = true,
+            members = listOf(
+                GroupMember(id = "m1", name = "阿岩", staticProfile = StaticProfile(speakingStyle = "热血；示例：「冲啊」 / 「走着」")),
+                GroupMember(id = "m2", name = "林晚", staticProfile = StaticProfile(speakingStyle = "")),
+                GroupMember(id = "m3", name = "老周", staticProfile = StaticProfile(speakingStyle = "慢悠悠；示例：「急啥」 / 「先坐」")),
+            ),
+        )
+        val contract = buildGroupVoiceContract(group)
+        assertTrue(contract.contains("群聊声音锁定"))
+        assertTrue(contract.contains("成员声音·阿岩"))
+        assertTrue(contract.contains("成员声音·老周"))
+        assertFalse(contract.contains("成员声音·林晚"))
+    }
+
+    @Test
+    fun buildGroupVoiceContractEmptyWhenNoStyledMemberOrNotGroup() {
+        val group = Character(
+            id = "g1",
+            name = "茶话会",
+            isGroup = true,
+            members = listOf(GroupMember(id = "m1", name = "阿岩")),
+        )
+        assertTrue(buildGroupVoiceContract(group).isEmpty())
+        assertTrue(buildGroupVoiceContract(character).isEmpty())
     }
 }

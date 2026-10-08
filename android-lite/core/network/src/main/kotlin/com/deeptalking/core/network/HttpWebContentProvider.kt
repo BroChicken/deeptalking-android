@@ -48,7 +48,9 @@ class HttpWebContentProvider(
             response.use { res ->
                 if (!res.isSuccessful) throw IllegalStateException("HTTP ${res.code}")
                 val body = res.body?.string().orEmpty()
-                if (PARSER_ERROR.containsMatchIn(body)) throw IllegalStateException("搜索响应不是 RSS")
+                if (PARSER_ERROR.containsMatchIn(body) || HTML_DOC.containsMatchIn(body)) {
+                    throw IllegalStateException("搜索响应不是 RSS")
+                }
                 val items = ITEM_RE.findAll(body).mapNotNull { match ->
                     val item = match.groupValues[1]
                     val title = trimText(extractTag(item, "title"), 160)
@@ -538,6 +540,7 @@ private val ITEM_RE = Regex(
     setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
 )
 private val PARSER_ERROR = Regex("<parsererror", RegexOption.IGNORE_CASE)
+private val HTML_DOC = Regex("<(?:!doctype\\s+html|html)\\b", RegexOption.IGNORE_CASE)
 private val HTTP_URL = Regex("^https?://", RegexOption.IGNORE_CASE)
 private val IMAGE_URL = Regex("\\.(png|jpe?g|gif|webp|bmp|svg)(\\?|#|\$)", RegexOption.IGNORE_CASE)
 private val B23_URL = Regex("^https?://(www\\.)?b23\\.tv/", RegexOption.IGNORE_CASE)

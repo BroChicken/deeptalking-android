@@ -103,6 +103,8 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
     val generating by vm.isGenerating.collectAsState()
     val fieldMigrationCount by vm.fieldMigrationPrompt.collectAsState()
     val lorebookMigrationCount by vm.lorebookMigrationPrompt.collectAsState()
+    val avatarRepairPrompt by vm.avatarRepairPrompt.collectAsState()
+    val avatarRepairProgress by vm.avatarRepairProgress.collectAsState()
     val tts by vm.tts.collectAsState()
 
     val activeCharacter = characters.firstOrNull { it.id == activeId }
@@ -205,13 +207,14 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                         onExport = export,
                         onImport = import,
                         onQuickGenerate = { prompt, cb -> vm.quickGenerate(prompt, cb) },
-                        onRepairAvatars = vm::repairAvatars,
+                        onRepairAvatars = vm::requestAvatarRepair,
                         onUpgradeToGroup = { char -> vm.upgradeToGroup(char) },
                     )
                 } else {
                     SettingsScreen(
                         config = config,
                         hasApiKey = vm.hasApiKey(config.apiPlatform),
+                        loadApiKey = { platform -> vm.storedApiKey(platform) },
                         testResult = vm.testResult.collectAsState().value,
                         onSave = vm::saveSettings,
                         onTestReminder = vm::testReminder,
@@ -361,6 +364,27 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
         }
     }
 
+    // Legacy `repairAllAvatars`: a confirmation before the manual batch, then a
+    // progress dialog showing `processed/total` while it runs.
+    avatarRepairPrompt?.let { count ->
+        AlertDialog(
+            onDismissRequest = { vm.dismissAvatarRepair() },
+            title = { Text("补全头像") },
+            text = { Text("将为 $count 个默认/损坏头像生成贴切 emoji，确定继续？") },
+            confirmButton = { TextButton(onClick = { vm.confirmAvatarRepair() }) { Text("开始补全") } },
+            dismissButton = { TextButton(onClick = { vm.dismissAvatarRepair() }) { Text("取消") } },
+        )
+    }
+
+    avatarRepairProgress?.let { (processed, total) ->
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text("正在补全头像…") },
+            text = { Text("已处理 $processed/$total") },
+            confirmButton = {},
+        )
+    }
+
     pendingImport?.let { text ->
         AlertDialog(
             onDismissRequest = { pendingImport = null },
@@ -496,19 +520,25 @@ private fun AppHeader(
 @Composable
 private fun CachePill(config: com.deeptalking.core.model.AppConfig, modifier: Modifier = Modifier) {
     val legacy = MaterialTheme.legacy
-    val metrics = config.requestMetrics
-    if (metrics.isEmpty()) return
+    // Legacy `renderCacheStats` (`stickers.js:266-288`): the pill reads
+    // `config.cacheStats`, shows `缓存 --` when unset, and averages the last 10
+    // chat requests' hit rate.
+    val stats = config.cacheStats
     val text = when {
-        metrics.none { (it.inputTokens ?: 0) > 0 } -> "缓存未返回命中数据"
+        stats == null -> "缓存 --"
+        stats.hitTokens == null || stats.missTokens == null -> "缓存未返回命中数据"
         else -> {
-            val recent = metrics.takeLast(12).filter { (it.inputTokens ?: 0) > 0 }
-            val last = recent.lastOrNull()?.hitRate ?: 0.0
-            val rates = recent.mapNotNull { it.hitRate }
-            val avg = if (rates.isEmpty()) 0.0 else rates.average()
-            val tokens = recent.lastOrNull()?.let { m ->
-                " · " + formatCompactNumber(m.hitTokens ?: 0) + "/" + formatCompactNumber(m.missTokens ?: 0)
-            } ?: ""
-            "缓存命中 ${(last * 100).toInt()}% · 近${recent.size}轮均值 ${(avg * 100).toInt()}%$tokens"
+            val hit = stats.hitTokens ?: 0
+            val miss = stats.missTokens ?: 0
+            val total = hit + miss
+            val rate = if (total > 0) Math.round(hit * 100.0 / total).toInt() else 0
+            val recent = config.requestMetrics.filter { it.taskType == "chat" && it.hitRate != null }.takeLast(10)
+            val average = if (recent.isNotEmpty()) {
+                Math.round(recent.sumOf { it.hitRate ?: 0.0 } * 100.0 / recent.size).toInt()
+            } else {
+                rate
+            }
+            "缓存命中 $rate% · 近${recent.size}轮均值 $average%"
         }
     }
     Text(
@@ -524,14 +554,6 @@ private fun CachePill(config: com.deeptalking.core.model.AppConfig, modifier: Mo
             .border(1.dp, legacy.border, RoundedCornerShape(4.dp))
             .padding(horizontal = 6.dp, vertical = 2.dp),
     )
-}
-
-/** Legacy `formatCompactNumber` (`src/js/media/stickers.js:290`). */
-private fun formatCompactNumber(value: Int): String {
-    if (value >= 1_000_000) return String.format(java.util.Locale.CHINA, "%.1fM", value / 1_000_000.0)
-    if (value >= 10_000) return Math.round(value / 1000.0).toString() + "k"
-    if (value >= 1000) return String.format(java.util.Locale.CHINA, "%.1fk", value / 1000.0)
-    return value.toString()
 }
 
 @Composable

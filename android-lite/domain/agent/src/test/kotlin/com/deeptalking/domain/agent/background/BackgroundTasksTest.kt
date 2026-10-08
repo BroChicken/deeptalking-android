@@ -330,4 +330,70 @@ class BackgroundTasksTest {
         )
         assertEquals(character, background.runInitialMemoryMigration(character))
     }
+
+    @Test
+    fun staleAnalysisIsDiscarded() = runBlocking {
+        val response = """{"status":"ok","analyzedShortTermIds":["s1"],"longTerm":[]}"""
+        val llm = ScriptedLlm(mutableListOf(response))
+        val background = BackgroundTasks(
+            llm,
+            MemoryServiceImpl(),
+            liveCharacter = { Character(id = "c1", revision = 99) },
+        )
+        val character = analyzableCharacter()
+        val (status, updated) = background.analyzeShortToLongTermStatus(character)
+        assertEquals(BackgroundTasks.TaskStatus.Stale, status)
+        assertEquals(character, updated)
+    }
+
+    @Test
+    fun currentAnalysisIsApplied() = runBlocking {
+        val response = """{"status":"ok","analyzedShortTermIds":["s1"],"longTerm":[]}"""
+        val llm = ScriptedLlm(mutableListOf(response))
+        val character = analyzableCharacter()
+        val background = BackgroundTasks(llm, MemoryServiceImpl(), liveCharacter = { character })
+        val (status, updated) = background.analyzeShortToLongTermStatus(character)
+        assertEquals(BackgroundTasks.TaskStatus.Success, status)
+        assertTrue(updated.shortTerm.first { it.id == "s1" }.analyzedAt != null)
+    }
+
+    @Test
+    fun autoFillCleansFieldValues() = runBlocking {
+        val (background, _) = tasks(listOf("""{"language":"语言：普通话。用户希望我这样做。"}"""))
+        val updated = background.autoFillStaticFields(listOf(Character(id = "c1", name = "小雨")))
+        assertEquals("普通话", updated[0].staticProfile.language)
+    }
+
+    @Test
+    fun remapFieldsWritesGroupDescription() = runBlocking {
+        val (background, _) = tasks(
+            listOf("""{"dynamicState":{"currentGoal":"举办一场宴会"},"description":"这群人是同门师兄弟，因师门任务聚在一起。"}"""),
+        )
+        val group = Character(id = "g1", name = "师门", isGroup = true)
+        val updated = background.remapFields(group)
+        assertEquals("这群人是同门师兄弟，因师门任务聚在一起。", updated.description)
+    }
+
+    @Test
+    fun analyzeEmitsStatusAndUsage() = runBlocking {
+        val statuses = mutableListOf<String>()
+        val usages = mutableListOf<Pair<String, com.deeptalking.engine.ondevice.TokenUsage>>()
+        val response = """{"status":"ok","analyzedShortTermIds":["s1"],"longTerm":[]}"""
+        val llm = object : LlmBackend {
+            override val id = "usage"
+            override suspend fun complete(request: LlmRequest): LlmResult =
+                LlmResult(text = response, usage = com.deeptalking.engine.ondevice.TokenUsage(3, 5, 1))
+            override fun stream(request: LlmRequest): Flow<LlmChunk> = flowOf()
+        }
+        val background = BackgroundTasks(
+            llm,
+            MemoryServiceImpl(),
+            onStatus = { statuses += it },
+            onAuxiliaryUsage = { task, usage -> usages += task to usage },
+        )
+        background.analyzeShortToLongTerm(analyzableCharacter())
+        assertTrue(statuses.contains("正在分析长期记忆…"))
+        assertEquals("analysis", usages.first().first)
+        assertEquals(3, usages.first().second.inputTokens)
+    }
 }

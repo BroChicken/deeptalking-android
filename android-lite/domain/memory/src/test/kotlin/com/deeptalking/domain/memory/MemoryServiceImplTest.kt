@@ -2,6 +2,7 @@ package com.deeptalking.domain.memory
 
 import com.deeptalking.core.common.AppLimits
 import com.deeptalking.core.model.Character
+import com.deeptalking.core.model.GroupMember
 import com.deeptalking.core.model.LongTermMemory
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.MemoryCategory
@@ -107,6 +108,42 @@ class MemoryServiceImplTest {
         }
         val trimmed = service.applyTurn(character, emptyList(), many)
         assertEquals(AppLimits.Memory.LONG_TERM_PER_CATEGORY, trimmed.longTerm.size)
+    }
+
+    @Test
+    fun applyTurnDeduplicatesExistingStoreWithoutIncoming() {
+        val service = MemoryServiceImpl()
+        val first = LongTermMemory(
+            id = "1",
+            category = MemoryCategory.UserProfile,
+            key = "饮品",
+            value = "用户爱喝咖啡",
+        )
+        val duplicate = first.copy(id = "2")
+        val character = Character(id = "c1", longTerm = listOf(first, duplicate))
+
+        val normalized = service.applyTurn(character, emptyList(), emptyList())
+
+        assertEquals(1, normalized.longTerm.size)
+    }
+
+    @Test
+    fun selectLorebookDeduplicatesSharedAndMemberEntries() {
+        val service = MemoryServiceImpl()
+        val shared = LorebookEntry(
+            id = "shared",
+            name = "银月",
+            content = "设定",
+            alwaysActive = true,
+        )
+        val sameId = shared.copy(name = "银月商会", content = "另一条设定")
+        val member = GroupMember(id = "m1", name = "甲", lorebook = listOf(sameId))
+        val character = Character(id = "g1", isGroup = true, lorebook = listOf(shared), members = listOf(member))
+
+        val selected = service.selectLorebook(character, "无关")
+
+        assertEquals(1, selected.size)
+        assertEquals("shared", selected[0].id)
     }
 
     @Test

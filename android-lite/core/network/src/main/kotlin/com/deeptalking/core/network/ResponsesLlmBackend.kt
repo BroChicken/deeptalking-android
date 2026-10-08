@@ -47,8 +47,10 @@ private val JSON_MEDIA_TYPE: MediaType = "application/json; charset=utf-8".toMed
 const val LLM_STATUS_CHUNK_NAME: String = "__status"
 
 private const val SEARCH_ACTIVE = "正在联网搜索…"
-private const val SEARCH_DONE = "正在接收回复…"
 private const val SEARCH_FAILED = "搜索未能完成，角色将自行应对…"
+
+/** Whitelist mirroring legacy `normalizeReasoningEffort` (`normalization.js:29-33`). */
+private val REASONING_EFFORTS = setOf("none", "low", "medium", "high", "max")
 
 /** Total request budget mirroring the legacy 180s hard cap (`conversation.js:460`). */
 private const val HARD_TIMEOUT_SECONDS = 180L
@@ -146,8 +148,7 @@ class ResponsesLlmBackend(
             .addHeader("Content-Type", "application/json")
             .addHeader("User-Agent", userAgent)
         if (stream) builder.addHeader("Accept", "text/event-stream")
-        apiKeyProvider()?.trim()?.takeIf { it.isNotEmpty() }
-            ?.let { builder.addHeader("Authorization", "Bearer $it") }
+        builder.addHeader("Authorization", authorizationHeader(apiKeyProvider()))
         // OpenCode Go gateway mandates a stable per-session header; missing it
         // returns 400 MissingSessionID (legacy `buildApiHeaders`).
         opencodeSessionHeader(request.apiPlatform, request.sessionId)?.let { (name, value) ->
@@ -197,7 +198,7 @@ class ResponsesLlmBackend(
             temperature = request.temperature,
             maxOutputTokens = request.maxOutputTokens,
             stream = stream,
-            reasoning = ReasoningDto(request.reasoningEffort ?: "medium"),
+            reasoning = ReasoningDto(normalizeReasoningEffort(request.reasoningEffort)),
         )
         return json.encodeToString(ResponsesRequest.serializer(), dto)
     }
@@ -240,11 +241,27 @@ internal fun responsesToResult(
         TokenUsage(
             inputTokens = it.inputTokens,
             outputTokens = it.outputTokens,
-            cachedTokens = it.inputTokensDetails?.cachedTokens,
+            cachedTokens = resolveCachedTokens(it),
         )
     }
 
     return LlmResult(text = text, toolCalls = toolCalls, usage = usage, raw = raw, reasoning = reasoning)
+}
+
+/**
+ * Resolves the cached-token count from usage, mirroring legacy `recordCacheUsage`
+ * (`responses.js:271-279`): `prompt_cache_hit_tokens` wins when both prompt-cache
+ * fields are present, otherwise fall back to `input_tokens_details.cached_tokens`.
+ */
+internal fun resolveCachedTokens(usage: UsageDto): Int? {
+    val hit = usage.promptCacheHitTokens
+    val miss = usage.promptCacheMissTokens
+    val detailCached = usage.inputTokensDetails?.cachedTokens
+    return when {
+        hit != null && miss != null -> maxOf(0, hit)
+        detailCached != null -> maxOf(0, detailCached)
+        else -> null
+    }
 }
 
 /**
@@ -302,7 +319,7 @@ internal class ResponsesSseInterpreter(private val json: Json) {
     fun onEvent(type: String?, data: String): SseOutcome {
         val root = runCatching { json.parseToJsonElement(data) as? JsonObject }.getOrNull()
             ?: return SseOutcome()
-        val eventType = root["type"].str() ?: type ?: return SseOutcome()
+        val eventType = root["type"].str() ?: type
         val chunks = mutableListOf<LlmChunk>()
         when (eventType) {
             "response.output_text.delta" -> {
@@ -321,15 +338,13 @@ internal class ResponsesSseInterpreter(private val json: Json) {
                 }
             }
 
-            "response.reasoning_text.delta", "response.reasoning_summary_text.delta" -> {
+            "response.reasoning_text.delta" -> {
                 val delta = root["delta"].str()
                 if (!delta.isNullOrEmpty()) chunks += LlmChunk.ReasoningDelta(delta)
             }
 
             "response.web_search_call.in_progress", "response.web_search_call.searching" ->
                 chunks += statusChunk(SEARCH_ACTIVE)
-
-            "response.web_search_call.completed" -> chunks += statusChunk(SEARCH_DONE)
 
             "response.web_search_call.failed" -> chunks += statusChunk(SEARCH_FAILED)
 
@@ -393,6 +408,17 @@ internal class ResponsesSseInterpreter(private val json: Json) {
                     ?: "流式响应错误"
                 return SseOutcome(chunks, error = IllegalStateException(message))
             }
+
+            else -> {
+                // Chat-Completions fallback: legacy `consumeStreamData` ends with
+                // `extractStreamText` reading `choices[0].delta.content`
+                // (`responses.js:221-226`).
+                val delta = root.choicesDelta()
+                if (!delta.isNullOrEmpty()) {
+                    sawTextDelta = true
+                    chunks += LlmChunk.TextDelta(delta)
+                }
+            }
         }
         return SseOutcome(chunks)
     }
@@ -409,6 +435,13 @@ internal class ResponsesSseInterpreter(private val json: Json) {
 private fun JsonElement?.str(): String? = (this as? JsonPrimitive)?.contentOrNull
 
 private fun JsonElement?.obj(): JsonObject? = this as? JsonObject
+
+/** Reads `choices[0].delta.content` from a Chat-Completions SSE chunk. */
+private fun JsonObject.choicesDelta(): String? {
+    val first = (this["choices"] as? JsonArray)?.firstOrNull() as? JsonObject ?: return null
+    val delta = first["delta"] as? JsonObject ?: return null
+    return delta["content"].str()
+}
 
 /**
  * Resolves the final Responses endpoint for a platform, mirroring the legacy
@@ -433,6 +466,42 @@ internal fun opencodeSessionHeader(platform: String?, sessionId: String?): Pair<
     if (platform == "opencode") "x-opencode-session" to (sessionId ?: "deeptalking-general") else null
 
 /**
+ * Builds the `Authorization` header, failing loudly when no API key is configured
+ * (legacy `buildApiHeaders` throws `未配置API Key，请在设置中填写`). The app-layer
+ * connection pre-check runs earlier, so this only guards a genuinely missing key.
+ */
+internal fun authorizationHeader(apiKey: String?): String {
+    val key = apiKey?.trim().orEmpty()
+    if (key.isEmpty()) throw IllegalStateException("未配置API Key，请在设置中填写")
+    return "Bearer $key"
+}
+
+/** Falls back to `medium` for values outside the legacy whitelist (`normalization.js:29-33`). */
+internal fun normalizeReasoningEffort(value: String?): String =
+    if (value != null && value in REASONING_EFFORTS) value else "medium"
+
+/**
+ * Keeps the multimodal tool result contract of legacy `web-content.js` (which
+ * pushes an `output` array containing `input_text` + `input_image`): when the
+ * tool content is a JSON array of input parts, pass it through as an array so
+ * the model actually receives the image; otherwise keep the raw string.
+ */
+private val TOOL_OUTPUT_PART_TYPES = setOf("input_text", "input_image", "input_file")
+
+private val toolOutputJson = Json { isLenient = true }
+
+internal fun toolOutputElement(content: String): JsonElement {
+    val parsed = runCatching { toolOutputJson.parseToJsonElement(content) as? JsonArray }.getOrNull()
+        ?: return JsonPrimitive(content)
+    if (parsed.isEmpty()) return JsonPrimitive(content)
+    val allParts = parsed.all { element ->
+        val type = (element as? JsonObject)?.get("type")?.str()
+        type != null && type in TOOL_OUTPUT_PART_TYPES
+    }
+    return if (allParts) parsed else JsonPrimitive(content)
+}
+
+/**
  * Builds the heterogeneous Responses `input` array from chat messages: plain
  * `{role, content}` items plus structured `function_call` / `function_call_output`
  * items and replayed `reasoning` items, mirroring the legacy `toolState.items`
@@ -455,7 +524,7 @@ internal fun buildResponsesInput(
             message.role == Role.Tool -> input += buildJsonObject {
                 put("type", "function_call_output")
                 put("call_id", message.toolCallId.orEmpty())
-                put("output", message.content)
+                put("output", toolOutputElement(message.content))
             }
 
             message.role == Role.Assistant && !message.toolName.isNullOrBlank() -> {

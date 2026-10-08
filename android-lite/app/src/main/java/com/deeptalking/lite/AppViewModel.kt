@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.deeptalking.core.common.AppLimits
 import com.deeptalking.core.model.AppConfig
+import com.deeptalking.core.model.CacheStats
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.GroupMember
@@ -38,8 +39,13 @@ import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
+import kotlinx.serialization.json.putJsonObject
 import java.time.Instant
 import java.util.UUID
 
@@ -104,51 +110,6 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     val lorebookMigrationPrompt: StateFlow<Int?> = lorebookMigrationState
 
     private val media = MediaStore(DeepTalkingApp.core.appContext)
-
-    init {
-        viewModelScope.launch {
-            core.data.characters.observeAll().collect { list ->
-                if (activeIdState.value == null && list.isNotEmpty()) {
-                    activeIdState.value = list.first().id
-                }
-            }
-        }
-        viewModelScope.launch { proactiveLoop() }
-        viewModelScope.launch { themeLoop() }
-        // Legacy one-time relative-time → absolute migration (no key required).
-        viewModelScope.launch {
-            runCatching { core.runStartupMigrations() }.onFailure { DeepTalkingApp.recordError(it) }
-        }
-        // Legacy on-load silent static-field completion (only with an API key).
-        viewModelScope.launch {
-            runCatching {
-                val cfg = core.data.config.observe().first()
-                core.runStartupMaintenance(cfg)
-            }.onFailure { DeepTalkingApp.recordError(it) }
-        }
-        // Legacy one-time migration prompts (field schema, then world book).
-        viewModelScope.launch {
-            runCatching { checkMigrationPrompts() }.onFailure { DeepTalkingApp.recordError(it) }
-        }
-        // Legacy silent avatar auto-repair for damaged placeholders.
-        autoRepairAvatars()
-        // Restore the on-device read-aloud voice selection and ready the built-in voices.
-        viewModelScope.launch {
-            val cfg = core.currentConfig()
-            cfg.ttsVoiceFile.takeIf { it.isNotBlank() }?.let { p ->
-                java.io.File(p).takeIf { it.exists() }?.let { core.cosyVoice.setVoiceFile(it) }
-            }
-            runCatching { core.cosyVoice.ensureDefaultVoices() }.onFailure { DeepTalkingApp.recordError(it) }
-            if (core.cosyVoice.voiceFile == null) {
-                core.cosyVoice.listVoices().firstOrNull()?.let { v ->
-                    core.cosyVoice.selectVoice(v.file)?.let { resolved ->
-                        core.data.config.update(core.currentConfig().copy(ttsVoiceFile = resolved.absolutePath))
-                    }
-                }
-            }
-            refreshTtsState(core.currentConfig())
-        }
-    }
 
     // --------------------------------------------------------- migrations
 
@@ -255,16 +216,25 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     ) {
         viewModelScope.launch {
             val now = Instant.now().toString()
-            val profile = (draft?.staticProfile ?: StaticProfile()).copy(
-                personality = personality.ifBlank { draft?.staticProfile?.personality.orEmpty() },
-                background = background.ifBlank { draft?.staticProfile?.background.orEmpty() },
+            // Legacy `createCharacter` cleans every generated field through
+            // `cleanFieldValue(parseRelativeText(...))` (and `normalizeUserAddress`
+            // for userAddress, `sanitizeDynamicStateField` for dynamic state).
+            val cleaned = draft?.let {
+                CharacterParity.normalizeEditedDraft(
+                    Character(id = "", staticProfile = it.staticProfile, dynamicState = it.dynamicState),
+                )
+            }
+            val cleanProfile = cleaned?.staticProfile ?: StaticProfile()
+            val profile = cleanProfile.copy(
+                personality = personality.ifBlank { cleanProfile.personality },
+                background = background.ifBlank { cleanProfile.background },
             )
             val character = Character(
                 id = UUID.randomUUID().toString(),
                 name = name.ifBlank { "新角色" },
                 emoji = emoji.ifBlank { "🙂" },
                 staticProfile = profile,
-                dynamicState = draft?.dynamicState ?: com.deeptalking.core.model.DynamicState(),
+                dynamicState = cleaned?.dynamicState ?: com.deeptalking.core.model.DynamicState(),
                 lorebook = draft?.lorebook.orEmpty(),
                 createdAt = now,
                 // Fresh entities are already on the current schema and hold no
@@ -411,12 +381,15 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             val group = character.copy(
                 isGroup = true,
                 name = draft.name.ifBlank { character.name + "的群组" },
-                emoji = character.emoji.ifBlank { draft.emoji.ifBlank { "👥" } },
+                // Legacy `generation.js:149`: the AI group avatar wins (`groupInfo.avatar ?? '👥'`).
+                emoji = draft.emoji.ifBlank { "👥" },
                 description = draft.description.ifBlank { character.description },
                 interactionRules = draft.interactionRules.ifBlank { character.interactionRules },
                 groupSharedDynamic = com.deeptalking.core.model.DynamicState(
                     currentSituation = character.dynamicState.currentSituation,
-                    currentLocation = character.dynamicState.currentLocation.ifBlank { draft.scene },
+                    // Legacy `generation.js:152`: group scene wins, falling back to the
+                    // original character's current location only when empty.
+                    currentLocation = draft.scene.ifBlank { character.dynamicState.currentLocation },
                 ),
                 members = members,
                 lorebook = mergedLorebook,
@@ -589,55 +562,6 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         }
     }
 
-    /** Repairs default/damaged emoji avatars (characters + group members) via the LLM. */
-    fun repairAvatars() {
-        viewModelScope.launch {
-            val cfg = runCatching { core.currentConfig() }.getOrNull() ?: return@launch
-            if (core.secrets.getApiKey(cfg.apiPlatform).isNullOrBlank() && core.secrets.getApiKey().isNullOrBlank()) {
-                eventsState.tryEmit(UiEvent("请先在设置页配置 API Key，再补全头像"))
-                return@launch
-            }
-            val all = core.data.characters.observeAll().first()
-            var done = 0
-            for (character in all) {
-                var updated = character
-                var changed = false
-                if (needsRepair(character.emoji)) {
-                    val emoji = runCatching { core.generateEmojiAvatar(cfg, character) }.getOrNull()
-                    if (!emoji.isNullOrBlank()) {
-                        updated = updated.copy(emoji = emoji)
-                        changed = true
-                        done++
-                    }
-                }
-                if (character.members.isNotEmpty()) {
-                    val members = updated.members.toMutableList()
-                    var memberChanged = false
-                    members.forEachIndexed { index, member ->
-                        if (needsRepair(member.emoji)) {
-                            val emoji = runCatching { core.generateEmojiAvatar(cfg, member, character) }.getOrNull()
-                            if (!emoji.isNullOrBlank()) {
-                                members[index] = member.copy(emoji = emoji)
-                                memberChanged = true
-                                done++
-                            }
-                        }
-                    }
-                    if (memberChanged) {
-                        updated = updated.copy(members = members)
-                        changed = true
-                    }
-                }
-                if (changed) core.data.characters.upsert(updated)
-            }
-            if (done == 0) {
-                eventsState.tryEmit(UiEvent("所有角色都已使用 emoji 头像，无需补全"))
-            } else {
-                eventsState.tryEmit(UiEvent("已生成 $done 个 emoji 头像"))
-            }
-        }
-    }
-
     /** Legacy `isAvatarDamaged`: empty, replacement char, or ASCII-only. */
     private fun isAvatarDamaged(emoji: String): Boolean {
         val v = emoji.trim()
@@ -653,36 +577,155 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         return isAvatarDamaged(v)
     }
 
-    /** Legacy `autoRepairAvatars`: silently repair damaged avatars on startup/import. */
-    fun autoRepairAvatars() {
+    private data class AvatarTarget(val character: Character, val memberIndex: Int?)
+
+    private data class RepairOutcome(val done: Int, val failed: Int, val failNames: List<String>)
+
+    /** Non-null while the manual "补全头像" confirmation dialog should show (target count). */
+    private val avatarRepairPromptState = MutableStateFlow<Int?>(null)
+    val avatarRepairPrompt: StateFlow<Int?> = avatarRepairPromptState
+
+    /** Non-null while a manual repair runs: (processed, total). */
+    private val avatarRepairProgressState = MutableStateFlow<Pair<Int, Int>?>(null)
+    val avatarRepairProgress: StateFlow<Pair<Int, Int>?> = avatarRepairProgressState
+
+    /** Legacy `collectAvatarRepairJobs`: manual targets include 👤/👥 placeholders. */
+    private suspend fun collectAvatarRepairTargets(includePlaceholders: Boolean): List<AvatarTarget> {
+        val all = core.data.characters.observeAll().first()
+        val targets = mutableListOf<AvatarTarget>()
+        all.forEach { character ->
+            val needs = if (includePlaceholders) {
+                needsRepair(character.emoji)
+            } else {
+                character.avatarRepairPending || isAvatarDamaged(character.emoji)
+            }
+            if (needs) targets += AvatarTarget(character, null)
+            character.members.forEachIndexed { index, member ->
+                val memberNeeds = if (includePlaceholders) {
+                    needsRepair(member.emoji)
+                } else {
+                    member.avatarRepairPending || isAvatarDamaged(member.emoji)
+                }
+                if (memberNeeds) targets += AvatarTarget(character, index)
+            }
+        }
+        return targets
+    }
+
+    /** Legacy `repairAllAvatars` entry: confirm first, then run with progress. */
+    fun requestAvatarRepair() {
+        viewModelScope.launch {
+            if (avatarRepairProgressState.value != null) {
+                eventsState.tryEmit(UiEvent("头像补全正在进行中，请稍候…"))
+                return@launch
+            }
+            val cfg = runCatching { core.currentConfig() }.getOrNull() ?: return@launch
+            if (!core.hasApiKey(cfg.apiPlatform)) {
+                eventsState.tryEmit(UiEvent("请先在设置页配置 API Key，再补全头像"))
+                return@launch
+            }
+            val count = collectAvatarRepairTargets(includePlaceholders = true).size
+            if (count == 0) {
+                eventsState.tryEmit(UiEvent("所有角色与群组成员都已使用 emoji 头像，无需补全"))
+                return@launch
+            }
+            avatarRepairPromptState.value = count
+        }
+    }
+
+    fun dismissAvatarRepair() {
+        avatarRepairPromptState.value = null
+    }
+
+    fun confirmAvatarRepair() {
+        avatarRepairPromptState.value = null
         viewModelScope.launch {
             val cfg = runCatching { core.currentConfig() }.getOrNull() ?: return@launch
+            if (!core.hasApiKey(cfg.apiPlatform)) {
+                eventsState.tryEmit(UiEvent("请先在设置页配置 API Key，再补全头像"))
+                return@launch
+            }
+            val targets = collectAvatarRepairTargets(includePlaceholders = true)
+            val result = repairAvatarTargets(cfg, targets, showProgress = true)
+            val msg = "已生成 ${result.done} 个 emoji 头像"
+            if (result.failed > 0) {
+                eventsState.tryEmit(UiEvent("$msg，失败 ${result.failed} 个（${result.failNames.joinToString("、")}），请检查网络后重试"))
+            } else {
+                eventsState.tryEmit(UiEvent(msg))
+            }
+        }
+    }
+
+    /** Legacy `repairAvatarJobs`: serial AI emoji generation, flagging failures as pending. */
+    private suspend fun repairAvatarTargets(
+        cfg: AppConfig,
+        targets: List<AvatarTarget>,
+        showProgress: Boolean,
+    ): RepairOutcome {
+        var done = 0
+        var failed = 0
+        val failNames = mutableListOf<String>()
+        try {
+            targets.forEachIndexed { index, target ->
+                if (showProgress) avatarRepairProgressState.value = (index + 1) to targets.size
+                val member = target.memberIndex?.let { target.character.members.getOrNull(it) }
+                val name = member?.name ?: target.character.name
+                val emoji = runCatching {
+                    if (member == null) core.generateEmojiAvatar(cfg, target.character)
+                    else core.generateEmojiAvatar(cfg, member, target.character)
+                }.getOrNull()
+                val latest = core.data.characters.get(target.character.id)
+                if (latest == null) return@forEachIndexed
+                if (!emoji.isNullOrBlank()) {
+                    val updated = if (member == null) {
+                        latest.copy(emoji = emoji, avatarRepairPending = false)
+                    } else {
+                        latest.copy(
+                            members = latest.members.mapIndexed { i, m ->
+                                if (i == target.memberIndex) m.copy(emoji = emoji, avatarRepairPending = false) else m
+                            },
+                        )
+                    }
+                    core.data.characters.upsert(updated)
+                    done++
+                } else {
+                    val updated = if (member == null) {
+                        latest.copy(avatarRepairPending = true)
+                    } else {
+                        latest.copy(
+                            members = latest.members.mapIndexed { i, m ->
+                                if (i == target.memberIndex) m.copy(avatarRepairPending = true) else m
+                            },
+                        )
+                    }
+                    core.data.characters.upsert(updated)
+                    failed++
+                    failNames += name
+                }
+                if (index < targets.lastIndex) delay(300)
+            }
+        } finally {
+            if (showProgress) avatarRepairProgressState.value = null
+        }
+        return RepairOutcome(done, failed, failNames)
+    }
+
+    /** Legacy `autoRepairAvatars`: silently repair damaged/pending avatars on startup/import. */
+    fun autoRepairAvatars() {
+        viewModelScope.launch {
+            if (avatarRepairProgressState.value != null) return@launch
+            val cfg = runCatching { core.currentConfig() }.getOrNull() ?: return@launch
             if (!core.hasApiKey(cfg.apiPlatform)) return@launch
-            val all = core.data.characters.observeAll().first()
-            for (character in all) {
-                var updated = character
-                var changed = false
-                if (isAvatarDamaged(character.emoji)) {
-                    val emoji = runCatching { core.generateEmojiAvatar(cfg, character) }.getOrNull()
-                    if (!emoji.isNullOrBlank()) {
-                        updated = updated.copy(emoji = emoji)
-                        changed = true
-                    }
+            val targets = collectAvatarRepairTargets(includePlaceholders = false)
+            if (targets.isEmpty()) return@launch
+            val result = repairAvatarTargets(cfg, targets, showProgress = false)
+            if (result.done > 0 || result.failed > 0) {
+                val msg = "已自动生成 ${result.done} 个损坏头像"
+                if (result.failed > 0) {
+                    eventsState.tryEmit(UiEvent("$msg，失败 ${result.failed} 个（${result.failNames.joinToString("、")}），可稍后在侧边栏点击“补全头像”重试"))
+                } else {
+                    eventsState.tryEmit(UiEvent(msg))
                 }
-                if (character.members.isNotEmpty()) {
-                    val members = updated.members.toMutableList()
-                    updated.members.forEachIndexed { index, member ->
-                        if (isAvatarDamaged(member.emoji)) {
-                            val emoji = runCatching { core.generateEmojiAvatar(cfg, member, character) }.getOrNull()
-                            if (!emoji.isNullOrBlank()) {
-                                members[index] = member.copy(emoji = emoji)
-                                changed = true
-                            }
-                        }
-                    }
-                    updated = updated.copy(members = members)
-                }
-                if (changed) core.data.characters.upsert(updated)
             }
         }
     }
@@ -700,6 +743,12 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     fun addPendingImage(uri: Uri) {
         if (pendingImagesState.value.size >= 4) {
             eventsState.tryEmit(UiEvent("一次最多发送 4 张图片"))
+            return
+        }
+        // Legacy `handleImagePick`: only `image/*` files are accepted.
+        val mime = runCatching { core.appContext.contentResolver.getType(uri) }.getOrNull()
+        if (mime == null || !mime.startsWith("image/")) {
+            eventsState.tryEmit(UiEvent("只能发送图片文件"))
             return
         }
         pendingImagesState.value = pendingImagesState.value + uri
@@ -744,6 +793,21 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                     )
                 }
                 val history = core.data.chat.getMessages(id)
+                // Legacy `sendStickerAsUser` writes a sent sticker to `msg.images`, so it
+                // is delivered to the model as `input_image`. The persisted message keeps
+                // `Kind.Sticker` for rendering; this request-only copy promotes it to
+                // `Kind.Image`, which is the only kind the Responses transport forwards.
+                val requestHistory = history.map { message ->
+                    if (message.role == Role.User && message.attachments.any { it.kind == MessageAttachment.Kind.Sticker }) {
+                        message.copy(
+                            attachments = message.attachments.map {
+                                if (it.kind == MessageAttachment.Kind.Sticker) it.copy(kind = MessageAttachment.Kind.Image) else it
+                            },
+                        )
+                    } else {
+                        message
+                    }
+                }
                 // Mirror the live chat into `character.instant` (incl. the just-appended
                 // user message) so set_reminder validation + volatile context see it.
                 val character = (core.data.characters.get(id) ?: return@launch)
@@ -751,23 +815,40 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 statusState.value = "生成中…"
                 streamingState.value = ""
 
-                val orchestrator = core.createOrchestrator(cfg) { updated ->
-                    core.appScope.launch { core.data.characters.upsert(updated) }
-                }
+                val orchestrator = core.createOrchestrator(
+                    cfg,
+                    onCharacterUpdated = { updated ->
+                        core.appScope.launch { core.data.characters.upsert(updated) }
+                    },
+                    onStatus = { statusState.value = it },
+                    onAuxiliaryUsage = { taskType, usage -> recordAuxiliaryUsage(taskType, usage) },
+                )
+                val priorCache = cfg.cacheStats
+                val hadCacheMiss = priorCache != null && priorCache.hitTokens == 0 && (priorCache.promptTokens ?: 0) > 0
+                val requestStartedAt = System.currentTimeMillis()
                 // Legacy `chatStageDecision('empty')`: an empty turn is retried twice
                 // (attemptsLeft=2 → up to 3 requests) before failing.
                 var result: OrchestratorResult? = null
                 var attempt = 0
+                var receiveLogged = false
                 while (attempt < 3) {
                     if (attempt > 0) {
                         statusState.value = "正在重新生成…"
                         streamingState.value = ""
+                    } else {
+                        statusState.value = if (hadCacheMiss) "缓存未命中，正在更新队列…" else "正在请求 API…"
                     }
                     val outcome = orchestrator.run(
                         character = character,
-                        history = history,
+                        history = requestHistory,
                         userText = text.trim(),
-                        onDelta = { streamingState.value = it },
+                        onDelta = { delta ->
+                            if (!receiveLogged && delta.isNotBlank()) {
+                                receiveLogged = true
+                                statusState.value = "正在接收回复…"
+                            }
+                            streamingState.value = delta
+                        },
                         onToolActivity = { statusState.value = it },
                         onQuickRepliesRepaired = { quickRepliesState.value = it },
                         proactive = proactive,
@@ -811,7 +892,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 core.data.characters.upsert(withReminders)
                 quickRepliesState.value = finalResult.quickReplies
                 statusState.value = ""
-                recordMetrics(cfg, id, finalResult)
+                recordMetrics(cfg, id, finalResult, requestHistory, System.currentTimeMillis() - requestStartedAt)
                 if (cfg.ttsEnabled && cfg.ttsAutoRead) speakReply(finalResult.reply, finalResult.updatedCharacter)
             } catch (error: Exception) {
                 streamingState.value = null
@@ -874,28 +955,177 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     /** Already-completed [Job] for the no-op branches of [submitTurn]. */
     private fun completedJob(): Job = Job().apply { complete() }
 
+    /** Serializes concurrent `requestMetrics`/`cacheStats` column writes. */
+    private val metricsMutex = Mutex()
+
+    /** Per-character prefix snapshots backing the request trace (legacy `requestPrefixSnapshots`). */
+    private val requestPrefixSnapshots = mutableMapOf<String, PrefixSnapshot>()
+
+    private data class PrefixSnapshot(
+        val instructionsHash: String,
+        val toolsHash: String,
+        val inputs: List<String>,
+    )
+
+    private data class RequestTrace(
+        val historyHash: String,
+        val prefixChange: String,
+        val commonHistoryMessages: Int,
+        val inputChars: Int,
+    )
+
+    /**
+     * App-side request trace; the instructions/tools hashes come from the
+     * domain (`OrchestratorResult`) since only it sees the assembled request.
+     */
+    private fun requestTrace(
+        characterId: String,
+        history: List<ChatMessage>,
+        instructionsHash: String,
+        toolsHash: String,
+    ): RequestTrace {
+        val inputs = history.filter { !it.rejected }.map { message ->
+            message.role.name + "|" + message.content + "|" +
+                message.attachments.joinToString(",") { it.kind.name + ":" + it.uri }
+        }
+        val previous = requestPrefixSnapshots[characterId]
+        var common = 0
+        if (previous != null) {
+            while (common < minOf(previous.inputs.size, inputs.size) && previous.inputs[common] == inputs[common]) common++
+        }
+        val change = when {
+            previous == null -> "first-request"
+            previous.instructionsHash != instructionsHash -> "instructions-changed"
+            previous.toolsHash != toolsHash -> "tools-changed"
+            common < previous.inputs.size -> "history-rebased"
+            else -> "history-extended"
+        }
+        requestPrefixSnapshots[characterId] = PrefixSnapshot(instructionsHash, toolsHash, inputs)
+        return RequestTrace(
+            historyHash = fnv1a(inputs.joinToString("\n")),
+            prefixChange = change,
+            commonHistoryMessages = common,
+            inputChars = inputs.sumOf { it.length },
+        )
+    }
+
+    /** Port of the legacy `hashRequestPart` FNV-1a hash. */
+    private fun fnv1a(text: String): String {
+        var hash = 0x811c9dc5L
+        for (ch in text) {
+            hash = hash xor ch.code.toLong()
+            hash = (hash * 0x01000193L) and 0xFFFFFFFFL
+        }
+        return hash.toString(16)
+    }
+
     /** Stores the last reply debug payload and appends a rolling usage/cache metric. */
-    private suspend fun recordMetrics(cfg: AppConfig, characterId: String, result: OrchestratorResult) {
+    private suspend fun recordMetrics(
+        cfg: AppConfig,
+        characterId: String,
+        result: OrchestratorResult,
+        requestHistory: List<ChatMessage>,
+        durationMs: Long,
+    ) {
+        val at = Instant.now().toString()
         val hitTokens = result.cachedTokens
         val missTokens = (result.inputTokens - hitTokens).coerceAtLeast(0)
         val hitRate = if (result.inputTokens > 0) hitTokens.toDouble() / result.inputTokens else 0.0
+        val trace = requestTrace(characterId, requestHistory, result.instructionsHash, result.toolsHash)
         val metric = RequestMetric(
-            at = Instant.now().toString(),
+            at = at,
             taskType = "chat",
             characterId = characterId,
+            model = cfg.modelName,
+            platform = cfg.apiPlatform,
+            status = "completed",
+            durationMs = durationMs,
+            instructionsHash = result.instructionsHash,
+            toolsHash = result.toolsHash,
+            historyHash = trace.historyHash,
+            prefixChange = trace.prefixChange,
+            commonHistoryMessages = trace.commonHistoryMessages,
+            contextChars = result.contextChars,
+            inputChars = trace.inputChars,
             inputTokens = result.inputTokens,
+            outputTokens = result.outputTokens,
             hitTokens = hitTokens,
             missTokens = missTokens,
             hitRate = hitRate,
         )
-        val metrics = (cfg.requestMetrics + metric).takeLast(60)
-        val debug = buildString {
-            append("reply: ").append(result.reply.take(500))
-            if (result.rawReply.isNotBlank() && result.rawReply != result.reply) {
-                append("\n\n原始回应（未处理）:\n").append(result.rawReply.take(1500))
+        // Legacy `recordCacheUsage`: a successful chat refreshes the header cache snapshot.
+        val cacheStats = if (result.inputTokens > 0) {
+            CacheStats(
+                hitTokens = hitTokens,
+                missTokens = missTokens,
+                promptTokens = result.inputTokens,
+                updatedAt = at,
+            )
+        } else {
+            cfg.cacheStats
+        }
+        // Legacy `DEBUG_REPLY_STORAGE_KEY`: a JSON object with the config snapshot,
+        // display/full text and quick replies, rendered as two sections in Settings.
+        val debug = buildJsonObject {
+            put("at", at)
+            putJsonObject("config") {
+                put("stream", cfg.stream)
+                put("reasoning", cfg.reasoningEffort)
+                put("model", cfg.modelName)
+            }
+            put("durationMs", durationMs)
+            put("displayText", result.reply.take(2000))
+            put("fullText", result.rawReply.take(2000))
+            putJsonArray("quickReplies") { result.quickReplies.forEach { add(it) } }
+        }.toString()
+        appendMetric(cacheStats = cacheStats, lastReplyDebug = debug) { it + metric }
+    }
+
+    /**
+     * Serializes the read-modify-write of the rolling metrics/cache columns so a
+     * background auxiliary usage report cannot be clobbered by a concurrent chat
+     * write (both used to overwrite the whole `AppConfig` from a stale snapshot).
+     */
+    private suspend fun appendMetric(
+        cacheStats: CacheStats? = null,
+        lastReplyDebug: String? = null,
+        append: (List<RequestMetric>) -> List<RequestMetric>,
+    ) {
+        metricsMutex.withLock {
+            val current = core.data.config.current()
+            runCatching {
+                core.data.config.update(
+                    current.copy(
+                        requestMetrics = append(current.requestMetrics).takeLast(AppLimits.Api.REQUEST_METRICS),
+                        cacheStats = cacheStats ?: current.cacheStats,
+                        lastReplyDebug = lastReplyDebug ?: current.lastReplyDebug,
+                    ),
+                )
             }
         }
-        runCatching { core.data.config.update(cfg.copy(requestMetrics = metrics, lastReplyDebug = debug)) }
+    }
+
+    /** Records an auxiliary (background/helper) LLM call's token usage (legacy `recordCacheUsage`). */
+    private fun recordAuxiliaryUsage(taskType: String, usage: com.deeptalking.engine.ondevice.TokenUsage) {
+        viewModelScope.launch {
+            val cfg = core.currentConfig()
+            val at = Instant.now().toString()
+            val hit = usage.cachedTokens ?: 0
+            val miss = (usage.inputTokens - hit).coerceAtLeast(0)
+            val metric = RequestMetric(
+                at = at,
+                taskType = taskType,
+                model = cfg.modelName,
+                platform = cfg.apiPlatform,
+                status = "completed",
+                inputTokens = usage.inputTokens,
+                outputTokens = usage.outputTokens,
+                hitTokens = hit,
+                missTokens = miss,
+                hitRate = if (usage.inputTokens > 0) hit.toDouble() / usage.inputTokens else 0.0,
+            )
+            appendMetric { it + metric }
+        }
     }
 
     /** Removes [message] and everything after it, then re-sends [message]'s text. */
@@ -940,11 +1170,18 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         core.data.chat.replace(characterId, history.take(fromIndex))
         val character = core.data.characters.get(characterId) ?: return
         fun hasRemovedSource(ids: List<String>) = ids.any { it in removedIds }
+        // Legacy `cleanDynamicStateSources` drops dynamic-state bookkeeping whose
+        // source messages were removed, so the model re-evaluates those fields.
+        // The native meta only carries `updatedAt`, so the affected fields cannot
+        // be attributed precisely; clear the meta maps wholesale for character +
+        // members (the dynamic values themselves are left untouched).
         core.data.characters.upsert(
             character.copy(
                 shortTerm = character.shortTerm.filterNot { hasRemovedSource(it.sourceMessageIds) },
                 longTerm = character.longTerm.filterNot { hasRemovedSource(it.sourceMessageIds) },
                 pendingRecall = character.pendingRecall.filterNot { hasRemovedSource(it.sourceMessageIds) },
+                dynamicStateMeta = emptyMap(),
+                members = character.members.map { it.copy(dynamicStateMeta = emptyMap()) },
                 revision = character.revision + 1,
             ),
         )
@@ -971,6 +1208,11 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
 
     fun hasApiKey(platform: String = ""): Boolean =
         !core.secrets.getApiKey(platform).isNullOrBlank() || !core.secrets.getApiKey().isNullOrBlank()
+
+    /** Legacy key backfill: the platform's stored key, falling back to the legacy global slot. */
+    fun storedApiKey(platform: String): String? =
+        core.secrets.getApiKey(platform)?.takeIf { it.isNotBlank() }
+            ?: core.secrets.getApiKey()?.takeIf { it.isNotBlank() }
 
     private val testResultState = MutableStateFlow<String?>(null)
     val testResult: StateFlow<String?> = testResultState
@@ -1328,5 +1570,57 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         ttsState.value = ttsState.value.copy(
             speaking = false, activeMessageId = null, phase = TtsPhase.Idle, elapsedMs = 0L, status = "",
         )
+    }
+
+    // Startup side effects live in a TRAILING init block on purpose: Kotlin runs
+    // initializer blocks and property initializers in textual order, and
+    // viewModelScope uses Dispatchers.Main.immediate, so a launch here executes
+    // synchronously until its first suspension. Running this from the top of the
+    // class would touch state flows declared further down (avatarRepairProgress,
+    // ttsState, lastUserActivityAt, appVisible, themeState, ...) before they are
+    // initialized -> NullPointerException. Declared last, every property is ready.
+    init {
+        viewModelScope.launch {
+            core.data.characters.observeAll().collect { list ->
+                if (activeIdState.value == null && list.isNotEmpty()) {
+                    activeIdState.value = list.first().id
+                }
+            }
+        }
+        viewModelScope.launch { proactiveLoop() }
+        viewModelScope.launch { themeLoop() }
+        // Legacy one-time relative-time → absolute migration (no key required).
+        viewModelScope.launch {
+            runCatching { core.runStartupMigrations() }.onFailure { DeepTalkingApp.recordError(it) }
+        }
+        // Legacy on-load silent static-field completion (only with an API key).
+        viewModelScope.launch {
+            runCatching {
+                val cfg = core.data.config.observe().first()
+                core.runStartupMaintenance(cfg)
+            }.onFailure { DeepTalkingApp.recordError(it) }
+        }
+        // Legacy one-time migration prompts (field schema, then world book).
+        viewModelScope.launch {
+            runCatching { checkMigrationPrompts() }.onFailure { DeepTalkingApp.recordError(it) }
+        }
+        // Legacy silent avatar auto-repair for damaged placeholders.
+        autoRepairAvatars()
+        // Restore the on-device read-aloud voice selection and ready the built-in voices.
+        viewModelScope.launch {
+            val cfg = core.currentConfig()
+            cfg.ttsVoiceFile.takeIf { it.isNotBlank() }?.let { p ->
+                java.io.File(p).takeIf { it.exists() }?.let { core.cosyVoice.setVoiceFile(it) }
+            }
+            runCatching { core.cosyVoice.ensureDefaultVoices() }.onFailure { DeepTalkingApp.recordError(it) }
+            if (core.cosyVoice.voiceFile == null) {
+                core.cosyVoice.listVoices().firstOrNull()?.let { v ->
+                    core.cosyVoice.selectVoice(v.file)?.let { resolved ->
+                        core.data.config.update(core.currentConfig().copy(ttsVoiceFile = resolved.absolutePath))
+                    }
+                }
+            }
+            refreshTtsState(core.currentConfig())
+        }
     }
 }

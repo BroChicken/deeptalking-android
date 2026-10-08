@@ -12,6 +12,8 @@ import com.deeptalking.core.model.MemorySubject
 import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.StaticProfile
+import com.deeptalking.domain.agent.background.STYLE_GUARD
+import com.deeptalking.domain.agent.background.buildGroupVoiceContract
 import com.deeptalking.domain.agent.background.buildQuickReplyPerspectiveReminder
 import com.deeptalking.domain.agent.background.buildStyleAnchor
 import com.deeptalking.domain.agent.background.buildStyleCorrectionReminder
@@ -252,7 +254,8 @@ internal fun buildRoleContext(character: Character, staticOnly: Boolean): String
     if (character.isGroup) {
         val groupLines = mutableListOf<String>()
         groupLines += "群组名称: " + trimText(character.name, 160)
-        groupLines += "群组前提: " + maskUserWord(character, trimText(character.description, 700))
+        val groupPremise = character.description.ifBlank { character.staticProfile.personality }
+        groupLines += "群组前提: " + maskUserWord(character, trimText(groupPremise, 700))
         groupLines += "场景: " + maskUserWord(
             character,
             trimText(if (staticOnly) "" else character.groupSharedDynamic.currentLocation, 500),
@@ -358,7 +361,7 @@ private const val HARD_0_5 =
     "0.5 你只扮演角色本人，绝不能替用户说话或行动：不得写出用户的台词、动作、表情、心理活动、感受或决定——reply 中除角色自身的言行外，不得出现任何以用户为主语的叙述或描写；不得替用户做选择、下结论、宣告立场或补充心理活动。用户消息里已有的括号动作只作为语境理解（可自然回应），不得替用户续写、扩写或新增。需要用户表态时把话头留给他（用问句、停顿或留白），不要替他回答。"
 
 private const val HARD_2_5 =
-    "2.5 语气锁定（最高优先级，仅次于规则0）：角色的语气、口吻、腔调**只能**来自角色设定中的“说话风格”与“对用户的称呼”，其优先级**高于**模型自身的通用腔调与惯用文风；不得让本角色的说话方式向任何默认腔调靠拢。**不同角色之间的语气差异必须显著**：同一段话若换到另一个角色口中，读起来应当像另一个人说的。同时，语气只界定**整体调性**（如慵懒、爽利、疏离、黏人、克制、张扬等），不得据此限制细节发挥——语气词、口头禅、句尾助词、拟声、标点习惯、称呼的具体选取与出现频率，一律由“说话风格”和当下剧情自然决定，本规则不对其做任何数量或类型上的限制。"
+    "2.5 语气锁定（最高优先级，仅次于规则0）：角色的语气、口吻、腔调**只能**来自角色设定中的“说话风格”与“对用户的称呼”，其优先级**高于**模型自身的通用腔调与惯用文风；不得让本角色的说话方式向任何默认腔调靠拢。**不同角色之间的语气差异必须显著**：同一段话若换到另一个角色口中，读起来应当像另一个人说的。语气只界定**整体调性**（如慵懒、爽利、疏离、黏人、克制、张扬等），细节由“说话风格”和当下剧情自然决定；但**必须让设定的口头禅、句尾助词、称呼、拟声、标点习惯等签名标记真的出现**（至少自然带出其中 2 处），不得把它们中和成通用书面语或默认 AI 助手腔。"
 
 private const val OUTPUT_FORMAT =
     "【输出格式】本轮收尾只能二选一：①调用 submit_response 工具提交（推荐；reply 写进工具参数的 reply 字段）；②直接输出单个 JSON 对象（以{开头、以}结尾，reply 为第一个字段，全文不得出现 JSON 以外的文字）。两种方式都不允许在结构化内容之外写说明、思考或旁白，也不得用 Markdown 代码块包裹；**即使本轮调用过其他工具，也必须以上述方式之一收尾**；reply 里的引号写 \\\"，换行写 \\n；quickReplies 恒为两条用户视角的短句。"
@@ -637,12 +640,13 @@ private fun recentEndings(character: Character, recentAssistantReplies: List<Str
     return endings
 }
 
-/** Style violations from stored messages, falling back to detecting them on passed replies. */
+/** Style violations from stored messages, falling back to detecting them on the last two replies. */
 private fun currentStyleViolations(character: Character, recentAssistantReplies: List<String>): List<String> {
     val fromMessages = getLastStyleViolations(character)
     if (fromMessages.isNotEmpty()) return fromMessages
-    if (recentAssistantReplies.isEmpty()) return emptyList()
-    return detectStyleViolations(recentAssistantReplies.last(), character, recentAssistantReplies.dropLast(1))
+    val recent = recentAssistantReplies.filter { it.isNotBlank() }.takeLast(STYLE_GUARD.lookbackReplies)
+    if (recent.isEmpty()) return emptyList()
+    return detectStyleViolations(recent.last(), character, recent.dropLast(1))
 }
 
 /** Port of `buildLorebookContext` (two sections + footer) using selectLorebook hits. */
@@ -732,8 +736,8 @@ suspend fun buildVolatileContext(
     tailBuilder.append(buildQuickReplyPerspectiveReminder(character))
     tailBuilder.append(buildStyleCorrectionReminder(violations))
     tailBuilder.append(buildStyleReview(character))
-    val styleAnchor = buildStyleAnchor(character)
-    val tail = tailBuilder.toString().take(850) + styleAnchor.take(650)
+    val voiceContract = if (character.isGroup) buildGroupVoiceContract(character) else buildStyleAnchor(character)
+    val tail = tailBuilder.toString().take(850) + voiceContract
 
     val reserved = timeBlock.length + timelineBlock.length + tail.length + 10
     val budget = (ContextBudget.volatileChars - reserved).coerceAtLeast(0)
@@ -765,7 +769,7 @@ suspend fun buildVolatileContext(
         .toMutableList()
     if (character.isGroup) {
         character.members.forEach { member ->
-            stateLines += "【${member.name}】" + trimText(maskUserWord(character, buildDynamicStateContext(member.dynamicState)), 220)
+            stateLines += "【${member.name}】" + trimText(buildDynamicStateContext(member.dynamicState), 220)
         }
     }
     add("【角色当前状态，可随对话变化】\n" + stateLines.joinToString("\n"), 1600)

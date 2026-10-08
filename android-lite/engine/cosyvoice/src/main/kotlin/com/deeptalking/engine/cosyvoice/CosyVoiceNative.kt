@@ -4,6 +4,7 @@ import com.sun.jna.Library
 import com.sun.jna.Native
 import com.sun.jna.Pointer
 import com.sun.jna.Structure
+import java.io.File
 
 /**
  * Raw JNA bindings to the community cosyvoice.cpp C API (`libcosyvoice.so`).
@@ -56,9 +57,37 @@ internal interface CosyVoiceLib : Library {
 
     companion object {
         const val LIB_NAME = "cosyvoice"
-        val instance: CosyVoiceLib by lazy { Native.load(LIB_NAME, CosyVoiceLib::class.java) }
+
+        /**
+         * JNA resolves `cosyvoice` to `libcosyvoice.so` and, on Android, does not
+         * search the app's native-library directory on its own -- the plain
+         * `Native.load("cosyvoice", ...)` fails with
+         * `dlopen failed: library "libcosyvoice.so" not found` even though the
+         * .so is packaged in the APK. [CosyVoiceController] publishes that
+         * directory through `jna.library.path`, so load by absolute path when
+         * that path resolves; fall back to the name-based load otherwise.
+         */
+        val instance: CosyVoiceLib by lazy {
+            val explicit = resolveLibraryFile(System.getProperty("jna.library.path"), "lib$LIB_NAME.so")
+            if (explicit != null) {
+                Native.load(explicit.absolutePath, CosyVoiceLib::class.java)
+            } else {
+                Native.load(LIB_NAME, CosyVoiceLib::class.java)
+            }
+        }
     }
 }
+
+/**
+ * First existing `libFileName` across the `jna.library.path` entries, in order.
+ * Pure so the absolute-path load can be unit tested off-device.
+ */
+internal fun resolveLibraryFile(libraryPathProperty: String?, libFileName: String, separator: String = File.pathSeparator): File? =
+    libraryPathProperty.orEmpty()
+        .split(separator)
+        .filter { it.isNotBlank() }
+        .map { File(it, libFileName) }
+        .firstOrNull { it.exists() }
 
 /** Mirrors `cosyvoice_generated_speech { float* data; uint32_t length; }`. */
 @Structure.FieldOrder("data", "length")

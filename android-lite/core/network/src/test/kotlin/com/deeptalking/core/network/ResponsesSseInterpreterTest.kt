@@ -48,14 +48,30 @@ class ResponsesSseInterpreterTest {
     }
 
     @Test
-    fun webSearchCompletedSurfacesStatusHint() {
+    fun webSearchCompletedEmitsNoStatus() {
         val outcome = interpreter().onEvent(
             "response.web_search_call.completed",
             """{"type":"response.web_search_call.completed"}""",
         )
-        val call = (outcome.chunks.single() as LlmChunk.ToolCallStart).call
-        assertEquals(LLM_STATUS_CHUNK_NAME, call.name)
-        assertEquals("正在接收回复…", call.arguments)
+        assertTrue(outcome.chunks.isEmpty())
+    }
+
+    @Test
+    fun reasoningSummaryDeltaIsIgnored() {
+        val outcome = interpreter().onEvent(
+            "response.reasoning_summary_text.delta",
+            """{"type":"response.reasoning_summary_text.delta","delta":"摘要"}""",
+        )
+        assertTrue(outcome.chunks.isEmpty())
+    }
+
+    @Test
+    fun chatCompletionsChoiceDeltaFallsBackToText() {
+        val outcome = interpreter().onEvent(
+            "chat.completion.chunk",
+            """{"choices":[{"delta":{"content":"兜底文本"}}]}""",
+        )
+        assertEquals(listOf(LlmChunk.TextDelta("兜底文本")), outcome.chunks)
     }
 
     @Test

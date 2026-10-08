@@ -2,6 +2,7 @@ package com.deeptalking.core.network
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
 
 /**
@@ -56,5 +57,22 @@ class ResponsesEndpointTest {
         assertNull(opencodeSessionHeader("deepseek", "deeptalking-abc"))
         assertNull(opencodeSessionHeader("custom", "deeptalking-abc"))
         assertNull(opencodeSessionHeader(null, "deeptalking-abc"))
+    }
+
+    @Test
+    fun authorizationHeaderRequiresApiKey() {
+        assertEquals("Bearer sk-123", authorizationHeader("  sk-123 "))
+        val error = assertFailsWith<IllegalStateException> { authorizationHeader("   ") }
+        assertEquals("未配置API Key，请在设置中填写", error.message)
+        assertFailsWith<IllegalStateException> { authorizationHeader(null) }
+    }
+
+    @Test
+    fun reasoningEffortFallsBackToMediumOutsideWhitelist() {
+        assertEquals("high", normalizeReasoningEffort("high"))
+        assertEquals("none", normalizeReasoningEffort("none"))
+        assertEquals("medium", normalizeReasoningEffort("ultra"))
+        assertEquals("medium", normalizeReasoningEffort(""))
+        assertEquals("medium", normalizeReasoningEffort(null))
     }
 }

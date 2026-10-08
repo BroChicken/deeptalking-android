@@ -40,6 +40,13 @@ object CharacterParity {
             "要体现口头禅、句尾助词、标点习惯与对用户的称呼，三条之间差异明显（能看出是同一个人、但场景不同）；" +
             "**禁止换行，三条之间只能用 \" / \" 分隔**，整个字段不超过 200 字。"
 
+    private val DYNAMIC_FIELD_KEYS = setOf(
+        "currentSituation", "currentLocation", "currentMood", "currentOccupation",
+        "currentGoal", "currentRelationship", "currentImportantOthers",
+    )
+
+    private val GROUP_SHARED_DYNAMIC_FIELDS = setOf("currentSituation", "currentLocation")
+
     data class GeneratedDraft(
         val isGroup: Boolean,
         val name: String,
@@ -90,7 +97,7 @@ object CharacterParity {
 
         val profile = parseStaticProfile(json)
         val dynamic = parseDynamicState(json["dynamicState"] as? JsonObject)
-        val lorebook = parseGeneratedLorebook(json["lorebook"])
+        val lorebook = dedupeGeneratedLorebook(parseGeneratedLorebook(json["lorebook"]))
         val members = (membersArray ?: JsonArray(emptyList()))
             .mapNotNull { (it as? JsonObject)?.let(::parseMember) }
             .filter { it.name.isNotBlank() }
@@ -243,20 +250,29 @@ object CharacterParity {
     /** Legacy `collectEditDraftFromDom`: clean + normalize the edited target on save. */
     fun normalizeEditedDraft(
         character: Character,
-        memberIndex: Int?,
+        memberIndex: Int? = null,
         base: ZonedDateTime = ZonedDateTime.now(),
         zone: ZoneId = base.zone,
     ): Character {
         if (memberIndex != null && memberIndex in character.members.indices) {
-            val updated = normalizeMember(character.members[memberIndex], base, zone)
+            val source = character.members[memberIndex]
+            // Manually edited dynamic fields drop their AI bookkeeping so the
+            // model re-evaluates them (legacy `delete dynamicStateMeta[key]`).
+            val updated = normalizeMember(source, base, zone).copy(
+                dynamicStateMeta = source.dynamicStateMeta - DYNAMIC_FIELD_KEYS,
+            )
             return character.copy(members = character.members.toMutableList().also { it[memberIndex] = updated })
         }
         if (character.isGroup) {
-            return character.copy(groupSharedDynamic = normalizeDynamicState(character.groupSharedDynamic, base, zone))
+            return character.copy(
+                groupSharedDynamic = normalizeDynamicState(character.groupSharedDynamic, base, zone),
+                dynamicStateMeta = character.dynamicStateMeta - GROUP_SHARED_DYNAMIC_FIELDS,
+            )
         }
         return character.copy(
             staticProfile = normalizeStaticProfile(character.staticProfile, base, zone),
             dynamicState = normalizeDynamicState(character.dynamicState, base, zone),
+            dynamicStateMeta = character.dynamicStateMeta - DYNAMIC_FIELD_KEYS,
         )
     }
 
@@ -316,6 +332,46 @@ object CharacterParity {
     fun capLorebookName(value: String): String = value.take(AppLimits.Lorebook.NAME_CHARS)
 
     fun capLorebookContent(value: String): String = value.take(AppLimits.Lorebook.CONTENT_CHARS)
+
+    /**
+     * Local name-based near-duplicate compaction for AI-generated entries
+     * (legacy `dedupeLorebook`): a later model entry whose normalized name
+     * matches an earlier model entry is merged into it. User entries are
+     * never touched.
+     */
+    fun dedupeGeneratedLorebook(entries: List<LorebookEntry>): List<LorebookEntry> {
+        val kept = mutableListOf<LorebookEntry>()
+        for (entry in entries) {
+            if (entry.origin != LorebookOrigin.Model) {
+                kept += entry
+                continue
+            }
+            val key = normalizeLorebookName(entry.name)
+            val target = if (key.isEmpty()) {
+                -1
+            } else {
+                kept.indexOfFirst { it.origin == LorebookOrigin.Model && normalizeLorebookName(it.name) == key }
+            }
+            if (target < 0) kept += entry else kept[target] = mergeGeneratedLorebook(kept[target], entry)
+        }
+        return kept
+    }
+
+    private fun mergeGeneratedLorebook(existing: LorebookEntry, incoming: LorebookEntry): LorebookEntry = existing.copy(
+        content = when {
+            existing.content.isBlank() -> incoming.content
+            incoming.content.isBlank() || existing.content.contains(incoming.content) -> existing.content
+            else -> existing.content + "\n" + incoming.content
+        },
+        keywords = (existing.keywords + incoming.keywords).distinct().take(AppLimits.Lorebook.KEYWORDS_PER_ENTRY),
+        alwaysActive = existing.alwaysActive || incoming.alwaysActive,
+        enabled = true,
+    )
+
+    private fun normalizeLorebookName(value: String): String = value.trim().lowercase()
+        .replace(Regex("[\\s\u3000]"), "")
+        .replace(Regex("[「」『』“”‘’\"'《》〈〉（）()\\[\\]【】{}<>]"), "")
+        .replace(Regex("[，。！？、；：,.!?;:·—_\\-]"), "")
 
     fun parseGeneratedLorebook(element: JsonElement?): List<LorebookEntry> {
         val array = element as? JsonArray ?: return emptyList()

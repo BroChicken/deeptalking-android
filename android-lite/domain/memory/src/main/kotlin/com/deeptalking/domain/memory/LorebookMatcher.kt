@@ -4,6 +4,8 @@ import com.deeptalking.core.common.AppLimits
 import com.deeptalking.core.common.trimTo
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.LorebookOrigin
+import java.text.Collator
+import java.util.Locale
 
 /**
  * Lorebook selection, similarity merge/dedup and eviction helpers ported from
@@ -183,6 +185,7 @@ fun matchLorebookEntries(
     val parts = mutableListOf(query)
     recentMessages.takeLast(limits.scanMessages.coerceAtLeast(0)).forEach { parts += it }
     val haystack = parts.joinToString("\n").lowercase()
+    val collator = Collator.getInstance(Locale.CHINA)
     val hits = entries.filter { entry ->
         if (!entry.enabled || entry.content.isBlank()) return@filter false
         if (entry.alwaysActive) return@filter true
@@ -197,7 +200,7 @@ fun matchLorebookEntries(
             alwaysDiff
         } else {
             val orderDiff = orderOf(a) - orderOf(b)
-            if (orderDiff != 0) orderDiff else a.name.compareTo(b.name)
+            if (orderDiff != 0) orderDiff else collator.compare(a.name, b.name)
         }
     }
     return hits.take(limits.injectEntries)

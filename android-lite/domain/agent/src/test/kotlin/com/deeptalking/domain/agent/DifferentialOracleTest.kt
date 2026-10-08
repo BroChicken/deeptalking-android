@@ -162,9 +162,9 @@ class DifferentialOracleTest {
             val expected = expectedAll[scenario.id]!!.jsonObject["systemPrompt"]!!.jsonPrimitive.content
             val actual = buildSystemPrompt(PersonaInputs(scenario.character, scenario.config))
             assertEquals(
-                "[${scenario.id}] system prompt must be byte-identical to legacy JS",
-                expected,
-                actual,
+                "[${scenario.id}] system prompt must be byte-identical to legacy JS (hard rules normalized)",
+                normalizeHardRule(expected),
+                normalizeHardRule(actual),
             )
         }
     }
@@ -180,6 +180,23 @@ class DifferentialOracleTest {
             Regex("【本轮节奏骨架（每轮随机给出，仅作节奏参考）】[\\s\\S]*?骨架只约束节奏与详略分布，不要写出任何结构标签或说明文字，措辞与语气一律服从角色设定。"),
             "【本轮节奏骨架】(正常化)",
         )
+
+    /**
+     * Rule 2.5 was intentionally hardened beyond the legacy JS (voice markers
+     * must surface; the default assistant voice is banned), so that one line is
+     * normalized out before the byte-for-byte comparison.
+     */
+    private fun normalizeHardRule(text: String): String =
+        text.replace(Regex("(?m)^2\\.5 语气锁定.*$"), "2.5 语气锁定(正常化)")
+
+    /**
+     * The single-character 语气锚 was upgraded to a 声音契约 and the group
+     * 声音锁定 block is native-only, so the trailing voice section is normalized
+     * out (mirrors the skeleton normalization).
+     */
+    private fun normalizeVoiceContract(text: String): String =
+        text.replace(Regex("【本轮(?:语气锚|声音契约)[\\s\\S]*$"), "【本轮声音契约】(正常化)")
+            .replace(Regex("【群聊声音锁定[\\s\\S]*$"), "【群聊声音锁定】(正常化)")
 
     @Test
     fun `volatile context matches the legacy JS oracle`() = runBlocking {
@@ -200,9 +217,9 @@ class DifferentialOracleTest {
                 recentAssistantReplies = recentAssistant,
             )
             assertEquals(
-                "[${scenario.id}] volatile context must be byte-identical to legacy JS (skeleton normalized)",
-                normalizeSkeleton(expected),
-                normalizeSkeleton(actual),
+                "[${scenario.id}] volatile context must be byte-identical to legacy JS (skeleton/voice normalized)",
+                normalizeVoiceContract(normalizeSkeleton(expected)),
+                normalizeVoiceContract(normalizeSkeleton(actual)),
             )
         }
     }

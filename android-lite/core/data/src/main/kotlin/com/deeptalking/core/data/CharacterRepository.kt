@@ -10,7 +10,18 @@ import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import java.time.Instant
 
-class CharacterRepository(private val dao: CharacterDao) {
+class CharacterRepository(
+    private val dao: CharacterDao,
+    /**
+     * Invoked once per distinct corrupt row payload so the original JSON can be
+     * preserved for recovery (`/persistence.js` keeps the raw string in
+     * `STORAGE_RECOVERY_KEY`). Never receives secrets: keys live in
+     * `:core:security`.
+     */
+    private val onCorruptRow: ((id: String, payload: String) -> Unit)? = null,
+) {
+
+    private val reportedCorrupt = java.util.concurrent.ConcurrentHashMap.newKeySet<Int>()
 
     fun observeAll(): Flow<List<Character>> =
         dao.observeAll().map { rows -> rows.mapNotNull(::decode) }
@@ -49,4 +60,11 @@ class CharacterRepository(private val dao: CharacterDao) {
 
     private fun decode(entity: CharacterEntity): Character? =
         runCatching { AppJson.decodeFromString<Character>(entity.payload) }.getOrNull()
+            ?: run {
+                val reporter = onCorruptRow
+                if (reporter != null && reportedCorrupt.add((entity.id + "\u0000" + entity.payload).hashCode())) {
+                    runCatching { reporter.invoke(entity.id, entity.payload) }
+                }
+                null
+            }
 }

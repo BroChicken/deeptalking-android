@@ -56,9 +56,17 @@ class MemoryServiceImpl : MemoryService {
 
     override fun selectLorebook(character: Character, recentText: String): List<LorebookEntry> {
         val entries = mutableListOf<LorebookEntry>()
-        entries += character.lorebook
+        val seen = mutableSetOf<String>()
+        fun push(list: List<LorebookEntry>) {
+            list.forEach { entry ->
+                if (!entry.enabled || entry.content.isBlank()) return@forEach
+                val key = entry.id.ifBlank { "${entry.name}|${entry.content}" }
+                if (seen.add(key)) entries += entry
+            }
+        }
+        push(character.lorebook)
         if (character.isGroup) {
-            character.members.forEach { entries += it.lorebook }
+            character.members.forEach { push(it.lorebook) }
         }
         val recentMessages = character.instant
             .filter { !it.isLoading }
@@ -82,7 +90,7 @@ class MemoryServiceImpl : MemoryService {
                 val incoming = memberLongTerm.entries
                     .firstOrNull { it.key.equals(member.name, ignoreCase = true) }
                     ?.value
-                if (incoming.isNullOrEmpty()) member else member.copy(longTerm = mergeStores(member.longTerm, incoming))
+                member.copy(longTerm = mergeStores(member.longTerm, incoming ?: emptyList()))
             }
         }
         return character.copy(shortTerm = mergedShortTerm, longTerm = mergedLongTerm, members = members)
@@ -145,8 +153,7 @@ class MemoryServiceImpl : MemoryService {
     }
 
     private fun mergeStores(existing: List<LongTermMemory>, incoming: List<LongTermMemory>): List<LongTermMemory> {
-        if (incoming.isEmpty()) return existing
-        val combined = existing + incoming
+        val combined = if (incoming.isEmpty()) existing else existing + incoming
         return MemoryCategory.entries.flatMap { category ->
             val forCategory = combined.filter { it.category == category }
             pruneLongTerm(dedupeLongTerm(forCategory, category))

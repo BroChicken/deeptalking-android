@@ -5,10 +5,13 @@ import com.deeptalking.core.data.CoreDataContainer
 import com.deeptalking.core.data.legacy.BackupService
 import com.deeptalking.core.data.legacy.FileStickerSink
 import com.deeptalking.core.data.legacy.MediaRef
+import com.deeptalking.core.common.AppLimits
 import com.deeptalking.core.model.AppConfig
+import com.deeptalking.core.model.BuiltinPlatforms
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.GroupMember
+import com.deeptalking.core.model.RequestMetric
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.core.network.HttpWebContentProvider
@@ -16,6 +19,8 @@ import com.deeptalking.core.network.ResponsesLlmBackend
 import com.deeptalking.core.security.SecretStore
 import com.deeptalking.engine.ondevice.InferenceRegistry
 import com.deeptalking.engine.ondevice.LlmRequest
+import com.deeptalking.engine.ondevice.LlmResult
+import com.deeptalking.engine.ondevice.TokenUsage
 import com.deeptalking.engine.cosyvoice.CosyVoiceController
 import com.deeptalking.domain.agent.ChatOrchestrator
 import com.deeptalking.domain.agent.ToolRegistry
@@ -28,7 +33,14 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.put
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
@@ -37,6 +49,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.util.UUID
 import java.util.concurrent.TimeUnit
+import java.time.Instant
 
 /** Manual DI graph for the native app, created once from [DeepTalkingApp]. */
 class NativeCore(context: Context) {
@@ -86,6 +99,7 @@ class NativeCore(context: Context) {
         config = data.config,
         stickerSink = stickerSink,
         mediaSource = MediaRef.source(appContext),
+        appVersion = BuildConfig.VERSION_NAME,
     )
 
     suspend fun currentConfig(): AppConfig = data.config.current()
@@ -105,6 +119,7 @@ class NativeCore(context: Context) {
             config.apiPlatform,
             backgroundQueue,
             config,
+            liveCharacter = { id -> data.characters.get(id) },
         )
 
     /**
@@ -156,6 +171,8 @@ class NativeCore(context: Context) {
                                 shortTerm = updated.shortTerm,
                                 longTerm = updated.longTerm,
                                 dynamicState = updated.dynamicState,
+                                staticProfile = updated.staticProfile,
+                                members = updated.members,
                                 timeParseVersion = updated.timeParseVersion,
                             ),
                         )
@@ -246,57 +263,150 @@ class NativeCore(context: Context) {
         if (character.isGroup) character.description else character.staticProfile.background
 
     /**
-     * Two-phase connectivity probe mirroring the legacy `testApiConnection`:
-     * (1) site reachability, (2) a minimal Responses call. Returns a
-     * human-readable multi-line report. Never throws.
+     * Two-phase connectivity probe mirroring the legacy `testApiConnection`
+     * (`status-settings.js:177-222`): (1) a GET on `baseUrl + '/'` for site
+     * reachability, (2) a minimal, non-streaming Responses POST whose real
+     * `HTTP <status>` and server error are echoed back. Returns a human-readable
+     * multi-line report. Never throws.
      */
     suspend fun testApiConnection(config: AppConfig, apiKey: String): String = withContext(Dispatchers.IO) {
-        val base = config.apiBaseUrl.trimEnd('/')
+        val base = normalizeApiBaseUrl(config.apiBaseUrl)
+        if (base.isEmpty()) return@withContext "未配置 API Base URL，请先填写后再测试。"
+        val client = OkHttpClient.Builder()
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .build()
         val report = StringBuilder()
         report.append("① 站点可达性：")
         report.append(
             runCatching {
-                val client = okhttp3.OkHttpClient.Builder()
-                    .connectTimeout(8, TimeUnit.SECONDS)
-                    .readTimeout(8, TimeUnit.SECONDS)
-                    .build()
-                // Probe the OpenAI-compatible model list: a real HTTP response (200 on
-                // OpenCode Go, 401 without a key elsewhere) means the site is reachable.
-                val probeUrl = (base.ifBlank { "https://api.deepseek.com/v1" }) + "/models"
                 client.newCall(
-                    okhttp3.Request.Builder()
-                        .url(probeUrl)
+                    Request.Builder()
+                        .url(base.trimEnd('/') + "/")
                         .header("User-Agent", userAgent)
+                        .get()
                         .build(),
                 ).execute().use { "可达（HTTP ${it.code}）" }
             }.getOrElse { "无法连接（${it.message ?: it}）。可能是网络不通、域名无法解析或被拦截" },
         )
         report.append("\n② 接口调用：")
+        val endpoint = responsesEndpointFor(config, base)
         report.append(
             runCatching {
-                val backend = ResponsesLlmBackend(apiKeyProvider = { apiKey }, baseUrl = base, userAgent = userAgent)
-                val result = backend.complete(
-                    LlmRequest(
-                        model = config.modelName,
-                        instructions = "用中文回复“连接正常”。",
-                        input = listOf(ChatMessage(role = Role.User, content = "hi")),
-                        maxOutputTokens = 32,
-                        reasoningEffort = "none",
-                        apiPlatform = config.apiPlatform,
-                        sessionId = "deeptalking-general",
-                    ),
-                )
-                "HTTP 200，正常返回（${result.text.take(40).ifBlank { "空" }}）"
-            }.getOrElse { "失败（${it.message ?: it}）" },
+                val payload = buildJsonObject {
+                    put("model", config.modelName.ifBlank { "deepseek-flash" })
+                    put("input", buildJsonArray {
+                        add(buildJsonObject {
+                            put("role", "user")
+                            put("content", "hi")
+                        })
+                    })
+                    put("max_output_tokens", 50)
+                    put("stream", false)
+                    put("reasoning", buildJsonObject { put("effort", "none") })
+                }.toString()
+                val request = Request.Builder()
+                    .url(endpoint)
+                    .addHeader("Content-Type", "application/json")
+                    .addHeader("User-Agent", userAgent)
+                    .addHeader("Authorization", "Bearer $apiKey")
+                    .post(payload.toRequestBody("application/json; charset=utf-8".toMediaType()))
+                    .build()
+                client.newCall(request).execute().use { response ->
+                    val text = response.body?.string().orEmpty()
+                    val parsed = runCatching {
+                        Json.parseToJsonElement(text) as? JsonObject
+                    }.getOrNull()
+                    val error = parsed?.get("error") as? JsonObject
+                    val output = parsed?.get("output")
+                    val outputText = parsed?.get("output_text")
+                    buildString {
+                        append("HTTP ${response.code}")
+                        when {
+                            error != null -> append("，服务端报错：")
+                                .append(error.str("message").ifBlank { error.str("type") })
+                            output is JsonArray || outputText is JsonPrimitive -> append("，正常返回")
+                            else -> append("（响应不是标准 JSON，可能端点到错了）")
+                        }
+                    }
+                }
+            }.getOrElse { "失败（${it.message ?: it}）。若站点可达但此处失败，多半是网络被拦或 Key 无效" },
         )
-        report.append("\n当前端点：$base/responses")
+        report.append("\n当前端点：").append(endpoint)
         report.toString()
+    }
+
+    /** Mirrors the legacy `normalizeApiBaseUrl`: trim + drop trailing slashes. */
+    private fun normalizeApiBaseUrl(value: String): String = value.trim().trimEnd('/')
+
+    /** Local mirror of `ResponsesLlmBackend.responsesEndpoint` (`core:network`, internal). */
+    private fun responsesEndpointFor(config: AppConfig, base: String): String {
+        var url = normalizeApiBaseUrl(base)
+            .replace(Regex("/chat/completions$", RegexOption.IGNORE_CASE), "")
+            .trimEnd('/')
+        val keepV1 = BuiltinPlatforms.firstOrNull { it.id == config.apiPlatform }?.keepV1InResponses == true
+        if (!keepV1) url = url.replace(Regex("/v1$", RegexOption.IGNORE_CASE), "")
+        return url + "/responses"
+    }
+
+    /**
+     * Runs a non-streaming auxiliary/background call and records its usage into
+     * `requestMetrics`, mirroring the legacy `callAPI` → `recordCacheUsage` path.
+     */
+    private suspend fun trackedComplete(config: AppConfig, taskType: String, request: LlmRequest): LlmResult {
+        val backend = ResponsesLlmBackend(
+            apiKeyProvider = { apiKeyFor(config.apiPlatform) },
+            baseUrl = config.apiBaseUrl,
+            userAgent = userAgent,
+        )
+        val startedAt = System.currentTimeMillis()
+        return try {
+            val result = backend.complete(request)
+            recordAuxMetric(config, taskType, startedAt, result.usage, "completed")
+            result
+        } catch (t: Throwable) {
+            recordAuxMetric(config, taskType, startedAt, null, "failed")
+            throw t
+        }
+    }
+
+    /** Appends one auxiliary/background request metric (legacy `recordCacheUsage`). */
+    private suspend fun recordAuxMetric(
+        config: AppConfig,
+        taskType: String,
+        startedAt: Long,
+        usage: TokenUsage?,
+        status: String,
+    ) {
+        val input = usage?.inputTokens?.takeIf { it > 0 }
+        val hit = usage?.cachedTokens
+        val miss = if (input != null && hit != null) (input - hit).coerceAtLeast(0) else null
+        val metric = RequestMetric(
+            at = Instant.now().toString(),
+            taskType = taskType,
+            model = config.modelName,
+            platform = config.apiPlatform,
+            status = status,
+            durationMs = System.currentTimeMillis() - startedAt,
+            inputTokens = input,
+            outputTokens = usage?.outputTokens,
+            hitTokens = hit,
+            missTokens = miss,
+            hitRate = if (input != null && hit != null) hit.toDouble() / input else null,
+        )
+        runCatching {
+            val latest = data.config.current()
+            data.config.update(
+                latest.copy(requestMetrics = (latest.requestMetrics + metric).takeLast(AppLimits.Api.REQUEST_METRICS)),
+            )
+        }
     }
 
     /** One-line character/group generation; returns the raw JSON string from the model. */
     suspend fun quickGenerate(config: AppConfig, prompt: String): String? {
-        val backend = ResponsesLlmBackend(apiKeyProvider = { apiKeyFor(config.apiPlatform) }, baseUrl = config.apiBaseUrl, userAgent = userAgent)
-        val result = backend.complete(
+        val result = trackedComplete(
+            config,
+            "auxiliary",
             LlmRequest(
                 model = config.modelName,
                 instructions = QUICK_GEN_INSTRUCTIONS,
@@ -318,13 +428,10 @@ class NativeCore(context: Context) {
      */
     suspend fun generateToneInstruction(config: AppConfig, spokenText: String, character: Character?): String? {
         if (spokenText.isBlank()) return null
-        val backend = ResponsesLlmBackend(
-            apiKeyProvider = { apiKeyFor(config.apiPlatform) },
-            baseUrl = config.apiBaseUrl,
-            userAgent = userAgent,
-        )
         val result = runCatching {
-            backend.complete(
+            trackedComplete(
+                config,
+                "auxiliary",
                 LlmRequest(
                     model = config.modelName,
                     instructions = TONE_INSTRUCTION_SYSTEM,
@@ -377,8 +484,9 @@ class NativeCore(context: Context) {
         )
 
     private suspend fun requestEmojiAvatar(config: AppConfig, description: String): String? {
-        val backend = ResponsesLlmBackend(apiKeyProvider = { apiKeyFor(config.apiPlatform) }, baseUrl = config.apiBaseUrl, userAgent = userAgent)
-        val result = backend.complete(
+        val result = trackedComplete(
+            config,
+            "auxiliary",
             LlmRequest(
                 model = config.modelName,
                 instructions = "你是角色头像助手。只输出一个最能代表该角色的 emoji 字符，不要任何文字、标点或解释。",
@@ -414,13 +522,14 @@ class NativeCore(context: Context) {
     /** Legacy `tagStickerImage`: vision-classify a sticker into one vocabulary tag. */
     suspend fun tagSticker(config: AppConfig, imageRef: String): String? {
         if (MediaRef.toDataUri(appContext, imageRef) == null) return null
-        val backend = ResponsesLlmBackend(apiKeyProvider = { apiKeyFor(config.apiPlatform) }, baseUrl = config.apiBaseUrl, userAgent = userAgent)
         val message = ChatMessage(
             role = Role.User,
-            content = "给这张表情包选一个标签。",
+            content = "给这张图打一个短词标签。",
             attachments = listOf(com.deeptalking.core.model.MessageAttachment(com.deeptalking.core.model.MessageAttachment.Kind.Image, imageRef)),
         )
-        val result = backend.complete(
+        val result = trackedComplete(
+            config,
+            "auxiliary",
             LlmRequest(
                 model = config.modelName,
                 instructions = "你是表情包分类助手。看这张表情包或图片，从下列标签中选一个最贴切的：" + STICKER_TAGS.joinToString("、") +
@@ -434,7 +543,9 @@ class NativeCore(context: Context) {
                 imageResolver = { ref -> MediaRef.toDataUri(appContext, ref) },
             ),
         )
-        val tag = result.text.trim().replace(Regex("\\s+"), "").take(6)
+        val tag = result.text.trim()
+            .replace(Regex("[\\s\r\n\"'“”‘’。，,、！!？?：:；;（）()\\[\\]]"), "")
+            .take(6)
         return tag.takeIf { it.isNotEmpty() }
     }
 
@@ -449,17 +560,64 @@ class NativeCore(context: Context) {
         member: GroupMember,
         hint: String,
     ): String? {
-        val backend = ResponsesLlmBackend(apiKeyProvider = { apiKeyFor(config.apiPlatform) }, baseUrl = config.apiBaseUrl, userAgent = userAgent)
-        val otherMembers = group.members
-            .filter { it.id != member.id }
-            .map { mapOf("name" to it.name, "personality" to it.staticProfile.personality, "roleInGroup" to it.roleInGroup) }
-        val userPayload = buildString {
-            append("群组信息:\n").append(group.description).append('\n')
-            append("群组其他成员:\n").append(otherMembers).append('\n')
-            append("待补全成员:\n").append(member.name).append(' ').append(member.staticProfile.personality).append('\n')
-            append("用户补充:\n").append(hint)
+        val groupInfo = buildJsonObject {
+            put("name", group.name)
+            put("avatar", group.emoji)
+            put("description", group.description)
+            put("scene", group.groupSharedDynamic.currentLocation)
+            put("interactionRules", group.interactionRules)
         }
-        val result = backend.complete(
+        val otherMembers = buildJsonArray {
+            group.members.filter { it.id != member.id }.forEach { other ->
+                add(
+                    buildJsonObject {
+                        put("name", other.name)
+                        put("personality", other.staticProfile.personality)
+                        put("speakingStyle", other.staticProfile.speakingStyle)
+                        put("roleInGroup", other.roleInGroup)
+                    },
+                )
+            }
+        }
+        val memberJson = buildJsonObject {
+            put("name", member.name)
+            put("avatar", member.emoji)
+            put("gender", member.staticProfile.gender)
+            put("age", member.staticProfile.age)
+            put("race", member.staticProfile.race)
+            put("appearance", member.staticProfile.appearance)
+            put("personality", member.staticProfile.personality)
+            put("values", member.staticProfile.values)
+            put("fears", member.staticProfile.fears)
+            put("background", member.staticProfile.background)
+            put("keyEvents", member.staticProfile.keyEvents)
+            put("speakingStyle", member.staticProfile.speakingStyle)
+            put("language", member.staticProfile.language)
+            put("userAddress", member.staticProfile.userAddress)
+            put("roleInGroup", member.roleInGroup)
+            put(
+                "dynamicState",
+                buildJsonObject {
+                    put("currentSituation", member.dynamicState.currentSituation)
+                    put("currentLocation", member.dynamicState.currentLocation)
+                    put("currentMood", member.dynamicState.currentMood)
+                    put("currentOccupation", member.dynamicState.currentOccupation)
+                    put("currentGoal", member.dynamicState.currentGoal)
+                    put("currentRelationship", member.dynamicState.currentRelationship)
+                    put("currentImportantOthers", member.dynamicState.currentImportantOthers)
+                },
+            )
+        }
+        val userPayload = buildString {
+            append("群组信息:\n").append(groupInfo).append('\n')
+            append("群组其他成员:\n").append(otherMembers).append('\n')
+            append("待补全成员:\n").append(memberJson).append('\n')
+            append("用户补充:\n").append(hint)
+            append('\n').append(com.deeptalking.feature.characters.CharacterParity.SPEAKING_STYLE_SAMPLES_RULE)
+        }
+        val result = trackedComplete(
+            config,
+            "auxiliary",
             LlmRequest(
                 model = config.modelName,
                 instructions = FILL_MEMBER_INSTRUCTIONS,
@@ -514,13 +672,25 @@ class NativeCore(context: Context) {
     fun createOrchestrator(
         config: AppConfig,
         onCharacterUpdated: (Character) -> Unit = {},
+        onStatus: (String) -> Unit = {},
+        onAuxiliaryUsage: (String, com.deeptalking.engine.ondevice.TokenUsage) -> Unit = { _, _ -> },
     ): ChatOrchestrator {
         val llm = ResponsesLlmBackend(
             apiKeyProvider = { apiKeyFor(config.apiPlatform) },
             baseUrl = config.apiBaseUrl,
             userAgent = userAgent,
         )
-        val background = BackgroundTasks(llm, memory, config.modelName, config.apiPlatform, backgroundQueue, config)
+        val background = BackgroundTasks(
+            llm,
+            memory,
+            config.modelName,
+            config.apiPlatform,
+            backgroundQueue,
+            config,
+            liveCharacter = { id -> data.characters.get(id) },
+            onStatus = onStatus,
+            onAuxiliaryUsage = onAuxiliaryUsage,
+        )
         return ChatOrchestrator(
             llm = llm,
             tools = tools,

@@ -31,6 +31,21 @@ class CosyVoiceController(private val context: Context) {
 
     private val store = VoiceStore(voicesDir)
 
+    init {
+        // JNA does not search the app's native library directory on Android, so
+        // the APK-packaged libcosyvoice.so is otherwise reported "not found".
+        // Publish the directory before the lazy CosyVoiceLib load, prepending it
+        // to any path a host (or tests) already set.
+        val nativeDir = context.applicationInfo.nativeLibraryDir
+        if (!nativeDir.isNullOrBlank()) {
+            val existing = System.getProperty("jna.library.path").orEmpty()
+            System.setProperty(
+                "jna.library.path",
+                if (existing.isBlank()) nativeDir else nativeDir + File.pathSeparator + existing,
+            )
+        }
+    }
+
     @Volatile
     var voiceFile: File? = null
         private set

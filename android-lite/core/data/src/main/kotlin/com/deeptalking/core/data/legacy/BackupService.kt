@@ -93,6 +93,11 @@ class BackupService(
     private val config: ConfigRepository,
     private val stickerSink: StickerSink? = null,
     private val mediaSource: MediaSource? = null,
+    /**
+     * App version written into the exported root (`version`), mirroring the
+     * legacy `APP_VERSION`. Pass `BuildConfig.VERSION_NAME` from `:app`.
+     */
+    private val appVersion: String = "native",
 ) {
     private val codec = Json {
         prettyPrint = true
@@ -118,7 +123,7 @@ class BackupService(
             }
             put("activeTheme", appConfig.activeTheme)
             put("exportDate", appConfig.exportDateOrNow())
-            put("version", "native")
+            put("version", appVersion)
         }
         return codec.encodeToString(JsonElement.serializer(), root)
     }

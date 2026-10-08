@@ -5,6 +5,7 @@ import com.deeptalking.core.common.trimTo
 import com.deeptalking.core.model.AppConfig
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
+import com.deeptalking.core.model.DynamicState
 import com.deeptalking.core.model.LongTermMemory
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.PromiseStatus
@@ -19,17 +20,26 @@ import com.deeptalking.domain.agent.prompts.buildVolatileContext
 import com.deeptalking.domain.agent.prompts.withDynamicField
 import com.deeptalking.domain.agent.prompts.withStaticField
 import com.deeptalking.domain.agent.background.BackgroundTasks
+import com.deeptalking.domain.agent.background.STYLE_GUARD
 import com.deeptalking.domain.agent.background.dedupeRepeatedEnding
+import com.deeptalking.domain.agent.background.detectStyleViolations
 import com.deeptalking.domain.agent.background.recentReplyTexts
+import com.deeptalking.domain.agent.tools.MemoryToolSupport
 import com.deeptalking.domain.agent.tools.SubmitResponseTool
 import com.deeptalking.domain.memory.MemoryService
+import com.deeptalking.domain.memory.ShortTermDraft
+import com.deeptalking.domain.memory.TimeRef
+import com.deeptalking.domain.memory.addShortTermMemory
 import com.deeptalking.domain.memory.consumeInjectedRecalls
 import com.deeptalking.domain.memory.SourceRef
 import com.deeptalking.domain.memory.hasStaticEditIntent
 import com.deeptalking.domain.memory.hasValidUserEvidence
 import com.deeptalking.domain.memory.knownSources
+import com.deeptalking.domain.memory.parseRelativeText
+import com.deeptalking.domain.memory.parseZoned
 import com.deeptalking.domain.memory.resolveDynamicStateSources
 import com.deeptalking.domain.memory.resolveMemoryConflicts
+import com.deeptalking.domain.memory.resolveTimeRef
 import com.deeptalking.domain.memory.upsertLongTermMemory
 import com.deeptalking.engine.ondevice.LlmBackend
 import kotlinx.serialization.json.JsonArray
@@ -39,6 +49,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import java.time.Instant
+import java.time.ZonedDateTime
 
 /** Result of one user turn. */
 data class OrchestratorResult(
@@ -59,6 +70,12 @@ data class OrchestratorResult(
     val inputTokens: Int = 0,
     val outputTokens: Int = 0,
     val cachedTokens: Int = 0,
+    /** FNV-1a hash of the system instructions (legacy `instructionsHash`). */
+    val instructionsHash: String = "",
+    /** FNV-1a hash of this request's tool definitions (legacy `toolsHash`). */
+    val toolsHash: String = "",
+    /** Character count of the per-turn volatile context message (legacy `contextChars`). */
+    val contextChars: Int = 0,
 )
 
 /**
@@ -97,7 +114,9 @@ class ChatOrchestrator(
         val instructions = buildSystemPrompt(PersonaInputs(character, config, proactive))
         val context = AgentContext(character = character, activeCharacterId = character.id)
 
-        val mapped = builder.mapHistory(history).toMutableList()
+        val mapped = builder.mapHistory(history).let { mapped ->
+            if (mapped.size > AppLimits.Memory.INSTANT) mapped.takeLast(AppLimits.Memory.INSTANT) else mapped
+        }.toMutableList()
         if (mapped.lastOrNull()?.role != Role.User) {
             mapped += ChatMessage(role = Role.User, content = userText, internalOnly = proactive)
         }
@@ -111,13 +130,18 @@ class ChatOrchestrator(
             proactiveTurn = proactive,
             recentAssistantReplies = recentAssistantReplies,
         )
-        val input = mapped + ChatMessage(
+        val contextMessage = ChatMessage(
             role = Role.User,
             content = "【系统提供的本轮上下文，仅供角色理解，不代表用户陈述】\n" + volatileContext,
         )
+        val input = mapped + contextMessage
 
         val autoTools = tools.definitions(context)
         val submitTool = SubmitResponseTool().definition
+        val instructionsHash = fnv1a(instructions)
+        val toolsHash = fnv1a(
+            autoTools.joinToString("\n") { "${it.name}|${it.description}|${it.parametersJson}|${it.strict}" },
+        )
         val loop = AgentLoop(llm, tools)
         val outcome = loop.run(
             character = character,
@@ -131,11 +155,29 @@ class ChatOrchestrator(
             onToolActivity = onToolActivity,
         )
 
-        val parsed = when {
+        val parsedBase = when {
             outcome.submitCall != null ->
                 ResponseParser.parseSubmitResponse(outcome.submitCall.arguments)
                     ?: ResponseParser.parseTurnFromText(outcome.text)
             else -> ResponseParser.parseTurnFromText(outcome.text)
+        }
+        // Prose/salvage turns may still carry a legacy `<MEM_UPDATE>` block; parse and
+        // fold it in before applying memory (legacy `parseMemoryFromText`).
+        val memUpdate = if (parsedBase.raw == null) ResponseParser.parseMemoryFromText(outcome.text) else null
+        val parsed = if (memUpdate != null) {
+            parsedBase.copy(
+                shortTerm = memUpdate.shortTerm,
+                shortTermTimeRefs = memUpdate.shortTermTimeRefs,
+                longTerm = memUpdate.longTerm,
+                longTermTimeRefs = memUpdate.longTermTimeRefs,
+                dynamicState = memUpdate.dynamicState,
+                staticFields = memUpdate.staticFields,
+                memberDynamicState = memUpdate.memberDynamicState,
+                promiseUpdates = memUpdate.promiseUpdates,
+                recall = memUpdate.recall,
+            )
+        } else {
+            parsedBase
         }
 
         val quickReplies = if (parsed.quickReplies.size >= 2) {
@@ -188,6 +230,13 @@ class ChatOrchestrator(
             parsed.reply
         }
         val displayReply = dedupeRepeatedEnding(critiqued, previousReply)
+        // Client-side style violation detection (legacy `detectStyleViolations`), stored
+        // on the assistant turn so the review pass can report "最近几轮问题".
+        val styleViolations = detectStyleViolations(
+            displayReply,
+            updated,
+            recentReplyTexts(character, STYLE_GUARD.lookbackReplies),
+        )
 
         // Mirror the live conversation window into `character.instant` (legacy
         // `memory.instant`): tools (set_reminder), the volatile context and the
@@ -196,6 +245,7 @@ class ChatOrchestrator(
             id = "assistant_" + character.id,
             role = Role.Assistant,
             content = displayReply,
+            styleViolations = styleViolations,
         )
         val instantWindow = (history.filter { !it.rejected } + assistantMessage).let {
             if (it.size > AppLimits.Memory.INSTANT) it.takeLast(AppLimits.Memory.INSTANT) else it
@@ -213,7 +263,8 @@ class ChatOrchestrator(
                 quickReplyRepairEnabled = config.quickReplyRepair,
                 onCharacterUpdated = onCharacterUpdated,
                 onQuickRepliesRepaired = onQuickRepliesRepaired,
-                proseFallback = parsed.raw == null,
+                styleViolations = styleViolations,
+                proseFallback = parsed.raw == null && memUpdate == null,
             )
         }
 
@@ -229,7 +280,20 @@ class ChatOrchestrator(
             inputTokens = outcome.usage?.inputTokens ?: 0,
             outputTokens = outcome.usage?.outputTokens ?: 0,
             cachedTokens = outcome.usage?.cachedTokens ?: 0,
+            instructionsHash = instructionsHash,
+            toolsHash = toolsHash,
+            contextChars = contextMessage.content.length,
         )
+    }
+
+    /** Port of the legacy `hashRequestPart` (FNV-1a over the FNV offset base). */
+    private fun fnv1a(text: String): String {
+        var hash = 0x811c9dc5L
+        for (ch in text) {
+            hash = hash xor ch.code.toLong()
+            hash = (hash * 0x01000193L) and 0xFFFFFFFFL
+        }
+        return hash.toString(16)
     }
 
     /** Labels of static profile fields whose value changed during the turn. */
@@ -287,10 +351,11 @@ class ChatOrchestrator(
         parsed: ParsedTurn,
         assistantMessage: ChatMessage,
     ): Character {
-        var updated = memory.applyTurn(character, parsed.shortTerm, emptyList())
+        val nowBase = ZonedDateTime.now()
+        var updated = applyShortTerm(character, parsed, nowBase)
         val sources = knownSources(updated)
 
-        updated = applyLongTerm(updated, parsed.longTerm, sources, assistantMessage)
+        updated = applyLongTerm(updated, parsed, sources, assistantMessage, nowBase)
 
         parsed.promiseUpdates.forEach { update ->
             updated = applyPromiseUpdate(updated, update, sources)
@@ -304,9 +369,11 @@ class ChatOrchestrator(
             var profile = updated.staticProfile
             fields.forEach { (key, element) ->
                 if (STATIC_PROFILE_FIELDS.none { it.first == key }) return@forEach
-                val value = fieldValue(element)
-                if (value.isEmpty()) return@forEach
                 val obj = fieldObject(element)
+                val raw = fieldValue(element)
+                if (raw.isEmpty()) return@forEach
+                val value = MemoryToolSupport.cleanFieldValue(key, parseRelativeText(raw, resolveFieldBase(obj, nowBase)))
+                if (value.isEmpty()) return@forEach
                 val resolved = hasValidUserEvidence(updated, fieldSourceIds(obj), fieldEvidence(obj), sources)
                     ?: return@forEach
                 if (!hasStaticEditIntent(key, resolved)) return@forEach
@@ -316,17 +383,7 @@ class ChatOrchestrator(
         }
 
         parsed.dynamicState?.let { state ->
-            var dynamic = updated.dynamicState
-            state.forEach { (key, element) ->
-                if (DYNAMIC_STATE_FIELDS.none { it.first == key }) return@forEach
-                val value = fieldValue(element)
-                if (value.isEmpty()) return@forEach
-                val obj = fieldObject(element)
-                if (resolveDynamicStateSources(updated, fieldSourceIds(obj), fieldEvidence(obj), assistantMessage, sources) == null) {
-                    return@forEach
-                }
-                dynamic = withDynamicField(dynamic, key, value)
-            }
+            val dynamic = applyDynamicStateFields(updated.dynamicState, state, updated, assistantMessage, sources, nowBase)
             updated = updated.copy(dynamicState = dynamic)
         }
 
@@ -335,17 +392,14 @@ class ChatOrchestrator(
                 val update = parsed.memberDynamicState.firstOrNull {
                     it.memberName.equals(member.name, ignoreCase = true)
                 } ?: return@map member
-                var dynamic = member.dynamicState
-                update.dynamicState.forEach { (key, element) ->
-                    if (DYNAMIC_STATE_FIELDS.none { it.first == key }) return@forEach
-                    val value = fieldValue(element)
-                    if (value.isEmpty()) return@forEach
-                    val obj = fieldObject(element)
-                    if (resolveDynamicStateSources(updated, fieldSourceIds(obj), fieldEvidence(obj), assistantMessage, sources) == null) {
-                        return@forEach
-                    }
-                    dynamic = withDynamicField(dynamic, key, value)
-                }
+                val dynamic = applyDynamicStateFields(
+                    member.dynamicState,
+                    update.dynamicState,
+                    updated,
+                    assistantMessage,
+                    sources,
+                    nowBase,
+                )
                 member.copy(dynamicState = dynamic)
             }
             updated = updated.copy(members = members)
@@ -354,15 +408,89 @@ class ChatOrchestrator(
         return resolveMemoryConflicts(updated)
     }
 
+    /**
+     * Validated short-term writes through [addShortTermMemory] (legacy `addShortTermMemory`
+     * from the main turn): every cited source must resolve to a real message, relative
+     * time wording is normalized, and `timeRef` is resolved to an absolute event time.
+     */
+    private fun applyShortTerm(character: Character, parsed: ParsedTurn, nowBase: ZonedDateTime): Character {
+        if (parsed.shortTerm.isEmpty()) return character
+        val nowIso = nowBase.toInstant().toString()
+        var working = character
+        parsed.shortTerm.forEachIndexed { index, item ->
+            val eventTime = resolveEventTime(item.eventTime, parsed.shortTermTimeRefs.getOrNull(index), nowBase, nowIso)
+            val result = addShortTermMemory(
+                list = working.shortTerm,
+                draft = ShortTermDraft(
+                    content = item.content,
+                    sourceMessageIds = item.sourceMessageIds,
+                    eventTime = eventTime,
+                    participants = item.participants,
+                    location = item.location,
+                ),
+                timestamp = nowIso,
+                sources = knownSources(working),
+            )
+            if (result.accepted) working = working.copy(shortTerm = result.list)
+        }
+        return working
+    }
+
+    /** Resolves a short-term `timeRef` against its declared/now event time (legacy write order). */
+    private fun resolveEventTime(
+        eventTime: String?,
+        timeRef: TimeRef?,
+        nowBase: ZonedDateTime,
+        nowIso: String,
+    ): String {
+        val base = parseZoned(eventTime) ?: nowBase
+        resolveTimeRef(timeRef, base)?.iso?.let { return it }
+        return parseZoned(eventTime)?.toInstant()?.toString() ?: nowIso
+    }
+
+    /** Applies one `dynamicState` object through the field cleaning + evidence gate. */
+    private fun applyDynamicStateFields(
+        current: DynamicState,
+        state: JsonObject,
+        host: Character,
+        assistantMessage: ChatMessage,
+        sources: Map<String, SourceRef>,
+        nowBase: ZonedDateTime,
+    ): DynamicState {
+        var dynamic = current
+        state.forEach { (key, element) ->
+            if (DYNAMIC_STATE_FIELDS.none { it.first == key }) return@forEach
+            val obj = fieldObject(element)
+            val raw = fieldValue(element)
+            if (raw.isEmpty()) return@forEach
+            val value = MemoryToolSupport.cleanFieldValue(key, parseRelativeText(raw, resolveFieldBase(obj, nowBase)))
+            if (value.isEmpty()) return@forEach
+            if (resolveDynamicStateSources(host, fieldSourceIds(obj), fieldEvidence(obj), assistantMessage, sources) == null) {
+                return@forEach
+            }
+            dynamic = withDynamicField(dynamic, key, value)
+        }
+        return dynamic
+    }
+
+    /** Base instant for a state/field update: its `timeRef` resolved against now, else now. */
+    private fun resolveFieldBase(obj: JsonObject?, nowBase: ZonedDateTime): ZonedDateTime {
+        val ref = ResponseParser.parseTimeRef(obj) ?: return nowBase
+        val resolved = resolveTimeRef(ref, nowBase) ?: return nowBase
+        return resolved.iso?.let { parseZoned(it) } ?: nowBase
+    }
+
     /** Validated long-term writes routed through `upsertLongTermMemory` (legacy `applyMemoryUpdate`). */
     private fun applyLongTerm(
         character: Character,
-        entries: List<LongTermMemory>,
+        parsed: ParsedTurn,
         sources: Map<String, SourceRef>,
         assistantMessage: ChatMessage,
+        nowBase: ZonedDateTime,
     ): Character {
         var working = character
-        entries.forEach { entry ->
+        parsed.longTerm.forEachIndexed { index, rawEntry ->
+            val entry = withResolvedEventTime(rawEntry, parsed.longTermTimeRefs.getOrNull(index), nowBase)
             if (entry.memberName.isNullOrBlank()) {
                 val store = working.longTerm.filter { it.category == entry.category }
                 val (newStore, ok) = upsertLongTermMemory(
@@ -378,11 +506,11 @@ class ChatOrchestrator(
                     )
                 }
             } else {
-                val index = working.members.indexOfFirst {
+                val memberIndex = working.members.indexOfFirst {
                     it.name.equals(entry.memberName, ignoreCase = true)
                 }
-                if (index < 0) return@forEach
-                val member = working.members[index]
+                if (memberIndex < 0) return@forEachIndexed
+                val member = working.members[memberIndex]
                 val store = member.longTerm.filter { it.category == entry.category }
                 val (newStore, ok) = upsertLongTermMemory(
                     character = working,
@@ -393,7 +521,7 @@ class ChatOrchestrator(
                 )
                 if (ok) {
                     val members = working.members.toMutableList()
-                    members[index] = member.copy(
+                    members[memberIndex] = member.copy(
                         longTerm = member.longTerm.filter { it.category != entry.category } + newStore,
                     )
                     working = working.copy(members = members)
@@ -401,6 +529,14 @@ class ChatOrchestrator(
             }
         }
         return working
+    }
+
+    /** Resolves a long-term `timeRef` to an absolute `eventTime` before the evidence-gated upsert. */
+    private fun withResolvedEventTime(item: LongTermMemory, timeRef: TimeRef?, nowBase: ZonedDateTime): LongTermMemory {
+        if (timeRef == null) return item
+        val base = parseZoned(item.eventTime) ?: nowBase
+        val iso = resolveTimeRef(timeRef, base)?.iso ?: return item
+        return item.copy(eventTime = iso)
     }
 
     /** Validated promise resolution/cancellation (legacy `consumePromiseUpdates`). */

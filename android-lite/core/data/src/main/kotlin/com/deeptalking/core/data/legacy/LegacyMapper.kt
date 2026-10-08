@@ -11,6 +11,7 @@ import com.deeptalking.core.model.LongTermMemory
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.LorebookOrigin
 import com.deeptalking.core.model.MemoryCategory
+import com.deeptalking.core.model.MemoryConflict
 import com.deeptalking.core.model.MemoryCounters
 import com.deeptalking.core.model.MemorySubject
 import com.deeptalking.core.model.PlatformSlot
@@ -63,6 +64,37 @@ private fun appendUnique(base: String, extra: String): String {
 private fun normalizeUserAddress(value: String?): String =
     (value ?: "").replace(Regex("\\s+"), "").take(20)
 
+/** Legacy `sanitizeAvatar` fallbacks (src/js/characters/avatar.js). */
+private const val DEFAULT_CHARACTER_AVATAR = "👤"
+private const val DEFAULT_GROUP_AVATAR = "👥"
+
+/** Legacy `isAvatarDamaged`: empty, mojibake (`?`/U+FFFD) or pure ASCII counts as damaged. */
+internal fun isAvatarDamaged(value: String?): Boolean {
+    val text = value?.trim().orEmpty()
+    if (text.isEmpty()) return true
+    if (text.contains('?') || text.contains('\uFFFD')) return true
+    return text.none { it.code > 127 }
+}
+
+/** Legacy `sanitizeAvatar`: a damaged value falls back to the default emoji. */
+internal fun sanitizeAvatar(value: String?, fallback: String): String =
+    if (isAvatarDamaged(value)) fallback else value!!.trim()
+
+/** Keys of legacy `STYLE_VIOLATION_LABELS` (src/js/core/config.js). */
+internal val STYLE_VIOLATION_LABELS: Set<String> =
+    setOf("metaTalk", "speaksForUser", "cliche", "reusedImagery", "toneDrift", "recitedLore")
+
+/** Keys of legacy `QUICK_REPLY_ISSUE_LABELS` (src/js/core/config.js). */
+internal val QUICK_REPLY_ISSUE_LABELS: Set<String> =
+    setOf("missing", "placeholder", "action", "mirrored", "characterName", "tooLong")
+
+/** Legacy active-theme whitelist (`normalizeAppData`). */
+internal val LEGACY_THEMES: Set<String> = setOf("theme-black", "theme-blue", "theme-yellow")
+
+/** Legacy `normalizeTimestamp(value, null)`: an unparseable value is dropped. */
+internal fun normalizeTimestamp(value: String?): String? =
+    parseInstant(value)?.truncatedTo(ChronoUnit.MILLIS)?.toString()
+
 /** Legacy `TIME_PARSE_VERSION` (src/js/memory/time.js). */
 const val TIME_PARSE_VERSION: Int = 1
 
@@ -71,6 +103,7 @@ const val MAX_STICKER_TAG_CHARS: Int = 6
 
 private const val DAY_START_HOUR: Int = 2
 private const val MAX_PARTICIPANTS: Int = 8
+private const val MAX_MEMBERS: Int = 8
 
 private fun extractKeywords(element: JsonElement?): List<String> = when (element) {
     null -> emptyList()
@@ -153,6 +186,79 @@ fun mapLongTerm(dto: LegacyLongTerm, category: MemoryCategory): LongTermMemory =
     corrections = dto.corrections,
 )
 
+/** Legacy `normalizeCharacter` maps each long-term category, then `dedupeLongTermList` runs per category. */
+private fun mapLongTermList(raw: Map<String, List<LegacyLongTerm>>?): List<LongTermMemory> =
+    raw.orEmpty().flatMap { (category, items) ->
+        val mapped = items.map { mapLongTerm(it, categoryOf(category)) }
+        dedupeLongTermList(mapped, categoryOf(category))
+    }
+
+/**
+ * Legacy `dedupeLongTermList` (src/js/memory/policy.js) for the non-event
+ * categories: entries sharing a case-insensitive `key` collapse into the first
+ * one, the newest values win. `events` are returned untouched — they are merged
+ * by event identity in [reconcileLegacyMemories].
+ */
+internal fun dedupeLongTermList(items: List<LongTermMemory>, category: MemoryCategory): List<LongTermMemory> {
+    if (category == MemoryCategory.Events) return items
+    val result = ArrayList<LongTermMemory>()
+    val seen = HashMap<String, Int>()
+    for (item in items) {
+        val identity = item.key.trim().lowercase()
+        val existingIndex = if (identity.isEmpty()) null else seen[identity]
+        if (existingIndex == null) {
+            result += item
+            if (identity.isNotEmpty()) seen[identity] = result.lastIndex
+            continue
+        }
+        val existing = result[existingIndex]
+        val existingTime = parseInstant(existing.updatedAt ?: existing.createdAt)?.toEpochMilli() ?: 0L
+        val itemTime = parseInstant(item.updatedAt ?: item.createdAt)?.toEpochMilli() ?: 0L
+        var merged = existing
+        if (itemTime >= existingTime) {
+            merged = if (existing.conflictedAt != null || item.conflictedAt != null) {
+                val conflicts = (existing.conflicts + item.conflicts).distinct().take(4).toMutableList()
+                if (item.value != existing.value && conflicts.none { it.value == item.value }) {
+                    conflicts += MemoryConflict(
+                        value = item.value,
+                        evidence = item.evidence,
+                        sourceMessageIds = item.sourceMessageIds,
+                        at = item.updatedAt ?: item.createdAt ?: "",
+                    )
+                }
+                existing.copy(
+                    value = item.value.ifEmpty { existing.value },
+                    subject = item.subject,
+                    sourceMessageIds = (existing.sourceMessageIds + item.sourceMessageIds).distinct().take(8),
+                    sourceRoles = item.sourceRoles,
+                    evidence = item.evidence.ifEmpty { existing.evidence },
+                    status = item.status,
+                    dueAt = item.dueAt ?: existing.dueAt,
+                    updatedAt = item.updatedAt ?: existing.updatedAt,
+                    conflicts = conflicts,
+                    conflictedAt = existing.conflictedAt ?: item.conflictedAt ?: item.updatedAt ?: existing.updatedAt,
+                )
+            } else {
+                existing.copy(
+                    value = item.value.ifEmpty { existing.value },
+                    subject = item.subject,
+                    sourceMessageIds = item.sourceMessageIds,
+                    sourceRoles = item.sourceRoles,
+                    evidence = item.evidence.ifEmpty { existing.evidence },
+                    status = item.status,
+                    dueAt = item.dueAt ?: existing.dueAt,
+                    updatedAt = item.updatedAt ?: existing.updatedAt,
+                )
+            }
+        }
+        result[existingIndex] = merged.copy(
+            tags = (existing.tags + item.tags).distinct().take(8),
+            importance = maxOf(existing.importance, item.importance),
+        )
+    }
+    return result
+}
+
 fun mapLorebook(dto: LegacyLorebookEntry): LorebookEntry = LorebookEntry(
     id = dto.id ?: "",
     name = (dto.name ?: "").take(60),
@@ -209,11 +315,11 @@ private fun mapInstant(dto: LegacyInstantMessage, imageSink: StickerSink?): Chat
             MessageAttachment(kind = MessageAttachment.Kind.Image, uri = ref)
         },
     internalOnly = dto.internalOnly == true,
-    extractedAt = dto.extractedAt,
+    extractedAt = normalizeTimestamp(dto.extractedAt),
     staticChanges = dto.staticChanges ?: emptyList(),
     lorebookChanges = dto.lorebookChanges ?: emptyList(),
-    styleViolations = dto.styleViolations ?: emptyList(),
-    quickReplyIssues = dto.quickReplyIssues ?: emptyList(),
+    styleViolations = (dto.styleViolations ?: emptyList()).filter { it in STYLE_VIOLATION_LABELS },
+    quickReplyIssues = (dto.quickReplyIssues ?: emptyList()).filter { it in QUICK_REPLY_ISSUE_LABELS },
 )
 
 /** Normalizes a sticker tag the way `normalizeStickers` does (strip whitespace, cap 6). */
@@ -342,7 +448,7 @@ private fun mapMembers(dto: LegacyCharacter, stickerSink: StickerSink?): List<Gr
         GroupMember(
             id = member.id ?: "",
             name = member.basicInfo?.name ?: "",
-            emoji = member.basicInfo?.avatar ?: "👤",
+            emoji = sanitizeAvatar(member.basicInfo?.avatar, DEFAULT_CHARACTER_AVATAR),
             roleInGroup = member.roleInGroup ?: "",
             staticProfile = mapStaticProfile(member.basicInfo, member.basicInfo?.fields, null),
             dynamicState = mapDynamicState(
@@ -353,9 +459,7 @@ private fun mapMembers(dto: LegacyCharacter, stickerSink: StickerSink?): List<Gr
             ),
             dynamicStateMeta = mapDynamicStateMeta(member.dynamicStateMeta),
             shortTerm = (memory?.shortTerm ?: emptyList()).map { mapShortTerm(it) }.takeLast(80),
-            longTerm = memory?.longTerm?.flatMap { (category, items) ->
-                items.map { mapLongTerm(it, categoryOf(category)) }
-            } ?: emptyList(),
+            longTerm = mapLongTermList(memory?.longTerm),
             lorebook = (member.lorebook ?: emptyList()).map { mapLorebook(it) }.take(200),
             instant = (memory?.instant ?: emptyList())
                 .filter { it.isLoading != true }
@@ -369,14 +473,14 @@ private fun mapMembers(dto: LegacyCharacter, stickerSink: StickerSink?): List<Gr
             sceneState = memory?.sceneState?.let { mapSceneState(it) },
             counters = mapCounters(memory?.counters),
             revision = (memory?.revision ?: 0).coerceAtLeast(0),
-            avatarRepairPending = member.avatarRepairPending == true,
+            avatarRepairPending = member.avatarRepairPending == true || isAvatarDamaged(member.basicInfo?.avatar),
             staticFillMeta = member.staticFillMeta?.let { mapStaticFillMeta(it) },
             staticFieldMeta = mapStaticFieldMeta(member.staticFieldMeta),
             fieldsMigrationVersion = member.fieldsMigrationVersion ?: "",
             timeParseVersion = (member.timeParseVersion ?: 0).coerceAtLeast(0),
             lorebookMigratedAt = member.lorebookMigratedAt,
         )
-    }
+    }.filter { it.name.isNotBlank() }.take(MAX_MEMBERS)
 
 /**
  * Maps one legacy character (single or group) into the native [Character].
@@ -391,6 +495,12 @@ fun mapCharacter(dto: LegacyCharacter, stickerSink: StickerSink?): Character {
     val basic = dto.basicInfo
     val groupInfo = dto.groupInfo
     val memory = dto.memory
+
+    val basicAvatar = sanitizeAvatar(
+        basic?.avatar,
+        if (isGroup) DEFAULT_GROUP_AVATAR else DEFAULT_CHARACTER_AVATAR,
+    )
+    val groupAvatar = sanitizeAvatar(groupInfo?.avatar, basicAvatar)
 
     val staticProfile = if (isGroup) StaticProfile() else {
         mapStaticProfile(basic, basic?.fields, dto.fields)
@@ -420,19 +530,17 @@ fun mapCharacter(dto: LegacyCharacter, stickerSink: StickerSink?): Character {
         currentLocation = effectiveDynamic.currentLocation,
     )
 
-    return Character(
+    val character = Character(
         id = dto.id ?: "",
         name = if (isGroup) pick(groupInfo?.name, basic?.name) else (basic?.name ?: ""),
-        emoji = if (isGroup) pick(groupInfo?.avatar, basic?.avatar, "👥") else pick(basic?.avatar, "👤"),
+        emoji = if (isGroup) groupAvatar else basicAvatar,
         description = description,
         isGroup = isGroup,
         interactionRules = groupInfo?.interactionRules ?: "",
         staticProfile = staticProfile,
         dynamicState = effectiveDynamic,
         shortTerm = (memory?.shortTerm ?: emptyList()).map { mapShortTerm(it) }.takeLast(80),
-        longTerm = memory?.longTerm?.flatMap { (category, items) ->
-            items.map { mapLongTerm(it, categoryOf(category)) }
-        } ?: emptyList(),
+        longTerm = mapLongTermList(memory?.longTerm),
         lorebook = (dto.lorebook ?: emptyList()).map { mapLorebook(it) }.take(200),
         stickers = mapStickers(dto.stickers, stickerSink),
         instant = (memory?.instant ?: emptyList())
@@ -440,7 +548,9 @@ fun mapCharacter(dto: LegacyCharacter, stickerSink: StickerSink?): Character {
             .map { mapInstant(it, stickerSink) }
             .takeLast(160),
         dynamicStateMeta = mapDynamicStateMeta(dto.dynamicStateMeta),
-        avatarRepairPending = dto.avatarRepairPending == true,
+        avatarRepairPending = dto.avatarRepairPending == true ||
+            isAvatarDamaged(basic?.avatar) ||
+            (isGroup && isAvatarDamaged(groupInfo?.avatar)),
         groupSharedDynamic = if (isGroup) sharedDynamic else DynamicState(),
         members = if (isGroup) mapMembers(dto, stickerSink) else emptyList(),
         fieldsMigrationVersion = dto.fieldsMigrationVersion ?: "",
@@ -461,6 +571,7 @@ fun mapCharacter(dto: LegacyCharacter, stickerSink: StickerSink?): Character {
         lorebookMigratedAt = dto.lorebookMigratedAt,
         revision = (memory?.revision ?: 0).coerceAtLeast(0),
     )
+    return repairMessageSequences(character)
 }
 
 private fun mapScene(dto: LegacyScene): SceneSummary = SceneSummary(
@@ -476,7 +587,8 @@ private fun mapSceneState(dto: LegacySceneState): SceneState = SceneState(
     key = dto.key ?: "",
     startCount = (dto.startCount ?: 0).coerceAtLeast(0),
     startSequence = dto.startSequence,
-    messageCount = (dto.messageCount ?: 0).coerceAtLeast(0),
+    // `normalizeCharacter` always resets `messageCount` to 0 on load.
+    messageCount = 0,
 )
 
 private fun mapDynamicStateMeta(element: JsonElement?): Map<String, DynamicStateMeta> {
@@ -570,11 +682,29 @@ private fun mapStaticFillMeta(dto: LegacyStaticFillMeta): StaticFillMeta = Stati
     retryAt = dto.retryAt,
 )
 
+/** Legacy `PLATFORM_CONFIGS` keys (src/js/core/config.js). */
+private val LEGACY_PLATFORMS: List<String> = listOf("deepseek", "opencode", "custom")
+
+private const val DEFAULT_API_BASE_URL: String = "https://api.deepseek.com/v1"
+
+private val PLATFORM_BASE_URLS: Map<String, String> = mapOf(
+    "deepseek" to "https://api.deepseek.com/v1",
+    "opencode" to "https://opencode.ai/zen/go/v1",
+    "custom" to "",
+)
+
+private val PLATFORM_MODELS: Map<String, String> = mapOf(
+    "deepseek" to "deepseek-flash",
+    "opencode" to "deepseek-flash",
+    "custom" to "",
+)
+
 /** Maps the legacy config; missing or malformed values fall back to legacy defaults. */
 fun mapConfig(dto: LegacyConfig?): AppConfig {
     if (dto == null) return AppConfig()
     val efforts = setOf("none", "low", "medium", "high", "max")
-    val platform = dto.apiPlatform?.takeIf { it.isNotBlank() } ?: "deepseek"
+    // A null platform defaults; an unknown (or blank) one normalizes to `custom`.
+    val platform = dto.apiPlatform?.let { if (it in LEGACY_PLATFORMS) it else "custom" } ?: "deepseek"
     val requestedModel = dto.modelName?.takeIf { it.isNotBlank() } ?: "deepseek-flash"
     // `normalizeAppData`: on the deepseek platform the retired `deepseek-chat`
     // alias is coerced to the current default model.
@@ -583,10 +713,33 @@ fun mapConfig(dto: LegacyConfig?): AppConfig {
     } else {
         requestedModel
     }
+    // `rawConfig.apiBaseUrl || rawConfig.apiEndpoint || preset || default`.
+    val rawBase = dto.apiBaseUrl?.takeIf { it.isNotBlank() } ?: dto.apiEndpoint
+    val presetBase = PLATFORM_BASE_URLS[platform].orEmpty().ifEmpty { DEFAULT_API_BASE_URL }
+    val apiBaseUrl = rawBase?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() } ?: presetBase
+
+    // `normalizeAppData` rebuilds a slot for every platform and backfills the
+    // active platform's slot from the main config (the API key half lives in
+    // `:core:security`, so it is intentionally absent here).
+    val platformSettings = LEGACY_PLATFORMS.associateWith { key ->
+        val raw = dto.platformSettings?.get(key)
+        PlatformSlot(
+            baseUrl = raw?.baseUrl?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() }
+                ?: PLATFORM_BASE_URLS[key].orEmpty(),
+            modelName = raw?.modelName?.trim()?.takeIf { it.isNotEmpty() }
+                ?: PLATFORM_MODELS[key].orEmpty(),
+        )
+    }.toMutableMap()
+    platformSettings[platform]?.let { slot ->
+        var updated = slot
+        if (updated.baseUrl.isEmpty() && apiBaseUrl.isNotEmpty()) updated = updated.copy(baseUrl = apiBaseUrl)
+        if (updated.modelName.isEmpty() && modelName.isNotEmpty()) updated = updated.copy(modelName = modelName)
+        platformSettings[platform] = updated
+    }
+
     return AppConfig(
         apiPlatform = platform,
-        apiBaseUrl = (dto.apiBaseUrl ?: dto.apiEndpoint)?.trim()?.trimEnd('/')
-            ?.takeIf { it.isNotEmpty() } ?: "https://api.deepseek.com/v1",
+        apiBaseUrl = apiBaseUrl,
         modelName = modelName,
         temperature = (dto.temperature ?: 0.8).coerceIn(0.0, 2.0),
         stream = dto.stream ?: true,
@@ -596,12 +749,7 @@ fun mapConfig(dto: LegacyConfig?): AppConfig {
         quickReplyRepair = dto.quickReplyRepair ?: true,
         cacheStats = mapCacheStats(dto.cacheStats),
         requestMetrics = mapRequestMetrics(dto.requestMetrics),
-        platformSettings = dto.platformSettings.orEmpty().mapValues { (_, slot) ->
-            PlatformSlot(
-                baseUrl = slot.baseUrl?.trim()?.trimEnd('/').orEmpty(),
-                modelName = slot.modelName?.trim().orEmpty(),
-            )
-        }.filterValues { it.baseUrl.isNotEmpty() || it.modelName.isNotEmpty() },
+        platformSettings = platformSettings,
     )
 }
 
@@ -695,14 +843,56 @@ fun reconcileLegacyMemories(character: Character): MemoryReconciliation {
 }
 
 /**
- * Legacy `ensureMessageSequences` (src/js/memory/policy.js) assigned a stored
- * monotonic `sequence` per instant message, a `counters.messageSequence` high
- * water mark and a `sceneState.startSequence` anchor. The mapper only derives
- * the sequence each message would get from list order (matching the legacy
- * fresh-store case, where the first message is 1). Nothing is mutated.
+ * Legacy `ensureMessageSequences` (src/js/memory/policy.js): every message keeps
+ * its stored `sequence` when that is a strictly-increasing safe integer, and is
+ * otherwise renumbered after the running high-water mark. [messageSequence] is
+ * the stored `counters.messageSequence` the numbering may start from.
  */
-fun ensureMessageSequences(messages: List<ChatMessage>): List<Int> =
-    messages.indices.map { it + 1 }
+fun ensureMessageSequences(messages: List<ChatMessage>, messageSequence: Int = 0): List<Int> {
+    var last = 0
+    var next = messageSequence.coerceAtLeast(0)
+    return messages.map { message ->
+        val sequence = if (message.sequence <= last) maxOf(last, next) + 1 else message.sequence
+        last = sequence
+        next = maxOf(next, sequence)
+        sequence
+    }
+}
+
+/**
+ * Applies the full legacy `ensureMessageSequences` side effects to a mapped
+ * character: per-message `sequence`, the `counters.messageSequence` high-water
+ * mark, and the clamped `sceneState.startSequence` anchor.
+ */
+internal fun repairMessageSequences(character: Character): Character {
+    val storedSequence = character.counters.messageSequence.coerceAtLeast(0)
+    val sequences = ensureMessageSequences(character.instant, storedSequence)
+    val next = maxOf(storedSequence, sequences.maxOrNull() ?: 0)
+    val repaired = character.instant.mapIndexed { index, message ->
+        if (message.sequence == sequences[index]) message else message.copy(sequence = sequences[index])
+    }
+    val sceneState = character.sceneState?.let { scene ->
+        val start = scene.startSequence ?: run {
+            val end = character.scenes.lastOrNull()?.endedAt?.let(::parseInstant)
+            when {
+                end != null -> {
+                    val endMillis = end.toEpochMilli()
+                    repaired.lastOrNull { message ->
+                        (parseInstant(message.timestamp)?.toEpochMilli() ?: Long.MAX_VALUE) <= endMillis
+                    }?.sequence ?: 0
+                }
+                scene.startCount in 1..repaired.size -> repaired[scene.startCount - 1].sequence
+                else -> 0
+            }
+        }
+        scene.copy(startSequence = start.coerceIn(0, next))
+    }
+    return character.copy(
+        instant = repaired,
+        counters = character.counters.copy(messageSequence = next),
+        sceneState = sceneState,
+    )
+}
 
 /** Legacy `getEventIdentity`: logical day (rolling over at 02:00) plus time slot, or "". */
 @Suppress("UNUSED_PARAMETER")

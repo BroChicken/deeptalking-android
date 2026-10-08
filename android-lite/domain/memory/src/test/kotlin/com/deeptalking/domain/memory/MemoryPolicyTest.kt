@@ -162,7 +162,7 @@ class MemoryPolicyTest {
     }
 
     @Test
-    fun upsertLongTermPreservesSemanticallyDifferentValues() {
+    fun upsertLongTermAdjudicatesSemanticallyDifferentValues() {
         val character = Character(id = "c1", instant = listOf(user("u1", "用户喜欢咖啡，但用户害怕打雷。")))
         val existing = LongTermMemory(
             category = MemoryCategory.UserProfile,
@@ -185,9 +185,10 @@ class MemoryPolicyTest {
         val (list, ok) = upsertLongTermMemory(character, incoming, listOf(existing))
         assertTrue(ok)
         assertEquals(1, list.size)
-        // Legacy keeps the existing value and records the competitor as a conflict.
+        // The trim embedded in the write adjudicates the conflict: the primary value
+        // wins the tie and the competitor is dropped.
         assertEquals("用户喜欢咖啡", list[0].value)
-        assertTrue(list[0].conflicts.any { it.value == "用户害怕打雷" })
+        assertTrue(list[0].conflicts.isEmpty())
     }
 
     @Test

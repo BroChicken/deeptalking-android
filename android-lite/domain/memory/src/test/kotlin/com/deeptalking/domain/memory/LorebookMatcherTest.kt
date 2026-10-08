@@ -83,6 +83,16 @@ class LorebookMatcherTest {
     }
 
     @Test
+    fun nameOrderingUsesChineseCollation() {
+        val zhao = entry("zhao", "赵", keywords = listOf("k"))
+        val a = entry("a", "阿", keywords = listOf("k"))
+
+        val ordered = matchLorebookEntries(listOf(zhao, a), "k")
+
+        assertEquals(listOf("a", "zhao"), ordered.map { it.id })
+    }
+
+    @Test
     fun markMentionsBumpsInjectedAndResetsTheirMisses() {
         val injected = entry("a", "甲", keywords = listOf("k"), misses = 2, mentions = 1)
         val untouched = entry("b", "乙", keywords = listOf("k"), misses = 5)

@@ -46,7 +46,9 @@ fun renderMarkdownAnnotated(
             val ordered = ORDERED.matchEntire(line)
             val quote = BLOCKQUOTE.matchEntire(trimmed)
             when {
-                trimmed.startsWith("```") -> inFence = true
+                trimmed.startsWith("```") -> {
+                    inFence = true
+                }
                 heading != null -> withStyle(
                     SpanStyle(fontWeight = FontWeight.Bold, fontSize = headingSize(heading.groupValues[1].length)),
                 ) { appendInline(heading.groupValues[2], actionColor, textColor, linkColor, codeBackground) }
@@ -76,6 +78,8 @@ private val BULLET = Regex("""\s*[-*+]\s+(.+)""")
 private val ORDERED = Regex("""\s*(\d+)[.)]\s+(.+)""")
 private val BLOCKQUOTE = Regex(""">\s?(.*)""")
 private val LINK = Regex("""\[([^\]]+)\]\((https?://[^\s)]+)\)""")
+private val EM_STAR = Regex("""\*([^*\n]+)\*(?!\*)""")
+private val EM_UNDERSCORE = Regex("""_([^_\n]+)_(?!_)""")
 
 private fun headingSize(level: Int) = when (level) {
     1 -> 1.35.em
@@ -162,7 +166,7 @@ private fun AnnotatedString.Builder.appendInline(
             source[i] == '(' || source[i] == '（' -> {
                 val close = if (source[i] == '(') ')' else '）'
                 val end = source.indexOf(close, i + 1)
-                if (end > i + 1 && end - i <= 80 && !source.substring(i, end).contains('\n')) {
+                if (end > i + 1 && !source.substring(i, end).contains('\n')) {
                     flush()
                     withStyle(actionStyle) { append(source.substring(i, end + 1)) }
                     i = end + 1
@@ -171,12 +175,17 @@ private fun AnnotatedString.Builder.appendInline(
                 }
             }
             source[i] == '*' || source[i] == '_' -> {
-                val ch = source[i]
-                val next = source.indexOf(ch, i + 1)
-                if (next > i + 1) {
+                // Legacy emphasis semantics: marker not doubled, content free of
+                // the marker and newlines, closing marker not part of a pair.
+                val marker = source[i]
+                val pattern = if (marker == '*') EM_STAR else EM_UNDERSCORE
+                val match = pattern.find(source, i)
+                if (match != null && match.range.first == i && source.getOrNull(i - 1) != marker) {
                     flush()
-                    withStyle(italicStyle) { append(source.substring(i + 1, next)) }
-                    i = next + 1
+                    withStyle(italicStyle) {
+                        appendInline(match.groupValues[1], actionColor, textColor, linkColor, codeBackground)
+                    }
+                    i = match.range.last + 1
                 } else {
                     plain.append(source[i]); i++
                 }

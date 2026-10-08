@@ -3,6 +3,7 @@ package com.deeptalking.feature.settings
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -46,6 +47,8 @@ import com.deeptalking.core.designsystem.legacy
 import com.deeptalking.core.model.AppConfig
 import com.deeptalking.core.model.BuiltinPlatforms
 import com.deeptalking.core.model.PlatformSlot
+import org.json.JSONArray
+import org.json.JSONObject
 
 private val THINKING_LEVELS = listOf(
     "none" to "无",
@@ -61,19 +64,25 @@ private val PLATFORM_LABELS = mapOf(
     "custom" to "自定义",
 )
 
+/** Legacy `normalizeApiBaseUrl` (`normalization.js:50`): trim + drop trailing slashes. */
+private fun normalizeApiBaseUrl(value: String): String = value.trim().trimEnd('/')
+
 /** Legacy `changePlatform`: persist the current platform's slot, then load the target's. */
 private fun switchPlatform(current: AppConfig, id: String): AppConfig {
     if (id == current.apiPlatform) return current
-    val slot = PlatformSlot(baseUrl = current.apiBaseUrl, modelName = current.modelName)
+    val slot = PlatformSlot(baseUrl = normalizeApiBaseUrl(current.apiBaseUrl), modelName = current.modelName)
     val settings = current.platformSettings + (current.apiPlatform to slot)
     val target = settings[id]
     val preset = BuiltinPlatforms.firstOrNull { it.id == id }
-    val baseUrl = target?.baseUrl?.takeIf { it.isNotBlank() }
-        ?: preset?.baseUrl?.takeIf { it.isNotBlank() }
-        ?: current.apiBaseUrl
+    // Legacy `applyPlatformFields`: `slot.baseUrl || preset.baseUrl || ''` (custom falls back empty).
+    val baseUrl = normalizeApiBaseUrl(
+        target?.baseUrl?.takeIf { it.isNotBlank() }
+            ?: preset?.baseUrl?.takeIf { it.isNotBlank() }
+            ?: "",
+    )
     val model = target?.modelName?.takeIf { it.isNotBlank() }
         ?: preset?.defaultModel?.takeIf { it.isNotBlank() }
-        ?: current.modelName
+        ?: ""
     return current.copy(
         apiPlatform = id,
         apiBaseUrl = baseUrl,
@@ -86,6 +95,7 @@ private fun switchPlatform(current: AppConfig, id: String): AppConfig {
 fun SettingsScreen(
     config: AppConfig,
     hasApiKey: Boolean,
+    loadApiKey: (String) -> String? = { null },
     testResult: String?,
     onSave: (AppConfig, apiKey: String?) -> Unit,
     onTestReminder: () -> Unit,
@@ -132,9 +142,9 @@ fun SettingsScreen(
     // Adopt external config changes (initial load/import) until the user starts editing.
     LaunchedEffect(config) { if (!userEdited && config != edited) edited = config }
 
-    // Per-platform API keys live in SecretStore; clear the typed field on switch so
-    // a key entered for one platform is never saved onto another (legacy slot swap).
-    LaunchedEffect(edited.apiPlatform) { apiKey = "" }
+    // Legacy `loadSettingsForm`: refill the target platform's stored key into the
+    // field on entry/platform switch (the input stays masked).
+    LaunchedEffect(edited.apiPlatform) { apiKey = loadApiKey(edited.apiPlatform).orEmpty() }
 
     val models = BuiltinPlatforms.firstOrNull { it.id == edited.apiPlatform }?.models.orEmpty()
 
@@ -157,7 +167,6 @@ fun SettingsScreen(
             onSelect = { label ->
                 val id = PLATFORM_LABELS.entries.firstOrNull { it.value == label }?.key ?: label
                 persist(switchPlatform(edited, id))
-                apiKey = ""
                 platformMenuOpen = false
             },
         )
@@ -165,7 +174,7 @@ fun SettingsScreen(
         FieldLabel("API Base URL（OpenAI 兼容）")
         LegacyField(
             value = edited.apiBaseUrl,
-            onValueChange = { persist(edited.copy(apiBaseUrl = it)) },
+            onValueChange = { persist(edited.copy(apiBaseUrl = normalizeApiBaseUrl(it))) },
             placeholder = "https://api.example.com/v1",
         )
 
@@ -428,16 +437,35 @@ private fun LegacyModelField(value: String, suggestions: List<String>, onValueCh
 @Composable
 private fun DebugInfoPanel(config: AppConfig, context: Context) {
     val legacy = MaterialTheme.legacy
+    // Legacy `renderDebugInfo` (`status-settings.js:67-99`): the last reply as a
+    // pretty JSON payload plus its raw (pre-processing) text, then the last 12
+    // usage/cache metrics as JSON. `lastReplyDebug` holds the JSON object.
     val parts = buildList {
-        if (config.lastReplyDebug.isNotBlank()) add("【最近一次回应】\n" + config.lastReplyDebug)
-        if (config.requestMetrics.isNotEmpty()) {
-            val recent = config.requestMetrics.takeLast(12).joinToString("\n") {
-                val input = it.inputTokens?.toString() ?: "--"
-                val hit = it.hitTokens?.toString() ?: "--"
-                val rate = it.hitRate?.let { value -> "%.0f".format(value * 100) + "%" } ?: "--"
-                "输入 $input · 命中 $hit · 命中率 $rate"
+        val raw = config.lastReplyDebug
+        if (raw.isNotBlank()) {
+            val obj = runCatching { JSONObject(raw) }.getOrNull()
+            if (obj != null && obj.has("displayText")) {
+                add("【最近一次回应】\n" + obj.toString(2))
+                val full = obj.optString("fullText")
+                if (full.isNotBlank()) add("【原始回应（未处理）】\n" + full)
+            } else {
+                add("【最近一次回应】\n" + raw)
             }
-            add("【最近 API 用量与缓存统计】\n$recent")
+        }
+        if (config.requestMetrics.isNotEmpty()) {
+            val array = JSONArray()
+            config.requestMetrics.takeLast(12).forEach { metric ->
+                val entry = JSONObject()
+                entry.put("at", metric.at)
+                entry.put("taskType", metric.taskType)
+                entry.put("characterId", metric.characterId ?: JSONObject.NULL)
+                entry.put("inputTokens", metric.inputTokens ?: JSONObject.NULL)
+                entry.put("hitTokens", metric.hitTokens ?: JSONObject.NULL)
+                entry.put("missTokens", metric.missTokens ?: JSONObject.NULL)
+                entry.put("hitRate", metric.hitRate ?: JSONObject.NULL)
+                array.put(entry)
+            }
+            add("【最近 API 用量与缓存统计】\n" + array.toString(2))
         }
     }
     if (parts.isEmpty()) return
@@ -451,6 +479,7 @@ private fun DebugInfoPanel(config: AppConfig, context: Context) {
                 .clickable {
                     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                     clipboard.setPrimaryClip(ClipData.newPlainText("debug", parts.joinToString("\n\n")))
+                    Toast.makeText(context, "调试信息已复制", Toast.LENGTH_SHORT).show()
                 }
                 .padding(horizontal = 8.dp, vertical = 3.dp),
         ) {

@@ -4,6 +4,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.net.Uri
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -150,20 +151,34 @@ fun ChatScreen(
     }
 
     val visibleMessages = messages.filterNot { it.internalOnly }
+    val lastAssistantId = visibleMessages.lastOrNull { it.role == Role.Assistant && !it.isLoading }?.id
 
     var initialScrollDone by remember(character?.id) { mutableStateOf(false) }
+    // Legacy `isNearChatBottom`: only follow new content when the viewport is
+    // already at (or within one item of) the bottom; otherwise leave the user's
+    // reading position untouched. Re-evaluated whenever a scroll settles.
+    var autoFollow by remember(character?.id) { mutableStateOf(true) }
+    LaunchedEffect(character?.id, listState.isScrollInProgress) {
+        if (!listState.isScrollInProgress) {
+            val info = listState.layoutInfo
+            val last = info.visibleItemsInfo.lastOrNull()
+            autoFollow = last == null ||
+                (info.totalItemsCount - 1 - last.index <= 1 &&
+                    last.offset + last.size <= info.viewportEndOffset + 8)
+        }
+    }
     LaunchedEffect(character?.id, visibleMessages.size) {
         if (visibleMessages.isEmpty()) return@LaunchedEffect
         val last = visibleMessages.size - 1
         if (!initialScrollDone) {
             runCatching { listState.scrollToItem(last) }
             initialScrollDone = true
-        } else {
+        } else if (autoFollow) {
             runCatching { listState.animateScrollToItem(last) }
         }
     }
     LaunchedEffect(visibleMessages.lastOrNull()?.content) {
-        if (isSending && visibleMessages.isNotEmpty()) {
+        if (isSending && visibleMessages.isNotEmpty() && autoFollow) {
             runCatching { listState.scrollToItem(visibleMessages.size - 1) }
         }
     }
@@ -181,26 +196,31 @@ fun ChatScreen(
                 ) {
                     items(visibleMessages, key = { it.id }) { message ->
                         BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
-                            MessageRow(
-                                message = message,
-                                character = character,
-                                isSending = isSending,
-                                maxBubbleWidth = maxWidth * 0.8f,
-                                onCopy = { copyToClipboard(context, message.content) },
-                                onEditResend = { editTarget = message },
-                                onRegenerate = { confirmRegenerate = message },
-                                onImageClick = { imagePreview = it },
-                                onReadAloud = { onReadAloud(message) },
-                                ttsActiveMessageId = ttsActiveMessageId,
-                                ttsPhase = ttsPhase,
-                                ttsElapsedMs = ttsElapsedMs,
-                            )
-                        }
-                    }
-                    if (quickReplies.isNotEmpty() && !isSending) {
-                        item {
-                            BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
-                                QuickReplyRow(quickReplies, isSending, maxWidth * 0.8f, onQuickReply)
+                            val bubbleMaxWidth = maxWidth * 0.8f
+                            Column(modifier = Modifier.fillMaxWidth()) {
+                                MessageRow(
+                                    message = message,
+                                    character = character,
+                                    isSending = isSending,
+                                    maxBubbleWidth = bubbleMaxWidth,
+                                    onCopy = {
+                                        copyToClipboard(context, message.content)
+                                        val who = if (message.role == Role.User) "用户" else character.name
+                                        Toast.makeText(context, "已复制" + who + "的消息", Toast.LENGTH_SHORT).show()
+                                    },
+                                    onEditResend = { editTarget = message },
+                                    onRegenerate = { confirmRegenerate = message },
+                                    onImageClick = { imagePreview = it },
+                                    onReadAloud = { onReadAloud(message) },
+                                    ttsActiveMessageId = ttsActiveMessageId,
+                                    ttsPhase = ttsPhase,
+                                    ttsElapsedMs = ttsElapsedMs,
+                                )
+                                // Legacy renders quick replies directly under the hit
+                                // assistant bubble, not as a standalone trailing row.
+                                if (message.id == lastAssistantId && quickReplies.isNotEmpty() && !isSending) {
+                                    QuickReplyRow(quickReplies, isSending, bubbleMaxWidth, onQuickReply)
+                                }
                             }
                         }
                     }
@@ -619,7 +639,9 @@ private fun MessageImages(message: ChatMessage, onImageClick: (String) -> Unit) 
                 contentDescription = "图片",
                 contentScale = ContentScale.Crop,
                 modifier = Modifier
-                    .size(if (attachment.kind == MessageAttachment.Kind.Sticker) 96.dp else 160.dp)
+                    // Legacy `.message-image` caps every inline image (stickers
+                    // included) at 220px.
+                    .size(220.dp)
                     .clip(RoundedCornerShape(10.dp))
                     .clickable { onImageClick(attachment.uri) },
             )
