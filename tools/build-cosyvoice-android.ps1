@@ -8,6 +8,10 @@
 # without it ggml cross-compiles to the armv8-a baseline (no sdot / no fmla.8h)
 # and inference is several times slower. See docs/NATIVE_MODULES.md.
 #
+# Applies perf patches to the upstream source: dedicated inference buffers,
+# a 2-slot DiT KV cache, and diffusion_steps 10 -> 3 (with a matching t_span
+# noise schedule). The flow stage dominates synthesis time.
+#
 #   powershell -File tools/build-cosyvoice-android.ps1
 #
 # Output: android-lite/engine/cosyvoice/src/main/jniLibs/arm64-v8a/*.so
@@ -15,8 +19,16 @@
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$work = Join-Path $env:TEMP 'cosyvoice-android-build'
+# Build cache lives inside the repo (git-ignored via tools/.work/) so it is not
+# lost when %TEMP% is cleaned. Holds the NDK, ONNX Runtime, simde, the upstream
+# cosyvoice.cpp checkout and the CMake build tree (~3.4 GB).
+$work = Join-Path $PSScriptRoot '.work\cosyvoice-android-build'
 New-Item -ItemType Directory -Force $work | Out-Null
+
+# Prefer the bundled portable CMake (3.31.6): the system CMake may be 4.x, which
+# rejects the upstream's cmake_minimum_required range.
+$cmakeBin = Join-Path $PSScriptRoot '.work\cmake331\cmake-3.31.6-windows-x86_64\bin'
+if (Test-Path (Join-Path $cmakeBin 'cmake.exe')) { $env:Path = "$cmakeBin;$env:Path" }
 
 $NDK_VERSION = '27.0.12077973'
 $NDK_URL = 'https://mirrors.cloud.tencent.com/AndroidSDK/android-ndk-r27-windows.zip'
@@ -24,7 +36,10 @@ $ORT_VERSION = '1.25.1'
 $ORT_AAR = "https://repo1.maven.org/maven2/com/microsoft/onnxruntime/onnxruntime-android/$ORT_VERSION/onnxruntime-android-$ORT_VERSION.aar"
 $ORT_HDR = "https://github.com/microsoft/onnxruntime/releases/download/v$ORT_VERSION/onnxruntime-linux-x64-$ORT_VERSION.tgz"
 
-$ndk = Join-Path $work "android-ndk-r27"
+$ndk = Join-Path $work 'ndk\android-ndk-r27'
+if (-not (Test-Path (Join-Path $ndk 'source.properties'))) {
+  $ndk = Join-Path $work 'android-ndk-r27'
+}
 if (-not (Test-Path (Join-Path $ndk 'source.properties'))) {
   Write-Host 'Downloading NDK...'
   $zip = Join-Path $work 'ndk.zip'
@@ -71,14 +86,28 @@ function Patch-File([string]$path, [string]$from, [string]$to) {
 }
 $p1 = Patch-File (Join-Path $src 'src\cosyvoice-model.cpp') 'COSYVOICE_INFERENCE_BUFFER_POLICY_BALANCED' 'COSYVOICE_INFERENCE_BUFFER_POLICY_DEDICATED'
 $p2 = Patch-File (Join-Path $src 'src\cosyvoice.cpp') 'params_v3.dit_kv_fixed_slots = 0;' 'params_v3.dit_kv_fixed_slots = 2;'
-if (-not ($p1 -and $p2)) { Write-Warning "cosyvoice perf patch matched buffer=$p1 dit=$p2 (upstream source changed?)" }
+
+# Fewer DiT diffusion steps. The flow stage dominates synthesis time and runs the
+# DiT once per step, so 10 -> 3 cuts flow cost ~70% at a small quality cost. The
+# noise schedule must be rewritten to span t in [0,1] over the new step count;
+# leaving the original 11-point table would make the last step cover only t<0.3.
+$modules = Join-Path $src 'src\cosyvoice-modules.h'
+$loader = Join-Path $src 'src\cosyvoice-loader.cpp'
+Patch-File $modules 'constexpr static int diffusion_steps = 10;' 'constexpr static int diffusion_steps = 3;' | Out-Null
+Patch-File $modules 'constexpr static int diffusion_steps = 5;'  'constexpr static int diffusion_steps = 3;' | Out-Null
+Patch-File $loader  'for (int i = 0; i != 11; ++i)' 'for (int i = 0; i != diffusion_steps + 1; ++i)' | Out-Null
+Patch-File $loader  'std::cos(0.1f * 0.5f * 3.14159265358979323846f * i)' 'std::cos((1.f / diffusion_steps) * 0.5f * 3.14159265358979323846f * i)' | Out-Null
+$stepsOk = ([System.IO.File]::ReadAllText($modules)).Contains('diffusion_steps = 3;')
+$tspanOk = ([System.IO.File]::ReadAllText($loader)).Contains('diffusion_steps + 1')
+if (-not ($p1 -and $p2 -and $stepsOk -and $tspanOk)) { Write-Warning "cosyvoice perf patch buffer=$p1 dit=$p2 steps3=$stepsOk tspan=$tspanOk (upstream source changed?)" }
 
 $build = Join-Path $work 'build-android-fe'
 cmake -S $src -B $build -G Ninja `
   "-DCMAKE_TOOLCHAIN_FILE=$(Join-Path $ndk 'build\cmake\android.toolchain.cmake')" `
   -DCMAKE_BUILD_TYPE=Release -DANDROID_PLATFORM=26 -DANDROID_ABI=arm64-v8a -DANDROID_STL=c++_shared `
   "-DSIMDE_INCLUDE_DIR=$simde" "-DORT_PREBUILT_DIR=$ortPre" -DCOSYVOICE_NO_ICU=ON -DBUILD_SHARED_LIBS=ON `
-  "-DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16" `
+  "-DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16+i8mm" `
+  "-DCMAKE_SHARED_LINKER_FLAGS=-llog" `
   -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 cmake --build $build --target cosyvoice
 

@@ -1,6 +1,5 @@
 package com.deeptalking.engine.cosyvoice
 
-import com.sun.jna.Callback
 import com.sun.jna.Library
 import com.sun.jna.Native
 import com.sun.jna.Pointer
@@ -15,6 +14,7 @@ import com.sun.jna.Structure
 internal interface CosyVoiceLib : Library {
 
     // -------- model context --------
+    fun cosyvoice_init_backend()
     fun cosyvoice_load_from_file(filename: String): Pointer?
     fun cosyvoice_load_from_file_ext(
         filename: String,
@@ -38,14 +38,10 @@ internal interface CosyVoiceLib : Library {
     fun cosyvoice_tts_context_new(ctx: Pointer, prompt: Pointer): Pointer?
     fun cosyvoice_tts_context_free(tts: Pointer)
     fun cosyvoice_tts_instruct(tts: Pointer, text: String, instruction: String?, speed: Float, result: GeneratedSpeech): Boolean
-    fun cosyvoice_tts_instruct_stream(
-        tts: Pointer,
-        text: String,
-        instruction: String?,
-        speed: Float,
-        callback: TtsAudioCallback,
-        userData: Pointer?,
-    ): Boolean
+
+    // -------- stop request (preempt a running synthesis) --------
+    fun cosyvoice_request_stop(ctx: Pointer)
+    fun cosyvoice_is_stop_requested(ctx: Pointer): Boolean
 
     // -------- frontend (reference audio -> prompt speech) --------
     fun cosyvoice_frontend_load_from_files(speechTokenizer: String, campplus: String): Pointer?
@@ -69,12 +65,4 @@ internal interface CosyVoiceLib : Library {
 internal class GeneratedSpeech : Structure() {
     @JvmField var data: Pointer? = null
     @JvmField var length: Int = 0
-}
-
-/**
- * `cosyvoice_tts_audio_callback_t`: `bool (*)(const float* audio, uint32_t n_samples, void* user_data)`.
- * Invoked on a native thread; [audio] is only valid for the duration of the call.
- */
-internal interface TtsAudioCallback : Callback {
-    fun invoke(audio: Pointer, nSamples: Int, userData: Pointer?): Boolean
 }

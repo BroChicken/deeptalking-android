@@ -28,6 +28,13 @@ class CosyVoiceEngine {
     private var ctx: Pointer? = null
     private var frontend: Pointer? = null
 
+    // Per-voice cache: the loaded prompt-speech GGUF and the prompt/TTS context
+    // derived from it, reused across read-aloud calls for the same voice.
+    private var voiceCachePath: String? = null
+    private var voiceCachePs: Pointer? = null
+    private var voiceCachePrompt: Pointer? = null
+    private var voiceCacheTts: Pointer? = null
+
     var sampleRate: Int = 24000
         private set
 
@@ -37,6 +44,7 @@ class CosyVoiceEngine {
     fun loadModel(modelPath: String) {
         if (ctx != null) return
         require(File(modelPath).exists()) { "模型文件不存在: $modelPath" }
+        runCatching { lib.cosyvoice_init_backend() }
         val threads = CpuTopology.performanceCoreCount()
         val started = System.currentTimeMillis()
         // Load through the low-level API so we can pin the thread count: the
@@ -56,6 +64,7 @@ class CosyVoiceEngine {
 
     @Synchronized
     fun unloadModel() {
+        freeVoiceCache()
         ctx?.let { runCatching { lib.cosyvoice_free(it) } }
         ctx = null
     }
@@ -111,70 +120,55 @@ class CosyVoiceEngine {
     fun synthesize(text: String, promptSpeechFile: String, instruction: String?, speed: Float): FloatArray {
         val c = ctx ?: error("模型尚未加载")
         require(File(promptSpeechFile).exists()) { "音色文件不存在: $promptSpeechFile" }
-        val ps = lib.cosyvoice_prompt_speech_load_from_file(promptSpeechFile) ?: error("音色加载失败")
-        var prompt: Pointer? = null
-        var tts: Pointer? = null
-        try {
-            prompt = lib.cosyvoice_prompt_init_from_prompt_speech(c, ps) ?: error("音色初始化失败")
-            tts = lib.cosyvoice_tts_context_new(c, prompt) ?: error("TTS 会话创建失败")
-            val result = GeneratedSpeech()
-            val started = System.currentTimeMillis()
-            val ok = lib.cosyvoice_tts_instruct(tts, text, instruction, speed, result)
-            if (!ok) error("语音合成失败")
-            result.read()
-            val length = result.length
-            val data = result.data
-            if (length <= 0 || data == null) return FloatArray(0)
-            val pcm = data.getFloatArray(0, length)
-            logRtf("synth", text.length, pcm.size, started)
-            return pcm
-        } finally {
-            tts?.let { runCatching { lib.cosyvoice_tts_context_free(it) } }
-            prompt?.let { runCatching { lib.cosyvoice_prompt_free(it) } }
-            runCatching { lib.cosyvoice_prompt_speech_free(ps) }
+        // The prompt-speech GGUF and the derived prompt/TTS context only depend on
+        // the voice, so load them once and reuse across read-aloud calls.
+        if (voiceCachePath != promptSpeechFile) {
+            freeVoiceCache()
+            val ps = lib.cosyvoice_prompt_speech_load_from_file(promptSpeechFile) ?: error("音色加载失败")
+            val prompt = lib.cosyvoice_prompt_init_from_prompt_speech(c, ps)
+                ?: run { runCatching { lib.cosyvoice_prompt_speech_free(ps) }; error("音色初始化失败") }
+            val tts = lib.cosyvoice_tts_context_new(c, prompt)
+                ?: run { runCatching { lib.cosyvoice_prompt_free(prompt) }; runCatching { lib.cosyvoice_prompt_speech_free(ps) }; error("TTS 会话创建失败") }
+            voiceCachePs = ps
+            voiceCachePrompt = prompt
+            voiceCacheTts = tts
+            voiceCachePath = promptSpeechFile
         }
+        val tts = voiceCacheTts ?: error("TTS 会话创建失败")
+        val result = GeneratedSpeech()
+        val started = System.currentTimeMillis()
+        val ok = lib.cosyvoice_tts_instruct(tts, text, instruction, speed, result)
+        if (!ok) error("语音合成失败")
+        result.read()
+        val length = result.length
+        val data = result.data
+        if (length <= 0 || data == null) return FloatArray(0)
+        val pcm = data.getFloatArray(0, length)
+        logRtf("synth", text.length, pcm.size, started)
+        return pcm
+    }
+
+    @Synchronized
+    private fun freeVoiceCache() {
+        voiceCacheTts?.let { runCatching { lib.cosyvoice_tts_context_free(it) } }
+        voiceCachePrompt?.let { runCatching { lib.cosyvoice_prompt_free(it) } }
+        voiceCachePs?.let { runCatching { lib.cosyvoice_prompt_speech_free(it) } }
+        voiceCacheTts = null
+        voiceCachePrompt = null
+        voiceCachePs = null
+        voiceCachePath = null
     }
 
     /**
-     * Synthesizes [text] incrementally, handing each audio chunk to [onChunk]
-     * as it becomes ready so playback can start long before the whole reply is
-     * done. [onChunk] returns false to abort. Returns true when the runtime
-     * reported success.
+     * Requests the running synthesis to stop and waits for it to unwind.
+     *
+     * Safe to call from any thread EXCEPT the one currently inside [synthesize]
+     * (the native worker blocks until the running job exits). Callers should run
+     * this off the main thread.
      */
-    @Synchronized
-    fun synthesizeStream(
-        text: String,
-        promptSpeechFile: String,
-        instruction: String?,
-        speed: Float,
-        onChunk: (FloatArray) -> Boolean,
-    ): Boolean {
-        val c = ctx ?: error("模型尚未加载")
-        require(File(promptSpeechFile).exists()) { "音色文件不存在: $promptSpeechFile" }
-        val ps = lib.cosyvoice_prompt_speech_load_from_file(promptSpeechFile) ?: error("音色加载失败")
-        var prompt: Pointer? = null
-        var tts: Pointer? = null
-        val started = System.currentTimeMillis()
-        var samples = 0
-        try {
-            prompt = lib.cosyvoice_prompt_init_from_prompt_speech(c, ps) ?: error("音色初始化失败")
-            tts = lib.cosyvoice_tts_context_new(c, prompt) ?: error("TTS 会话创建失败")
-            val callback = object : TtsAudioCallback {
-                override fun invoke(audio: Pointer, nSamples: Int, userData: Pointer?): Boolean {
-                    if (nSamples <= 0) return true
-                    val chunk = audio.getFloatArray(0, nSamples)
-                    samples += chunk.size
-                    return onChunk(chunk)
-                }
-            }
-            val ok = lib.cosyvoice_tts_instruct_stream(tts, text, instruction, speed, callback, null)
-            if (ok) logRtf("stream", text.length, samples, started)
-            return ok
-        } finally {
-            tts?.let { runCatching { lib.cosyvoice_tts_context_free(it) } }
-            prompt?.let { runCatching { lib.cosyvoice_prompt_free(it) } }
-            runCatching { lib.cosyvoice_prompt_speech_free(ps) }
-        }
+    fun cancel() {
+        val c = ctx ?: return
+        runCatching { lib.cosyvoice_request_stop(c) }
     }
 
     private fun logRtf(kind: String, chars: Int, samples: Int, startedMs: Long) {

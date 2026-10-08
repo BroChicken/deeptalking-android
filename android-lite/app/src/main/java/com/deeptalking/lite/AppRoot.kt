@@ -226,7 +226,6 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                             com.deeptalking.feature.settings.VoiceOption(it.file, it.name, it.builtin)
                         },
                         ttsActiveVoice = tts.activeVoice,
-                        ttsStyle = tts.style,
                         ttsStatus = tts.status,
                         ttsSpeaking = tts.speaking,
                         ttsBusy = tts.busy,
@@ -237,7 +236,6 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                         onSelectTtsVoice = vm::selectVoice,
                         onRenameTtsVoice = vm::renameVoice,
                         onDeleteTtsVoice = vm::deleteVoice,
-                        onTtsStyleChange = vm::setTtsStyle,
                         onTestTtsSpeak = vm::speakText,
                         onStopTts = vm::stopSpeaking,
                     )
@@ -278,7 +276,10 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                     onDeleteSticker = { id -> activeCharacter?.let { vm.deleteSticker(it, id) } },
                     onSetStickerTag = { id, tag -> activeCharacter?.let { vm.setStickerTag(it, id, tag) } },
                     onSendSticker = { sticker, text -> vm.sendSticker(sticker, text) },
-                    onReadAloud = { msg -> vm.speakText(msg.content) },
+                    onReadAloud = { msg -> vm.onBubbleReadAloud(msg, activeCharacter) },
+                    ttsActiveMessageId = tts.activeMessageId,
+                    ttsPhase = tts.phase,
+                    ttsElapsedMs = tts.elapsedMs,
                 )
             }
         }

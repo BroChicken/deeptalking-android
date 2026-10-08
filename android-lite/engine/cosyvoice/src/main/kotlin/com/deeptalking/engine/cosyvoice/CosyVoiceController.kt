@@ -2,6 +2,7 @@ package com.deeptalking.engine.cosyvoice
 
 import android.content.Context
 import android.net.Uri
+import com.deeptalking.core.model.TtsPhase
 import com.deeptalking.engine.ondevice.AudioChunk
 import com.deeptalking.engine.ondevice.TtsBackend
 import kotlinx.coroutines.Dispatchers
@@ -98,6 +99,8 @@ class CosyVoiceController(private val context: Context) {
         runCatching {
             File(voicesDir, "default_1.gguf").delete()
             File(voicesDir, "default_2.gguf").delete()
+            File(voicesDir, "builtin_1.gguf").delete()
+            File(voicesDir, "builtin_2.gguf").delete()
         }
         val existing = store.list().map { it.file }.toSet()
         for (default in DEFAULTS) {
@@ -161,30 +164,26 @@ class CosyVoiceController(private val context: Context) {
             pcm to engine.sampleRate
         }
 
-    /** Synthesizes and plays [text] on the speaker; blocks until finished. */
-    suspend fun speak(text: String, style: String? = null) = withContext(Dispatchers.Default) {
-        if (!engine.isModelLoaded) engine.loadModel(models.modelFile.absolutePath)
-        val path = voiceFile?.absolutePath ?: error("尚未选择音色，请先导入参考音频")
-        val rate = engine.sampleRate
-        var delivered = 0
-        player.begin(rate)
-        runCatching {
-            engine.synthesizeStream(text, path, style, 1.0f) { chunk ->
-                delivered += chunk.size
-                player.write(chunk)
-                !player.isStopped
-            }
+    /**
+     * Synthesizes and plays [text] on the speaker; blocks until playback ends.
+     * [onPhase] reports [TtsPhase.Synthesizing] before the (slow) synthesis and
+     * [TtsPhase.Playing] once audio starts, so the UI can show live progress.
+     */
+    suspend fun speak(text: String, style: String? = null, onPhase: (TtsPhase) -> Unit = {}) =
+        withContext(Dispatchers.Default) {
+            onPhase(TtsPhase.Synthesizing)
+            val (pcm, rate) = synthesize(text, style, voiceFile?.absolutePath)
+            onPhase(TtsPhase.Playing)
+            player.play(pcm, rate)
         }
-        if (delivered > 0) {
-            // Streaming started: let the queued audio drain and return.
-            player.finish()
-            return@withContext
-        }
-        // Streaming produced nothing (unsupported runtime / failure): fall back
-        // to whole-buffer synthesis so read-aloud still works.
+
+    /**
+     * Preempts any running synthesis and stops playback. [CosyVoiceEngine.cancel]
+     * blocks until the native worker exits, so this must not run on the main thread.
+     */
+    fun cancel() {
+        runCatching { engine.cancel() }
         player.stop()
-        val pcm = engine.synthesize(text, path, style, 1.0f)
-        player.play(pcm, rate)
     }
 
     fun stop() = player.stop()
@@ -198,8 +197,8 @@ class CosyVoiceController(private val context: Context) {
 
     private companion object {
         val DEFAULTS = listOf(
-            DefaultVoice("voices/sample_1.wav", "builtin_1.gguf", "内置音色 1", "今天天气真不错，我们一起去公园散步吧。"),
-            DefaultVoice("voices/sample_2.wav", "builtin_2.gguf", "内置音色 2", "大家好，很高兴在这里和你聊天。"),
+            DefaultVoice("voices/sample_1.wav", "builtin_1_v2.gguf", "内置音色 1", "今天天气真不错，我们一起去公园散步吧。"),
+            DefaultVoice("voices/sample_2.wav", "builtin_2_v2.gguf", "内置音色 2", "大家好，很高兴在这里和你聊天。"),
         )
     }
 }

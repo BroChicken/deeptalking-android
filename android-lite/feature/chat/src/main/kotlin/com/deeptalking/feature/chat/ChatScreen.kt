@@ -43,6 +43,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.EmojiEmotions
@@ -50,10 +51,12 @@ import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.SmartToy
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -98,6 +101,7 @@ import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.MessageAttachment
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.Sticker
+import com.deeptalking.core.model.TtsPhase
 import java.util.Locale
 
 @Composable
@@ -120,6 +124,9 @@ fun ChatScreen(
     onSetStickerTag: (String, String) -> Unit = { _, _ -> },
     onSendSticker: (Sticker, String) -> Unit = { _, _ -> },
     onReadAloud: (ChatMessage) -> Unit = {},
+    ttsActiveMessageId: String? = null,
+    ttsPhase: TtsPhase = TtsPhase.Idle,
+    ttsElapsedMs: Long = 0L,
 ) {
     var input by rememberSaveable(stateSaver = TextFieldValue.Saver) { mutableStateOf(TextFieldValue("")) }
     var imagePreview by rememberSaveable { mutableStateOf<String?>(null) }
@@ -184,6 +191,9 @@ fun ChatScreen(
                                 onRegenerate = { confirmRegenerate = message },
                                 onImageClick = { imagePreview = it },
                                 onReadAloud = { onReadAloud(message) },
+                                ttsActiveMessageId = ttsActiveMessageId,
+                                ttsPhase = ttsPhase,
+                                ttsElapsedMs = ttsElapsedMs,
                             )
                         }
                     }
@@ -383,6 +393,9 @@ private fun MessageRow(
     onRegenerate: () -> Unit,
     onImageClick: (String) -> Unit,
     onReadAloud: () -> Unit,
+    ttsActiveMessageId: String?,
+    ttsPhase: TtsPhase,
+    ttsElapsedMs: Long,
 ) {
     val isUser = message.role == Role.User
     val colors = MaterialTheme.appColors
@@ -427,7 +440,10 @@ private fun MessageRow(
                         }
                     }
                     if (!message.isLoading && message.content.isNotBlank()) {
-                        MessageMeta(message, isUser, isSending, onCopy, onEditResend, onRegenerate, onReadAloud)
+                        MessageMeta(
+                            message, isUser, isSending, onCopy, onEditResend, onRegenerate, onReadAloud,
+                            ttsActiveMessageId == message.id, ttsPhase, ttsElapsedMs,
+                        )
                     }
                 }
             }
@@ -444,6 +460,9 @@ private fun MessageMeta(
     onEditResend: () -> Unit,
     onRegenerate: () -> Unit,
     onReadAloud: () -> Unit,
+    readAloudActive: Boolean,
+    ttsPhase: TtsPhase,
+    ttsElapsedMs: Long,
 ) {
     val legacy = MaterialTheme.legacy
     Row(
@@ -465,12 +484,62 @@ private fun MessageMeta(
                     Icon(Icons.Default.Edit, contentDescription = "编辑并重发", tint = legacy.textMuted, modifier = Modifier.size(15.dp))
                 }
             } else {
-                IconButton(onClick = onReadAloud, modifier = Modifier.size(30.dp)) {
-                    Icon(Icons.Default.VolumeUp, contentDescription = "朗读", tint = legacy.textMuted, modifier = Modifier.size(15.dp))
-                }
+                ReadAloudButton(
+                    active = readAloudActive,
+                    phase = ttsPhase,
+                    elapsedMs = ttsElapsedMs,
+                    onClick = onReadAloud,
+                    tint = legacy.textMuted,
+                )
                 IconButton(onClick = onRegenerate, modifier = Modifier.size(30.dp)) {
                     Icon(Icons.Default.Refresh, contentDescription = "重新生成", tint = legacy.textMuted, modifier = Modifier.size(15.dp))
                 }
+            }
+        }
+    }
+}
+
+/**
+ * The bubble's read-aloud control. Shows live synthesis progress (spinner +
+ * elapsed seconds), a stop button while playing, a tick when done, and the
+ * speaker icon when idle.
+ */
+@Composable
+private fun ReadAloudButton(
+    active: Boolean,
+    phase: TtsPhase,
+    elapsedMs: Long,
+    onClick: () -> Unit,
+    tint: Color,
+) {
+    val busy = active && (phase == TtsPhase.Synthesizing || phase == TtsPhase.Playing)
+    when {
+        busy && phase == TtsPhase.Synthesizing -> {
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(14.dp))
+                    .clickable(onClick = onClick)
+                    .padding(horizontal = 6.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
+            ) {
+                CircularProgressIndicator(modifier = Modifier.size(12.dp), strokeWidth = 2.dp, color = tint)
+                Text("合成中 ${elapsedMs / 1000}s", fontSize = 11.sp, color = tint)
+            }
+        }
+        busy && phase == TtsPhase.Playing -> {
+            IconButton(onClick = onClick, modifier = Modifier.size(30.dp)) {
+                Icon(Icons.Default.Stop, contentDescription = "停止朗读", tint = tint, modifier = Modifier.size(15.dp))
+            }
+        }
+        active && phase == TtsPhase.Done -> {
+            IconButton(onClick = {}, enabled = false, modifier = Modifier.size(30.dp)) {
+                Icon(Icons.Default.Check, contentDescription = "朗读完成", tint = tint, modifier = Modifier.size(15.dp))
+            }
+        }
+        else -> {
+            IconButton(onClick = onClick, modifier = Modifier.size(30.dp)) {
+                Icon(Icons.Default.VolumeUp, contentDescription = "朗读", tint = tint, modifier = Modifier.size(15.dp))
             }
         }
     }

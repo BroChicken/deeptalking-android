@@ -16,11 +16,16 @@ import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.RequestMetric
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.StaticProfile
+import com.deeptalking.core.model.TtsPhase
+import com.deeptalking.core.model.extractSpeechText
 import com.deeptalking.domain.agent.OrchestratorResult
 import com.deeptalking.feature.characters.CharacterParity
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -134,6 +139,13 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 java.io.File(p).takeIf { it.exists() }?.let { core.cosyVoice.setVoiceFile(it) }
             }
             runCatching { core.cosyVoice.ensureDefaultVoices() }.onFailure { DeepTalkingApp.recordError(it) }
+            if (core.cosyVoice.voiceFile == null) {
+                core.cosyVoice.listVoices().firstOrNull()?.let { v ->
+                    core.cosyVoice.selectVoice(v.file)?.let { resolved ->
+                        core.data.config.update(core.currentConfig().copy(ttsVoiceFile = resolved.absolutePath))
+                    }
+                }
+            }
             refreshTtsState(core.currentConfig())
         }
     }
@@ -800,7 +812,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 quickRepliesState.value = finalResult.quickReplies
                 statusState.value = ""
                 recordMetrics(cfg, id, finalResult)
-                if (cfg.ttsEnabled && cfg.ttsAutoRead) speakText(finalResult.reply)
+                if (cfg.ttsEnabled && cfg.ttsAutoRead) speakReply(finalResult.reply, finalResult.updatedCharacter)
             } catch (error: Exception) {
                 streamingState.value = null
                 statusState.value = ""
@@ -1072,6 +1084,8 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         const val PROACTIVE_IDLE_MS = 60_000L
         const val FIELD_MIGRATION_SKIP_KEY = "deeptalking_field_migration_skip_v1"
         const val LOREBOOK_MIGRATION_SKIP_KEY = "deeptalking_lorebook_migration_skip_v1"
+        /** How long the bubble shows the "done" tick before reverting to idle. */
+        const val TTS_DONE_LINGER_MS = 1_000L
     }
 
     // ------------------------------------------------------------------- theme
@@ -1106,7 +1120,6 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             modelReady = runCatching { core.cosyVoice.isModelReady }.getOrDefault(false),
             voices = voices,
             activeVoice = activeFile,
-            style = cfg.ttsStyle,
             speed = cfg.ttsSpeed,
         )
     }
@@ -1124,11 +1137,6 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             core.data.config.update(core.currentConfig().copy(ttsAutoRead = autoRead))
             refreshTtsState(core.currentConfig())
         }
-    }
-
-    fun setTtsStyle(style: String) {
-        ttsState.value = ttsState.value.copy(style = style)
-        viewModelScope.launch { core.data.config.update(core.currentConfig().copy(ttsStyle = style)) }
     }
 
     fun setTtsSpeed(speed: Float) {
@@ -1205,25 +1213,120 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         }
     }
 
-    /** Reads the currently visible AI reply aloud. */
+    // ------------------------------------------------------------- read-aloud
+
+    private var ttsTimerJob: Job? = null
+    private var ttsGeneration = 0
+
+    /**
+     * Reads an AI reply aloud: strips stage directions, derives a tone instruction
+     * from the character persona, then synthesizes. Only one request runs at a
+     * time; starting a new one preempts the previous.
+     */
+    fun speakMessage(message: ChatMessage, character: Character?) {
+        val speech = extractSpeechText(message.content)
+        if (speech.isEmpty()) {
+            eventsState.tryEmit(UiEvent("这条消息没有可朗读的内容"))
+            return
+        }
+        startSpeak(message.id, speech, character)
+    }
+
+    /** Bubble tap: starts read-aloud, or stops it when this message is already active. */
+    fun onBubbleReadAloud(message: ChatMessage, character: Character?) {
+        val busy = ttsState.value.phase == TtsPhase.Synthesizing || ttsState.value.phase == TtsPhase.Playing
+        if (busy && ttsState.value.activeMessageId == message.id) stopSpeaking() else speakMessage(message, character)
+    }
+
+    /** Settings voice preview: synthesizes the typed text with no tone instruction. */
     fun speakText(text: String) {
-        val clean = text.trim()
-        if (clean.isEmpty()) return
-        viewModelScope.launch {
+        val speech = text.trim()
+        if (speech.isEmpty()) return
+        startSpeak(null, speech, null)
+    }
+
+    /** Auto-reads a freshly generated reply (no bubble highlight). */
+    private fun speakReply(reply: String, character: Character?) {
+        val speech = extractSpeechText(reply)
+        if (speech.isEmpty()) return
+        startSpeak(null, speech, character)
+    }
+
+    private fun startSpeak(messageId: String?, speech: String, character: Character?) {
+        val generation = ++ttsGeneration
+        val previous = ttsJob
+        ttsJob = viewModelScope.launch {
+            // Preempt: cancel the previous request and unblock its native synthesis.
+            if (previous != null) {
+                previous.cancel()
+                withContext(Dispatchers.IO) { runCatching { core.cosyVoice.cancel() } }
+            }
             val cfg = core.currentConfig()
             if (!cfg.ttsEnabled) {
                 eventsState.tryEmit(UiEvent("请先在设置-语音朗读中开启"))
                 return@launch
             }
-            ttsState.value = ttsState.value.copy(speaking = true, status = "正在合成…")
-            runCatching { core.cosyVoice.speak(clean, cfg.ttsStyle.ifBlank { null }) }
-                .onFailure { t -> ttsState.value = ttsState.value.copy(status = "朗读失败：${t.message}") }
-            ttsState.value = ttsState.value.copy(speaking = false)
+            if (generation != ttsGeneration) return@launch
+            ttsState.value = ttsState.value.copy(
+                speaking = true,
+                activeMessageId = messageId,
+                phase = TtsPhase.Synthesizing,
+                elapsedMs = 0L,
+                status = "正在合成…",
+            )
+            startTtsTimer()
+            val instruction = if (character != null && core.hasApiKey(cfg.apiPlatform)) {
+                runCatching { core.generateToneInstruction(cfg, speech, character) }.getOrNull()
+            } else {
+                null
+            }
+            if (generation != ttsGeneration) return@launch
+            val ok = runCatching {
+                core.cosyVoice.speak(speech, instruction) { phase ->
+                    viewModelScope.launch {
+                        if (generation == ttsGeneration) ttsState.value = ttsState.value.copy(phase = phase)
+                    }
+                }
+            }.onFailure { t ->
+                if (generation == ttsGeneration) eventsState.tryEmit(UiEvent("朗读失败：${t.message}"))
+            }.isSuccess
+            if (generation != ttsGeneration) return@launch
+            stopTtsTimer()
+            ttsState.value = ttsState.value.copy(phase = if (ok) TtsPhase.Done else TtsPhase.Error, status = "")
+            delay(TTS_DONE_LINGER_MS)
+            if (generation == ttsGeneration) {
+                ttsState.value = ttsState.value.copy(
+                    speaking = false, activeMessageId = null, phase = TtsPhase.Idle, elapsedMs = 0L, status = "",
+                )
+            }
         }
     }
 
+    private fun startTtsTimer() {
+        ttsTimerJob?.cancel()
+        val startedAt = System.currentTimeMillis()
+        ttsTimerJob = viewModelScope.launch {
+            while (isActive) {
+                ttsState.value = ttsState.value.copy(elapsedMs = System.currentTimeMillis() - startedAt)
+                delay(200)
+            }
+        }
+    }
+
+    private fun stopTtsTimer() {
+        ttsTimerJob?.cancel()
+        ttsTimerJob = null
+    }
+
+    /** Stops any running read-aloud (playback + native synthesis). */
     fun stopSpeaking() {
-        runCatching { core.cosyVoice.stop() }
-        ttsState.value = ttsState.value.copy(speaking = false)
+        ++ttsGeneration
+        ttsJob?.cancel()
+        ttsJob = null
+        stopTtsTimer()
+        viewModelScope.launch { withContext(Dispatchers.IO) { runCatching { core.cosyVoice.cancel() } } }
+        ttsState.value = ttsState.value.copy(
+            speaking = false, activeMessageId = null, phase = TtsPhase.Idle, elapsedMs = 0L, status = "",
+        )
     }
 }

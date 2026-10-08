@@ -33,7 +33,7 @@
 统一入口：`powershell -File tools/native-verify.ps1`（自动解析 JDK17/Android SDK/Gradle，见 `tools/native/env.ps1`）。
 它等价于：
 0. `gradle :app:assembleDebug` —— 全模块编译通过。
-1. `gradle :engine:ondevice:test :domain:agent:test :domain:memory:test :core:data:testDebugUnitTest :feature:richtext:testDebugUnitTest` —— 单元测试全绿。
+1. `gradle :engine:ondevice:test :domain:agent:test :domain:memory:test :core:data:testDebugUnitTest :core:model:test :feature:richtext:testDebugUnitTest` —— 单元测试全绿。
    - 新增工具/记忆/解析/迁移逻辑时必须同步补测试。
 2. 端侧接口新增实现时，在 `:engine:ondevice` 或对应模块补一个"假后端可插拔"测试。
 3. `docs/`（尤其 `docs/AGENT_ARCHITECTURE.md`、`docs/NATIVE_MODULES.md`）已同步更新。

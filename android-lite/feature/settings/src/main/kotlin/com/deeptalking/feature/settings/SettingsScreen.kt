@@ -98,7 +98,6 @@ fun SettingsScreen(
     ttsProgressLabel: String = "",
     ttsVoices: List<VoiceOption> = emptyList(),
     ttsActiveVoice: String = "",
-    ttsStyle: String = "",
     ttsStatus: String = "",
     ttsSpeaking: Boolean = false,
     ttsBusy: Boolean = false,
@@ -109,7 +108,6 @@ fun SettingsScreen(
     onSelectTtsVoice: (String) -> Unit = {},
     onRenameTtsVoice: (String, String) -> Unit = { _, _ -> },
     onDeleteTtsVoice: (String) -> Unit = {},
-    onTtsStyleChange: (String) -> Unit = {},
     onTestTtsSpeak: (String) -> Unit = {},
     onStopTts: () -> Unit = {},
 ) {
@@ -245,7 +243,6 @@ fun SettingsScreen(
             progressLabel = ttsProgressLabel,
             voices = ttsVoices,
             activeVoiceId = ttsActiveVoice,
-            style = ttsStyle,
             status = ttsStatus,
             speaking = ttsSpeaking,
             busy = ttsBusy,
@@ -256,7 +253,6 @@ fun SettingsScreen(
             onSelectVoice = onSelectTtsVoice,
             onRenameVoice = onRenameTtsVoice,
             onDeleteVoice = onDeleteTtsVoice,
-            onStyleChange = onTtsStyleChange,
             onTestSpeak = onTestTtsSpeak,
             onStop = onStopTts,
         )

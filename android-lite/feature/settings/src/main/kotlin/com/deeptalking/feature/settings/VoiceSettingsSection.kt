@@ -49,7 +49,6 @@ fun VoiceSettingsSection(
     progressLabel: String,
     voices: List<VoiceOption>,
     activeVoiceId: String,
-    style: String,
     status: String,
     speaking: Boolean,
     busy: Boolean,
@@ -60,7 +59,6 @@ fun VoiceSettingsSection(
     onSelectVoice: (String) -> Unit,
     onRenameVoice: (String, String) -> Unit,
     onDeleteVoice: (String) -> Unit,
-    onStyleChange: (String) -> Unit,
     onTestSpeak: (String) -> Unit,
     onStop: () -> Unit,
 ) {
@@ -171,14 +169,6 @@ fun VoiceSettingsSection(
             color = legacy.textMuted.copy(alpha = 0.8f),
         )
     }
-
-    OutlinedTextField(
-        value = style,
-        onValueChange = onStyleChange,
-        label = { Text("情绪/风格指令（自由描述，如“温柔而略带笑意，语速稍慢”）") },
-        modifier = Modifier.fillMaxWidth(),
-        textStyle = MaterialTheme.typography.bodySmall,
-    )
 
     OutlinedTextField(
         value = testText,

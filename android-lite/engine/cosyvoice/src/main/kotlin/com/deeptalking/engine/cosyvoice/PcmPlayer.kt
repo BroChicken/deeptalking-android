@@ -2,30 +2,22 @@ package com.deeptalking.engine.cosyvoice
 
 import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioTrack
 import kotlin.math.max
 import kotlin.math.min
 
-/**
- * Streams 16-bit PCM to the speaker with a single reusable [AudioTrack].
- *
- * Supports both whole-buffer playback ([play]) and incremental streaming
- * ([begin]/[write]/[finish]) so read-aloud can start as soon as the first
- * synthesized chunk arrives.
- */
+/** Streams 16-bit PCM to the speaker with a single reusable [AudioTrack]. */
 internal class PcmPlayer {
 
     private var track: AudioTrack? = null
     private var currentRate = 0
-    private var totalWritten = 0L
 
     @Volatile
     private var stopped = false
 
-    val isStopped: Boolean get() = stopped
-
     @Synchronized
-    private fun ensureTrack(rate: Int): AudioTrack {
+    private fun track(rate: Int): AudioTrack {
         val existing = track
         if (existing != null && currentRate == rate) return existing
         existing?.release()
@@ -57,22 +49,16 @@ internal class PcmPlayer {
         return t
     }
 
-    /** Prepares the track for a new streaming playback. */
+    /** Blocking write; returns early when [stop] is called. */
     @Synchronized
-    fun begin(rate: Int) {
+    fun play(samples: FloatArray, rate: Int) {
+        if (samples.isEmpty()) return
         stopped = false
-        totalWritten = 0
-        ensureTrack(rate)
-    }
-
-    /** Blocking write of one chunk; no-op once [stop] has been called. */
-    @Synchronized
-    fun write(samples: FloatArray) {
-        if (samples.isEmpty() || stopped) return
-        val t = track ?: return
+        val t = track(rate)
         val buf = ShortArray(samples.size)
         for (i in samples.indices) {
-            buf[i] = (samples[i] * 32767f).toInt().coerceIn(-32768, 32767).toShort()
+            val v = (samples[i] * 32767f).toInt().coerceIn(-32768, 32767)
+            buf[i] = v.toShort()
         }
         var offset = 0
         while (offset < buf.size && !stopped) {
@@ -81,26 +67,6 @@ internal class PcmPlayer {
             if (written < 0) break
             offset += written
         }
-        totalWritten += offset
-    }
-
-    /** Waits (bounded) for the queued audio to finish playing. */
-    @Synchronized
-    fun finish() {
-        val t = track ?: return
-        val deadline = System.currentTimeMillis() + DRAIN_TIMEOUT_MS
-        while (!stopped && t.playbackHeadPosition.toLong() < totalWritten && System.currentTimeMillis() < deadline) {
-            runCatching { Thread.sleep(20) }
-        }
-    }
-
-    /** Blocking whole-buffer playback; returns early when [stop] is called. */
-    @Synchronized
-    fun play(samples: FloatArray, rate: Int) {
-        if (samples.isEmpty()) return
-        begin(rate)
-        write(samples)
-        finish()
     }
 
     @Synchronized
@@ -117,9 +83,5 @@ internal class PcmPlayer {
         runCatching { track?.release() }
         track = null
         currentRate = 0
-    }
-
-    private companion object {
-        const val DRAIN_TIMEOUT_MS = 5000L
     }
 }

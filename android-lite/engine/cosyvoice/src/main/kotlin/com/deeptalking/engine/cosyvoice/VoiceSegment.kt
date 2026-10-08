@@ -14,7 +14,7 @@ internal object VoiceSegment {
     const val RATE = 16000
 
     /** Target length of the reference window handed to the frontend. */
-    const val TARGET_SECONDS = 6.0f
+    const val TARGET_SECONDS = 3.0f
 
     /** Below this much usable speech, voice cloning is unreliable. */
     const val MIN_SECONDS = 2.0f
