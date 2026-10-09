@@ -84,8 +84,7 @@ private val DYNAMIC_FIELDS = listOf(
     "currentMood" to "当前情绪",
     "currentOccupation" to "当前职业/身份",
     "currentGoal" to "当前目标",
-    "currentRelationship" to "当前关系",
-    "currentImportantOthers" to "当前重要他人",
+    "currentTone" to "当前语气",
 )
 
 @Composable
@@ -929,8 +928,7 @@ private fun dynamicValue(state: com.deeptalking.core.model.DynamicState, key: St
     "currentMood" -> state.currentMood
     "currentOccupation" -> state.currentOccupation
     "currentGoal" -> state.currentGoal
-    "currentRelationship" -> state.currentRelationship
-    "currentImportantOthers" -> state.currentImportantOthers
+    "currentTone" -> state.currentTone
     else -> ""
 }
 
@@ -940,7 +938,6 @@ private fun withDynamic(state: com.deeptalking.core.model.DynamicState, key: Str
     "currentMood" -> state.copy(currentMood = value)
     "currentOccupation" -> state.copy(currentOccupation = value)
     "currentGoal" -> state.copy(currentGoal = value)
-    "currentRelationship" -> state.copy(currentRelationship = value)
-    "currentImportantOthers" -> state.copy(currentImportantOthers = value)
+    "currentTone" -> state.copy(currentTone = value)
     else -> state
 }

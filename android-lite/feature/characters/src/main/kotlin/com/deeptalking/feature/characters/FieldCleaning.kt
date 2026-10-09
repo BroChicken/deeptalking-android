@@ -24,7 +24,7 @@ object FieldCleaning {
 
     private val DYNAMIC_FIELD_KEYS = listOf(
         "currentSituation", "currentLocation", "currentMood", "currentOccupation",
-        "currentGoal", "currentRelationship", "currentImportantOthers",
+        "currentGoal", "currentTone",
     )
 
     private val STATIC_FIELD_LABELS = listOf(
@@ -33,7 +33,7 @@ object FieldCleaning {
     )
 
     private val DYNAMIC_FIELD_LABELS = listOf(
-        "当前处境", "当前位置/场景", "当前情绪", "当前职业/身份", "当前目标", "当前关系", "当前重要他人",
+        "当前处境", "当前位置/场景", "当前情绪", "当前职业/身份", "当前目标", "当前语气",
     )
 
     private val FIELD_KEYS: Set<String> = (STATIC_FIELD_KEYS + DYNAMIC_FIELD_KEYS).toSet()

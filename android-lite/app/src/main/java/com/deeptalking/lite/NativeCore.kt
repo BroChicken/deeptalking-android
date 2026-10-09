@@ -421,54 +421,6 @@ class NativeCore(context: Context) {
         return result.text.takeIf { it.isNotBlank() }
     }
 
-    /**
-     * Derives a short, free-form tone/emotion instruction for read-aloud TTS from
-     * the character's persona plus the spoken line. Returns null when the model is
-     * unreachable or returns nothing, so callers can fall back to a neutral voice.
-     */
-    suspend fun generateToneInstruction(config: AppConfig, spokenText: String, character: Character?): String? {
-        if (spokenText.isBlank()) return null
-        val result = runCatching {
-            trackedComplete(
-                config,
-                "auxiliary",
-                LlmRequest(
-                    model = config.modelName,
-                    instructions = TONE_INSTRUCTION_SYSTEM,
-                    input = listOf(
-                        ChatMessage(
-                            role = Role.User,
-                            content = "【角色设定】\n" + buildTonePersona(character) + "\n\n【台词】\n" + spokenText,
-                        ),
-                    ),
-                    temperature = 0.7,
-                    maxOutputTokens = 80,
-                    reasoningEffort = "none",
-                    apiPlatform = config.apiPlatform,
-                    sessionId = "deeptalking-general",
-                ),
-            ).text
-        }.getOrNull()
-        return result?.trim()?.takeIf { it.isNotBlank() }
-    }
-
-    /** Summarizes the persona fields that shape delivery (voice/tone), not content. */
-    private fun buildTonePersona(character: Character?): String {
-        if (character == null) return "（无角色设定，按台词自然语气朗读）"
-        val sp = character.staticProfile
-        val ds = character.dynamicState
-        val parts = buildList {
-            if (character.name.isNotBlank()) add("姓名：" + character.name)
-            if (sp.personality.isNotBlank()) add("性格：" + sp.personality)
-            if (sp.speakingStyle.isNotBlank()) add("说话风格：" + sp.speakingStyle)
-            if (sp.userAddress.isNotBlank()) add("对用户的称呼：" + sp.userAddress)
-            if (sp.language.isNotBlank()) add("语言/方言：" + sp.language)
-            if (ds.currentMood.isNotBlank()) add("当前情绪：" + ds.currentMood)
-            if (ds.currentSituation.isNotBlank()) add("当前处境：" + ds.currentSituation)
-        }
-        return if (parts.isEmpty()) "（无角色设定，按台词自然语气朗读）" else parts.joinToString("\n")
-    }
-
     /** Generates a single emoji avatar from a character's description. */
     suspend fun generateEmojiAvatar(config: AppConfig, character: Character): String? =
         requestEmojiAvatar(
@@ -603,8 +555,7 @@ class NativeCore(context: Context) {
                     put("currentMood", member.dynamicState.currentMood)
                     put("currentOccupation", member.dynamicState.currentOccupation)
                     put("currentGoal", member.dynamicState.currentGoal)
-                    put("currentRelationship", member.dynamicState.currentRelationship)
-                    put("currentImportantOthers", member.dynamicState.currentImportantOthers)
+                    put("currentTone", member.dynamicState.currentTone)
                 },
             )
         }
@@ -726,19 +677,13 @@ class NativeCore(context: Context) {
             不得使用陈词滥调的人设模板；世界层设定一律写进 lorebook，不要写进角色个人背景。
         """.trimIndent()
 
-        val TONE_INSTRUCTION_SYSTEM = """
-            你是配音导演。根据角色设定与台词，输出一句简短的中文语气指令，用于指导语音合成（TTS）的语气、情绪、语速与音量。
-            只输出指令本身，不要解释、不要引号、不要换行，20 字以内。
-            示例：温柔而略带笑意，语速稍慢，音量适中。
-        """.trimIndent()
-
         val FILL_MEMBER_INSTRUCTIONS = """
             你是角色卡补全助手。只返回 JSON。
             只能根据群组设定、现有角色卡和用户的一句话补全空字段，不能覆盖或编造与已有字段冲突的信息。
             已有字段是绝对权威，任何情况下不得改写、润色或替换。
             返回字段：name, avatar, gender, age, race, appearance, personality, values, fears,
             background, keyEvents, speakingStyle, language, userAddress, roleInGroup,
-            dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccupation, currentGoal, currentRelationship, currentImportantOthers)。
+            dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccupation, currentGoal, currentTone)。
             只给出有把握的字段，没有把握就省略。成员的说话方式必须与群内其他成员显著不同。
         """.trimIndent()
     }

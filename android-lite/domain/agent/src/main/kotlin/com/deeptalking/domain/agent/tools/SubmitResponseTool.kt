@@ -276,6 +276,6 @@ class SubmitResponseTool : AgentTool {
 
     private fun dynamicStateKeys(): List<String> = listOf(
         "currentSituation", "currentLocation", "currentMood", "currentOccupation",
-        "currentGoal", "currentRelationship", "currentImportantOthers",
+        "currentGoal", "currentTone",
     )
 }

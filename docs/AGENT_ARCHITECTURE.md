@@ -166,10 +166,12 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 
 | 层 | 内容 | 上限 |
 |---|---|---|
-| `instant` | 最近原始消息 | 160 条（截断保底 40） |
+| `instant` | 最近原始消息 | 30 条（截断保底 10） |
 | `shortTerm` | 事件流程摘要 | 80 条（截断保底 20） |
 | `longTerm` | 分类长期记忆 | 每类 40 条 |
 | `scenes` | 场景概要 | 保留最近 8 条（`AppLimits.Scene.RETAIN`），注入最近 2 条 |
+
+**上下文窗口（有意偏离旧版）**：`INSTANT=30` / `INSTANT_TRIM_FLOOR=10`（旧版 160/40）。发给模型的原始历史窗口即当前 `instant`（最多 30 条原文，增长期不缺席）；满 30 触发 `extraction` 把较旧约 20 条总结进 `shortTerm`（volatile 注入的"摘要"），`instant` 裁到最近 10 条后再长回 30。更早内容由 volatile 的 `shortTerm` + `scenes` + 长期记忆承载。`Scene.SPAN=12`（旧版 24）。
 
 ### longTerm 五类
 
@@ -197,9 +199,9 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 
 | 任务 | 触发 | 计数器（`memoryTaskKeys`） | 说明 |
 |---|---|---|---|
-| `extraction` | `instant` 满 160 | `extractionRetryAt` / `extractionFailures` | 即时消息 → 短期摘要 |
+| `extraction` | `instant` 满 30 | `extractionRetryAt` / `extractionFailures` | 即时消息 → 短期摘要 |
 | `analysis` | `shortTerm` 满 80 且积压 ≥ 60 | `analysisRetryAt` / `analysisFailures` | 短期摘要 → 长期记忆 |
-| `scene` | 场景切换或跨度 ≥ 24 条（按消息序号） | `sceneRetryAt` / `sceneFailures` | 场景概要 |
+| `scene` | 场景切换或跨度 ≥ 12 条（按消息序号） | `sceneRetryAt` / `sceneFailures` | 场景概要 |
 | `lorebook` | 有已分析摘要尚未整理（或积压 ≥ 8，`consolidateSpan`） | `lorebookRetryAt` / `lorebookFailures` | 沉淀世界书条目 + 自动淘汰 |
 
 `scheduleMemoryRetry()` 统一指数退避（5 分钟 → 30 分钟封顶）；`resetMemoryRetry()` 成功后清零。`checkMemoryTriggers()` — src/js/memory/tasks.js:199 依次调度这四个任务。
@@ -208,10 +210,11 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 
 **证据与时间精度**：`evidenceMatchesSummary()` 要求证据与实际回复有 ≥2 个双字片段重叠（≥35%），不再"满 8 字即采信"，防止无关文本改写情绪/静态设定；`applyStaticFieldUpdates` 与 `update_character_field` 都额外要求 `hasStaticEditIntent()`（用户原话提到该字段且是修改意图）。`resolveTimeRef` 对带时分秒的 explicit ISO 原样保留（含时区偏移），只给"仅日期有理"的结果补时段起点，不再把明确时刻改写成"当天 12:00"。
 
-### 动态状态（7 字段）
+### 动态状态（6 字段）
 
-`DYNAMIC_STATE_FIELDS` — src/js/core/config.js:119：`currentSituation` / `currentLocation` / `currentMood` / `currentOccupation` / `currentGoal` / `currentRelationship` / `currentImportantOthers`。
-每个字段的 value 必须带 `sourceMessageIds` + `evidence` 溯源；群组整体只维护 `currentSituation` + `currentLocation`（`GROUP_SHARED_DYNAMIC_FIELDS` src/js/core/config.js:129）。
+`DYNAMIC_STATE_FIELDS`（`:domain:agent` 的 `prompts/Prompts.kt`）：`currentSituation` / `currentLocation` / `currentMood` / `currentOccupation` / `currentGoal` / `currentTone`。
+**有意偏离旧 WebView**：旧版的 `currentRelationship`（当前关系）与 `currentImportantOthers`（当前重要他人）已删除（旧值不再迁移，下次保存即抹除）；新增 `currentTone`（当前语气），由模型每轮更新，写成面向朗读的 TTS 播报指令（语气/情绪/语速/音量，≤20 字），朗读时直接作为 `style` 传给 CosyVoice，省去旧版"朗读前再调一次 API 生成语气指令"的开销。
+每个字段的 value 必须带 `sourceMessageIds` + `evidence` 溯源；群组整体只维护 `currentSituation` + `currentLocation`（`GROUP_SHARED_DYNAMIC_FIELDS`），成员各自的完整状态（含 `currentTone`）写入 `memberDynamicState`。
 
 ### 世界书（lorebook）
 
@@ -321,9 +324,9 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 | — | 优先级阶梯（规则块首行）：`0／0.5 与【输出格式】= 硬性契约 > 2.5／2.6 > 角色设定 > 风格偏好` |
 | `0` | （最高优先级）本轮必须以结构化方式收尾，二选一：调用 `submit_response` 工具（推荐）或直接输出单个 JSON 对象；不得在结构化内容之外写说明/旁白，不得裸写散文 |
 | `1` | 保持角色身份连续；先用已提供的记忆；"系统提供的本轮上下文"不是用户的话 |
-| `2` | reply 的字数（120–250 字手感锚点）、分段、动作穿插（每 1–2 句一次，不超过正文 1/3）、去重与结尾多样性 |
-| `2.6` | **表演质量（真人感）**：show-don't-tell、句长节奏起伏、对白优先、回避陈词滥调与复用比喻、每轮只推进一件事、不强行升华、人物性格稳定 |
-| `3` | 人格/背景锁定 + `dynamicState` 更新与溯源规则 + 时间写法（绝对日期 + 十个时段） |
+| `2` | reply 正文写法（像日常说话）：**不设下限**、只设 **≤250 字上限**防大段空话；分段/行内样式限制；**动作可选、单拍短、不堆叠、总量 ≤ ¼、不复述对白情绪**；去重（禁重复近期整句/句式/意象/固定动作/收尾） |
+| `2.6` | **表演质量（真人感，像日常说话）**：show-don't-tell、句长节奏起伏、对白优先、回避陈词滥调与复用比喻、删掉不推进内容的句子、人物性格稳定 |
+| `3` | 人格/背景锁定 + `dynamicState` 更新与溯源规则（时间写法见 `3.8`） |
 | `3.5` | 谨慎修改基础设定：用户直接要求 → `update_character_field`；无要求时仅"决定性不可逆转折"才改 |
 | `3.6` | 状态/设定字段的 value 写法（只写内容本身，不加主语，解释进 evidence） |
 | `3.7` | 记忆字段必须写明主体（禁止"我/你/TA"这类代词） |
@@ -331,7 +334,7 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 | `3.9` | 用户提"说话方式类"要求时，本轮 reply 直接演出、禁止元话术 |
 | `4`–`6` | 只记录未来有价值的信息；`subject` 取值约束；promises 的承诺方/受约方与状态流转 |
 | `7` | `quickReplies` 恰好两条且必须是**用户视角**（禁止角色口吻、**禁止角色对用户的提问**、禁止复述角色台词） |
-| `8` | JSON 格式示例（**新会话前 5 轮用完整示例，之后自动换成 `JSON_EXAMPLE_BRIEF` 精简示例**，见 src/js/core/normalization.js:2） |
+| `8` | JSON 字段结构精简示例（字段完整定义见 `submit_response` 工具 schema） |
 | `9` | `longTerm.category` 取值与 `importance` 范围 |
 | `9.5` | 相对时间（timeRef）说明（取值与示例已下沉到工具 schema） |
 | `A` | 工具使用总则（详细适用场景以工具描述为准；工具结果属内部上下文，不得向用户透露检索过程） |
@@ -434,16 +437,16 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 | `MAX_TOOL_CALLS` | 12 | src/js/agent/tool-definitions.js:3 |
 | `AGENT_TOOL_MEMORY_INJECT_LIMIT` | 5 | src/js/agent/tool-definitions.js:4 |
 | `MAX_API_RETRIES` | 3（退避 1s/2s/4s） | src/js/api/retry.js:2 |
-| `MEMORY_LIMITS` | instant 160(保底 40) / shortTerm 80(保底 20) / longTermPerCategory 40 / pendingRecall 6 / analysisBatch 40 / summarySources 160 | src/js/core/config.js:104 |
+| `MEMORY_LIMITS` | instant 30(保底 10) / shortTerm 80(保底 20) / longTermPerCategory 40 / pendingRecall 6 / analysisBatch 40 / summarySources 160（原生 instant/sceneSpan 已下调，见"上下文窗口"） | src/js/core/config.js:104 |
 | `API_LIMITS` | auxiliaryTimeoutMs 90000 / requestMetrics 60 / prefixSnapshots 12 | src/js/core/config.js:98 |
 | `PROMPT_LIMITS` | roleChars 8000 / memberChars 900 | src/js/core/config.js:113 |
-| `CONTEXT_BUDGET` | retrievedChars 1200 / summaryChars 1600 / sceneSummaries 2 / sceneInjectionChars 600 / sceneSpan 24 / volatileChars 6000 | src/js/core/config.js:173 |
+| `CONTEXT_BUDGET` | retrievedChars 1200 / summaryChars 1600 / sceneSummaries 2 / sceneInjectionChars 600 / sceneSpan 12 / volatileChars 6000 | src/js/core/config.js:173 |
 | `LOREBOOK_LIMITS` | entries 200 / keywordsPerEntry 20 / nameChars 60 / contentChars 2000 / injectEntries 6 / injectChars 1400 / scanMessages 6 / autoEntriesPerPass 3 / evictionMisses 3 / consolidateSpan 8 / maxAlwaysActive 6 / nameSimilarity 0.5 / contentSimilarity 0.45 / mergeSentenceSimilarity 0.6 | src/js/core/config.js:159 |
 | `NARRATIVE_PATTERNS` | 10 条节奏骨架 | src/js/core/config.js:144 |
-| `DYNAMIC_STATE_FIELDS` | 7 个动态字段 | src/js/core/config.js:119 |
+| `DYNAMIC_STATE_FIELDS` | 6 个动态字段（原生：currentTone 取代 currentRelationship/currentImportantOthers） | src/js/core/config.js:119 |
 | `STATIC_PROFILE_FIELDS` | 12 个基础设定字段 | src/js/core/config.js:130 |
 | `CHARACTER_QUALITY_RULE` / `SPEAKING_STYLE_SAMPLES_RULE` | 建卡与补全共用的质量/示例台词约束 | src/js/characters/avatar.js:76 / src/js/characters/avatar.js:76 |
-| `STYLE_GUARD` | reviewEveryTurns 3 / lookbackReplies 2 / anchorStyleChars 300 / anchorSamples 2 / critiqueMaxChars 1600 / critiqueMinRatio 0.5 / critiqueMaxRatio 2 | src/js/core/config.js:182 |
+| `STYLE_GUARD` | reviewEveryTurns 3 / lookbackReplies 2 / anchorStyleChars 300 / anchorSamples 3 / critiqueMaxChars 1600 / critiqueMinRatio 0.5 / critiqueMaxRatio 2 | src/js/core/config.js:182 |
 | `STYLE_CLICHES` | 11 条陈词滥调（违规检测用） | src/js/core/config.js:194 |
 | `QUICK_REPLY_GUARD` | maxChars 60 / mirrorChars 8 / repairMaxChars 40 | src/js/core/config.js:208 |
 | `QUICK_REPLY_ISSUE_LABELS` | 6 类快速回应视角问题说明（内部提醒用） | src/js/core/config.js:214 |

@@ -437,8 +437,6 @@ private fun mapDynamicState(dto: LegacyCharacter): DynamicState {
         currentMood = mood,
         currentOccupation = read(dyn?.currentOccupation, { it.currentOccupation }, basic?.occupation),
         currentGoal = goal,
-        currentRelationship = read(dyn?.currentRelationship, { it.currentRelationship }, basic?.relationshipWithUser),
-        currentImportantOthers = read(dyn?.currentImportantOthers, { it.currentImportantOthers }, basic?.importantOthers),
     )
 }
 

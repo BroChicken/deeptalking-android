@@ -193,6 +193,38 @@ class CosyVoiceController(private val context: Context) {
         }
 
     /**
+     * Synthesizes several (text, style) turns — one per speaking group member —
+     * and plays them back as a single continuous stream, so each member's line
+     * uses that member's own tone instruction. Blocks until playback ends.
+     */
+    suspend fun speakSegments(segments: List<Pair<String, String?>>, onPhase: (TtsPhase) -> Unit = {}) =
+        withContext(Dispatchers.Default) {
+            val usable = segments.filter { it.first.isNotBlank() }
+            if (usable.isEmpty()) return@withContext
+            onPhase(TtsPhase.Synthesizing)
+            var rate = engine.sampleRate
+            val parts = ArrayList<FloatArray>(usable.size)
+            var total = 0
+            for ((text, style) in usable) {
+                val (pcm, sampleRate) = synthesize(text, style, voiceFile?.absolutePath)
+                rate = sampleRate
+                if (pcm.isNotEmpty()) {
+                    parts += pcm
+                    total += pcm.size
+                }
+            }
+            if (total == 0) return@withContext
+            val merged = FloatArray(total)
+            var at = 0
+            for (part in parts) {
+                System.arraycopy(part, 0, merged, at, part.size)
+                at += part.size
+            }
+            onPhase(TtsPhase.Playing)
+            player.play(merged, rate)
+        }
+
+    /**
      * Preempts any running synthesis and stops playback. [CosyVoiceEngine.cancel]
      * blocks until the native worker exits, so this must not run on the main thread.
      */

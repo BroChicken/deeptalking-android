@@ -25,8 +25,8 @@ data class DynamicState(
     val currentMood: String = "",
     val currentOccupation: String = "",
     val currentGoal: String = "",
-    val currentRelationship: String = "",
-    val currentImportantOthers: String = "",
+    /** Delivery instruction for read-aloud TTS (语气/情绪/语速/音量); replaces the legacy relationship fields. */
+    val currentTone: String = "",
 )
 
 @Serializable

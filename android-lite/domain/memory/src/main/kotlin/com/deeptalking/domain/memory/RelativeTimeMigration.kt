@@ -100,8 +100,7 @@ object RelativeTimeMigration {
             currentMood = parseRelativeText(state.currentMood, base("currentMood"), zone),
             currentOccupation = parseRelativeText(state.currentOccupation, base("currentOccupation"), zone),
             currentGoal = parseRelativeText(state.currentGoal, base("currentGoal"), zone),
-            currentRelationship = parseRelativeText(state.currentRelationship, base("currentRelationship"), zone),
-            currentImportantOthers = parseRelativeText(state.currentImportantOthers, base("currentImportantOthers"), zone),
+            currentTone = state.currentTone,
         )
     }
 

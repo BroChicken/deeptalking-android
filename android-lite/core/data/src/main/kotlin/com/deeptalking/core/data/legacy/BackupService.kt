@@ -249,8 +249,7 @@ class BackupService(
         put("currentMood", state.currentMood)
         put("currentOccupation", state.currentOccupation)
         put("currentGoal", state.currentGoal)
-        put("currentRelationship", state.currentRelationship)
-        put("currentImportantOthers", state.currentImportantOthers)
+        put("currentTone", state.currentTone)
     }
 
     private fun memoryToJson(

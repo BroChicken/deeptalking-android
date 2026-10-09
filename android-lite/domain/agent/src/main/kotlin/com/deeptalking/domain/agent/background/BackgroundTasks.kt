@@ -1191,8 +1191,7 @@ class BackgroundTasks(
             currentMood = if (isGroup) "" else character.dynamicState.currentMood,
             currentOccupation = if (isGroup) "" else character.dynamicState.currentOccupation,
             currentGoal = if (isGroup) "" else character.dynamicState.currentGoal,
-            currentRelationship = if (isGroup) "" else character.dynamicState.currentRelationship,
-            currentImportantOthers = if (isGroup) "" else character.dynamicState.currentImportantOthers,
+            currentTone = if (isGroup) "" else character.dynamicState.currentTone,
         )
         val payload = buildJsonObject {
             put("name", character.name)
@@ -1203,13 +1202,12 @@ class BackgroundTasks(
                 put("currentMood", state.currentMood)
                 put("currentOccupation", state.currentOccupation)
                 put("currentGoal", state.currentGoal)
-                put("currentRelationship", state.currentRelationship)
-                put("currentImportantOthers", state.currentImportantOthers)
+                put("currentTone", state.currentTone)
             })
             put("background", if (isGroup) character.description else character.staticProfile.background)
         }
         val prompt = "下面是一个角色/成员的当前字段文本。请把它整理成新版字段结构：\n" +
-            "动态状态字段只能是：currentSituation、currentLocation、currentMood、currentOccupation、currentGoal、currentRelationship、currentImportantOthers；静态设定只保留 background（仅单角色）。\n" +
+            "动态状态字段只能是：currentSituation、currentLocation、currentMood、currentOccupation、currentGoal、currentTone；静态设定只保留 background（仅单角色）。\n" +
             "要求：①按语义归入最贴切字段，消除重复；②时间写绝对日期；③只整理已有信息，不编造；④写成自然完整的陈述句。\n" +
             "只返回JSON对象：{\"dynamicState\":{...},\"background\":\"...\"}。\n现有内容（JSON）：\n" + json.encodeToString(payload)
         val raw = complete(FILL_SYSTEM, prompt, sessionId = sessionIdFor(character))

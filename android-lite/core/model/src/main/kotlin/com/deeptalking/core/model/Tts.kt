@@ -64,6 +64,65 @@ private fun stripParentheticals(source: String): String {
     return sb.toString()
 }
 
+/** One spoken turn: [speaker] is the member name in a group reply, or null for a single character. */
+data class SpeechSegment(val speaker: String?, val text: String)
+
+private val LEADING_QUOTES = "「『\"'“‘"
+private val TRAILING_QUOTES = "」』\"'”’"
+
+/**
+ * Splits a group reply into per-speaker [SpeechSegment]s so each member's line can
+ * be read aloud with that member's own tone. Group replies use the
+ * `成员名："内容"` line format (see GROUP_RULE_10); a member's turn may span
+ * several lines until the next speaker line. Falls back to a single
+ * speaker-less segment when no member line is found (or [memberNames] is empty),
+ * which is also the path used for single characters.
+ */
+fun extractSpeechSegments(source: String, memberNames: List<String>): List<SpeechSegment> {
+    if (source.isBlank()) return emptyList()
+    val names = memberNames.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        .sortedByDescending { it.length }
+    if (names.isEmpty()) {
+        val text = extractSpeechText(source)
+        return if (text.isEmpty()) emptyList() else listOf(SpeechSegment(null, text))
+    }
+
+    data class Pending(val speaker: String?, val body: StringBuilder)
+    val pending = mutableListOf<Pending>()
+
+    for (rawLine in source.lines()) {
+        val line = rawLine.trim()
+        val speaker = names.firstOrNull { name ->
+            line.startsWith(name) && line.getOrNull(name.length) in listOf('：', ':')
+        }
+        if (speaker != null) {
+            pending += Pending(speaker, StringBuilder(line.substring(speaker.length + 1).trimStart()))
+        } else {
+            val last = pending.lastOrNull()
+            if (last == null) pending += Pending(null, StringBuilder(line))
+            else if (line.isNotEmpty()) {
+                if (last.body.isNotEmpty()) last.body.append('\n')
+                last.body.append(line)
+            }
+        }
+    }
+
+    val segments = pending.mapNotNull { (speaker, body) ->
+        val text = extractSpeechText(trimQuotes(body.toString()))
+        if (text.isEmpty()) null else SpeechSegment(speaker, text)
+    }
+    if (segments.isNotEmpty()) return segments
+    val fallback = extractSpeechText(source)
+    return if (fallback.isEmpty()) emptyList() else listOf(SpeechSegment(null, fallback))
+}
+
+private fun trimQuotes(value: String): String {
+    var text = value.trim()
+    if (text.isNotEmpty() && text.first() in LEADING_QUOTES) text = text.substring(1).trim()
+    if (text.isNotEmpty() && text.last() in TRAILING_QUOTES) text = text.dropLast(1).trim()
+    return text
+}
+
 /** Inserts a single space when a removed group sat between ASCII word characters. */
 private fun appendSeparatorIfAscii(sb: StringBuilder, next: Char?) {
     val prev = sb.lastOrNull()

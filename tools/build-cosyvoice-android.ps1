@@ -9,8 +9,9 @@
 # and inference is several times slower. See docs/NATIVE_MODULES.md.
 #
 # Applies perf patches to the upstream source: dedicated inference buffers,
-# a 2-slot DiT KV cache, and diffusion_steps 10 -> 3 (with a matching t_span
-# noise schedule). The flow stage dominates synthesis time.
+# a 2-slot DiT KV cache, and diffusion_steps 10 -> 5 (with a matching t_span
+# noise schedule). The flow stage dominates synthesis time. 3 steps cut quality
+# too much; 5 is the tuned compromise. Set $DIFFUSION_STEPS below to retune.
 #
 #   powershell -File tools/build-cosyvoice-android.ps1
 #
@@ -74,6 +75,10 @@ if (-not (Test-Path (Join-Path $src 'CMakeLists.txt'))) {
   git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/Lourdle/cosyvoice.cpp.git $src
 }
 
+# Reset the checkout before patching so re-runs are deterministic: an earlier
+# run may have already rewritten diffusion_steps / the t_span noise schedule.
+if (Test-Path (Join-Path $src '.git')) { git -C $src checkout -- . 2>$null }
+
 # Performance patch: the app loads the model through the high-level API
 # (context params v1), so the authors' streaming optimizations live in the
 # defaults. Turn on the DiT KV cache (2 fixed slots, "balanced speed/memory")
@@ -88,18 +93,21 @@ $p1 = Patch-File (Join-Path $src 'src\cosyvoice-model.cpp') 'COSYVOICE_INFERENCE
 $p2 = Patch-File (Join-Path $src 'src\cosyvoice.cpp') 'params_v3.dit_kv_fixed_slots = 0;' 'params_v3.dit_kv_fixed_slots = 2;'
 
 # Fewer DiT diffusion steps. The flow stage dominates synthesis time and runs the
-# DiT once per step, so 10 -> 3 cuts flow cost ~70% at a small quality cost. The
-# noise schedule must be rewritten to span t in [0,1] over the new step count;
-# leaving the original 11-point table would make the last step cover only t<0.3.
+# DiT once per step, so 10 -> 5 roughly halves flow cost at a small quality cost
+# (3 steps degraded quality too much). The noise schedule must be rewritten to
+# span t in [0,1] over the new step count; leaving the original 11-point table
+# would make the last step cover only the top of the range.
+$DIFFUSION_STEPS = 5
 $modules = Join-Path $src 'src\cosyvoice-modules.h'
 $loader = Join-Path $src 'src\cosyvoice-loader.cpp'
-Patch-File $modules 'constexpr static int diffusion_steps = 10;' 'constexpr static int diffusion_steps = 3;' | Out-Null
-Patch-File $modules 'constexpr static int diffusion_steps = 5;'  'constexpr static int diffusion_steps = 3;' | Out-Null
+Patch-File $modules 'constexpr static int diffusion_steps = 10;' "constexpr static int diffusion_steps = $DIFFUSION_STEPS;" | Out-Null
+Patch-File $modules 'constexpr static int diffusion_steps = 5;'  "constexpr static int diffusion_steps = $DIFFUSION_STEPS;" | Out-Null
+Patch-File $modules 'constexpr static int diffusion_steps = 3;'  "constexpr static int diffusion_steps = $DIFFUSION_STEPS;" | Out-Null
 Patch-File $loader  'for (int i = 0; i != 11; ++i)' 'for (int i = 0; i != diffusion_steps + 1; ++i)' | Out-Null
 Patch-File $loader  'std::cos(0.1f * 0.5f * 3.14159265358979323846f * i)' 'std::cos((1.f / diffusion_steps) * 0.5f * 3.14159265358979323846f * i)' | Out-Null
-$stepsOk = ([System.IO.File]::ReadAllText($modules)).Contains('diffusion_steps = 3;')
+$stepsOk = ([System.IO.File]::ReadAllText($modules)).Contains("diffusion_steps = $DIFFUSION_STEPS;")
 $tspanOk = ([System.IO.File]::ReadAllText($loader)).Contains('diffusion_steps + 1')
-if (-not ($p1 -and $p2 -and $stepsOk -and $tspanOk)) { Write-Warning "cosyvoice perf patch buffer=$p1 dit=$p2 steps3=$stepsOk tspan=$tspanOk (upstream source changed?)" }
+if (-not ($p1 -and $p2 -and $stepsOk -and $tspanOk)) { Write-Warning "cosyvoice perf patch buffer=$p1 dit=$p2 steps=$DIFFUSION_STEPS($stepsOk) tspan=$tspanOk (upstream source changed?)" }
 
 $build = Join-Path $work 'build-android-fe'
 cmake -S $src -B $build -G Ninja `

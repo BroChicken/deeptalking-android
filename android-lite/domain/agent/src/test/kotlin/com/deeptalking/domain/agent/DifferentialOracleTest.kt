@@ -162,9 +162,9 @@ class DifferentialOracleTest {
             val expected = expectedAll[scenario.id]!!.jsonObject["systemPrompt"]!!.jsonPrimitive.content
             val actual = buildSystemPrompt(PersonaInputs(scenario.character, scenario.config))
             assertEquals(
-                "[${scenario.id}] system prompt must be byte-identical to legacy JS (hard rules normalized)",
-                normalizeHardRule(expected),
-                normalizeHardRule(actual),
+                "[${scenario.id}] system prompt must match legacy JS outside the (intentionally slimmed) rules block",
+                normalizeSystemContract(normalizeHardRule(expected)),
+                normalizeSystemContract(normalizeHardRule(actual)),
             )
         }
     }
@@ -198,6 +198,30 @@ class DifferentialOracleTest {
         text.replace(Regex("【本轮(?:语气锚|声音契约)[\\s\\S]*$"), "【本轮声音契约】(正常化)")
             .replace(Regex("【群聊声音锁定[\\s\\S]*$"), "【群聊声音锁定】(正常化)")
 
+    /**
+     * The dynamic-state field set intentionally diverges from the legacy JS: the
+     * two relationship fields were replaced by a single `currentTone` used as the
+     * read-aloud delivery instruction. Normalize the affected field list, the
+     * extra rule sentence and the 【角色当前状态】 block out of the comparison.
+     */
+    private fun normalizeDynamicFields(text: String): String =
+        text
+            .replace(Regex("dynamicState可更新字段：[^。]*。"), "dynamicState可更新字段：<字段>。")
+            .replace(Regex("currentTone用于后续语音朗读，[^。]*。"), "")
+            .replace("（处境、地点、情绪、职业、目标、关系、重要他人）", "（动态字段）")
+            .replace("（处境、地点、情绪、职业、目标、语气）", "（动态字段）")
+            .replace(Regex("【角色当前状态，可随对话变化】[\\s\\S]*?\\n\\n"), "【角色当前状态】(正常化)\n\n")
+
+    /**
+     * The 【交互规则】 rules block and the trailing 【输出格式】 were intentionally
+     * slimmed well beyond the legacy JS, so they are normalized out; the role
+     * context and the hard-contract block (0.5 / 2.5) are still compared exactly.
+     */
+    private fun normalizeSystemContract(text: String): String =
+        text
+            .replace(Regex("【交互规则】[\\s\\S]*?(?=【角色设定（固定)"), "【交互规则】(正常化)\n")
+            .replace(Regex("(?m)^【输出格式】.*$"), "【输出格式】(正常化)")
+
     @Test
     fun `volatile context matches the legacy JS oracle`() = runBlocking {
         val now = json.parseToJsonElement(readResource("scenarios.json")).jsonObject["now"]!!.jsonPrimitive.content
@@ -217,9 +241,9 @@ class DifferentialOracleTest {
                 recentAssistantReplies = recentAssistant,
             )
             assertEquals(
-                "[${scenario.id}] volatile context must be byte-identical to legacy JS (skeleton/voice normalized)",
-                normalizeVoiceContract(normalizeSkeleton(expected)),
-                normalizeVoiceContract(normalizeSkeleton(actual)),
+                "[${scenario.id}] volatile context must be byte-identical to legacy JS (skeleton/voice/dynamic normalized)",
+                normalizeDynamicFields(normalizeVoiceContract(normalizeSkeleton(expected))),
+                normalizeDynamicFields(normalizeVoiceContract(normalizeSkeleton(actual))),
             )
         }
     }

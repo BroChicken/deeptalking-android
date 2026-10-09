@@ -11,8 +11,8 @@ object AppLimits {
     }
 
     object Memory {
-        const val INSTANT = 160
-        const val INSTANT_TRIM_FLOOR = 40
+        const val INSTANT = 30
+        const val INSTANT_TRIM_FLOOR = 10
         const val SHORT_TERM = 80
         const val SHORT_TERM_TRIM_FLOOR = 20
         const val LONG_TERM_PER_CATEGORY = 40
@@ -46,7 +46,7 @@ object AppLimits {
         /** Max scene summaries injected (legacy `CONTEXT_BUDGET.sceneSummaries`). */
         const val SUMMARIES = 2
         /** Messages after the scene cursor needed to summarize. */
-        const val SPAN = 24
+        const val SPAN = 12
         /** Minimum messages before a scene may be summarized. */
         const val MIN_MESSAGES = 6
     }

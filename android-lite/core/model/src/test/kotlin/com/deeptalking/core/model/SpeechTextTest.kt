@@ -61,4 +61,47 @@ class SpeechTextTest {
     fun blankInput() {
         assertEquals("", extractSpeechText("   \n  "))
     }
+
+    @Test
+    fun segmentsSingleCharacterWhenNoMemberLine() {
+        val segments = extractSpeechSegments("你好，（微笑）今天天气不错。", listOf("张三", "李四"))
+        assertEquals(1, segments.size)
+        assertEquals(null, segments[0].speaker)
+        assertEquals("你好，今天天气不错。", segments[0].text)
+    }
+
+    @Test
+    fun segmentsGroupReplyPerMember() {
+        val reply = "张三：\"（笑）今天去哪？\"\n李四：\"我随便，听你的。\""
+        val segments = extractSpeechSegments(reply, listOf("张三", "李四"))
+        assertEquals(2, segments.size)
+        assertEquals("张三", segments[0].speaker)
+        assertEquals("今天去哪？", segments[0].text)
+        assertEquals("李四", segments[1].speaker)
+        assertEquals("我随便，听你的。", segments[1].text)
+    }
+
+    @Test
+    fun keepsMultiLineTurnUnderOneSpeaker() {
+        val reply = "张三：\"今天去哪？\n随便走走也行。\"\n李四：\"好。\""
+        val segments = extractSpeechSegments(reply, listOf("张三", "李四"))
+        assertEquals(2, segments.size)
+        assertEquals("张三", segments[0].speaker)
+        assertEquals("今天去哪？ 随便走走也行。", segments[0].text)
+        assertEquals("李四", segments[1].speaker)
+    }
+
+    @Test
+    fun fallsBackToSingleSegmentWhenFormatMissing() {
+        val reply = "大家安静一下，我有话要说。"
+        val segments = extractSpeechSegments(reply, listOf("张三", "李四"))
+        assertEquals(1, segments.size)
+        assertEquals(null, segments[0].speaker)
+        assertEquals("大家安静一下，我有话要说。", segments[0].text)
+    }
+
+    @Test
+    fun segmentsBlankInputIsEmpty() {
+        assertEquals(0, extractSpeechSegments("   ", listOf("张三")).size)
+    }
 }

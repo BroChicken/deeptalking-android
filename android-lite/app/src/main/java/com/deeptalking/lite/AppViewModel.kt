@@ -18,6 +18,8 @@ import com.deeptalking.core.model.RequestMetric
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.core.model.TtsPhase
+import com.deeptalking.core.model.SpeechSegment
+import com.deeptalking.core.model.extractSpeechSegments
 import com.deeptalking.core.model.extractSpeechText
 import com.deeptalking.domain.agent.OrchestratorResult
 import com.deeptalking.feature.characters.CharacterParity
@@ -344,7 +346,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 append("请列出所有近期对话中已出现、应成为固定成员的其他角色；若不足一人，再新增一名最适合当前剧情的成员。")
                 append("返回JSON：{\"groupInfo\":{\"name\":\"群组名\",\"avatar\":\"emoji\",\"description\":\"群组前提（这群人是谁、为什么在一起，1-2 句；不要写世界观/地点/组织等世界层设定）\",\"scene\":\"场景\",\"interactionRules\":\"成员互动规则\"},")
                 append("\"lorebook\":[{\"name\":\"条目名\",\"keywords\":[\"触发词\"],\"content\":\"命中后注入的世界层设定\",\"alwaysActive\":false}],")
-                append("\"additionalMembers\":[{\"name\":\"\",\"avatar\":\"emoji\",\"gender\":\"\",\"age\":\"\",\"race\":\"\",\"appearance\":\"\",\"personality\":\"\",\"values\":\"\",\"fears\":\"\",\"background\":\"\",\"keyEvents\":\"\",\"speakingStyle\":\"\",\"language\":\"\",\"userAddress\":\"\",\"roleInGroup\":\"\",\"dynamicState\":{\"currentSituation\":\"\",\"currentLocation\":\"\",\"currentMood\":\"\",\"currentOccupation\":\"\",\"currentGoal\":\"\",\"currentRelationship\":\"\",\"currentImportantOthers\":\"\"}}]}。")
+                append("\"additionalMembers\":[{\"name\":\"\",\"avatar\":\"emoji\",\"gender\":\"\",\"age\":\"\",\"race\":\"\",\"appearance\":\"\",\"personality\":\"\",\"values\":\"\",\"fears\":\"\",\"background\":\"\",\"keyEvents\":\"\",\"speakingStyle\":\"\",\"language\":\"\",\"userAddress\":\"\",\"roleInGroup\":\"\",\"dynamicState\":{\"currentSituation\":\"\",\"currentLocation\":\"\",\"currentMood\":\"\",\"currentOccupation\":\"\",\"currentGoal\":\"\",\"currentTone\":\"\"}}]}。")
                 append("lorebook 只需补上近期对话中出现、值得日后复用的世界层设定（没有就返回空数组）；additionalMembers只能包含新增成员，至少一名，且姓名必须互不重复；每名成员必须尽可能填满所有字段，不能只返回名称和性格；成员之间的说话方式必须显著不同（看台词就能分辨是谁）。")
                 append(CharacterParity.CHARACTER_QUALITY_RULE)
                 append(CharacterParity.SPEAKING_STYLE_SAMPLES_RULE)
@@ -1461,17 +1463,19 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     private var ttsGeneration = 0
 
     /**
-     * Reads an AI reply aloud: strips stage directions, derives a tone instruction
-     * from the character persona, then synthesizes. Only one request runs at a
+     * Reads an AI reply aloud. Stage directions are stripped and each turn's
+     * tone instruction comes from the speaker's `currentTone` dynamic field (so
+     * no extra API call is needed). Group replies are split per member, and each
+     * member's line uses that member's own tone. Only one request runs at a
      * time; starting a new one preempts the previous.
      */
     fun speakMessage(message: ChatMessage, character: Character?) {
-        val speech = extractSpeechText(message.content)
-        if (speech.isEmpty()) {
+        val segments = buildSpeechSegments(message.content, character)
+        if (segments.isEmpty()) {
             eventsState.tryEmit(UiEvent("这条消息没有可朗读的内容"))
             return
         }
-        startSpeak(message.id, speech, character)
+        startSpeak(message.id, segments, character)
     }
 
     /** Bubble tap: starts read-aloud, or stops it when this message is already active. */
@@ -1484,22 +1488,43 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     fun speakText(text: String) {
         val speech = text.trim()
         if (speech.isEmpty()) return
-        startSpeak(null, speech, null)
+        startSpeak(null, listOf(SpeechSegment(null, speech)), null)
     }
 
     /** Auto-reads a freshly generated reply (no bubble highlight). */
     private fun speakReply(reply: String, character: Character?) {
-        val speech = extractSpeechText(reply)
-        if (speech.isEmpty()) return
-        startSpeak(null, speech, character)
+        val segments = buildSpeechSegments(reply, character)
+        if (segments.isEmpty()) return
+        startSpeak(null, segments, character)
     }
 
-    private fun startSpeak(messageId: String?, speech: String, character: Character?) {
+    /** Splits a reply into speakable turns: per member for groups, else one turn. */
+    private fun buildSpeechSegments(content: String, character: Character?): List<SpeechSegment> =
+        if (character != null && character.isGroup) {
+            extractSpeechSegments(content, character.members.map { it.name })
+        } else {
+            val speech = extractSpeechText(content)
+            if (speech.isEmpty()) emptyList() else listOf(SpeechSegment(null, speech))
+        }
+
+    /** Tone instruction for one spoken turn: the speaker's `currentTone`. */
+    private fun toneFor(segment: SpeechSegment, character: Character?): String? {
+        val raw = if (segment.speaker != null) {
+            character?.members?.firstOrNull { it.name == segment.speaker }?.dynamicState?.currentTone
+        } else {
+            character?.dynamicState?.currentTone
+        }
+        return raw?.trim()?.takeIf { it.isNotEmpty() }
+    }
+
+    private fun startSpeak(messageId: String?, segments: List<SpeechSegment>, character: Character?) {
         val generation = ++ttsGeneration
         val previous = ttsJob
         ttsJob = viewModelScope.launch {
-            // Preempt: cancel the previous request and unblock its native synthesis.
-            if (previous != null) {
+            // Preempt: only cancel a genuinely running request. Cancelling an
+            // already-finished job still stops the player (pause+flush), which
+            // used to silence every read-aloud after the first one.
+            if (previous?.isActive == true) {
                 previous.cancel()
                 withContext(Dispatchers.IO) { runCatching { core.cosyVoice.cancel() } }
             }
@@ -1517,14 +1542,10 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 status = "正在合成…",
             )
             startTtsTimer()
-            val instruction = if (character != null && core.hasApiKey(cfg.apiPlatform)) {
-                runCatching { core.generateToneInstruction(cfg, speech, character) }.getOrNull()
-            } else {
-                null
-            }
+            val turns = segments.map { it.text to toneFor(it, character) }
             if (generation != ttsGeneration) return@launch
             val ok = runCatching {
-                core.cosyVoice.speak(speech, instruction) { phase ->
+                core.cosyVoice.speakSegments(turns) { phase ->
                     viewModelScope.launch {
                         if (generation == ttsGeneration) ttsState.value = ttsState.value.copy(phase = phase)
                     }

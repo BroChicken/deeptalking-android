@@ -161,7 +161,6 @@ class LegacyMapperTest {
         assertEquals("find temple the map", character.dynamicState.currentGoal)
         assertEquals("forest", character.dynamicState.currentLocation)
         assertEquals("mage", character.dynamicState.currentOccupation)
-        assertEquals("Bob", character.dynamicState.currentImportantOthers)
 
         assertEquals(1, character.instant.size)
         val message = character.instant.first()
