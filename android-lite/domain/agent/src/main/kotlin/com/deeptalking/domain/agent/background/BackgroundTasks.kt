@@ -880,9 +880,13 @@ class BackgroundTasks(
             if (raw.isEmpty()) return@forEach
             val value = MemoryToolSupport.cleanFieldValue(key, parseRelativeText(raw, resolveFieldBase(obj, nowBase)))
             if (value.isEmpty()) return@forEach
-            val ids = stringList(obj["sourceMessageIds"])
-            val evidence = obj.string("evidence")
-            resolveDynamicStateSources(character, ids, evidence, assistantMessage, sources) ?: return@forEach
+            // `currentTone` is the read-aloud delivery instruction (self-referential),
+            // accepted without the user-evidence gate.
+            if (key != "currentTone") {
+                val ids = stringList(obj["sourceMessageIds"])
+                val evidence = obj.string("evidence")
+                resolveDynamicStateSources(character, ids, evidence, assistantMessage, sources) ?: return@forEach
+            }
             state = withDynamicField(state, key, value)
         }
         return character.copy(dynamicState = state)

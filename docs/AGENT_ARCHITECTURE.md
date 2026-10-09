@@ -134,7 +134,7 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 | `quickReplies` | 恰好两条**用户视角**短句（用户下一句可直接发送；不得是角色的台词、表态或角色对用户的提问） |
 | `shortTerm` | 本轮事件流程摘要 |
 | `longTerm` | 未来仍有价值的稳定事实（category∈userProfile/relationship/events/promises/habits） |
-| `dynamicState` | 角色动态状态（7 字段） |
+| `dynamicState` | 角色动态状态（6 字段） |
 | `memberDynamicState` | 群组成员动态状态（仅群组） |
 | `promiseUpdates` | 用户明确完成/取消的承诺（resolved/cancelled） |
 | `recall` | 主动召回记忆的请求 |
@@ -214,7 +214,7 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 
 `DYNAMIC_STATE_FIELDS`（`:domain:agent` 的 `prompts/Prompts.kt`）：`currentSituation` / `currentLocation` / `currentMood` / `currentOccupation` / `currentGoal` / `currentTone`。
 **有意偏离旧 WebView**：旧版的 `currentRelationship`（当前关系）与 `currentImportantOthers`（当前重要他人）已删除（旧值不再迁移，下次保存即抹除）；新增 `currentTone`（当前语气），由模型每轮更新，写成面向朗读的 TTS 播报指令（语气/情绪/语速/音量，≤20 字），朗读时直接作为 `style` 传给 CosyVoice，省去旧版"朗读前再调一次 API 生成语气指令"的开销。
-每个字段的 value 必须带 `sourceMessageIds` + `evidence` 溯源；群组整体只维护 `currentSituation` + `currentLocation`（`GROUP_SHARED_DYNAMIC_FIELDS`），成员各自的完整状态（含 `currentTone`）写入 `memberDynamicState`。
+除 `currentTone` 外，每个字段的 value 必须带 `sourceMessageIds` + `evidence` 溯源；群组整体只维护 `currentSituation` + `currentLocation`（`GROUP_SHARED_DYNAMIC_FIELDS`），成员各自的完整状态（含 `currentTone`）写入 `memberDynamicState`。`currentTone` 是朗读投递属性（自指、非事实状态），**每轮必填且免证据门**（`applyDynamicStateFields` / `applyDynamicStateUpdate` 对 `currentTone` 跳过 `resolveDynamicStateSources`），是唯一不受"仅更新有依据字段"约束的动态字段。
 
 ### 世界书（lorebook）
 
@@ -382,7 +382,7 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 ### 人格组装
 
 - `buildRoleContext(char, staticOnly)` — src/js/prompts/context.js:15：从 `char.basicInfo` 拼人格（主字段 + 次字段，共 12 项 `STATIC_PROFILE_FIELDS` src/js/core/config.js:130）；群组则拼群组信息 + 成员清单（`buildMemberContext` src/js/prompts/context.js:2）。
-- `buildDynamicStateContext()` — src/js/prompts/context.js:44：把 7 个动态字段渲染为"状态"文本（未设置的显示 `(未设置)`；volatile 里的角色/成员状态块同样用 `(未设置)` 且经 `maskUserWord` 脱敏，与其它注入路径一致）。
+- `buildDynamicStateContext()` — src/js/prompts/context.js:44：把动态字段渲染为"状态"文本（未设置的显示 `(未设置)`；volatile 里的角色/成员状态块同样用 `(未设置)` 且经 `maskUserWord` 脱敏，与其它注入路径一致）。
 - `buildRequestPayload(char, query)` — src/js/prompts/request.js:1：装配 system + 历史 + 本轮 volatile。
 
 ### 子任务提示词（非主对话）

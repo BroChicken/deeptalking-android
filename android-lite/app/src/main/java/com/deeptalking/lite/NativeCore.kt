@@ -16,6 +16,7 @@ import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.core.network.HttpWebContentProvider
 import com.deeptalking.core.network.ResponsesLlmBackend
+import com.deeptalking.core.network.opencodeSessionHeader
 import com.deeptalking.core.security.SecretStore
 import com.deeptalking.engine.ondevice.InferenceRegistry
 import com.deeptalking.engine.ondevice.LlmRequest
@@ -310,6 +311,14 @@ class NativeCore(context: Context) {
                     .addHeader("Content-Type", "application/json")
                     .addHeader("User-Agent", userAgent)
                     .addHeader("Authorization", "Bearer $apiKey")
+                    .apply {
+                        // OpenCode Go mandates a stable per-session header; the probe
+                        // must send it too or the gateway returns 400 MissingSessionID
+                        // (legacy `testApiConnection` used `buildApiHeaders`).
+                        opencodeSessionHeader(config.apiPlatform, "deeptalking-general")?.let { (name, value) ->
+                            addHeader(name, value)
+                        }
+                    }
                     .post(payload.toRequestBody("application/json; charset=utf-8".toMediaType()))
                     .build()
                 client.newCall(request).execute().use { response ->

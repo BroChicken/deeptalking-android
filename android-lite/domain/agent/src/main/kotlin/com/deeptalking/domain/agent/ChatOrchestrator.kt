@@ -465,7 +465,12 @@ class ChatOrchestrator(
             if (raw.isEmpty()) return@forEach
             val value = MemoryToolSupport.cleanFieldValue(key, parseRelativeText(raw, resolveFieldBase(obj, nowBase)))
             if (value.isEmpty()) return@forEach
-            if (resolveDynamicStateSources(host, fieldSourceIds(obj), fieldEvidence(obj), assistantMessage, sources) == null) {
+            // `currentTone` is the read-aloud delivery instruction, not a factual
+            // state: it is self-referential (derived from how the character just
+            // spoke), so it is accepted without the user-evidence gate.
+            if (key != "currentTone" &&
+                resolveDynamicStateSources(host, fieldSourceIds(obj), fieldEvidence(obj), assistantMessage, sources) == null
+            ) {
                 return@forEach
             }
             dynamic = withDynamicField(dynamic, key, value)

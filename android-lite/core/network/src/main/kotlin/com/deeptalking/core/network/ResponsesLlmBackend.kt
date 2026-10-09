@@ -462,7 +462,7 @@ internal fun responsesEndpoint(baseUrl: String, platform: String?): String {
  * missing value returns `400 MissingSessionID`. Returns null for other
  * platforms (legacy `buildApiHeaders`).
  */
-internal fun opencodeSessionHeader(platform: String?, sessionId: String?): Pair<String, String>? =
+fun opencodeSessionHeader(platform: String?, sessionId: String?): Pair<String, String>? =
     if (platform == "opencode") "x-opencode-session" to (sessionId ?: "deeptalking-general") else null
 
 /**

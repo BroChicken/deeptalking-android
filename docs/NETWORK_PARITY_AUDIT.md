@@ -7,7 +7,7 @@
 
 | # | 差异 | 旧版 | 原生修复位置 |
 |---|---|---|---|
-| 1 | OpenCode `x-opencode-session` 请求头缺失 | `src/js/core/normalization.js:68-71` | `core/network/ResponsesLlmBackend.kt`（`opencodeSessionHeader`）+ `engine/ondevice/Inference.kt`（`LlmRequest.apiPlatform/sessionId`）+ `domain/agent/SessionId.kt` |
+| 1 | OpenCode `x-opencode-session` 请求头缺失 | `src/js/core/normalization.js:68-71`（含 `testApiConnection` 经 `buildApiHeaders` 带头，`src/js/ui/status-settings.js:204`） | `core/network/ResponsesLlmBackend.kt`（`opencodeSessionHeader`，`newRequest` 与 `:app` 的 `NativeCore.testApiConnection` 探针均调用）+ `engine/ondevice/Inference.kt`（`LlmRequest.apiPlatform/sessionId`）+ `domain/agent/SessionId.kt` |
 | 2 | 流式请求缺 `Accept: text/event-stream` | `normalization.js:65-67` | `ResponsesLlmBackend.newRequest(stream)` |
 | 3 | 端点未按平台处理 `/v1` | `src/js/prompts/request.js:207-216` `getResponsesEndpoint` | `ResponsesLlmBackend.responsesEndpoint`（deepseek 去 `/v1`，opencode 保留） |
 | 4 | 无请求级重试 | `src/js/api/retry.js:1-31` | `domain/agent/ApiRetry.kt` + `AgentLoop.collectStreamWithRetry`（3 次 / 1s,2s,4s；瞬时错误 network/abort/429/5xx） |

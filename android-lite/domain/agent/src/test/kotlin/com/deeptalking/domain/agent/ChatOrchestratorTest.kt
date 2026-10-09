@@ -75,6 +75,38 @@ class ChatOrchestratorTest {
     }
 
     @Test
+    fun `currentTone is applied without the evidence gate`() = runBlocking {
+        val args = """
+            {"reply":"（笑了笑）今天天气真好。","quickReplies":["是啊","出去走走"],
+             "dynamicState":{"currentTone":{"value":"温柔含笑，语速偏慢"},
+                             "currentMood":{"value":"愉快","sourceMessageIds":["ghost"],"evidence":"不存在的原话"}}}
+        """.trimIndent()
+        val orchestrator = ChatOrchestrator(
+            llm = ScriptedLlm(args),
+            tools = ToolRegistry(listOf(NoTools())),
+            memory = MemoryServiceImpl(),
+            config = AppConfig(),
+        )
+
+        val result = orchestrator.run(
+            character = character(),
+            history = listOf(ChatMessage(id = "m1", role = Role.User, content = "今天天气如何")),
+            userText = "今天天气如何",
+        )
+
+        assertEquals(
+            "currentTone (delivery instruction) must be accepted without evidence",
+            "温柔含笑，语速偏慢",
+            result.updatedCharacter.dynamicState.currentTone,
+        )
+        assertEquals(
+            "a non-tone field with an unresolvable source must still be rejected",
+            "",
+            result.updatedCharacter.dynamicState.currentMood,
+        )
+    }
+
+    @Test
     fun `rejects long-term memory without valid subject and evidence`() = runBlocking {
         val args = """
             {"reply":"你好呀","quickReplies":["还不错","有点累"],

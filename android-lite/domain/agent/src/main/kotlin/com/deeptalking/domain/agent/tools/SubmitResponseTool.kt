@@ -31,7 +31,9 @@ class SubmitResponseTool : AgentTool {
     private fun buildSchema(): JsonElement {
         val dynField = dynamicStateFieldSchema()
         val dynProps = buildJsonObject {
-            dynamicStateKeys().forEach { put(it, dynField) }
+            dynamicStateKeys().forEach { key ->
+                put(key, if (key == "currentTone") currentToneFieldSchema() else dynField)
+            }
         }
         val staticProps = buildJsonObject {
             STATIC_PROFILE_FIELDS.forEach { (key, _) -> put(key, dynField) }
@@ -66,8 +68,9 @@ class SubmitResponseTool : AgentTool {
                         buildJsonObject {
                             put("type", "object")
                             put("additionalProperties", false)
-                            put("description", "角色当前动态状态，仅在有明确依据时更新")
+                            put("description", "角色当前动态状态：仅在有明确依据时更新对应字段；currentTone 例外，每轮都必须给出")
                             put("properties", dynProps)
+                            put("required", buildJsonArray { add("currentTone") })
                         },
                     )
                     put(
@@ -178,6 +181,25 @@ class SubmitResponseTool : AgentTool {
                 put("sourceMessageIds", stringArraySchema())
                 put("evidence", buildJsonObject { put("type", "string") })
                 put("timeRef", timeRefSchema())
+            },
+        )
+        put("required", buildJsonArray { add("value") })
+    }
+
+    /** `currentTone` is the read-aloud delivery instruction, always required and evidence-free. */
+    private fun currentToneFieldSchema(): JsonElement = buildJsonObject {
+        put("type", "object")
+        put("additionalProperties", false)
+        put(
+            "properties",
+            buildJsonObject {
+                put(
+                    "value",
+                    buildJsonObject {
+                        put("type", "string")
+                        put("description", "本轮朗读播报指令：语气/情绪/语速/音量，20字以内（如“温柔含笑，语速偏慢，音量适中”）；每轮必填，无需 sourceMessageIds/evidence")
+                    },
+                )
             },
         )
         put("required", buildJsonArray { add("value") })
