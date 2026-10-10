@@ -214,7 +214,7 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 ### 动态状态（6 字段）
 
 `DYNAMIC_STATE_FIELDS`（`:domain:agent` 的 `prompts/Prompts.kt`）：`currentSituation` / `currentLocation` / `currentMood` / `currentOccupation` / `currentGoal` / `currentTone`。
-**有意偏离旧 WebView**：旧版的 `currentRelationship`（当前关系）与 `currentImportantOthers`（当前重要他人）已删除（旧值不再迁移，下次保存即抹除）；新增 `currentTone`（当前语气），由模型每轮更新，写成面向朗读的 TTS 播报指令（语气/情绪/语速/音量，≤20 字），朗读时直接作为 `style` 传给 CosyVoice，省去旧版"朗读前再调一次 API 生成语气指令"的开销。
+**有意偏离旧 WebView**：旧版的 `currentRelationship`（当前关系）与 `currentImportantOthers`（当前重要他人）已删除（旧值不再迁移，下次保存即抹除）；新增 `currentTone`（当前语气），由模型每轮更新，写成面向朗读的 TTS 播报指令（按需描述语气/情绪/语速/节奏/停顿/重音，可短可长、软上限约 60 字），朗读时直接作为 `style` 传给 CosyVoice，省去旧版"朗读前再调一次 API 生成语气指令"的开销。
 除 `currentTone` 外，每个字段的 value 必须带 `sourceMessageIds` + `evidence` 溯源；群组整体只维护 `currentSituation` + `currentLocation`（`GROUP_SHARED_DYNAMIC_FIELDS`），成员各自的完整状态（含 `currentTone`）写入 `memberDynamicState`。`currentTone` 是朗读投递属性（自指、非事实状态），**每轮必填且免证据门**（`applyDynamicStateFields` / `applyDynamicStateUpdate` 对 `currentTone` 跳过 `resolveDynamicStateSources`），是唯一不受"仅更新有依据字段"约束的动态字段。
 
 ### 世界书（lorebook）

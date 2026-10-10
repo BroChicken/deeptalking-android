@@ -64,6 +64,12 @@ private val PLATFORM_LABELS = mapOf(
     "custom" to "自定义",
 )
 
+/** DoH provider id → display label (see `:core:network` `DohDns`). */
+private val DOH_PROVIDERS = listOf(
+    "alidns" to "阿里 AliDNS",
+    "tencent" to "腾讯 DoH.pub",
+)
+
 /** Legacy `normalizeApiBaseUrl` (`normalization.js:50`): trim + drop trailing slashes. */
 private fun normalizeApiBaseUrl(value: String): String = value.trim().trimEnd('/')
 
@@ -127,6 +133,7 @@ fun SettingsScreen(
     var apiKey by remember { mutableStateOf("") }
     var platformMenuOpen by rememberSaveable { mutableStateOf(false) }
     var thinkingMenuOpen by rememberSaveable { mutableStateOf(false) }
+    var dohMenuOpen by rememberSaveable { mutableStateOf(false) }
     // Once the user edits, local state wins: the config flow's delayed echo of our own
     // per-change saves must never roll the field back mid-typing.
     var userEdited by remember { mutableStateOf(false) }
@@ -194,6 +201,25 @@ fun SettingsScreen(
 
         if (!testResult.isNullOrBlank()) {
             Text(testResult, fontSize = 12.sp, color = legacy.textMuted)
+        }
+
+        CheckRow(
+            "加密 DNS 解析（DoH）",
+            edited.dohEnabled,
+            hint = "部分运营商劫持域名解析（返回无法连接的假 IP）。开启后用 DoH 绕过，失败自动回退系统 DNS",
+        ) { persist(edited.copy(dohEnabled = it)) }
+        if (edited.dohEnabled) {
+            FieldLabel("DoH 提供方")
+            LegacyDropdown(
+                selected = DOH_PROVIDERS.firstOrNull { it.first == edited.dohProvider }?.second ?: DOH_PROVIDERS.first().second,
+                options = DOH_PROVIDERS.map { it.second },
+                expanded = dohMenuOpen,
+                onExpandedChange = { dohMenuOpen = it },
+                onSelect = { label ->
+                    DOH_PROVIDERS.firstOrNull { it.second == label }?.let { persist(edited.copy(dohProvider = it.first)) }
+                    dohMenuOpen = false
+                },
+            )
         }
 
         FieldLabel("模型名称")

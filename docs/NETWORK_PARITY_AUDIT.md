@@ -17,6 +17,7 @@
 | 8 | 缺 Key 抛错 / `reasoningEffort` 校验 / Chat-Completions 兜底 | `normalization.js:31-33,63`、`responses.js:221-226` | `ResponsesLlmBackend.authorizationHeader`（缺 Key 抛错）、`normalizeReasoningEffort`（白名单兜底）、SSE `else` 分支读 `choices[0].delta.content` |
 | 9 | 抓取图片作为多模态输入 | `web-content.js:139/170/184` | `buildResponsesInput.toolOutputElement` 识别 `[{input_text},{input_image}]` 数组并原样作为 `function_call_output` 下发 |
 | 10 | 设备信任库缺锚导致 `opencode.ai` TLS 校验失败（`CertPathValidatorException: Trust anchor ... not found`） | 旧版无此问题：`fetch()` 由 WebView/Chromium 代管 TLS（自带根库 + AIA 补链）；原生 OkHttp/Conscrypt 只信系统库且不补链 | `:app` 的 `res/xml/network_security_config.xml`（对 `opencode.ai` 保留 `system` 锚并附加 `res/raw/opencode_we1.pem`/`opencode_gts_root_r4.pem`/`opencode_globalsign_root_ca.pem`） |
+| 11 | 运营商劫持明文 DNS，`opencode.ai` 被解析成假 IP 导致所有请求 `failed to connect ... after 8000ms`（非 TLS） | 旧版无此问题：Chromium 的 Secure DNS（DoH）绕过劫持；原生 OkHttp 走系统 DNS | `:core:network` 的 `DohDns`（RFC 8484 wire DoH，默认阿里 AliDNS、兜底腾讯，端点固定 IP 自举、失败回退 `Dns.SYSTEM`），接入 `ResponsesLlmBackend`/`HttpWebContentProvider`/`testApiConnection`；设置页「加密 DNS 解析（DoH）」开关 + 提供方选择（`AppConfig.dohEnabled`/`dohProvider`，默认开） |
 
 ## 待补（已确认缺失）
 

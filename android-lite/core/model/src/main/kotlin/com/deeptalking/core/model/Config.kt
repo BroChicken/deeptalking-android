@@ -36,6 +36,12 @@ data class AppConfig(
     val ttsStyle: String = "",
     /** CosyVoice3 speech speed multiplier (0.5–2.0). */
     val ttsSpeed: Float = 1.0f,
+    /**
+     * Resolve hostnames over DNS-over-HTTPS to bypass carrier DNS hijacking
+     * (falls back to the system resolver). Provider id: `alidns` / `tencent`.
+     */
+    val dohEnabled: Boolean = true,
+    val dohProvider: String = "alidns",
 )
 
 /** Non-secret half of a per-platform config slot (legacy `platformSettings[p]`). */

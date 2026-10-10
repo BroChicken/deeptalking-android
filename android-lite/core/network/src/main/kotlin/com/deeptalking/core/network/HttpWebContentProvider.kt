@@ -11,6 +11,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import okhttp3.Dns
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -367,8 +368,9 @@ class HttpWebContentProvider(
     }
 }
 
-fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
+fun defaultClient(dns: Dns = Dns.SYSTEM): OkHttpClient = OkHttpClient.Builder()
     .readTimeout(20, TimeUnit.SECONDS)
+    .dns(dns)
     .build()
 
 private data class BiliId(

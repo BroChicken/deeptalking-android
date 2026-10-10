@@ -15,7 +15,9 @@ import com.deeptalking.core.model.RequestMetric
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.core.network.HttpWebContentProvider
+import com.deeptalking.core.network.DohDns
 import com.deeptalking.core.network.ResponsesLlmBackend
+import com.deeptalking.core.network.defaultClient
 import com.deeptalking.core.network.opencodeSessionHeader
 import com.deeptalking.core.security.SecretStore
 import com.deeptalking.engine.ondevice.InferenceRegistry
@@ -64,8 +66,16 @@ class NativeCore(context: Context) {
 
     val secrets: SecretStore = SecretStore(appContext)
     val data: CoreDataContainer = CoreDataContainer(appContext)
+
+    /** Live DoH policy, refreshed from the persisted config (see [applyDohPolicy]). */
+    @Volatile
+    private var dohPolicy: DohDns.Policy = DohDns.Policy(enabled = true)
+
+    /** Shared resolver: bypasses carrier DNS hijacking via DoH, falls back to system DNS. */
+    private val dohDns: DohDns = DohDns { dohPolicy }
+
     val memory: MemoryServiceImpl = MemoryServiceImpl()
-    val web: HttpWebContentProvider = HttpWebContentProvider()
+    val web: HttpWebContentProvider = HttpWebContentProvider(defaultClient(dohDns))
     val tools: ToolRegistry = ToolRegistry(defaultTools(memory, web, stickersEnabled = true))
 
     /**
@@ -91,7 +101,7 @@ class NativeCore(context: Context) {
 
     /** LLM is remote; the read-aloud TTS backend is on-device. embedding/asr stay null. */
     val inference: InferenceRegistry = InferenceRegistry(
-        llm = ResponsesLlmBackend(apiKeyProvider = { secrets.getApiKey() }, userAgent = userAgent),
+        llm = ResponsesLlmBackend(apiKeyProvider = { secrets.getApiKey() }, userAgent = userAgent, dns = dohDns),
         tts = cosyVoice.backend,
     )
 
@@ -105,7 +115,12 @@ class NativeCore(context: Context) {
         appVersion = BuildConfig.VERSION_NAME,
     )
 
-    suspend fun currentConfig(): AppConfig = data.config.current()
+    suspend fun currentConfig(): AppConfig = data.config.current().also { applyDohPolicy(it) }
+
+    /** Keeps the shared [DohDns] policy in sync with the persisted config. */
+    private fun applyDohPolicy(config: AppConfig) {
+        dohPolicy = DohDns.Policy(config.dohEnabled, config.dohProvider)
+    }
 
     /** True when the active platform (or the legacy global slot) has an API key. */
     fun hasApiKey(platform: String): Boolean = !apiKeyFor(platform).isNullOrBlank()
@@ -116,7 +131,12 @@ class NativeCore(context: Context) {
 
     private fun backgroundTasks(config: AppConfig): BackgroundTasks =
         BackgroundTasks(
-            ResponsesLlmBackend(apiKeyProvider = { apiKeyFor(config.apiPlatform) }, baseUrl = config.apiBaseUrl, userAgent = userAgent),
+            ResponsesLlmBackend(
+                apiKeyProvider = { apiKeyFor(config.apiPlatform) },
+                baseUrl = config.apiBaseUrl,
+                userAgent = userAgent,
+                dns = dohDns,
+            ),
             memory,
             config.modelName,
             config.apiPlatform,
@@ -296,11 +316,13 @@ class NativeCore(context: Context) {
      * multi-line report. Never throws.
      */
     suspend fun testApiConnection(config: AppConfig, apiKey: String): String = withContext(Dispatchers.IO) {
+        applyDohPolicy(config)
         val base = normalizeApiBaseUrl(config.apiBaseUrl)
         if (base.isEmpty()) return@withContext "未配置 API Base URL，请先填写后再测试。"
         val client = OkHttpClient.Builder()
             .connectTimeout(8, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
+            .dns(dohDns)
             .build()
         val report = StringBuilder()
         report.append("① 站点可达性：")
@@ -664,6 +686,7 @@ class NativeCore(context: Context) {
             apiKeyProvider = { apiKeyFor(config.apiPlatform) },
             baseUrl = config.apiBaseUrl,
             userAgent = userAgent,
+            dns = dohDns,
         )
         val background = BackgroundTasks(
             llm,

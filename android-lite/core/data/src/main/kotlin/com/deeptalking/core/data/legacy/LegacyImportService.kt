@@ -124,6 +124,8 @@ class LegacyImportService(
                     ttsVoiceFile = current.ttsVoiceFile,
                     ttsStyle = current.ttsStyle,
                     ttsSpeed = current.ttsSpeed,
+                    dohEnabled = current.dohEnabled,
+                    dohProvider = current.dohProvider,
                     lastReplyDebug = current.lastReplyDebug,
                     requestMetrics = current.requestMetrics,
                     platformSettings = mapped.platformSettings.ifEmpty { current.platformSettings },

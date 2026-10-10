@@ -28,6 +28,7 @@ import kotlinx.serialization.json.put
 import okhttp3.MediaType
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.Dns
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
@@ -69,11 +70,14 @@ class ResponsesLlmBackend(
     override val id: String = "responses",
     /** Identifies this client (OpenCode Go rejects generic SDK/HTTP-library UAs). */
     private val userAgent: String = "DeepTalking-Lite",
+    /** Resolver for all requests; pass a [DohDns] to bypass poisoned system DNS. */
+    private val dns: Dns = Dns.SYSTEM,
 ) : LlmBackend {
 
     private val client: OkHttpClient = OkHttpClient.Builder()
         .callTimeout(HARD_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .readTimeout(HARD_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        .dns(dns)
         .build()
 
     /**

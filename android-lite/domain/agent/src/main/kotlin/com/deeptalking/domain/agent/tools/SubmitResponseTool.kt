@@ -48,7 +48,7 @@ class SubmitResponseTool : AgentTool {
                         "reply",
                         buildJsonObject {
                             put("type", "string")
-                            put("description", "用户可见的回复正文，支持Markdown；按语义可自然分段；动作、表情、心理活动用括号穿插在语句之间、与语句交替推进（平均每1–2句一次，不要只在开头或结尾集中出现），动作总长不超过回复一半；口吻一律以角色设定的“说话风格”为准")
+                            put("description", "用户可见的回复正文，支持Markdown；按语义可自然分段；动作、表情、心理、环境与旁白描写必须用全角括号（如“（轻轻叹气）我知道了。”）穿插在语句之间，除台词与直接陈述外的一切描写都要落在括号里；每处只写一个短节拍、不连续堆叠、括号动作总长不超过正文四分之一；台词、句子一律不加引号或「」等符号包裹；口吻一律以角色设定的“说话风格”为准")
                         },
                     )
                     put(
@@ -197,7 +197,7 @@ class SubmitResponseTool : AgentTool {
                     "value",
                     buildJsonObject {
                         put("type", "string")
-                        put("description", "本轮朗读播报指令：语气/情绪/语速/音量，20字以内（如“温柔含笑，语速偏慢，音量适中”）；每轮必填，无需 sourceMessageIds/evidence")
+                        put("description", "本轮朗读播报指令：按需描述语气/情绪/语速/节奏/停顿/重音与情感层次，可短可长（通常不超过约 60 字，如“声音温柔含笑，语速偏慢，句尾轻轻收住”）；每轮必填，无需 sourceMessageIds/evidence")
                     },
                 )
             },
