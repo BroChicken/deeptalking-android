@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Preserve the app's existing cleartext behavior (user-entered http base URLs). -->
+    <base-config cleartextTrafficPermitted="true" />
+
+    <!--
+        opencode.ai serves a Google Trust Services chain (leaf <- WE1 <- GTS Root R4,
+        cross-signed by GlobalSign Root CA). OkHttp/Conscrypt validates against the
+        device system store only and does NOT fetch missing intermediates, so devices
+        with an old or GMS-less trust store fail with "Trust anchor ... not found"
+        even though the WebView/Chromium stack (own root store + AIA) accepted it.
+        Trust the site's CA set in addition to the system anchors.
+    -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">opencode.ai</domain>
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="@raw/opencode_we1" />
+            <certificates src="@raw/opencode_gts_root_r4" />
+            <certificates src="@raw/opencode_globalsign_root_ca" />
+        </trust-anchors>
+    </domain-config>
+</network-security-config>

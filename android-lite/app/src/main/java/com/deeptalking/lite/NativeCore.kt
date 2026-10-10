@@ -29,7 +29,9 @@ import com.deeptalking.domain.agent.background.BackgroundTaskQueue
 import com.deeptalking.domain.agent.background.BackgroundTasks
 import com.deeptalking.domain.agent.defaultTools
 import com.deeptalking.domain.memory.MemoryServiceImpl
+import com.deeptalking.domain.memory.MEMORY_REPAIR_VERSION
 import com.deeptalking.domain.memory.RelativeTimeMigration
+import com.deeptalking.domain.memory.repairMemories
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -178,6 +180,29 @@ class NativeCore(context: Context) {
                             ),
                         )
                     }
+                }
+            }
+        }
+    }
+
+    /** One-time deterministic memory repair: reconcile + near-duplicate dedupe (offline, no API key). */
+    suspend fun runMemoryRepair() {
+        characterMaintenanceMutex.withLock {
+            runCatching {
+                data.characters.all().forEach { character ->
+                    if (character.memoryRepairVersion >= MEMORY_REPAIR_VERSION) return@forEach
+                    val latest = data.characters.get(character.id) ?: return@forEach
+                    if (latest.memoryRepairVersion >= MEMORY_REPAIR_VERSION) return@forEach
+                    val repaired = repairMemories(latest)
+                    val fresh = data.characters.get(character.id) ?: latest
+                    data.characters.upsert(
+                        fresh.copy(
+                            shortTerm = repaired.shortTerm,
+                            longTerm = repaired.longTerm,
+                            members = repaired.members,
+                            memoryRepairVersion = MEMORY_REPAIR_VERSION,
+                        ),
+                    )
                 }
             }
         }

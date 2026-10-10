@@ -106,8 +106,9 @@ class MemoryServiceImplTest {
                 createdAt = now,
             )
         }
+        // Long-term is kept unbounded now; nothing is evicted by count.
         val trimmed = service.applyTurn(character, emptyList(), many)
-        assertEquals(AppLimits.Memory.LONG_TERM_PER_CATEGORY, trimmed.longTerm.size)
+        assertEquals(many.size, trimmed.longTerm.size)
     }
 
     @Test

@@ -33,6 +33,25 @@ class ChatRepository(private val dao: MessageDao) {
 
     suspend fun clearAll() = dao.deleteAll()
 
+    /**
+     * Copies the memory-task `extractedAt` marks from the live [instant] window back
+     * onto the persisted chat rows. The live window is rebuilt from Room every turn
+     * (`windowInstant`), so without this write-back the marks would be lost and
+     * extraction would re-process the same messages forever. Only rows that already
+     * exist are touched; synthesized in-window messages are ignored.
+     */
+    suspend fun markExtracted(characterId: String, instant: List<ChatMessage>) {
+        val marked = instant.filter { it.extractedAt != null }.associateBy { it.id }
+        if (marked.isEmpty()) return
+        val updates = dao.getForCharacter(characterId).mapNotNull { row ->
+            val message = decode(row) ?: return@mapNotNull null
+            val source = marked[message.id] ?: return@mapNotNull null
+            if (message.extractedAt == source.extractedAt) return@mapNotNull null
+            row.copy(payload = AppJson.encodeToString(message.copy(extractedAt = source.extractedAt)))
+        }
+        if (updates.isNotEmpty()) dao.upsertAll(updates)
+    }
+
     private fun toEntity(characterId: String, message: ChatMessage): MessageEntity {
         val timestamp = message.timestamp ?: Instant.now().toString()
         val id = message.id.ifBlank { UUID.randomUUID().toString() }

@@ -158,6 +158,18 @@ class StyleGuardTest {
     }
 
     @Test
+    fun buildStyleAnchorDoesNotWrapSamplesInQuotes() {
+        val styled = Character(
+            id = "c1",
+            name = "小雨",
+            staticProfile = StaticProfile(speakingStyle = "慵懒；示例：「困了」 / 「再说吧」"),
+        )
+        val anchor = buildStyleAnchor(styled)
+        assertTrue(anchor.contains("困了"))
+        assertFalse(anchor.contains("「"))
+    }
+
+    @Test
     fun buildGroupVoiceContractOneBlockPerStyledMember() {
         val group = Character(
             id = "g1",

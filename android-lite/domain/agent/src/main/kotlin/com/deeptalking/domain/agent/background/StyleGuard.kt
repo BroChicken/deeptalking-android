@@ -94,7 +94,8 @@ fun buildStyleAnchor(character: Character?): String {
     lines += "【本轮声音契约（离生成最近，优先级高于一切风格偏好）】"
     if (summary.isNotEmpty()) lines += "说话风格：$summary"
     if (samples.isNotEmpty()) {
-        lines += "照此口吻说话（只借用语气，不要照抄内容）：" + samples.joinToString(" ") { "「$it」" }
+        lines += "照此口吻说话（只借用语气与用词，不要照抄内容，也不要照搬其中的引号或标点）：" +
+            samples.joinToString(" / ")
     }
     if (address.isNotEmpty()) lines += "对用户的称呼：$address"
     lines += "本轮必须：用你自己的口吻说话；至少自然带出你的口头禅、句尾助词、称呼共 2 处，并保持你的标点习惯；" +
@@ -121,7 +122,8 @@ fun buildGroupVoiceContract(character: Character?): String {
         lines += "【成员声音·${member.name.trim()}】"
         if (summary.isNotEmpty()) lines += "说话风格：$summary"
         if (samples.isNotEmpty()) {
-            lines += "照此口吻说话（只借用语气，不要照抄内容）：" + samples.joinToString(" ") { "「$it」" }
+            lines += "照此口吻说话（只借用语气与用词，不要照抄内容，也不要照搬其中的引号或标点）：" +
+                samples.joinToString(" / ")
         }
         if (address.isNotEmpty()) lines += "对用户的称呼：$address"
         lines += "该成员本轮台词必须体现以上口头禅、句尾助词与称呼，且与其他成员明显不同。"

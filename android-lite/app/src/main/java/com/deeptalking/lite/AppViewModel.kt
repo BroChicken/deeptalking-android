@@ -820,7 +820,10 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 val orchestrator = core.createOrchestrator(
                     cfg,
                     onCharacterUpdated = { updated ->
-                        core.appScope.launch { core.data.characters.upsert(updated) }
+                        core.appScope.launch {
+                            core.data.characters.upsert(updated)
+                            core.data.chat.markExtracted(updated.id, updated.instant)
+                        }
                     },
                     onStatus = { statusState.value = it },
                     onAuxiliaryUsage = { taskType, usage -> recordAuxiliaryUsage(taskType, usage) },
@@ -1271,6 +1274,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             )
             // Legacy runs silent static-field completion + migration prompts after import.
             runCatching { core.runStartupMigrations() }.onFailure { DeepTalkingApp.recordError(it) }
+            runCatching { core.runMemoryRepair() }.onFailure { DeepTalkingApp.recordError(it) }
             runCatching {
                 val cfg = core.data.config.observe().first()
                 core.runStartupMaintenance(cfg)
@@ -1613,6 +1617,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         // Legacy one-time relative-time → absolute migration (no key required).
         viewModelScope.launch {
             runCatching { core.runStartupMigrations() }.onFailure { DeepTalkingApp.recordError(it) }
+            runCatching { core.runMemoryRepair() }.onFailure { DeepTalkingApp.recordError(it) }
         }
         // Legacy on-load silent static-field completion (only with an API key).
         viewModelScope.launch {

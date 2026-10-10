@@ -160,29 +160,6 @@ class MemoryServiceImpl : MemoryService {
         }
     }
 
-    private fun dedupeShortTerm(items: List<ShortTermMemory>): List<ShortTermMemory> {
-        val indexByIdentity = mutableMapOf<String, Int>()
-        val result = mutableListOf<ShortTermMemory>()
-        for (item in items) {
-            val identity = item.content.trim().lowercase() + "|" + eventIdentity(item.eventTime)
-            val existingIndex = indexByIdentity[identity]
-            if (existingIndex == null) {
-                indexByIdentity[identity] = result.size
-                result += item
-            } else {
-                val existing = result[existingIndex]
-                result[existingIndex] = existing.copy(
-                    sourceMessageIds = (existing.sourceMessageIds + item.sourceMessageIds).distinct()
-                        .take(AppLimits.Memory.SUMMARY_SOURCES),
-                    sourceRoles = (existing.sourceRoles + item.sourceRoles).distinct(),
-                    userEvidence = (existing.userEvidence + item.userEvidence).distinct()
-                        .take(AppLimits.Memory.SUMMARY_SOURCES),
-                )
-            }
-        }
-        return result
-    }
-
     private fun longTermStoreOf(character: Character, memberName: String?): List<LongTermMemory> {
         if (memberName == null) return character.longTerm
         return memberOf(character, memberName)?.longTerm ?: emptyList()

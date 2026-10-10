@@ -1,8 +1,12 @@
 package com.deeptalking.domain.agent.background
 
+import com.deeptalking.core.common.AppLimits
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.DynamicState
+import com.deeptalking.core.model.LongTermMemory
+import com.deeptalking.core.model.MemoryCategory
+import com.deeptalking.core.model.MemorySubject
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.SceneState
 import com.deeptalking.core.model.ShortTermMemory
@@ -395,5 +399,43 @@ class BackgroundTasksTest {
         assertTrue(statuses.contains("正在分析长期记忆…"))
         assertEquals("analysis", usages.first().first)
         assertEquals(3, usages.first().second.inputTokens)
+    }
+
+    @Test
+    fun consolidateMemoryMergesDuplicateGroup() = runBlocking {
+        val (background, _) = tasks(
+            listOf(
+                """{"status":"ok","groups":[{"keepId":"a1","mergeIds":["a2"],"key":"用户喜欢喝美式咖啡","value":"用户喜欢喝美式咖啡，每天早上一杯。","importance":6,"tags":["咖啡"]}]}""",
+            ),
+        )
+        val now = Instant.now().toString()
+        val entries = (1..AppLimits.Memory.CONSOLIDATE_TRIGGER).map { index ->
+            LongTermMemory(
+                id = "a$index",
+                category = MemoryCategory.UserProfile,
+                subject = MemorySubject.User,
+                key = "键$index",
+                value = "值$index",
+                createdAt = now,
+            )
+        }
+        val (status, updated) = background.consolidateMemory(Character(id = "c1", longTerm = entries))
+        assertEquals(BackgroundTasks.TaskStatus.Success, status)
+        assertEquals(AppLimits.Memory.CONSOLIDATE_TRIGGER - 1, updated.longTerm.size)
+        assertTrue(updated.longTerm.none { it.id == "a2" })
+        assertEquals("用户喜欢喝美式咖啡", updated.longTerm.first { it.id == "a1" }.key)
+    }
+
+    @Test
+    fun consolidateMemoryMalformedOutputTouchesNothing() = runBlocking {
+        val (background, _) = tasks(listOf("{}"))
+        val now = Instant.now().toString()
+        val entries = (1..AppLimits.Memory.CONSOLIDATE_TRIGGER).map { index ->
+            LongTermMemory(id = "a$index", category = MemoryCategory.UserProfile, key = "键$index", value = "值$index", createdAt = now)
+        }
+        val character = Character(id = "c1", longTerm = entries)
+        val (status, updated) = background.consolidateMemory(character)
+        assertEquals(BackgroundTasks.TaskStatus.Failure, status)
+        assertEquals(entries.size, updated.longTerm.size)
     }
 }

@@ -82,6 +82,17 @@ class SpeechTextTest {
     }
 
     @Test
+    fun segmentsUnquotedGroupReplyPerMember() {
+        val reply = "张三：（笑）今天去哪？\n李四：我随便，听你的。"
+        val segments = extractSpeechSegments(reply, listOf("张三", "李四"))
+        assertEquals(2, segments.size)
+        assertEquals("张三", segments[0].speaker)
+        assertEquals("今天去哪？", segments[0].text)
+        assertEquals("李四", segments[1].speaker)
+        assertEquals("我随便，听你的。", segments[1].text)
+    }
+
+    @Test
     fun keepsMultiLineTurnUnderOneSpeaker() {
         val reply = "张三：\"今天去哪？\n随便走走也行。\"\n李四：\"好。\""
         val segments = extractSpeechSegments(reply, listOf("张三", "李四"))

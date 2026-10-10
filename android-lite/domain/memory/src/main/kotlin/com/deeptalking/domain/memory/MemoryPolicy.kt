@@ -41,6 +41,36 @@ internal fun parseTimestampMillis(value: String?): Long? {
 
 internal fun clamp(value: Int, min: Int, max: Int): Int = value.coerceIn(min, max)
 
+/** Strips punctuation/symbols/whitespace and lowercases, so two phrasings compare on content alone. */
+internal fun normalizeMemoryText(text: String): String =
+    text.lowercase().replace(Regex("[\\p{P}\\p{S}\\s]+"), "")
+
+/** Character bigrams of [text]; used as a cheap bag-of-features for similarity. */
+internal fun charBigrams(text: String): Set<String> {
+    if (text.length < 2) return if (text.isEmpty()) emptySet() else setOf(text)
+    val set = HashSet<String>(text.length)
+    for (index in 0 until text.length - 1) set.add(text.substring(index, index + 2))
+    return set
+}
+
+/** Jaccard similarity of two texts over their normalized character bigrams (0.0–1.0). */
+fun textSimilarity(a: String, b: String): Double {
+    val na = normalizeMemoryText(a)
+    val nb = normalizeMemoryText(b)
+    if (na.isEmpty() || nb.isEmpty()) return 0.0
+    if (na == nb) return 1.0
+    val sa = charBigrams(na)
+    val sb = charBigrams(nb)
+    if (sa.isEmpty() || sb.isEmpty()) return 0.0
+    val intersection = sa.count { it in sb }
+    val union = sa.size + sb.size - intersection
+    return if (union == 0) 0.0 else intersection.toDouble() / union
+}
+
+/** True when [a] and [b] describe the same fact closely enough to merge (deterministic pass). */
+fun areNearDuplicate(a: String, b: String, threshold: Double = AppLimits.Memory.NEAR_DUP_SIMILARITY): Boolean =
+    textSimilarity(a, b) >= threshold
+
 /**
  * Effective importance after time decay. Ported from `computeEffectiveImportance`,
  * including the self-learned `learnedBonus` delta.
@@ -75,15 +105,16 @@ fun memorySortScore(memory: LongTermMemory, now: Long = System.currentTimeMillis
 }
 
 /**
- * Trims a long-term list to at most [limit] items (highest [memorySortScore]
- * first) and then adjudicates any accumulated conflicts. Embedding the
- * adjudication here mirrors legacy `trimCharacterMemory`, which called
- * `resolveMemoryConflicts` after every trim — so background trimming resolves
- * conflicts too, not only the main turn.
+ * Applies the accumulated-conflict adjudication after an optional count trim.
+ * Long-term memory is kept unbounded by default (`limit = Int.MAX_VALUE`), so
+ * this only resolves conflicts; a caller that still wants a hard bound can pass
+ * one explicitly. Embedding the adjudication here mirrors legacy
+ * `trimCharacterMemory`, which called `resolveMemoryConflicts` after every trim
+ * — so background writes resolve conflicts too, not only the main turn.
  */
 fun pruneLongTerm(
     items: List<LongTermMemory>,
-    limit: Int = AppLimits.Memory.LONG_TERM_PER_CATEGORY,
+    limit: Int = Int.MAX_VALUE,
     now: Long = System.currentTimeMillis(),
 ): List<LongTermMemory> {
     val trimmed = if (items.size <= limit) items else items.sortedByDescending { memorySortScore(it, now) }.take(limit)
@@ -264,7 +295,7 @@ private fun mergeTimelineValue(base: LongTermMemory, incoming: LongTermMemory): 
     val incomingTime = parseTimestampMillis(incoming.eventTime) ?: 0L
     val first = if (baseTime <= incomingTime) base else incoming
     val second = if (baseTime <= incomingTime) incoming else base
-    return first.value.trimTo(900) + "\n" + second.value.trimTo(900)
+    return first.value + "\n" + second.value
 }
 
 /**
@@ -374,6 +405,67 @@ fun dedupeLongTerm(items: List<LongTermMemory>, category: MemoryCategory): List<
 
 // ---- short-term writes ----------------------------------------------------------------
 
+/**
+ * One-time deterministic repair of an already-loaded store: short-term reconciled +
+ * near-duplicate merged, each long-term category de-duplicated. Idempotent and
+ * offline (no LLM); used by the `memoryRepairVersion` startup migration to fold
+ * the accumulated duplicates left by earlier re-extraction loops.
+ */
+fun repairMemories(character: Character): Character {
+    fun repairLong(list: List<LongTermMemory>): List<LongTermMemory> =
+        MemoryCategory.entries.flatMap { category ->
+            dedupeLongTerm(list.filter { it.category == category }, category)
+        }
+    return character.copy(
+        shortTerm = dedupeShortTerm(character.shortTerm),
+        longTerm = repairLong(character.longTerm),
+        members = character.members.map {
+            it.copy(shortTerm = dedupeShortTerm(it.shortTerm), longTerm = repairLong(it.longTerm))
+        },
+    )
+}
+
+/** Current target of the one-time deterministic memory repair. */
+const val MEMORY_REPAIR_VERSION = 1
+
+/**
+ * Deterministic near-duplicate pass over short-term memory: items sharing an event
+ * identity (or whose content is a near-duplicate of an earlier item) collapse into
+ * the first occurrence, unioning their sources/evidence. Unlike [reconcileLegacyMemories]
+ * this also merges re-phrasings that share no exact identity, so repeated extraction
+ * of the same beat cannot pile up.
+ */
+fun dedupeShortTerm(items: List<ShortTermMemory>): List<ShortTermMemory> {
+    val result = mutableListOf<ShortTermMemory>()
+    for (item in items) {
+        val identity = eventIdentity(item.eventTime)
+        val dupIndex = result.indexOfFirst { existing ->
+            val sameIdentity = identity.isNotEmpty() && eventIdentity(existing.eventTime) == identity
+            sameIdentity || areNearDuplicate(existing.content, item.content)
+        }
+        if (dupIndex < 0) {
+            result += item
+            continue
+        }
+        val existing = result[dupIndex]
+        result[dupIndex] = existing.copy(
+            content = if (item.content.length > existing.content.length) item.content else existing.content,
+            sourceMessageIds = (existing.sourceMessageIds + item.sourceMessageIds).distinct()
+                .takeLast(AppLimits.Memory.SUMMARY_SOURCES),
+            sourceRoles = (existing.sourceRoles + item.sourceRoles).distinct(),
+            userEvidence = (existing.userEvidence + item.userEvidence)
+                .distinctBy { it.sourceMessageId to it.text },
+            participants = normalizeParticipantsList(existing.participants + item.participants),
+            location = if (item.location.isNotBlank()) item.location else existing.location,
+            eventTime = earlierTimestamp(existing.eventTime, item.eventTime) ?: existing.eventTime,
+            createdAt = earlierTimestamp(existing.createdAt, item.createdAt) ?: existing.createdAt,
+            // Merged content invalidates the prior analysis, so force a re-analysis.
+            analyzedAt = null,
+        )
+    }
+    return result
+}
+
 /** Input to [addShortTermMemory] (legacy `sourceData`). */
 data class ShortTermDraft(
     val content: String,
@@ -400,7 +492,7 @@ fun addShortTermMemory(
     sources: Map<String, SourceRef>,
     nowMillis: Long = System.currentTimeMillis(),
 ): ShortTermAddResult {
-    var text = draft.content.trimTo(500)
+    var text = draft.content.trim()
     if (text.isEmpty()) return ShortTermAddResult(list, false)
     val sourceIds = draft.sourceMessageIds.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
         .take(AppLimits.Memory.SUMMARY_SOURCES)
@@ -419,7 +511,8 @@ fun addShortTermMemory(
     val identity = eventIdentity(eventTime)
     if (identity.isNotEmpty()) {
         val existingIndex = list.indexOfFirst { item ->
-            item.content == text && eventIdentity(item.eventTime) == identity
+            eventIdentity(item.eventTime) == identity &&
+                (item.content == text || areNearDuplicate(item.content, text))
         }
         if (existingIndex >= 0) {
             val existing = list[existingIndex]
@@ -485,18 +578,33 @@ fun upsertLongTermMemory(
     val nowIso = Instant.ofEpochMilli(nowMillis).toString()
     val base = parseZoned(item.eventTime) ?: parseZoned(nowIso) ?: return store to false
     val key = parseRelativeText(item.key.trimTo(100), base)
-    val value = parseRelativeText(item.value.trimTo(900), base)
+    val value = parseRelativeText(item.value.trim(), base)
     if (key.isBlank() || value.isBlank()) return store to false
 
     val eventTime = normalizeTimestampIso(item.eventTime, nowIso)
     val participants = normalizeParticipantsList(item.participants)
     val location = item.location.trim().take(160)
     val identity = if (item.category == MemoryCategory.Events) eventIdentity(eventTime) else ""
+    // Exact key+identity wins; otherwise fold into a same-category near-duplicate
+    // (key similarity for regular categories, event identity for events) so
+    // re-phrasings of one fact do not accumulate as separate entries.
     val index = store.indexOfFirst { memory ->
         memory.key.trim().lowercase() == key.lowercase() &&
             (identity.isEmpty() || eventIdentity(memory.eventTime) == identity)
     }
-    if (item.category == MemoryCategory.Promises && index >= 0 && store[index].status != PromiseStatus.Active) {
+    val target = if (index >= 0) {
+        index
+    } else {
+        store.indexOfFirst { memory ->
+            memory.category == item.category && memory.subject == item.subject &&
+                if (item.category == MemoryCategory.Events) {
+                    identity.isNotEmpty() && eventIdentity(memory.eventTime) == identity
+                } else {
+                    areNearDuplicate(memory.key, key)
+                }
+        }
+    }
+    if (item.category == MemoryCategory.Promises && target >= 0 && store[target].status != PromiseStatus.Active) {
         return store to false
     }
 
@@ -510,9 +618,9 @@ fun upsertLongTermMemory(
     val resolvedIds = item.sourceMessageIds.map { it.trim() }.filter { it.isNotEmpty() }.distinct().take(8)
 
     val updated = store.toMutableList()
-    if (index >= 0) {
-        val existing = store[index]
-        updated[index] = if (memoriesSemanticallyDiffer(value, existing.value)) {
+    if (target >= 0) {
+        val existing = store[target]
+        updated[target] = if (memoriesSemanticallyDiffer(value, existing.value)) {
             // 语义冲突：不静默覆盖，保留双方证据并标记，交由 resolveMemoryConflicts 裁决
             val conflicts = existing.conflicts.take(4).toMutableList()
             if (conflicts.none { it.value == value }) {

@@ -217,4 +217,64 @@ class MemoryPolicyTest {
         // Legacy `dedupeLongTermList`: without conflictedAt the later item's value wins.
         assertEquals("用户害怕打雷", merged[0].value)
     }
+
+    @Test
+    fun addShortTermMemoryKeepsLongContentUntruncated() {
+        val long = "用" + "户".repeat(799) + "。"
+        val character = Character(id = "c1", instant = listOf(user("u1", long)))
+        val result = addShortTermMemory(
+            list = emptyList(),
+            draft = ShortTermDraft(content = long, sourceMessageIds = listOf("u1")),
+            timestamp = "2026-08-01T12:00:00Z",
+            sources = knownSources(character),
+        )
+        assertTrue(result.accepted)
+        assertEquals(long.length, result.list[0].content.length)
+    }
+
+    @Test
+    fun upsertLongTermFoldsNearDuplicateKey() {
+        val character = Character(id = "c1", instant = listOf(user("u1", "用户喜欢咖啡")))
+        val existing = LongTermMemory(
+            category = MemoryCategory.UserProfile,
+            subject = MemorySubject.User,
+            key = "用户喜欢喝咖啡",
+            value = "用户喜欢喝咖啡",
+            sourceMessageIds = listOf("u1"),
+            evidence = "用户喜欢咖啡",
+            importance = 5,
+        )
+        val incoming = existing.copy(id = "new", key = "用户喜欢喝咖啡。")
+        val (list, ok) = upsertLongTermMemory(character, incoming, listOf(existing))
+        assertTrue(ok)
+        assertEquals(1, list.size)
+    }
+
+    @Test
+    fun dedupeShortTermMergesNearDuplicates() {
+        val items = listOf(
+            ShortTermMemory(id = "1", content = "用户和小雨在咖啡馆聊天", eventTime = "2026-08-01T12:00:00Z"),
+            ShortTermMemory(id = "2", content = "用户和小雨在咖啡馆聊天。", eventTime = "2026-08-01T12:30:00Z"),
+        )
+        val merged = dedupeShortTerm(items)
+        assertEquals(1, merged.size)
+    }
+
+    @Test
+    fun repairMemoriesCollapsesShortAndLongDuplicates() {
+        val character = Character(
+            id = "c1",
+            shortTerm = listOf(
+                ShortTermMemory(id = "s1", content = "用户去了公园", eventTime = "2026-08-01T12:00:00Z"),
+                ShortTermMemory(id = "s2", content = "用户去了公园。", eventTime = "2026-08-01T12:30:00Z"),
+            ),
+            longTerm = listOf(
+                LongTermMemory(category = MemoryCategory.Habits, subject = MemorySubject.User, key = "习惯", value = "用户每天跑步"),
+                LongTermMemory(category = MemoryCategory.Habits, subject = MemorySubject.User, key = "习惯", value = "用户每天跑步。"),
+            ),
+        )
+        val repaired = repairMemories(character)
+        assertEquals(1, repaired.shortTerm.size)
+        assertEquals(1, repaired.longTerm.size)
+    }
 }

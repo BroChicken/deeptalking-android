@@ -57,6 +57,8 @@ data class GroupMember(
     val fieldsMigrationVersion: String = "",
     val timeParseVersion: Int = 0,
     val lorebookMigratedAt: String? = null,
+    /** Guards the one-time deterministic memory repair (reconcile + near-duplicate dedupe). */
+    val memoryRepairVersion: Int = 0,
 )
 
 /** Character or group entity. Groups set [isGroup] and populate [members]. */
@@ -103,6 +105,8 @@ data class Character(
     val timeParseVersion: Int = 0,
     /** When the one-time world-book migration ran (legacy `lorebookMigratedAt`). */
     val lorebookMigratedAt: String? = null,
+    /** Guards the one-time deterministic memory repair (reconcile + near-duplicate dedupe). */
+    val memoryRepairVersion: Int = 0,
     val createdAt: String? = null,
     val updatedAt: String? = null,
     /** Memory revision counter, bumped when a branch is discarded (legacy `memory.revision`). */

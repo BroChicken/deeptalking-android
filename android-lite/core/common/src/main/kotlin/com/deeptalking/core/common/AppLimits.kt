@@ -15,10 +15,28 @@ object AppLimits {
         const val INSTANT_TRIM_FLOOR = 10
         const val SHORT_TERM = 80
         const val SHORT_TERM_TRIM_FLOOR = 20
+
+        /**
+         * Legacy hard per-category cap. No longer used to evict entries (long-term is
+         * kept unbounded; only time decay removes events/promises), retained for
+         * reference by callers that still want a bound.
+         */
         const val LONG_TERM_PER_CATEGORY = 40
         const val PENDING_RECALL = 6
-        const val ANALYSIS_BATCH = 40
-        const val SUMMARY_SOURCES = 160
+        const val ANALYSIS_BATCH = 20
+        const val SUMMARY_SOURCES = 20
+
+        /**
+         * Character-bigram Jaccard similarity at which two memory texts are treated
+         * as near-duplicates and merged (deterministic pass).
+         */
+        const val NEAR_DUP_SIMILARITY = 0.72
+
+        /** Long-term entries that trigger an LLM consolidation pass. */
+        const val CONSOLIDATE_TRIGGER = 24
+
+        /** Max entries handed to one LLM consolidation pass. */
+        const val CONSOLIDATE_BATCH = 60
     }
 
     object Prompt {

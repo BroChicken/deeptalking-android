@@ -203,8 +203,9 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 | `analysis` | `shortTerm` 满 80 且积压 ≥ 60 | `analysisRetryAt` / `analysisFailures` | 短期摘要 → 长期记忆 |
 | `scene` | 场景切换或跨度 ≥ 12 条（按消息序号） | `sceneRetryAt` / `sceneFailures` | 场景概要 |
 | `lorebook` | 有已分析摘要尚未整理（或积压 ≥ 8，`consolidateSpan`） | `lorebookRetryAt` / `lorebookFailures` | 沉淀世界书条目 + 自动淘汰 |
+| `consolidate` | `longTerm` 达 `CONSOLIDATE_TRIGGER`(24) | `consolidateRetryAt` / `consolidateFailures` | 长期记忆语义去重整合（原生新增；确定性近似去重在写入路径即时进行） |
 
-`scheduleMemoryRetry()` 统一指数退避（5 分钟 → 30 分钟封顶）；`resetMemoryRetry()` 成功后清零。`checkMemoryTriggers()` — src/js/memory/tasks.js:199 依次调度这四个任务。
+`scheduleMemoryRetry()` 统一指数退避（5 分钟 → 30 分钟封顶）；`resetMemoryRetry()` 成功后清零。`checkMemoryTriggers()` — src/js/memory/tasks.js:199 依次调度这四个任务。（原生的长期整合为第 5 个任务。）
 
 **摘要生命周期（`revision` 标记）**：每条短期摘要带 `revision` / `analyzedRevision` / `lorebookScannedRevision`。长期分析只标记 `analyzedRevision`、世界书整理只标记 `lorebookScannedRevision`；`trimShortTermList()` 只有在**两个消费者都处理过同一 revision**、且超出 `shortTermTrimFloor` 时才允许裁剪，避免"世界书还没读到摘要就被删掉"（历史 bug）。摘要被改写时 `revision + 1`，两个标记同时失效、重新排队。`summarizeScene()` 跳过 `sequence ≤ sceneState.startSequence` 的旧消息，裁剪后仍能稳定统计"距上次场景已过多少条"。（原生 `ShortTermMemory` 与 `SceneState` 已带同名字段，行为一致。）
 
@@ -324,7 +325,7 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 | — | 优先级阶梯（规则块首行）：`0／0.5 与【输出格式】= 硬性契约 > 2.5／2.6 > 角色设定 > 风格偏好` |
 | `0` | （最高优先级）本轮必须以结构化方式收尾，二选一：调用 `submit_response` 工具（推荐）或直接输出单个 JSON 对象；不得在结构化内容之外写说明/旁白，不得裸写散文 |
 | `1` | 保持角色身份连续；先用已提供的记忆；"系统提供的本轮上下文"不是用户的话 |
-| `2` | reply 正文写法（像日常说话）：**不设下限**、只设 **≤250 字上限**防大段空话；分段/行内样式限制；**动作可选、单拍短、不堆叠、总量 ≤ ¼、不复述对白情绪**；去重（禁重复近期整句/句式/意象/固定动作/收尾） |
+| `2` | reply 正文写法（像日常说话）：**不设下限**、只设 **≤250 字上限**防大段空话；分段/行内样式限制；**动作/表情/心理/旁白一律写全角括号、单拍短、不堆叠、总量 ≤ ¼、不复述对白情绪**；**台词不加任何引号或符号包裹**；去重（禁重复近期整句/句式/意象/固定动作/收尾） |
 | `2.6` | **表演质量（真人感，像日常说话）**：show-don't-tell、句长节奏起伏、对白优先、回避陈词滥调与复用比喻、删掉不推进内容的句子、人物性格稳定 |
 | `3` | 人格/背景锁定 + `dynamicState` 更新与溯源规则（时间写法见 `3.8`） |
 | `3.5` | 谨慎修改基础设定：用户直接要求 → `update_character_field`；无要求时仅"决定性不可逆转折"才改 |
@@ -437,7 +438,7 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 | `MAX_TOOL_CALLS` | 12 | src/js/agent/tool-definitions.js:3 |
 | `AGENT_TOOL_MEMORY_INJECT_LIMIT` | 5 | src/js/agent/tool-definitions.js:4 |
 | `MAX_API_RETRIES` | 3（退避 1s/2s/4s） | src/js/api/retry.js:2 |
-| `MEMORY_LIMITS` | instant 30(保底 10) / shortTerm 80(保底 20) / longTermPerCategory 40 / pendingRecall 6 / analysisBatch 40 / summarySources 160（原生 instant/sceneSpan 已下调，见"上下文窗口"） | src/js/core/config.js:104 |
+| `MEMORY_LIMITS` | instant 30(保底 10) / shortTerm 80(保底 20) / longTerm 无上限（仅时效 `applyMemoryDecay`） / pendingRecall 6 / analysisBatch 20 / summarySources 20 / nearDupSimilarity 0.72 / consolidateTrigger 24（原生已下调；短期正文与长期 value 不再按字数截断） | src/js/core/config.js:104 |
 | `API_LIMITS` | auxiliaryTimeoutMs 90000 / requestMetrics 60 / prefixSnapshots 12 | src/js/core/config.js:98 |
 | `PROMPT_LIMITS` | roleChars 8000 / memberChars 900 | src/js/core/config.js:113 |
 | `CONTEXT_BUDGET` | retrievedChars 1200 / summaryChars 1600 / sceneSummaries 2 / sceneInjectionChars 600 / sceneSpan 12 / volatileChars 6000 | src/js/core/config.js:173 |

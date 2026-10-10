@@ -274,10 +274,12 @@ data class MemoryCounters(
     val analysisRetryAt: String? = null,
     val sceneRetryAt: String? = null,
     val lorebookRetryAt: String? = null,
+    val consolidateRetryAt: String? = null,
     val extractionFailures: Int = 0,
     val analysisFailures: Int = 0,
     val sceneFailures: Int = 0,
     val lorebookFailures: Int = 0,
+    val consolidateFailures: Int = 0,
     val lorebookScannedCount: Int = 0,
     val messageSequence: Int = 0,
 )
