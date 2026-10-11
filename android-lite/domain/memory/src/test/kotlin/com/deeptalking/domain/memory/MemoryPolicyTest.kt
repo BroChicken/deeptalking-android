@@ -233,7 +233,7 @@ class MemoryPolicyTest {
     }
 
     @Test
-    fun upsertLongTermFoldsNearDuplicateKey() {
+    fun upsertLongTermKeepsDistinctKeysButMergesExactKey() {
         val character = Character(id = "c1", instant = listOf(user("u1", "用户喜欢咖啡")))
         val existing = LongTermMemory(
             category = MemoryCategory.UserProfile,
@@ -244,10 +244,17 @@ class MemoryPolicyTest {
             evidence = "用户喜欢咖啡",
             importance = 5,
         )
-        val incoming = existing.copy(id = "new", key = "用户喜欢喝咖啡。")
-        val (list, ok) = upsertLongTermMemory(character, incoming, listOf(existing))
-        assertTrue(ok)
-        assertEquals(1, list.size)
+        // A merely similar key must NOT be folded into the existing entry (legacy exact-key match).
+        val similar = existing.copy(id = "new", key = "用户喜欢喝咖啡。")
+        val (distinct, okDistinct) = upsertLongTermMemory(character, similar, listOf(existing))
+        assertTrue(okDistinct)
+        assertEquals(2, distinct.size)
+
+        // The exact same key still merges (updates in place) instead of duplicating.
+        val exact = existing.copy(id = "new2", value = "用户喜欢喝咖啡，每天早上一杯。")
+        val (merged, okMerged) = upsertLongTermMemory(character, exact, listOf(existing))
+        assertTrue(okMerged)
+        assertEquals(1, merged.size)
     }
 
     @Test

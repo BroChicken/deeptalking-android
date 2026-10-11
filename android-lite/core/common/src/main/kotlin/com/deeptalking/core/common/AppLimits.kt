@@ -31,12 +31,6 @@ object AppLimits {
          * as near-duplicates and merged (deterministic pass).
          */
         const val NEAR_DUP_SIMILARITY = 0.72
-
-        /** Long-term entries that trigger an LLM consolidation pass. */
-        const val CONSOLIDATE_TRIGGER = 24
-
-        /** Max entries handed to one LLM consolidation pass. */
-        const val CONSOLIDATE_BATCH = 60
     }
 
     object Prompt {

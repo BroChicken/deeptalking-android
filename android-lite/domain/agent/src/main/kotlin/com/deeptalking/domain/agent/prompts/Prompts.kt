@@ -11,6 +11,7 @@ import com.deeptalking.core.model.MemoryCategory
 import com.deeptalking.core.model.MemorySubject
 import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.Role
+import com.deeptalking.core.model.ShortTermMemory
 import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.domain.agent.background.STYLE_GUARD
 import com.deeptalking.domain.agent.background.buildGroupVoiceContract
@@ -134,6 +135,23 @@ internal fun trimText(value: String?, maxLength: Int = 0): String {
 
 internal fun normalizeUserAddress(value: String?): String =
     value.orEmpty().replace(Regex("\\s+"), "").take(20)
+
+/**
+ * Date label for an injected short-term line. Falls back to the earliest cited
+ * source message's timestamp when the summary carries no time of its own, so an
+ * injected line never reaches the model without a date to anchor it.
+ */
+private fun shortTermDate(character: Character, item: ShortTermMemory): String {
+    val direct = trimText(item.eventTime ?: item.createdAt, 10)
+    if (direct.isNotBlank()) return direct
+    val ids = item.sourceMessageIds.toSet()
+    if (ids.isEmpty()) return ""
+    val earliest = character.instant
+        .filter { it.id in ids && !it.timestamp.isNullOrBlank() }
+        .minByOrNull { it.timestamp.orEmpty() }
+        ?.timestamp
+    return trimText(earliest, 10)
+}
 
 /** Never send the literal word “用户” to the model. */
 internal fun maskUserWord(character: Character?, text: String?): String =
@@ -343,7 +361,7 @@ private const val RULE_9_5 =
     "9.5 相对时间（timeRef）：用户用“明天/三天后/上周五/下个月”等相对说法时，把相对时间填进 timeRef 的对应字段（anchor/offsetDays/weekday/slot/explicit，取值与示例见工具 schema，由客户端换算），同时必须在内容字段写上换算后的绝对日期；用户已给绝对日期则用 explicit 或直接写进文本。时段只能用：深夜、凌晨、清晨、早晨、上午、中午、下午、傍晚、晚上、夜里。"
 
 private const val RULE_A =
-    "A. 本会话可用工具，何时用、怎么用见各工具描述（search_memory / list_memories / delete_memory / update_memory / set_reminder / get_current_time / web_search / web_fetch / send_sticker / ask_user）。原则：回忆过往用 search_memory，检索不到再 list_memories 盘点；记忆过期/重复/被用户纠正时先定位再用 delete_memory 或 update_memory 处理，用户明确否认或纠正时必须用 update_memory 带原话改正，不要只靠删除；待办只在**用户自己明确提出或同意**时用 set_reminder 记录（附 sourceMessageIds + evidence），你要求用户做或你叮嘱的事不记；工具结果属系统内部上下文，仅供理解，自然融入 reply，不得向用户透露检索过程或工具名，但工具返回的图片本身可直接展示。"
+    "A. 本会话可用工具，何时用、怎么用见各工具描述（search_memory / list_memories / delete_memory / update_memory / set_reminder / get_current_time / web_search / web_fetch / send_sticker / ask_user）。原则：回忆过往用 search_memory，检索不到再 list_memories 盘点；**用户提到某个具体日期/某天发生的事（如“九号晚上”“三号”“上周五”“那天记不记得”）时，用 search_memory 的 date/timeRef 按日期召回那天的原始对话与记忆，不要只凭摘要回忆**；记忆过期/重复/被用户纠正时先定位再用 delete_memory 或 update_memory 处理，用户明确否认或纠正时必须用 update_memory 带原话改正，不要只靠删除；待办只在**用户自己明确提出或同意**时用 set_reminder 记录（附 sourceMessageIds + evidence），你要求用户做或你叮嘱的事不记；工具结果属系统内部上下文，仅供理解，自然融入 reply，不得向用户透露检索过程或工具名，但工具返回的图片本身可直接展示。**断言前先核对**：说“第一次/从来没/总是/每次/以前也…”这类关于过去、次数或习惯的话之前，先用 search_memory 确认；查不到依据就别断言，改说不确定或反问用户，不要编造。"
 
 private const val GROUP_RULE_10 =
     "10. 当前是群组对话：只能由已列出的成员发言（一人或多人）。reply 中用户可见回复必须用每人独立一行的“成员名：内容”格式（台词不加任何引号或符号），动作按第 2 条写进全角括号，例如“张三：（看了一眼纸）这件事我先说说我的看法。\n李四：我补充一点。”。每位成员按语义可自然分段；不要写旁白、不要加未列出的发言者；示例仅示范结构，不得模仿其口吻。quickReplies 同样两条、用户视角，不得写成成员台词/提问/承诺。成员状态用 memberDynamicState 更新，不要写入群组整体 dynamicState。"
@@ -708,7 +726,7 @@ suspend fun buildVolatileContext(
         val item = shortSource[i]
         appendWithinLimit(
             shortLines,
-            "[${trimText(item.eventTime ?: item.createdAt, 10)}] ${maskUserWord(character, trimText(item.content, 300))}",
+            "[${shortTermDate(character, item).ifBlank { "日期未知" }}] ${maskUserWord(character, trimText(item.content, 300))}",
             summaryBudget,
         )
     }

@@ -206,4 +206,35 @@ class MemoryToolsTest {
         assertTrue(Regex("\"开心\"").findAll(definition.parametersJson).count() == 1)
         assertTrue(definition.description.contains("开心"))
     }
+
+    @Test
+    fun `search_memory recalls a day's raw messages by date`() = runBlocking {
+        val character = Character(
+            id = "c1",
+            instant = listOf(
+                ChatMessage(id = "u1", role = Role.User, content = "九号晚上一起看流星雨", timestamp = "2026-10-09T12:00:00Z"),
+                ChatMessage(id = "u2", role = Role.Assistant, content = "嗯，我记得那一夜。", timestamp = "2026-10-09T12:05:00Z"),
+                ChatMessage(id = "u3", role = Role.User, content = "十号之后就没提过了", timestamp = "2026-10-20T12:00:00Z"),
+            ),
+            shortTerm = listOf(
+                ShortTermMemory(id = "s1", content = "2026-10-09 深夜一起看流星雨", eventTime = "2026-10-09T12:00:00Z"),
+                ShortTermMemory(id = "s2", content = "2026-10-20 深夜聊了别的", eventTime = "2026-10-20T12:00:00Z"),
+            ),
+            longTerm = listOf(
+                mem("m1", key = "流星雨", value = "2026-10-09 深夜两人一起看流星雨", createdAt = "2026-10-09T12:00:00Z"),
+                mem("m2", key = "闲聊", value = "2026-10-20 深夜聊了别的", createdAt = "2026-10-20T12:00:00Z"),
+            ),
+        )
+        val result = SearchMemoryTool(memory).execute(
+            call("search_memory", """{"date":"2026-10-09"}"""),
+            context(character),
+        )
+        val json = result.contentJson
+        assertTrue(json.contains("\"mode\":\"date\""))
+        assertTrue(json.contains("九号晚上一起看流星雨"))
+        assertTrue(json.contains("流星雨"))
+        // Another day must not leak into the result.
+        assertTrue(!json.contains("十号之后就没提过了"))
+        assertTrue(!json.contains("聊了别的"))
+    }
 }

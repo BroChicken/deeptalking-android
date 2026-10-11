@@ -45,6 +45,16 @@ class DifferentialOracleTest {
 
     private val json = Json { ignoreUnknownKeys = true }
 
+    /**
+     * Intentional deviations from the legacy tool contract. `search_memory` gained
+     * date recall (`date`/`timeRef`/`slot`) and `query` became optional, so its
+     * required/property sets no longer match the JS oracle; the native contract is
+     * asserted here instead (see `SearchMemoryTool`).
+     */
+    private val NATIVE_TOOL_CONTRACT: Map<String, Pair<List<String>, List<String>>> = mapOf(
+        "search_memory" to (emptyList<String>() to listOf("query", "date", "timeRef", "slot", "memberName")),
+    )
+
     private fun readResource(name: String): String =
         javaClass.classLoader.getResourceAsStream(name)?.bufferedReader()?.readText()
             ?: error("missing test resource: $name")
@@ -109,12 +119,22 @@ class DifferentialOracleTest {
 
             for ((index, def) in defs.withIndex()) {
                 val jsTool = expected["toolNames"]!!.jsonArray[index].jsonObject
-                val jsRequired = jsTool["required"]!!.jsonArray.map { it.jsonPrimitive.content }.sorted()
-                val jsProps = jsTool["propertyKeys"]!!.jsonArray.map { it.jsonPrimitive.content }.sorted()
                 val kotlinParams = json.parseToJsonElement(def.parametersJson).jsonObject
                 val kotlinRequired = (kotlinParams["required"]?.jsonArray ?: JsonArray(emptyList()))
                     .map { it.jsonPrimitive.content }.sorted()
                 val kotlinProps = (kotlinParams["properties"]?.jsonObject?.keys ?: emptySet()).sorted()
+
+                val native = NATIVE_TOOL_CONTRACT[def.name]
+                if (native != null) {
+                    // Intentional deviation: assert the native contract instead of the JS one.
+                    assertEquals("[${scenario.id}] ${def.name} native required params", native.first.sorted(), kotlinRequired)
+                    assertEquals("[${scenario.id}] ${def.name} native property keys", native.second.sorted(), kotlinProps)
+                    assertEquals("[${scenario.id}] ${def.name} strict flag", jsTool["strict"]!!.jsonPrimitive.content.toBoolean(), def.strict)
+                    continue
+                }
+
+                val jsRequired = jsTool["required"]!!.jsonArray.map { it.jsonPrimitive.content }.sorted()
+                val jsProps = jsTool["propertyKeys"]!!.jsonArray.map { it.jsonPrimitive.content }.sorted()
                 assertEquals("[${scenario.id}] ${def.name} required params", jsRequired, kotlinRequired)
                 assertEquals("[${scenario.id}] ${def.name} property keys", jsProps, kotlinProps)
                 assertEquals("[${scenario.id}] ${def.name} strict flag", jsTool["strict"]!!.jsonPrimitive.content.toBoolean(), def.strict)
@@ -222,6 +242,15 @@ class DifferentialOracleTest {
             .replace(Regex("【交互规则】[\\s\\S]*?(?=【角色设定（固定)"), "【交互规则】(正常化)\n")
             .replace(Regex("(?m)^【输出格式】.*$"), "【输出格式】(正常化)")
 
+    /**
+     * `getPromiseContext` reads the wall clock (`Instant.now()`, mirroring the legacy
+     * `Date.now()`), while the oracle is pinned to a fixed `now`; a promise's
+     * 进行中/待确认 label therefore flips as real time crosses its `dueAt`. Normalize
+     * the label so the comparison stays about content, not the test run date.
+     */
+    private fun normalizePromiseStatus(text: String): String =
+        text.replace("[进行中]", "[承诺状态]").replace("[待确认，已过期]", "[承诺状态]")
+
     @Test
     fun `volatile context matches the legacy JS oracle`() = runBlocking {
         val now = json.parseToJsonElement(readResource("scenarios.json")).jsonObject["now"]!!.jsonPrimitive.content
@@ -242,8 +271,8 @@ class DifferentialOracleTest {
             )
             assertEquals(
                 "[${scenario.id}] volatile context must be byte-identical to legacy JS (skeleton/voice/dynamic normalized)",
-                normalizeDynamicFields(normalizeVoiceContract(normalizeSkeleton(expected))),
-                normalizeDynamicFields(normalizeVoiceContract(normalizeSkeleton(actual))),
+                normalizePromiseStatus(normalizeDynamicFields(normalizeVoiceContract(normalizeSkeleton(expected)))),
+                normalizePromiseStatus(normalizeDynamicFields(normalizeVoiceContract(normalizeSkeleton(actual)))),
             )
         }
     }

@@ -202,7 +202,7 @@ fun detectQuickReplyIssues(replies: List<String>, character: Character, replyTex
 }
 
 /** Background memory sub-tasks with independent retry bookkeeping (legacy `memoryTaskKeys`). */
-enum class MemoryTaskKind { Extraction, Analysis, Scene, Lorebook, Consolidate }
+enum class MemoryTaskKind { Extraction, Analysis, Scene, Lorebook }
 
 /**
  * Retry counters for the background memory sub-tasks (legacy
@@ -221,15 +221,12 @@ data class MemoryTaskCounters(
     val sceneRetryAt: String? = null,
     val lorebookFailures: Int = 0,
     val lorebookRetryAt: String? = null,
-    val consolidateFailures: Int = 0,
-    val consolidateRetryAt: String? = null,
 ) {
     fun failuresOf(task: MemoryTaskKind): Int = when (task) {
         MemoryTaskKind.Extraction -> extractionFailures
         MemoryTaskKind.Analysis -> analysisFailures
         MemoryTaskKind.Scene -> sceneFailures
         MemoryTaskKind.Lorebook -> lorebookFailures
-        MemoryTaskKind.Consolidate -> consolidateFailures
     }
 
     fun retryAtOf(task: MemoryTaskKind): String? = when (task) {
@@ -237,7 +234,6 @@ data class MemoryTaskCounters(
         MemoryTaskKind.Analysis -> analysisRetryAt
         MemoryTaskKind.Scene -> sceneRetryAt
         MemoryTaskKind.Lorebook -> lorebookRetryAt
-        MemoryTaskKind.Consolidate -> consolidateRetryAt
     }
 
     fun with(task: MemoryTaskKind, failures: Int, retryAt: String?): MemoryTaskCounters = when (task) {
@@ -245,7 +241,6 @@ data class MemoryTaskCounters(
         MemoryTaskKind.Analysis -> copy(analysisFailures = failures, analysisRetryAt = retryAt)
         MemoryTaskKind.Scene -> copy(sceneFailures = failures, sceneRetryAt = retryAt)
         MemoryTaskKind.Lorebook -> copy(lorebookFailures = failures, lorebookRetryAt = retryAt)
-        MemoryTaskKind.Consolidate -> copy(consolidateFailures = failures, consolidateRetryAt = retryAt)
     }
 }
 
@@ -319,8 +314,6 @@ class BackgroundTasks(
         sceneRetryAt = character.counters.sceneRetryAt,
         lorebookFailures = character.counters.lorebookFailures,
         lorebookRetryAt = character.counters.lorebookRetryAt,
-        consolidateFailures = character.counters.consolidateFailures,
-        consolidateRetryAt = character.counters.consolidateRetryAt,
     )
 
     private fun Character.withCounters(counters: MemoryTaskCounters): Character = copy(
@@ -333,8 +326,6 @@ class BackgroundTasks(
             sceneRetryAt = counters.sceneRetryAt,
             lorebookFailures = counters.lorebookFailures,
             lorebookRetryAt = counters.lorebookRetryAt,
-            consolidateFailures = counters.consolidateFailures,
-            consolidateRetryAt = counters.consolidateRetryAt,
         ),
     )
 
@@ -788,98 +779,6 @@ class BackgroundTasks(
         return TaskStatus.Success to working
     }
 
-    /** True when a long-term consolidation pass is worth running for [character]. */
-    fun consolidateMemoryDue(character: Character): Boolean =
-        character.longTerm.size >= AppLimits.Memory.CONSOLIDATE_TRIGGER
-
-    /**
-     * LLM consolidation of long-term memory: feeds the shared store to the model
-     * and folds semantically-duplicate entries (different wording, same fact) into
-     * one. Deterministic near-duplicate merging runs on write; this catches the
-     * paraphrase-level duplicates that lexical similarity cannot. Returns `Failure`
-     * unchanged when the output is malformed, so nothing is dropped on error.
-     */
-    suspend fun consolidateMemory(character: Character): Pair<TaskStatus, Character> {
-        val items = character.longTerm.take(AppLimits.Memory.CONSOLIDATE_BATCH)
-        if (items.size < AppLimits.Memory.CONSOLIDATE_TRIGGER) return TaskStatus.Success to character
-
-        val payload = items.map { item ->
-            ConsolidationInput(
-                id = item.id,
-                category = item.category.name,
-                subject = item.subject.name,
-                key = item.key,
-                value = item.value,
-            )
-        }
-        val prompt = CONSOLIDATION_PROMPT_HEAD + json.encodeToString(payload) + CONSOLIDATION_PROMPT_TAIL
-
-        val guard = captureGuard(character)
-        onStatus("正在整理长期记忆…")
-        val raw = complete(CONSOLIDATION_SYSTEM, prompt, sessionId = sessionIdFor(character), taskType = "consolidate")
-        if (!isGuardCurrent(guard)) return TaskStatus.Stale to character
-        if (raw.isBlank()) return TaskStatus.Failure to character
-        val root = ResponseParser.parseJsonLenient(raw) as? JsonObject ?: return TaskStatus.Failure to character
-        if (root.string("status") != "ok") return TaskStatus.Failure to character
-        val groups = root["groups"] as? JsonArray ?: return TaskStatus.Failure to character
-        if (groups.isEmpty()) return TaskStatus.Success to character
-
-        val consolidated = applyConsolidation(character.longTerm, groups)
-            ?: return TaskStatus.Failure to character
-        return TaskStatus.Success to character.copy(longTerm = consolidated)
-    }
-
-    /**
-     * Applies one consolidation batch: each group keeps `keepId`, absorbs the union
-     * of the group's sources/evidence, and takes the model's merged key/value. Ids
-     * must exist and be used at most once; any violation returns null (no change).
-     */
-    private fun applyConsolidation(store: List<LongTermMemory>, groups: JsonArray): List<LongTermMemory>? {
-        val byId = store.associateBy { it.id }
-        data class Merge(val keepId: String, val dropIds: Set<String>, val obj: JsonObject)
-        val merges = mutableListOf<Merge>()
-        val claimed = mutableSetOf<String>()
-        for (element in groups) {
-            val obj = element as? JsonObject ?: return null
-            val keepId = obj.string("keepId").trim()
-            val dropIds = stringList(obj["mergeIds"]).map { it.trim() }.filter { it.isNotEmpty() }.toSet()
-            if (keepId.isEmpty() || dropIds.isEmpty()) return null
-            val ids = dropIds + keepId
-            if (ids.any { it !in byId }) return null
-            if (ids.any { it in claimed }) return null
-            claimed += ids
-            merges += Merge(keepId, dropIds, obj)
-        }
-        val dropped = merges.flatMap { it.dropIds }.toSet()
-        val result = store.filterNot { it.id in dropped }.map { item ->
-            val merge = merges.firstOrNull { it.keepId == item.id } ?: return@map item
-            val peers = merge.dropIds.mapNotNull { byId[it] }
-            val sources = (item.sourceMessageIds + peers.flatMap { it.sourceMessageIds }).distinct().take(8)
-            val evidence = merge.obj.string("evidence").ifEmpty { item.evidence }
-            val mergedImportance = (merge.obj["importance"] as? JsonPrimitive)?.contentOrNull?.toIntOrNull() ?: 0
-            item.copy(
-                key = merge.obj.string("key").trim().ifEmpty { item.key },
-                value = merge.obj.string("value").trim().ifEmpty { item.value },
-                tags = (item.tags + stringList(merge.obj["tags"]) + peers.flatMap { it.tags }).distinct().take(8),
-                importance = if (mergedImportance > 0) mergedImportance.coerceIn(1, 10) else item.importance,
-                sourceMessageIds = sources,
-                evidence = evidence,
-                updatedAt = item.updatedAt ?: Instant.now().toString(),
-            )
-        }
-        return result
-    }
-
-    @Serializable
-    private data class ConsolidationInput(
-        val id: String,
-        val category: String,
-        val subject: String,
-        val key: String,
-        val value: String,
-    )
-
-
     suspend fun runMemoryMaintenance(character: Character): Character {
         var working = ensureMessageSequences(character)
         working = applyMemoryDecay(working)
@@ -909,17 +808,6 @@ class BackgroundTasks(
             }
         }
 
-        if (consolidateMemoryDue(working) && canRunMemoryTask(counters, MemoryTaskKind.Consolidate, nowMillis)) {
-            val (status, afterConsolidate) = consolidateMemory(working)
-            counters = when (status) {
-                TaskStatus.Success -> {
-                    working = afterConsolidate
-                    resetMemoryRetry(counters, MemoryTaskKind.Consolidate)
-                }
-                TaskStatus.Failure -> scheduleMemoryRetry(counters, MemoryTaskKind.Consolidate, nowMillis)
-                TaskStatus.Stale -> counters
-            }
-        }
         working = working.withCounters(counters)
         return working
     }
@@ -1666,7 +1554,6 @@ class BackgroundTasks(
 
         const val EXTRACTION_SYSTEM = "你是一个信息提取助手。只返回JSON数组，不要其他文字。"
         const val ANALYSIS_SYSTEM = "你是一个记忆分析助手。只返回JSON，不要其他文字。"
-        const val CONSOLIDATION_SYSTEM = "你是记忆去重整理助手。只返回JSON，不要其他文字。"
         const val CRITIQUE_SYSTEM = "你是文风校对助手。只返回JSON。"
 
         const val EXTRACTION_COUNT_LIMITED = "返回JSON数组，最多十五个元素。"
@@ -1683,11 +1570,5 @@ class BackgroundTasks(
 
         const val ANALYSIS_PROMPT_TAIL =
             "\n\n返回JSON格式:\n{\"status\":\"ok\",\"analyzedShortTermIds\":[\"全部输入的short_id\"],\"longTerm\": [{\"category\": \"...\", \"subject\": \"user|relationship|world\", \"key\": \"稳定且可复用的标识\", \"value\": \"...\", \"tags\": [...], \"importance\": 1-10, \"sourceShortTermIds\":[\"short_id\"], \"sourceMessageIds\": [\"msg_id\"], \"evidence\": \"被选择用户消息中的逐字原话\", \"eventTime\": \"ISO时间\", \"participants\":[\"参与者\"],\"location\":\"地点或未说明\",\"status\": \"active\", \"dueAt\": \"ISO时间\", \"arcOf\": \"可选，持续情节线名称\", \"arcStage\": \"可选，起始/发展/转折/现状\"}]}\ncategory可选: userProfile, relationship, events, promises, habits。value同样必须写明主体：涉及用户写“用户”，涉及角色写角色名（群组写具体成员名），禁止“我/你/TA”这类指代不清的代词。key与value中的时间一律写绝对日期（YYYY-MM-DD 或 YYYY-MM-DD 时段），禁止“明天/明晚/上周/上个月/三天后”这类相对时间词。这里只提取用户的约定（promises 的 promisor=user、promisor与promisee只能是 user 或 character）；角色单方承诺由主对话记录，不在此处提取。"
-
-        const val CONSOLIDATION_PROMPT_HEAD =
-            "下面是同一个角色的长期记忆条目（每条含 id、category、subject、key、value）。请找出**描述同一件事/同一事实**的重复或高度相似条目，把它们合并成一条；措辞不同但意思相同也算重复。规则：\n- 只有确实重复的才合并；不同的事实、不同时间的不同事件不要合并。\n- 合并后的 key 要稳定、可复用、写明主体（涉及用户写“用户”，涉及角色写角色名）；value 取更完整准确的表述，可综合多条的信息。\n- 每条分组给出 keepId（保留条目的id，选信息最全、最新的一条）与 mergeIds（要删除并入 keepId 的其它条目id，至少一个）。\n- 没有重复就返回空数组 groups。\n条目:\n"
-
-        const val CONSOLIDATION_PROMPT_TAIL =
-            "\n\n返回JSON：{\"status\":\"ok\",\"groups\":[{\"keepId\":\"id\",\"mergeIds\":[\"id2\",\"id3\"],\"key\":\"合并后的key\",\"value\":\"合并后的value\",\"importance\":1-10,\"tags\":[\"关键词\"]}]}。只输出分组，不要输出未合并的条目；没有重复时 groups 为空数组。"
     }
 }

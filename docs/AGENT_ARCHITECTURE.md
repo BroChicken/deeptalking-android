@@ -88,7 +88,7 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 | 工具 | 作用 | 定义位置 |
 |---|---|---|
 | `get_current_time` | 获取当前时间/时区 | src/js/agent/tool-definitions.js:14 |
-| `search_memory` | 按关键词检索长期记忆（可指定成员私人记忆） | src/js/agent/tool-definitions.js:20 |
+| `search_memory` | 按关键词检索长期记忆（可指定成员私人记忆）；**原生新增按日期召回**（`date`/`timeRef`/`slot`，返回那天的原始对话+摘要+长期记忆） | src/js/agent/tool-definitions.js:20 |
 | `list_memories` | 按分类盘点记忆清单（不含详情） | src/js/agent/tool-definitions.js:26 |
 | `delete_memory` | 按 ID 删除记忆 | src/js/agent/tool-definitions.js:32 |
 | `set_reminder` | 记录待办/约定（promises，须用户发起 + 原话证据） | src/js/agent/tool-definitions.js:38 |
@@ -168,7 +168,7 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 |---|---|---|
 | `instant` | 最近原始消息 | 30 条（截断保底 10） |
 | `shortTerm` | 事件流程摘要 | 80 条（截断保底 20） |
-| `longTerm` | 分类长期记忆 | 每类 40 条 |
+| `longTerm` | 分类长期记忆 | 无数量上限（仅 `applyMemoryDecay` 时效遗忘；旧版"每类 40 条"上限已移除） |
 | `scenes` | 场景概要 | 保留最近 8 条（`AppLimits.Scene.RETAIN`），注入最近 2 条 |
 
 **上下文窗口（有意偏离旧版）**：`INSTANT=30` / `INSTANT_TRIM_FLOOR=10`（旧版 160/40）。发给模型的原始历史窗口即当前 `instant`（最多 30 条原文，增长期不缺席）；满 30 触发 `extraction` 把较旧约 20 条总结进 `shortTerm`（volatile 注入的"摘要"），`instant` 裁到最近 10 条后再长回 30。更早内容由 volatile 的 `shortTerm` + `scenes` + 长期记忆承载。`Scene.SPAN=12`（旧版 24）。
@@ -184,8 +184,9 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 
 ### 相关度检索
 
-`retrieveRelevantMemories(char, query, memoryStore)` — src/js/memory/updates.js:1
-- 评分 = 有效重要度×0.45 + 关键词命中加分 + 时效加分（90 天内递增）+ 剧情弧线 `arcOf` +3。
+`retrieveRelevantMemories(char, query, memoryStore)` — src/js/memory/updates.js:1；原生为 `:domain:memory` 的 `Retrieval.rankMemories` / `topK`。
+- 旧版评分 = 有效重要度×0.45 + 关键词命中加分（每命中一个词 +2 / 长词 +4） + 时效加分（90 天内递增） + 剧情弧线 `arcOf` +3。
+- **原生改进（有意偏离）**：每个命中词按「归一化特异性（IDF 式：含该词的记忆越少、权重越高）× 命中字段（`tags`×2 / `key`×1.5 / `value`×1）× 词长」加权，再乘覆盖率加成，压掉"晚上/事情"这类泛词；`topK` 先过相关性下限 `MIN_MATCH_SCORE`(1.5)，再按「同一事件（日期+时段）只留一条 + 每类最多 `MAX_PER_CATEGORY`(3) 条」去重；若下限会清空结果则回退到完整排序（不会召回为空）。该评分被自动注入与 `search_memory` 工具共用。
 - 取 top 12，配合 `pendingRecall`（待召回记忆，强制置顶）。
 - 可传入 `memoryStore` 以检索群组成员的私人记忆。
 
@@ -203,9 +204,8 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 | `analysis` | `shortTerm` 满 80 且积压 ≥ 60 | `analysisRetryAt` / `analysisFailures` | 短期摘要 → 长期记忆 |
 | `scene` | 场景切换或跨度 ≥ 12 条（按消息序号） | `sceneRetryAt` / `sceneFailures` | 场景概要 |
 | `lorebook` | 有已分析摘要尚未整理（或积压 ≥ 8，`consolidateSpan`） | `lorebookRetryAt` / `lorebookFailures` | 沉淀世界书条目 + 自动淘汰 |
-| `consolidate` | `longTerm` 达 `CONSOLIDATE_TRIGGER`(24) | `consolidateRetryAt` / `consolidateFailures` | 长期记忆语义去重整合（原生新增；确定性近似去重在写入路径即时进行） |
 
-`scheduleMemoryRetry()` 统一指数退避（5 分钟 → 30 分钟封顶）；`resetMemoryRetry()` 成功后清零。`checkMemoryTriggers()` — src/js/memory/tasks.js:199 依次调度这四个任务。（原生的长期整合为第 5 个任务。）
+`scheduleMemoryRetry()` 统一指数退避（5 分钟 → 30 分钟封顶）；`resetMemoryRetry()` 成功后清零。`checkMemoryTriggers()` — src/js/memory/tasks.js:199 依次调度这四个任务。
 
 **摘要生命周期（`revision` 标记）**：每条短期摘要带 `revision` / `analyzedRevision` / `lorebookScannedRevision`。长期分析只标记 `analyzedRevision`、世界书整理只标记 `lorebookScannedRevision`；`trimShortTermList()` 只有在**两个消费者都处理过同一 revision**、且超出 `shortTermTrimFloor` 时才允许裁剪，避免"世界书还没读到摘要就被删掉"（历史 bug）。摘要被改写时 `revision + 1`，两个标记同时失效、重新排队。`summarizeScene()` 跳过 `sequence ≤ sceneState.startSequence` 的旧消息，裁剪后仍能稳定统计"距上次场景已过多少条"。（原生 `ShortTermMemory` 与 `SceneState` 已带同名字段，行为一致。）
 
@@ -418,7 +418,8 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 - **记忆任务重试**：`memoryTaskKeys(task)` — src/js/memory/tasks.js:34 统一映射 `extraction` / `analysis` / `scene` / `lorebook` 四组计数器（`*Failures` / `*RetryAt`），`scheduleMemoryRetry` 指数退避（5→30 分钟封顶）。
 - **后台任务过期保护**：`captureMemoryTask(char)` 记录角色引用、`memory.revision` 与末条消息 ID；`isMemoryTaskCurrent()` 在后台调用返回后校验，过期（角色被删、轮次推进、分支被删）就直接丢弃。`extractProseTurnMemory` 在快照副本上运行 `convertProseToJson`，不修改真实 `lastInjectedRecallIds`；回写前要求 `revision` 未变、原 assistant 消息仍在，并只接受引用本轮用户消息或本轮回复的记忆。快速回应换位生成、空字段补全同样带 guard。
 - **摘要不被提前丢弃**：`trimShortTermList` 只在长期分析与世界书整理都消费了同一 `revision` 后才裁剪；世界书条目在写库前整批校验来源与字段，失败不推进 `lorebookScannedRevision`、也不累计 `misses`，避免一次坏输出造成误淘汰。
-- **检索相关性下限**：`retrieveRelevantMemories` 只保留至少命中一个非停用词的候选，避免纯高重要性但无关的旧记忆挤占注入；`pendingRecall`（模型主动召回）优先占位，即使候选取满也一定注入；短指代查询经 `buildMemoryQuery` 补上下文。
+- **检索相关性下限**：`rankMemories` 只保留至少命中一个非停用词的候选，并用特异性下限 `MIN_MATCH_SCORE`(1.5) 过滤"泛词"命中，避免纯高重要性但无关的旧记忆挤占注入；`pendingRecall`（模型主动召回）优先占位，即使候选取满也一定注入；短指代查询经 `buildMemoryQuery` 补上下文；**用户提到具体日期时，由模型用 `search_memory` 的 `date`/`timeRef` 按日期召回那天的原始对话与记忆**（口语日期→绝对日期由模型依据时间基准换算）。
+- **断言前先核对**：系统提示词要求模型在说"第一次/从来没/总是/每次/以前也…"这类**可被记忆证伪**的话之前先 `search_memory` 确认，查不到依据就不下断言（改说不确定或反问），禁止编造——治"明明不是第一次却说第一次"（关键词通道召回不到时，模型凭直觉断言）。
 - **时间精度**：`resolveTimeRef` 保留带时区/时分的 explicit ISO，仅"日期或时段"表达才落整点/时段起点，避免把明确时刻改写成正午。记忆衰减/排序的时间基准逐级回退（`Date.parse(lastRecalled) || Date.parse(updatedAt) || Date.parse(createdAt)`），`lastRecalled` 非空但不可解析时不会短路掉更新的时间戳、也不会被当成 1970 年。
 - **联网工具超时**：`fetchWithTimeout()`（src/js/api/web-content.js）给 B站 API、短链解析、Microlink、网页直连统一加超时，避免任意外部请求卡死工具循环（后台任务无重试兜底）。
 - **请求失败也留痕**：`performChatRequest` / `callAI` 的 fetch 失败或非 2xx 也会写入 `requestMetrics`（`status: 'failed'`），并取消未读完的流式 reader，便于诊断网络与限流问题。`buildApiHeaders` 在 apiKey 缺失时提前抛出明确错误，不发出 `Bearer undefined` 请求。
@@ -438,7 +439,7 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 | `MAX_TOOL_CALLS` | 12 | src/js/agent/tool-definitions.js:3 |
 | `AGENT_TOOL_MEMORY_INJECT_LIMIT` | 5 | src/js/agent/tool-definitions.js:4 |
 | `MAX_API_RETRIES` | 3（退避 1s/2s/4s） | src/js/api/retry.js:2 |
-| `MEMORY_LIMITS` | instant 30(保底 10) / shortTerm 80(保底 20) / longTerm 无上限（仅时效 `applyMemoryDecay`） / pendingRecall 6 / analysisBatch 20 / summarySources 20 / nearDupSimilarity 0.72 / consolidateTrigger 24（原生已下调；短期正文与长期 value 不再按字数截断） | src/js/core/config.js:104 |
+| `MEMORY_LIMITS` | instant 30(保底 10) / shortTerm 80(保底 20) / longTerm 无上限（仅时效 `applyMemoryDecay`） / pendingRecall 6 / analysisBatch 20 / summarySources 20 / nearDupSimilarity 0.72 / minMatchScore 1.5 / maxPerCategory 3（短期正文与长期 value 不再按字数截断） | src/js/core/config.js:104 |
 | `API_LIMITS` | auxiliaryTimeoutMs 90000 / requestMetrics 60 / prefixSnapshots 12 | src/js/core/config.js:98 |
 | `PROMPT_LIMITS` | roleChars 8000 / memberChars 900 | src/js/core/config.js:113 |
 | `CONTEXT_BUDGET` | retrievedChars 1200 / summaryChars 1600 / sceneSummaries 2 / sceneInjectionChars 600 / sceneSpan 12 / volatileChars 6000 | src/js/core/config.js:173 |

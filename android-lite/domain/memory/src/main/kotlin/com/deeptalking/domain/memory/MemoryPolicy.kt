@@ -426,23 +426,19 @@ fun repairMemories(character: Character): Character {
 }
 
 /** Current target of the one-time deterministic memory repair. */
-const val MEMORY_REPAIR_VERSION = 1
+const val MEMORY_REPAIR_VERSION = 2
 
 /**
- * Deterministic near-duplicate pass over short-term memory: items sharing an event
- * identity (or whose content is a near-duplicate of an earlier item) collapse into
- * the first occurrence, unioning their sources/evidence. Unlike [reconcileLegacyMemories]
- * this also merges re-phrasings that share no exact identity, so repeated extraction
- * of the same beat cannot pile up.
+ * Deterministic near-duplicate pass over short-term memory: items whose content is
+ * a near-duplicate of an earlier item collapse into the first occurrence, unioning
+ * their sources/evidence. Only *content* similarity merges — two distinct beats that
+ * merely share a day/time slot are kept separate, so a repair pass can never drop a
+ * unique fact (this is a deliberate deviation from the old identity-only merge).
  */
 fun dedupeShortTerm(items: List<ShortTermMemory>): List<ShortTermMemory> {
     val result = mutableListOf<ShortTermMemory>()
     for (item in items) {
-        val identity = eventIdentity(item.eventTime)
-        val dupIndex = result.indexOfFirst { existing ->
-            val sameIdentity = identity.isNotEmpty() && eventIdentity(existing.eventTime) == identity
-            sameIdentity || areNearDuplicate(existing.content, item.content)
-        }
+        val dupIndex = result.indexOfFirst { existing -> areNearDuplicate(existing.content, item.content) }
         if (dupIndex < 0) {
             result += item
             continue
@@ -585,24 +581,12 @@ fun upsertLongTermMemory(
     val participants = normalizeParticipantsList(item.participants)
     val location = item.location.trim().take(160)
     val identity = if (item.category == MemoryCategory.Events) eventIdentity(eventTime) else ""
-    // Exact key+identity wins; otherwise fold into a same-category near-duplicate
-    // (key similarity for regular categories, event identity for events) so
-    // re-phrasings of one fact do not accumulate as separate entries.
-    val index = store.indexOfFirst { memory ->
+    // Exact key (+ event identity for events) is the ONLY merge key, matching the
+    // legacy `upsertLongTermMemory`. Near-duplicate *keys* are deliberately not
+    // folded: that silently overwrote distinct memories that merely shared wording.
+    val target = store.indexOfFirst { memory ->
         memory.key.trim().lowercase() == key.lowercase() &&
             (identity.isEmpty() || eventIdentity(memory.eventTime) == identity)
-    }
-    val target = if (index >= 0) {
-        index
-    } else {
-        store.indexOfFirst { memory ->
-            memory.category == item.category && memory.subject == item.subject &&
-                if (item.category == MemoryCategory.Events) {
-                    identity.isNotEmpty() && eventIdentity(memory.eventTime) == identity
-                } else {
-                    areNearDuplicate(memory.key, key)
-                }
-        }
     }
     if (item.category == MemoryCategory.Promises && target >= 0 && store[target].status != PromiseStatus.Active) {
         return store to false
