@@ -404,4 +404,97 @@ class BackgroundTasksTest {
         assertEquals("analysis", usages.first().first)
         assertEquals(3, usages.first().second.inputTokens)
     }
+
+    // ---- analysis robustness (the pass that used to fail on every single run) ----
+
+    private fun filler(from: Int, to: Int) = (from..to).map { index ->
+        ShortTermMemory(
+            id = "f$index",
+            content = "占位$index",
+            sourceMessageIds = listOf("u1"),
+            eventTime = "2026-08-01T12:00:00Z",
+            analyzedAt = "done",
+        )
+    }
+
+    @Test
+    fun analyzeAcceptsAPartialAcknowledgement() = runBlocking {
+        // The model echoed only one of the two ids it was given: the acknowledged item
+        // is consumed and the other stays for a later pass. Requiring an exact set made
+        // every imperfect reply fail the pass, so nothing was ever marked analyzed.
+        val (background, _) = tasks(listOf("""{"status":"ok","analyzedShortTermIds":["s1"],"longTerm":[]}"""))
+        val character = Character(
+            id = "c1",
+            shortTerm = listOf(
+                ShortTermMemory(id = "s1", content = "事件一", sourceMessageIds = listOf("u1"), eventTime = "2026-08-01T12:00:00Z"),
+                ShortTermMemory(id = "s2", content = "事件二", sourceMessageIds = listOf("u1"), eventTime = "2026-08-01T13:00:00Z"),
+            ) + filler(3, 22),
+        )
+        val (status, updated) = background.analyzeShortToLongTermStatus(character)
+        assertEquals(BackgroundTasks.TaskStatus.Success, status)
+        assertTrue(updated.shortTerm.first { it.id == "s1" }.analyzedAt != null)
+        assertEquals(null, updated.shortTerm.first { it.id == "s2" }.analyzedAt)
+    }
+
+    @Test
+    fun analyzeIgnoresAcknowledgedIdsOutsideTheBatch() = runBlocking {
+        val (background, _) = tasks(
+            listOf("""{"status":"ok","analyzedShortTermIds":["s1","ghost"],"longTerm":[]}"""),
+        )
+        val (status, updated) = background.analyzeShortToLongTermStatus(analyzableCharacter())
+        assertEquals(BackgroundTasks.TaskStatus.Success, status)
+        assertTrue(updated.shortTerm.first { it.id == "s1" }.analyzedAt != null)
+    }
+
+    @Test
+    fun analyzeSalvagesATruncatedReply() = runBlocking {
+        // Cut off mid-element: the complete element and the echoed ids still land.
+        val element = """{"category":"userProfile","subject":"user","key":"饮品",""" +
+            """"value":"用户喜欢喝美式咖啡。","sourceShortTermIds":["s1"],"sourceMessageIds":["u1"],""" +
+            """"evidence":"用户喜欢喝美式咖啡。"}"""
+        val truncated = """{"status":"ok","analyzedShortTermIds":["s1"],"longTerm":[$element,""" +
+            """{"category":"events","subject":"legacy","key":"未完"""
+        val (background, _) = tasks(listOf(truncated))
+        val (status, updated) = background.analyzeShortToLongTermStatus(analyzableCharacter())
+        assertEquals(BackgroundTasks.TaskStatus.Success, status)
+        assertEquals(1, updated.longTerm.size)
+        assertTrue(updated.shortTerm.first { it.id == "s1" }.analyzedAt != null)
+    }
+
+    @Test
+    fun analyzeEscalatesToASmallerBatchBeforeGivingUp() = runBlocking {
+        // First reply is unusable; the retry with a smaller batch is good. Escalation is
+        // what turns a truncated reply into a slow success instead of a permanent failure.
+        val good = """{"status":"ok","analyzedShortTermIds":["s1"],"longTerm":[]}"""
+        val (background, llm) = tasks(listOf("抱歉，我无法完成。", good))
+        val (status, updated) = background.analyzeShortToLongTermStatus(analyzableCharacter())
+        assertEquals(BackgroundTasks.TaskStatus.Success, status)
+        assertEquals(2, llm.requests.size)
+        assertTrue(updated.shortTerm.first { it.id == "s1" }.analyzedAt != null)
+    }
+
+    @Test
+    fun analysisFailureIsRecordedInCountersAndNothingIsMarked() = runBlocking {
+        val (background, _) = tasks(listOf("抱歉，我无法完成。"))
+        val updated = background.analyzeShortToLongTerm(analyzableCharacter())
+        assertTrue(updated.counters.analysisLastError.contains("unparsable"))
+        assertEquals(null, updated.shortTerm.first { it.id == "s1" }.analyzedAt)
+    }
+
+    @Test
+    fun analysisSuccessClearsTheRecordedFailure() = runBlocking {
+        val (background, _) = tasks(listOf("""{"status":"ok","analyzedShortTermIds":["s1"],"longTerm":[]}"""))
+        val character = analyzableCharacter()
+        val failed = character.copy(counters = character.counters.copy(analysisLastError = "unparsable | x"))
+        val updated = background.analyzeShortToLongTerm(failed)
+        assertEquals("", updated.counters.analysisLastError)
+    }
+
+    @Test
+    fun drainReportsNoProgressButKeepsTheDiagnostic() = runBlocking {
+        val (background, _) = tasks(listOf("抱歉，我无法完成。"))
+        val outcome = background.drainMemoryBacklog(analyzableCharacter())
+        assertFalse(outcome.progressed)
+        assertTrue(outcome.character.counters.analysisLastError.isNotBlank())
+    }
 }

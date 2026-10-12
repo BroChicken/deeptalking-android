@@ -221,6 +221,8 @@ data class MemoryTaskCounters(
     val sceneRetryAt: String? = null,
     val lorebookFailures: Int = 0,
     val lorebookRetryAt: String? = null,
+    /** Diagnostic for the last analysis failure (see `MemoryCounters.analysisLastError`). */
+    val analysisLastError: String = "",
 ) {
     fun failuresOf(task: MemoryTaskKind): Int = when (task) {
         MemoryTaskKind.Extraction -> extractionFailures
@@ -278,6 +280,20 @@ data class MemoryTaskGuard(
     val lastMessageId: String?,
 )
 
+/**
+ * Batch sizes the short→long analysis escalates down through. The first rung is the
+ * normal size; the others only run after a failure, because a smaller request yields
+ * a smaller reply that cannot be cut off by the provider's output cap.
+ */
+private val ANALYSIS_BATCH_LADDER = listOf(
+    AppLimits.Memory.ANALYSIS_ITEM_LIMIT,
+    AppLimits.Memory.ANALYSIS_ITEM_LIMIT / 2,
+    AppLimits.Memory.ANALYSIS_ITEM_LIMIT / 4,
+).filter { it > 0 }
+
+/** Outcome of one backlog-drain pass: the updated character plus whether it consumed a batch. */
+data class DrainOutcome(val character: Character, val progressed: Boolean)
+
 class BackgroundTasks(
     private val llm: LlmBackend,
     private val memory: MemoryService,
@@ -314,6 +330,7 @@ class BackgroundTasks(
         sceneRetryAt = character.counters.sceneRetryAt,
         lorebookFailures = character.counters.lorebookFailures,
         lorebookRetryAt = character.counters.lorebookRetryAt,
+        analysisLastError = character.counters.analysisLastError,
     )
 
     private fun Character.withCounters(counters: MemoryTaskCounters): Character = copy(
@@ -326,8 +343,27 @@ class BackgroundTasks(
             sceneRetryAt = counters.sceneRetryAt,
             lorebookFailures = counters.lorebookFailures,
             lorebookRetryAt = counters.lorebookRetryAt,
+            analysisLastError = counters.analysisLastError,
         ),
     )
+
+    /** Attaches a diagnostic code (plus the head of the raw reply) to a failed analysis pass. */
+    private fun Character.withAnalysisError(code: String, raw: String = ""): Character {
+        val head = raw.replace(Regex("\\s+"), " ").trim().take(160)
+        val text = if (head.isEmpty()) code else "$code | $head"
+        return withCounters(countersOf(this).copy(analysisLastError = text))
+    }
+
+    /** Ids from the reply's acknowledgement list that really belong to [analyzableIds]. */
+    private fun acknowledgedOf(root: JsonObject, analyzableIds: Set<String>): Set<String> =
+        stringList(root["analyzedShortTermIds"]).map { it.trim() }.filter { it in analyzableIds }.toSet()
+
+    /**
+     * True when retrying with a smaller batch could plausibly help: the reply itself was
+     * unusable (cut off, or the id list was lost), as opposed to a transport failure.
+     */
+    private fun isRetryableAnalysisError(text: String): Boolean =
+        text.substringBefore(" | ") in setOf("unparsable", "no-acknowledged-ids")
 
     fun detectStyleViolations(
         reply: String,
@@ -492,7 +528,9 @@ class BackgroundTasks(
      */
     suspend fun analyzeShortToLongTerm(character: Character): Character {
         val (status, updated) = analyzeShortToLongTermTask(character)
-        return if (status == TaskStatus.Success) updated else character
+        // On failure only the counters change (nothing is ever marked analyzed), but the
+        // diagnostic is carried through so the caller can persist and show it.
+        return if (status == TaskStatus.Stale) character else updated
     }
 
     /** Analysis with an explicit status (legacy `analyzeShortToLongTerm`), including `Stale`. */
@@ -500,27 +538,49 @@ class BackgroundTasks(
         analyzeShortToLongTermTask(character)
 
     /**
-     * One backlog-drain pass for the one-time cleanup: force an analysis batch
-     * (ignoring the size trigger and the retry backoff), then run the world-book /
-     * scene maintenance that acknowledges the same revision. Both consumers must
-     * acknowledge an item before [trimShortTerm] may drop it, so this is what lets a
-     * piled-up short-term backlog shrink *gradually* instead of being truncated.
-     *
-     * Returns the updated character on progress, or null when there is nothing left
-     * to analyze / the pass failed (so the caller stops instead of spinning).
+     * One backlog-drain pass for the cleanup: force an analysis batch (ignoring the
+     * size trigger and the retry backoff), then run the world-book / scene maintenance
+     * that acknowledges the same revision. Both consumers must acknowledge an item
+     * before [trimShortTerm] may drop it, so this is what lets a piled-up short-term
+     * backlog shrink *gradually* instead of being truncated.
      */
-    suspend fun drainMemoryBacklog(character: Character): Character? {
+    suspend fun drainMemoryBacklog(character: Character): DrainOutcome {
         val (status, analyzed) = analyzeShortToLongTermStatus(character)
-        if (status != TaskStatus.Success) return null
-        val maintained = runMemoryMaintenance(analyzed)
-        return if (maintained != analyzed) maintained else analyzed
+        return when (status) {
+            // Guard tripped: a newer turn superseded this snapshot, so give up quietly.
+            TaskStatus.Stale -> DrainOutcome(character, progressed = false)
+            // Failure changed only the counters; hand them back so the reason is saved.
+            TaskStatus.Failure -> DrainOutcome(analyzed, progressed = false)
+            TaskStatus.Success -> {
+                val maintained = runMemoryMaintenance(analyzed)
+                DrainOutcome(if (maintained != analyzed) maintained else analyzed, progressed = true)
+            }
+        }
     }
 
     private suspend fun analyzeShortToLongTermTask(character: Character): Pair<TaskStatus, Character> {
+        // Escalating batches: a smaller request produces a smaller reply, which is how
+        // a reply cut off by the provider's output cap is still processed. Before this
+        // ladder the oversized reply failed the pass every time, nothing was ever
+        // stamped `analyzedAt`, and short-term memory could never be trimmed.
+        var firstFailure: Pair<TaskStatus, Character>? = null
+        for (batchSize in ANALYSIS_BATCH_LADDER) {
+            val (status, updated) = analyzeShortTermBatch(character, batchSize)
+            if (status == TaskStatus.Success || status == TaskStatus.Stale) return status to updated
+            // Keep the first (most specific) diagnostic rather than overwriting it with
+            // the less informative failure of a later, smaller attempt.
+            if (firstFailure == null) firstFailure = status to updated
+            if (!isRetryableAnalysisError(updated.counters.analysisLastError)) break
+        }
+        return firstFailure ?: (TaskStatus.Failure to character)
+    }
+
+    /** One analysis request over at most [batchSize] short-term items. */
+    private suspend fun analyzeShortTermBatch(character: Character, batchSize: Int): Pair<TaskStatus, Character> {
         val analyzeLimit = (character.shortTerm.size - AppLimits.Memory.SHORT_TERM_TRIM_FLOOR).coerceAtLeast(0)
         val items = character.shortTerm.take(analyzeLimit)
             .filter { it.analyzedAt == null || it.analyzedRevision != it.revision }
-            .take(AppLimits.Memory.ANALYSIS_BATCH)
+            .take(batchSize)
         if (items.isEmpty()) return TaskStatus.Failure to character
 
         val inputs = items.map { item ->
@@ -539,19 +599,32 @@ class BackgroundTasks(
         onStatus("正在分析长期记忆…")
         val raw = complete(ANALYSIS_SYSTEM, prompt, sessionId = sessionIdFor(character), taskType = "analysis")
         if (!isGuardCurrent(guard)) return TaskStatus.Stale to character
-        if (raw.isBlank()) return TaskStatus.Failure to character
-        val root = ResponseParser.parseJsonLenient(raw) as? JsonObject ?: return TaskStatus.Failure to character
-        if (root.string("status") != "ok") return TaskStatus.Failure to character
-        val longTermArray = root["longTerm"] as? JsonArray ?: return TaskStatus.Failure to character
+        if (raw.isBlank()) return TaskStatus.Failure to character.withAnalysisError("empty-reply")
 
+        val parsed = ResponseParser.parseJsonLenient(raw) as? JsonObject
+        if (parsed != null && parsed["status"] != null && !parsed.string("status").equals("ok", ignoreCase = true)) {
+            return TaskStatus.Failure to character.withAnalysisError("status=" + parsed.string("status"), raw)
+        }
         val analyzableIds = items.map { it.id }.toSet()
-        val acknowledgedList = stringList(root["analyzedShortTermIds"]).map { it.trim() }.filter { it.isNotEmpty() }
-        val acknowledged = acknowledgedList.toSet()
-        if (acknowledgedList.size != analyzableIds.size ||
-            acknowledged.size != analyzableIds.size ||
-            acknowledged.any { it !in analyzableIds }
-        ) {
-            return TaskStatus.Failure to character
+        fun hasElements(candidate: JsonObject): Boolean =
+            (candidate["longTerm"] as? JsonArray)?.isNotEmpty() == true
+        fun hasAck(candidate: JsonObject): Boolean =
+            acknowledgedOf(candidate, analyzableIds).isNotEmpty()
+        // The lenient parser silently drops a truncated array, so salvage is consulted
+        // whenever the parse produced no usable elements (or no acknowledgement at all).
+        val salvaged = salvageAnalysisReply(raw)
+        val root = parsed?.takeIf { hasAck(it) && hasElements(it) }
+            ?: salvaged?.takeIf { hasAck(it) }
+            ?: parsed?.takeIf { hasAck(it) }
+            ?: return TaskStatus.Failure to character.withAnalysisError("unparsable", raw)
+        val longTermArray = root["longTerm"] as? JsonArray ?: JsonArray(emptyList())
+        // Tolerant acknowledgement: the model only has to echo *some* of this batch's
+        // ids correctly. Missing ids simply stay unanalyzed (retried on the next pass)
+        // and foreign ids are ignored — demanding an exact set was another way a single
+        // imperfect reply dead-locked the queue forever.
+        val acknowledged = acknowledgedOf(root, analyzableIds)
+        if (acknowledged.isEmpty()) {
+            return TaskStatus.Failure to character.withAnalysisError("no-acknowledged-ids", raw)
         }
 
         data class Prepared(val item: LongTermMemory, val shortTermIds: List<String>)
@@ -567,7 +640,7 @@ class BackgroundTasks(
             val obj = element as? JsonObject ?: continue
             val item = parseLongTerm(obj)
             val sourceShortTermIds = stringList(obj["sourceShortTermIds"]).map { it.trim() }.filter { it.isNotEmpty() }.distinct()
-            if (sourceShortTermIds.isEmpty() || sourceShortTermIds.any { it !in analyzableIds }) continue
+            if (sourceShortTermIds.isEmpty() || sourceShortTermIds.any { it !in acknowledged }) continue
             val claimed = items.filter { it.id in sourceShortTermIds }
             val allowedMessageIds = claimed.flatMap { it.sourceMessageIds }.toSet()
             val itemMessageIds = item.sourceMessageIds.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
@@ -604,10 +677,11 @@ class BackgroundTasks(
         val nowIso = Instant.now().toString()
         working = working.copy(
             shortTerm = working.shortTerm.map {
-                if (it.id in analyzableIds) it.copy(analyzedAt = nowIso, analyzedRevision = it.revision) else it
+                if (it.id in acknowledged) it.copy(analyzedAt = nowIso, analyzedRevision = it.revision) else it
             },
         )
-        return TaskStatus.Success to trimMemory(working)
+        // Success clears the diagnostic, so a stale reason never lingers in the save.
+        return TaskStatus.Success to trimMemory(working.withAnalysisError(""))
     }
 
     /** Outcome of a memory sub-task: Success updates state, Failure retries, Stale aborts. */
@@ -1384,6 +1458,8 @@ class BackgroundTasks(
             unanalyzedCount >= (AppLimits.Memory.SHORT_TERM - AppLimits.Memory.SHORT_TERM_TRIM_FLOOR)
         if (hasAnalyzable && canRunMemoryTask(counters, MemoryTaskKind.Analysis, nowMillis)) {
             val (analysisStatus, analyzed) = analyzeShortToLongTermStatus(working)
+            // Carry the failure diagnostic (or its clearing) into the persisted counters.
+            counters = counters.copy(analysisLastError = analyzed.counters.analysisLastError)
             when (analysisStatus) {
                 TaskStatus.Success -> {
                     working = analyzed
@@ -1451,7 +1527,7 @@ class BackgroundTasks(
             instructions = system,
             input = listOf(ChatMessage(role = Role.User, content = user)),
             temperature = normalizeTemperature(config.temperature),
-            maxOutputTokens = null,
+            maxOutputTokens = AppLimits.Api.AUXILIARY_MAX_OUTPUT_TOKENS,
             stream = false,
             reasoningEffort = "none",
             apiPlatform = apiPlatform,

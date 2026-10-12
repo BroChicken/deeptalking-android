@@ -236,32 +236,52 @@ class NativeCore(context: Context) {
         }
     }
 
-    /** What the one-time memory cleanup would do; `null` when nothing needs it. */
+    /**
+     * What the memory cleanup sees right now.
+     *
+     * [shortTermPending] is the work left to do (entries above the low-water mark),
+     * while [shortTermTotal] is the raw list length — the "over the cap" prompt is
+     * based on the cap, the "how much is left" message on [shortTermPending].
+     */
     data class MemoryCleanupTarget(
         val characters: Int,
-        val shortTerm: Int,
+        val shortTermTotal: Int,
+        val shortTermPending: Int,
         val images: Int,
-    )
+        /** True when some character's short-term is over [AppLimits.Memory.SHORT_TERM]. */
+        val overLimit: Boolean,
+    ) {
+        /** True when there is still something to consume. */
+        val hasWork: Boolean get() = shortTermPending > 0 || images > 0
+    }
+
+    /** Result of a bounded drain: how many batches landed, plus the last failure reason. */
+    data class MemoryDrainResult(val passes: Int, val lastAnalysisError: String)
 
     /**
-     * Detects the two unbounded-growth leftovers: short-term memory piled up past
-     * [AppLimits.Memory.SHORT_TERM] (the analysis task could not drain it) and image
-     * attachments older than [AppLimits.Media.IMAGE_RETENTION_MESSAGES] messages.
+     * Detects the two leftovers: short-term memory piled up because the analysis task
+     * could never drain it, and image attachments older than
+     * [AppLimits.Media.IMAGE_RETENTION_MESSAGES] messages.
      */
     suspend fun memoryCleanupTarget(): MemoryCleanupTarget = withContext(Dispatchers.IO) {
         var characters = 0
-        var shortTerm = 0
+        var total = 0
+        var pending = 0
         var images = 0
+        var overLimit = false
         data.characters.all().forEach { character ->
-            val over = (character.shortTerm.size - AppLimits.Memory.SHORT_TERM).coerceAtLeast(0)
+            val size = character.shortTerm.size
+            if (size > AppLimits.Memory.SHORT_TERM) overLimit = true
+            val over = (size - AppLimits.Memory.SHORT_TERM_LOW_WATER).coerceAtLeast(0)
             val staleImages = staleImageCount(data.chat.getMessages(character.id))
             if (over > 0 || staleImages > 0) {
                 characters++
-                shortTerm += over
+                total += size
+                pending += over
                 images += staleImages
             }
         }
-        MemoryCleanupTarget(characters, shortTerm, images)
+        MemoryCleanupTarget(characters, total, pending, images, overLimit)
     }
 
     private fun staleImageCount(messages: List<ChatMessage>): Int {
@@ -304,42 +324,55 @@ class NativeCore(context: Context) {
     }
 
     /**
-     * Gradually drains the short-term backlog: runs up to [maxBatches] passes, each
-     * converting up to [AppLimits.Memory.ANALYSIS_BATCH] items into long-term memory
-     * (which is what lets the trim drop them). Deliberately bounded so the cleanup
-     * never spends a burst of API calls; stops as soon as a pass makes no progress.
-     * Returns the number of passes that made progress.
+     * Gradually drains the short-term backlog towards
+     * [AppLimits.Memory.SHORT_TERM_LOW_WATER]: runs up to [maxBatches] passes, each
+     * converting up to [AppLimits.Memory.ANALYSIS_ITEM_LIMIT] items into long-term
+     * memory (which is what lets the trim drop them). Deliberately bounded so a single
+     * invocation never spends a burst of API calls; stops as soon as a pass makes no
+     * progress. The caller persists the "still pending" flag and continues on the next
+     * launch, so one confirmation is enough.
      */
     suspend fun drainShortTermBacklog(
         config: AppConfig,
         maxBatches: Int = AppLimits.Memory.CLEANUP_BATCHES_PER_RUN,
-    ): Int = withContext(Dispatchers.IO) {
-        if (apiKeyFor(config.apiPlatform).isNullOrBlank()) return@withContext 0
+    ): MemoryDrainResult = withContext(Dispatchers.IO) {
+        if (apiKeyFor(config.apiPlatform).isNullOrBlank()) return@withContext MemoryDrainResult(0, "")
         val tasks = backgroundTasks(config)
         var passes = 0
+        var lastError = ""
         repeat(maxBatches) {
             var progressed = false
             for (character in data.characters.all()) {
-                if (character.shortTerm.size <= AppLimits.Memory.SHORT_TERM) continue
-                val updated = tasks.drainMemoryBacklog(character) ?: continue
-                val fresh = data.characters.get(character.id) ?: character
-                data.characters.upsert(
-                    fresh.copy(
-                        shortTerm = updated.shortTerm,
-                        longTerm = updated.longTerm,
-                        members = updated.members,
-                        scenes = updated.scenes,
-                        sceneState = updated.sceneState,
-                        lorebook = updated.lorebook,
-                        counters = updated.counters,
-                    ),
-                )
-                progressed = true
+                if (character.shortTerm.size <= AppLimits.Memory.SHORT_TERM_LOW_WATER) continue
+                val outcome = tasks.drainMemoryBacklog(character)
+                if (outcome.character.counters.analysisLastError.isNotBlank()) {
+                    lastError = outcome.character.counters.analysisLastError
+                }
+                // Persist even when the pass made no progress: the counters carry the
+                // diagnostic that explains why (and are wiped on the next success).
+                if (outcome.character != character) persistMemory(character, outcome.character)
+                if (outcome.progressed) progressed = true
             }
-            if (!progressed) return@withContext passes
+            if (!progressed) return@withContext MemoryDrainResult(passes, lastError)
             passes++
         }
-        passes
+        MemoryDrainResult(passes, lastError)
+    }
+
+    /** Persists the memory fields a background pass owns, without clobbering a concurrent write. */
+    private suspend fun persistMemory(original: Character, updated: Character) {
+        val fresh = data.characters.get(original.id) ?: original
+        data.characters.upsert(
+            fresh.copy(
+                shortTerm = updated.shortTerm,
+                longTerm = updated.longTerm,
+                members = updated.members,
+                scenes = updated.scenes,
+                sceneState = updated.sceneState,
+                lorebook = updated.lorebook,
+                counters = updated.counters,
+            ),
+        )
     }
 
     /** One-time world-book migration for characters whose background has not been migrated. */

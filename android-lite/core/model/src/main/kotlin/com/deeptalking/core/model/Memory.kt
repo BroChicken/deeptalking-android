@@ -280,6 +280,12 @@ data class MemoryCounters(
     val lorebookFailures: Int = 0,
     val lorebookScannedCount: Int = 0,
     val messageSequence: Int = 0,
+    /**
+     * Why the last short→long analysis pass failed (a short code plus the head of the
+     * raw reply). Survives export/import so an opaque model-contract failure can be
+     * diagnosed instead of silently retrying forever.
+     */
+    val analysisLastError: String = "",
 )
 
 /** Latest chat cache-usage snapshot (legacy `config.cacheStats`). */

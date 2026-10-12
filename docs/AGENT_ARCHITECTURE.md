@@ -201,7 +201,7 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 | 任务 | 触发 | 计数器（`memoryTaskKeys`） | 说明 |
 |---|---|---|---|
 | `extraction` | `instant` 满 30 | `extractionRetryAt` / `extractionFailures` | 即时消息 → 短期摘要 |
-| `analysis` | `shortTerm` 满 80 且积压 ≥ 60 | `analysisRetryAt` / `analysisFailures` | 短期摘要 → 长期记忆（**逐条容错**：单条校验不过只丢该条，不再让整批失败——否则同一条"毒丸"会让整批永远重试） |
+| `analysis` | `shortTerm` 满 80 且积压 ≥ 60 | `analysisRetryAt` / `analysisFailures` | 短期摘要 → 长期记忆（**逐条容错**：单条校验不过只丢该条；**ack 宽容**：只承认批次内 id，缺的下轮再送、混入的忽略；**小批降级** `ANALYSIS_ITEM_LIMIT` 8→4→2；**截断抢救** `salvageAnalysisReply`；显式 `max_output_tokens`） |
 | `scene` | 场景切换或跨度 ≥ 12 条（按消息序号） | `sceneRetryAt` / `sceneFailures` | 场景概要 |
 | `lorebook` | 有已分析摘要尚未整理（或积压 ≥ 8，`consolidateSpan`） | `lorebookRetryAt` / `lorebookFailures` | 沉淀世界书条目 + 自动淘汰 |
 
@@ -420,7 +420,7 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 - **摘要不被提前丢弃**：`trimShortTermList` 只在长期分析与世界书整理都消费了同一 `revision` 后才裁剪；世界书条目在写库前整批校验来源与字段，失败不推进 `lorebookScannedRevision`、也不累计 `misses`，避免一次坏输出造成误淘汰。
 - **检索相关性下限**：`rankMemories` 只保留至少命中一个非停用词的候选，并用特异性下限 `MIN_MATCH_SCORE`(1.5) 过滤"泛词"命中，避免纯高重要性但无关的旧记忆挤占注入；`pendingRecall`（模型主动召回）优先占位，即使候选取满也一定注入；短指代查询经 `buildMemoryQuery` 补上下文；**用户提到具体日期时，由模型用 `search_memory` 的 `date`/`timeRef` 按日期召回那天的原始对话与记忆**（口语日期→绝对日期由模型依据时间基准换算）。
 - **断言前先核对**：系统提示词要求模型在说"第一次/从来没/总是/每次/以前也…"这类**可被记忆证伪**的话之前先 `search_memory` 确认，查不到依据就不下断言（改说不确定或反问），禁止编造——治"明明不是第一次却说第一次"（关键词通道召回不到时，模型凭直觉断言）。
-- **短期记忆上限靠"消化"不靠"截断"**：`trimShortTerm` 只丢**已被分析且世界书消费过**的条目（内容已在长期记忆里），未消费的永不丢；`SHORT_TERM`(80) 由分析逐批达成。图片只保留最近 `AppLimits.Media.IMAGE_RETENTION_MESSAGES`(50) 条消息（更早的删附件与文件、正文保留）。积压/超窗由启动弹窗（`checkMemoryCleanupPrompt`）询问，确认后 `NativeCore.pruneOldMessageImages` + `drainShortTermBacklog`（每次最多 `CLEANUP_BATCHES_PER_RUN`(5) 批）**渐进**处理，绝不截断。**去重/修复这类 O(n²) 重活一律在 `Dispatchers.Default`/`IO` 上跑**（`viewModelScope.launch` 默认主线程；放主线程会 ANR 且修复标记写不进去 → 每次启动重跑）。
+- **短期记忆上限靠"消化"不靠"截断"**：`trimShortTerm` 只丢**已被分析且世界书消费过**的条目（内容已在长期记忆里），未消费的永不丢；`SHORT_TERM`(80) 靠分析逐批消化，稳态落在低水位 `SHORT_TERM_LOW_WATER`(20)。图片只保留最近 `AppLimits.Media.IMAGE_RETENTION_MESSAGES`(50) 条消息（更早的删附件与文件、正文保留）。**一次弹窗、之后自动跑完**：`checkMemoryCleanupPrompt` 只在短期 >80 或有超窗图片时询问一次；确认后 `NativeCore.pruneOldMessageImages` 立即剪图片，`drainShortTermBacklog` 分批把积压转成长期记忆（每次启动最多 `CLEANUP_BATCHES_PER_RUN`(5) 批、空闲每分钟 1 批），并把 `deeptalking_memory_cleanup_pending_v1` 置位**持续消化到 20 条**才清除标记 —— 同一批积压不会问第二次，绝不截断。**去重/修复这类 O(n²) 重活一律在 `Dispatchers.Default`/`IO` 上跑**（`viewModelScope.launch` 默认主线程；放主线程会 ANR 且修复标记写不进去 → 每次启动重跑）。
 - **时间精度**：`resolveTimeRef` 保留带时区/时分的 explicit ISO，仅"日期或时段"表达才落整点/时段起点，避免把明确时刻改写成正午。记忆衰减/排序的时间基准逐级回退（`Date.parse(lastRecalled) || Date.parse(updatedAt) || Date.parse(createdAt)`），`lastRecalled` 非空但不可解析时不会短路掉更新的时间戳、也不会被当成 1970 年。
 - **联网工具超时**：`fetchWithTimeout()`（src/js/api/web-content.js）给 B站 API、短链解析、Microlink、网页直连统一加超时，避免任意外部请求卡死工具循环（后台任务无重试兜底）。
 - **请求失败也留痕**：`performChatRequest` / `callAI` 的 fetch 失败或非 2xx 也会写入 `requestMetrics`（`status: 'failed'`），并取消未读完的流式 reader，便于诊断网络与限流问题。`buildApiHeaders` 在 apiKey 缺失时提前抛出明确错误，不发出 `Bearer undefined` 请求。
@@ -440,7 +440,7 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 | `MAX_TOOL_CALLS` | 12 | src/js/agent/tool-definitions.js:3 |
 | `AGENT_TOOL_MEMORY_INJECT_LIMIT` | 5 | src/js/agent/tool-definitions.js:4 |
 | `MAX_API_RETRIES` | 3（退避 1s/2s/4s） | src/js/api/retry.js:2 |
-| `MEMORY_LIMITS` | instant 30(保底 10) / shortTerm 80(保底 20，**靠分析消化而非截断**) / longTerm 无上限（仅时效 `applyMemoryDecay`） / pendingRecall 6 / analysisBatch 20 / summarySources 20 / nearDupSimilarity 0.72 / minMatchScore 1.5 / maxPerCategory 3 / imageRetentionMessages 50 / cleanupBatches 5（短期正文与长期 value 不再按字数截断） | src/js/core/config.js:104 |
+| `MEMORY_LIMITS` | instant 30(保底 10) / shortTerm 80(保底/低水位 20，**靠分析消化而非截断**) / longTerm 无上限（仅时效 `applyMemoryDecay`） / pendingRecall 6 / analysisBatch 20(lorebook 窗口) / **analysisItemLimit 8(→4→2 降级)** / **auxiliaryMaxOutputTokens 4096** / summarySources 20 / nearDupSimilarity 0.72 / minMatchScore 1.5 / maxPerCategory 3 / imageRetentionMessages 50 / cleanupBatches 5（短期正文与长期 value 不再按字数截断） | src/js/core/config.js:104 |
 | `API_LIMITS` | auxiliaryTimeoutMs 90000 / requestMetrics 60 / prefixSnapshots 12 | src/js/core/config.js:98 |
 | `PROMPT_LIMITS` | roleChars 8000 / memberChars 900 | src/js/core/config.js:113 |
 | `CONTEXT_BUDGET` | retrievedChars 1200 / summaryChars 1600 / sceneSummaries 2 / sceneInjectionChars 600 / sceneSpan 12 / volatileChars 6000 | src/js/core/config.js:173 |

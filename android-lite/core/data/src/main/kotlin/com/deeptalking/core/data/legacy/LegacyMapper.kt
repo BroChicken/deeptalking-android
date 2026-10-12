@@ -617,6 +617,7 @@ private fun mapCounters(element: JsonElement?): MemoryCounters {
         lorebookFailures = (obj.intLenient("lorebookFailures") ?: 0).coerceAtLeast(0),
         lorebookScannedCount = (obj.intLenient("lorebookScannedCount") ?: 0).coerceAtLeast(0),
         messageSequence = (obj.intLenient("messageSequence") ?: 0).coerceAtLeast(0),
+        analysisLastError = obj.stringOrNull("analysisLastError").orEmpty().take(240),
     )
 }
 

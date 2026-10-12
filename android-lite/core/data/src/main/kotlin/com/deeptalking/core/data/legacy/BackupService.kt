@@ -291,6 +291,7 @@ class BackupService(
         put("lorebookFailures", counters.lorebookFailures)
         put("lorebookScannedCount", counters.lorebookScannedCount)
         put("messageSequence", counters.messageSequence)
+        if (counters.analysisLastError.isNotBlank()) put("analysisLastError", counters.analysisLastError)
     }
 
     private fun longTermMapToJson(items: List<LongTermMemory>): JsonObject = buildJsonObject {

@@ -129,9 +129,9 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         }
     }
 
-    // --------------------------------------------------- one-time memory cleanup
+    // --------------------------------------------------------- memory cleanup
 
-    /** Non-null when the one-time memory cleanup dialog should show. */
+    /** Non-null when the memory cleanup dialog should show. */
     private val memoryCleanupState = MutableStateFlow<NativeCore.MemoryCleanupTarget?>(null)
     val memoryCleanupPrompt: StateFlow<NativeCore.MemoryCleanupTarget?> = memoryCleanupState
 
@@ -140,14 +140,16 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     val memoryCleanupProgress: StateFlow<Boolean> = memoryCleanupProgressState
 
     /**
-     * Detects the leftovers of the short-term pile-up (short-term memory past its cap
-     * because analysis could not drain it) and images older than the retention
-     * window. Silent when there is nothing to clean or the user opted out.
+     * Asks once, when short-term memory is over its cap (the analysis task could not
+     * drain it) or when images sit outside the retention window. Silent while a
+     * confirmed cleanup is still running: one confirmation is enough, the app finishes
+     * the job on its own and only asks again if it piles up later.
      */
     private suspend fun checkMemoryCleanupPrompt() {
         if (core.data.settings.getBoolean(MEMORY_CLEANUP_SKIP_KEY)) return
+        if (core.data.settings.getBoolean(MEMORY_CLEANUP_PENDING_KEY)) return
         val target = runCatching { core.memoryCleanupTarget() }.getOrNull() ?: return
-        if (target.shortTerm <= 0 && target.images <= 0) return
+        if (!target.overLimit && target.images <= 0) return
         memoryCleanupState.value = target
     }
 
@@ -161,41 +163,92 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     }
 
     /**
-     * Confirms the cleanup: prune stale images immediately, then drain short-term in
-     * bounded passes (up to [AppLimits.Memory.CLEANUP_BATCHES_PER_RUN]). Nothing is
-     * truncated — the backlog is *processed* into long-term memory, so it shrinks
-     * over successive runs instead of losing facts.
+     * Confirms the cleanup: stale images are pruned immediately and short-term is
+     * drained in bounded passes. Nothing is truncated — the backlog is *processed* into
+     * long-term memory. If work is left over, the pending flag stays set and the app
+     * keeps consuming it quietly on later launches and idle moments until short-term
+     * settles at its low-water mark, so the dialog is never shown twice for one backlog.
      */
     fun runMemoryCleanup() {
         memoryCleanupState.value = null
         viewModelScope.launch {
-            val removedImages = runCatching { core.pruneOldMessageImages() }.getOrDefault(0)
             val cfg = runCatching { core.currentConfig() }.getOrNull()
             val canAnalyze = cfg != null && core.hasApiKey(cfg.apiPlatform)
-            val batches = if (canAnalyze) {
-                memoryCleanupProgressState.value = true
+            if (canAnalyze) core.data.settings.putBoolean(MEMORY_CLEANUP_PENDING_KEY, true)
+            memoryCleanupProgressState.value = true
+            val removedImages = runCatching { core.pruneOldMessageImages() }.getOrDefault(0)
+            val drain = if (canAnalyze) {
                 runCatching { core.drainShortTermBacklog(cfg!!) }
-                    .getOrDefault(0)
-                    .also { memoryCleanupProgressState.value = false }
+                    .getOrElse { NativeCore.MemoryDrainResult(0, it.message ?: "整理失败") }
             } else {
-                0
+                NativeCore.MemoryDrainResult(0, "")
             }
-            val parts = mutableListOf<String>()
-            if (removedImages > 0) parts += "清理了 $removedImages 张旧图片"
-            if (batches > 0) parts += "整理了 $batches 批短期记忆"
+            memoryCleanupProgressState.value = false
             val remaining = runCatching { core.memoryCleanupTarget() }.getOrNull()
-            val tail = if (remaining != null && (remaining.shortTerm > 0 || remaining.images > 0)) {
-                "，仍有 ${remaining.shortTerm} 条短期记忆待整理，下次打开会继续"
-            } else {
-                ""
-            }
-            val head = when {
-                parts.isNotEmpty() -> parts.joinToString("，")
-                !canAnalyze -> "已清理图片；短期记忆需要 API Key 才能整理"
-                else -> "没有需要清理的内容"
-            }
-            eventsState.tryEmit(UiEvent(head + tail))
+            val stillPending = canAnalyze && remaining?.hasWork == true && drain.passes > 0
+            if (canAnalyze) core.data.settings.putBoolean(MEMORY_CLEANUP_PENDING_KEY, stillPending)
+            eventsState.tryEmit(
+                UiEvent(cleanupSummary(removedImages, drain, remaining, canAnalyze, stillPending)),
+            )
         }
+    }
+
+    /**
+     * One quiet chunk of a confirmed cleanup. Returns true while the backlog is still
+     * being consumed. Stops (and clears the flag) as soon as a chunk makes no progress,
+     * so a broken API cannot spin — the reason is reported once.
+     */
+    private suspend fun runMemoryCleanupChunk(maxBatches: Int): Boolean {
+        if (!core.data.settings.getBoolean(MEMORY_CLEANUP_PENDING_KEY)) return false
+        if (sendingState.value) return false
+        val cfg = runCatching { core.currentConfig() }.getOrNull()
+        if (cfg == null || !core.hasApiKey(cfg.apiPlatform)) return false
+        val drain = runCatching { core.drainShortTermBacklog(cfg, maxBatches) }
+            .getOrElse { NativeCore.MemoryDrainResult(0, it.message ?: "整理失败") }
+        val remaining = runCatching { core.memoryCleanupTarget() }.getOrNull()
+        if (remaining?.hasWork == true && drain.passes > 0) {
+            return true
+        }
+        core.data.settings.putBoolean(MEMORY_CLEANUP_PENDING_KEY, false)
+        when {
+            drain.lastAnalysisError.isNotBlank() ->
+                eventsState.tryEmit(UiEvent("短期记忆整理失败：${drain.lastAnalysisError}"))
+            drain.passes > 0 ->
+                eventsState.tryEmit(UiEvent("短期记忆已整理到 ${remaining?.shortTermTotal ?: 0} 条"))
+        }
+        return false
+    }
+
+    /** Keeps a confirmed cleanup going in the background (one batch per minute while idle). */
+    private suspend fun memoryCleanupLoop() {
+        while (true) {
+            delay(60_000)
+            runCatching { runMemoryCleanupChunk(1) }.onFailure { DeepTalkingApp.recordError(it) }
+        }
+    }
+
+    private fun cleanupSummary(
+        removedImages: Int,
+        drain: NativeCore.MemoryDrainResult,
+        remaining: NativeCore.MemoryCleanupTarget?,
+        canAnalyze: Boolean,
+        stillPending: Boolean,
+    ): String {
+        val parts = mutableListOf<String>()
+        if (removedImages > 0) parts += "清理了 $removedImages 张旧图片"
+        if (drain.passes > 0) parts += "整理了 ${drain.passes} 批短期记忆"
+        if (!canAnalyze) {
+            parts += "短期记忆需要 API Key 才能整理"
+        } else if (drain.passes == 0 && drain.lastAnalysisError.isNotBlank()) {
+            parts += "短期记忆整理失败：${drain.lastAnalysisError}"
+        }
+        if (parts.isEmpty()) parts += "没有需要清理的内容"
+        val tail = when {
+            stillPending -> "，还有 ${remaining?.shortTermPending ?: 0} 条会自动继续整理"
+            canAnalyze && remaining != null -> "，短期记忆现有 ${remaining.shortTermTotal} 条"
+            else -> ""
+        }
+        return parts.joinToString("，") + tail
     }
 
     fun runFieldMigration() {
@@ -1350,6 +1403,8 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             }.onFailure { DeepTalkingApp.recordError(it) }
             runCatching { checkMigrationPrompts() }.onFailure { DeepTalkingApp.recordError(it) }
             runCatching { checkMemoryCleanupPrompt() }.onFailure { DeepTalkingApp.recordError(it) }
+            runCatching { runMemoryCleanupChunk(AppLimits.Memory.CLEANUP_BATCHES_PER_RUN) }
+                .onFailure { DeepTalkingApp.recordError(it) }
             autoRepairAvatars()
         }
     }
@@ -1405,6 +1460,12 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
 
         /** Set when the user chose "以后不再询问" on the one-time memory cleanup. */
         const val MEMORY_CLEANUP_SKIP_KEY = "deeptalking_memory_cleanup_skip_v1"
+
+        /**
+         * Set while a confirmed cleanup is still consuming the short-term backlog: the
+         * app then keeps working on its own and never asks twice for one backlog.
+         */
+        const val MEMORY_CLEANUP_PENDING_KEY = "deeptalking_memory_cleanup_pending_v1"
         /** How long the bubble shows the "done" tick before reverting to idle. */
         const val TTS_DONE_LINGER_MS = 1_000L
     }
@@ -1687,6 +1748,12 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         }
         viewModelScope.launch { proactiveLoop() }
         viewModelScope.launch { themeLoop() }
+        // Continue a confirmed memory cleanup quietly (one launch chunk, then idle chunks).
+        viewModelScope.launch {
+            runCatching { runMemoryCleanupChunk(AppLimits.Memory.CLEANUP_BATCHES_PER_RUN) }
+                .onFailure { DeepTalkingApp.recordError(it) }
+        }
+        viewModelScope.launch { memoryCleanupLoop() }
         // Legacy one-time relative-time → absolute migration (no key required).
         viewModelScope.launch {
             runCatching { core.runStartupMigrations() }.onFailure { DeepTalkingApp.recordError(it) }

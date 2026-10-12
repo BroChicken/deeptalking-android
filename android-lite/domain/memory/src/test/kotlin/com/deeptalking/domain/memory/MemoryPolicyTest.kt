@@ -305,4 +305,31 @@ class MemoryPolicyTest {
         // Sources changed, so the prior analysis is invalidated.
         assertEquals(null, fixed.analyzedAt)
     }
+
+    @Test
+    fun trimShortTermDropsConsumedItemsButNeverAnUnconsumedOne() {
+        // A consumed item (analyzed AND world-book scanned) may be dropped once it is
+        // older than the newest floor; the floor itself is always kept.
+        val consumed = (1..30).map { index ->
+            ShortTermMemory(id = "s$index", content = "事件$index", analyzedAt = "done", lorebookScannedAt = "done")
+        }
+        assertEquals(20, trimShortTerm(consumed).size)
+
+        val pending = ShortTermMemory(id = "pending", content = "还没消化")
+        val trimmed = trimShortTerm(listOf(pending) + consumed)
+        assertEquals(21, trimmed.size)
+        assertTrue(trimmed.any { it.id == "pending" })
+        assertTrue(trimmed.none { it.id == "s1" || it.id == "s10" })
+        assertTrue(trimmed.any { it.id == "s11" })
+    }
+
+    @Test
+    fun trimShortTermKeepsAnItemTheLorebookHasNotScannedYet() {
+        // Analysis alone is not enough: this is exactly the state the pile-up sat in
+        // (analyzed but never scanned, so nothing could ever be dropped).
+        val items = (1..30).map { index ->
+            ShortTermMemory(id = "s$index", content = "事件$index", analyzedAt = "done")
+        }
+        assertEquals(30, trimShortTerm(items).size)
+    }
 }

@@ -8,6 +8,16 @@ object AppLimits {
         const val AUXILIARY_TIMEOUT_MS = 90_000L
         const val REQUEST_METRICS = 60
         const val PREFIX_SNAPSHOTS = 12
+
+        /**
+         * Output cap for background/auxiliary calls, sent explicitly instead of
+         * relying on the provider default. The short→long analysis reply must echo
+         * every input id *and* carry the whole long-term payload; with no explicit cap
+         * an over-long reply is silently truncated, the JSON fails to parse, and the
+         * batch is discarded — which is exactly how analysis used to fail on every
+         * pass while nothing was ever marked analyzed.
+         */
+        const val AUXILIARY_MAX_OUTPUT_TOKENS = 4_096
     }
 
     object Memory {
@@ -27,10 +37,22 @@ object AppLimits {
         const val SUMMARY_SOURCES = 20
 
         /**
-         * Analysis batches the one-time short-term backlog drain runs per invocation.
-         * Deliberately small ("慢慢处理"): each batch converts up to
-         * [ANALYSIS_BATCH] short-term items into long-term memory, so the backlog
-         * shrinks gradually instead of being truncated away.
+         * Short-term items one short→long analysis request carries. Deliberately much
+         * smaller than [ANALYSIS_BATCH]: the reply has to echo every input id and carry
+         * the full long-term payload, so a large request is the one that overruns the
+         * provider's output cap and gets truncated (see
+         * [AppLimits.Api.AUXILIARY_MAX_OUTPUT_TOKENS]).
+         */
+        const val ANALYSIS_ITEM_LIMIT = 8
+
+        /** Low-water mark: short-term is "consumed" once it settles at this size. */
+        const val SHORT_TERM_LOW_WATER = SHORT_TERM_TRIM_FLOOR
+
+        /**
+         * Analysis batches the cleanup drain runs per invocation. Deliberately small
+         * ("慢慢处理"): each batch converts up to [ANALYSIS_ITEM_LIMIT] short-term items
+         * into long-term memory, so the backlog shrinks gradually instead of being
+         * truncated away.
          */
         const val CLEANUP_BATCHES_PER_RUN = 5
 

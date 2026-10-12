@@ -378,8 +378,10 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                 text = {
                     Column {
                         val lines = mutableListOf<String>()
-                        if (target.shortTerm > 0) {
-                            lines += "短期记忆积压了 ${target.shortTerm} 条（长期分析曾失败，没能整理掉）。"
+                        if (target.shortTermPending > 0) {
+                            lines += "短期记忆现有 ${target.shortTermTotal} 条，其中 ${target.shortTermPending} 条还没消化成" +
+                                "长期记忆（会分批处理，直到降到 " +
+                                "${com.deeptalking.core.common.AppLimits.Memory.SHORT_TERM_LOW_WATER} 条左右）。"
                         }
                         if (target.images > 0) {
                             lines += "有 ${target.images} 张较旧的聊天图片可以清理（只删图片，聊天文字保留）。"
@@ -387,8 +389,8 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                         Text(lines.joinToString("\n"))
                         Spacer(Modifier.height(6.dp))
                         Text(
-                            "整理会把短期记忆分批转成长期记忆，不会删除内容；每次打开最多处理 " +
-                                "${com.deeptalking.core.common.AppLimits.Memory.CLEANUP_BATCHES_PER_RUN} 批，直到恢复正常。",
+                            "点一次就行：图片立刻清理，短期记忆分批转成长期记忆，之后会在后台自己继续，" +
+                                "不会删除内容。",
                             fontSize = 13.sp,
                         )
                         Row(verticalAlignment = Alignment.CenterVertically) {
