@@ -155,33 +155,35 @@ class NativeCore(context: Context) {
      */
     suspend fun runStartupMaintenance(config: AppConfig) {
         if (apiKeyFor(config.apiPlatform).isNullOrBlank()) return
-        characterMaintenanceMutex.withLock {
-            runCatching {
-                val tasks = backgroundTasks(config)
-                val snapshot = data.characters.all()
-                val updated = tasks.autoFillStaticFields(snapshot)
-                updated.forEachIndexed { index, character ->
-                    val original = snapshot.getOrNull(index) ?: return@forEachIndexed
-                    if (character == original) return@forEachIndexed
-                    // Re-read so a concurrent migration's markers are not reverted;
-                    // only apply the fields this task owns.
-                    val latest = data.characters.get(character.id) ?: return@forEachIndexed
-                    if (latest.staticProfile == character.staticProfile && latest.staticFillMeta == character.staticFillMeta) {
-                        return@forEachIndexed
+        withContext(Dispatchers.IO) {
+            characterMaintenanceMutex.withLock {
+                runCatching {
+                    val tasks = backgroundTasks(config)
+                    val snapshot = data.characters.all()
+                    val updated = tasks.autoFillStaticFields(snapshot)
+                    updated.forEachIndexed { index, character ->
+                        val original = snapshot.getOrNull(index) ?: return@forEachIndexed
+                        if (character == original) return@forEachIndexed
+                        // Re-read so a concurrent migration's markers are not reverted;
+                        // only apply the fields this task owns.
+                        val latest = data.characters.get(character.id) ?: return@forEachIndexed
+                        if (latest.staticProfile == character.staticProfile && latest.staticFillMeta == character.staticFillMeta) {
+                            return@forEachIndexed
+                        }
+                        data.characters.upsert(
+                            latest.copy(
+                                staticProfile = character.staticProfile,
+                                staticFillMeta = character.staticFillMeta,
+                            ),
+                        )
                     }
-                    data.characters.upsert(
-                        latest.copy(
-                            staticProfile = character.staticProfile,
-                            staticFillMeta = character.staticFillMeta,
-                        ),
-                    )
                 }
             }
         }
     }
 
     /** One-time relative-time → absolute migration (legacy `convertLegacyRelativeTimes`). */
-    suspend fun runStartupMigrations() {
+    suspend fun runStartupMigrations() = withContext(Dispatchers.Default) {
         characterMaintenanceMutex.withLock {
             runCatching {
                 data.characters.all().forEach { character ->
@@ -208,7 +210,11 @@ class NativeCore(context: Context) {
     }
 
     /** One-time deterministic memory repair: reconcile + near-duplicate dedupe (offline, no API key). */
-    suspend fun runMemoryRepair() {
+    suspend fun runMemoryRepair() = withContext(Dispatchers.Default) {
+        // The near-duplicate pass is O(n²) over the short-term pile-up. Running it on
+        // the main thread (which is where `viewModelScope.launch` starts) froze the UI
+        // for minutes, so `memoryRepairVersion` was never stamped and the repair re-ran
+        // on EVERY launch — an endless hang that the system eventually kills (ANR).
         characterMaintenanceMutex.withLock {
             runCatching {
                 data.characters.all().forEach { character ->
@@ -242,7 +248,7 @@ class NativeCore(context: Context) {
      * [AppLimits.Memory.SHORT_TERM] (the analysis task could not drain it) and image
      * attachments older than [AppLimits.Media.IMAGE_RETENTION_MESSAGES] messages.
      */
-    suspend fun memoryCleanupTarget(): MemoryCleanupTarget {
+    suspend fun memoryCleanupTarget(): MemoryCleanupTarget = withContext(Dispatchers.IO) {
         var characters = 0
         var shortTerm = 0
         var images = 0
@@ -255,7 +261,7 @@ class NativeCore(context: Context) {
                 images += staleImages
             }
         }
-        return MemoryCleanupTarget(characters, shortTerm, images)
+        MemoryCleanupTarget(characters, shortTerm, images)
     }
 
     private fun staleImageCount(messages: List<ChatMessage>): Int {
@@ -271,7 +277,7 @@ class NativeCore(context: Context) {
      * retention window. Message text is untouched, so history stays readable.
      * Returns the number of attachments removed.
      */
-    suspend fun pruneOldMessageImages(): Int {
+    suspend fun pruneOldMessageImages(): Int = withContext(Dispatchers.IO) {
         var removed = 0
         val referenced = mutableSetOf<String>()
         data.characters.all().forEach { character ->
@@ -294,7 +300,7 @@ class NativeCore(context: Context) {
         directory.listFiles()?.forEach { file ->
             if ("images/${file.name}" !in referenced) runCatching { file.delete() }
         }
-        return removed
+        removed
     }
 
     /**
@@ -307,8 +313,8 @@ class NativeCore(context: Context) {
     suspend fun drainShortTermBacklog(
         config: AppConfig,
         maxBatches: Int = AppLimits.Memory.CLEANUP_BATCHES_PER_RUN,
-    ): Int {
-        if (apiKeyFor(config.apiPlatform).isNullOrBlank()) return 0
+    ): Int = withContext(Dispatchers.IO) {
+        if (apiKeyFor(config.apiPlatform).isNullOrBlank()) return@withContext 0
         val tasks = backgroundTasks(config)
         var passes = 0
         repeat(maxBatches) {
@@ -330,10 +336,10 @@ class NativeCore(context: Context) {
                 )
                 progressed = true
             }
-            if (!progressed) return passes
+            if (!progressed) return@withContext passes
             passes++
         }
-        return passes
+        passes
     }
 
     /** One-time world-book migration for characters whose background has not been migrated. */

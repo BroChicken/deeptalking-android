@@ -43,9 +43,12 @@ internal fun parseTimestampMillis(value: String?): Long? {
 
 internal fun clamp(value: Int, min: Int, max: Int): Int = value.coerceIn(min, max)
 
+/** Compiled once: `normalizeMemoryText` runs inside O(n²) similarity passes. */
+private val PUNCTUATION_OR_SPACE = Regex("[\\p{P}\\p{S}\\s]+")
+
 /** Strips punctuation/symbols/whitespace and lowercases, so two phrasings compare on content alone. */
 internal fun normalizeMemoryText(text: String): String =
-    text.lowercase().replace(Regex("[\\p{P}\\p{S}\\s]+"), "")
+    text.lowercase().replace(PUNCTUATION_OR_SPACE, "")
 
 /** Character bigrams of [text]; used as a cheap bag-of-features for similarity. */
 internal fun charBigrams(text: String): Set<String> {
@@ -479,13 +482,28 @@ const val MEMORY_REPAIR_VERSION = 3
  * their sources/evidence. Only *content* similarity merges — two distinct beats that
  * merely share a day/time slot are kept separate, so a repair pass can never drop a
  * unique fact (this is a deliberate deviation from the old identity-only merge).
+ *
+ * The pass is O(n²), so every item's signature (normalized text + bigram set) is
+ * computed **once** and cached, and pairs whose bigram sets differ too much in size
+ * are rejected before any set work. Rebuilding the signature inside the pair loop —
+ * and compiling the normalization regex per call — made a 500-entry repair allocate
+ * hundreds of millions of strings and block its caller for minutes.
  */
 fun dedupeShortTerm(items: List<ShortTermMemory>): List<ShortTermMemory> {
     val result = mutableListOf<ShortTermMemory>()
+    val signatures = mutableListOf<BigramSignature>()
     for (item in items) {
-        val dupIndex = result.indexOfFirst { existing -> areNearDuplicate(existing.content, item.content) }
+        val signature = bigramSignature(item.content)
+        var dupIndex = -1
+        for (index in result.indices) {
+            if (couldBeNearDuplicate(signatures[index], signature)) {
+                dupIndex = index
+                break
+            }
+        }
         if (dupIndex < 0) {
             result += item
+            signatures += signature
             continue
         }
         val existing = result[dupIndex]
@@ -495,7 +513,7 @@ fun dedupeShortTerm(items: List<ShortTermMemory>): List<ShortTermMemory> {
             Triple(existing.sourceMessageIds, existing.sourceRoles, existing.userEvidence),
             Triple(item.sourceMessageIds, item.sourceRoles, item.userEvidence),
         )
-        result[dupIndex] = existing.copy(
+        val merged = existing.copy(
             content = if (item.content.length > existing.content.length) item.content else existing.content,
             sourceMessageIds = sources.sourceMessageIds,
             sourceRoles = sources.sourceRoles,
@@ -507,8 +525,35 @@ fun dedupeShortTerm(items: List<ShortTermMemory>): List<ShortTermMemory> {
             // Merged content invalidates the prior analysis, so force a re-analysis.
             analyzedAt = null,
         )
+        result[dupIndex] = merged
+        signatures[dupIndex] = bigramSignature(merged.content)
     }
     return result
+}
+
+/** Normalized character bigrams of one memory text, computed once per O(n²) pass. */
+private class BigramSignature(val length: Int, val grams: Set<String>)
+
+private fun bigramSignature(text: String): BigramSignature {
+    val grams = charBigrams(normalizeMemoryText(text))
+    return BigramSignature(grams.size, grams)
+}
+
+/**
+ * Cheap necessary condition for `textSimilarity(a, b) >= NEAR_DUP_SIMILARITY`: the
+ * Jaccard index is at most `min / (|a| + |b| - min)`, so a pair whose bigram sets
+ * differ too much in size can never reach the threshold — rejecting those up front
+ * avoids almost all of the set-intersection work on unrelated memories.
+ */
+private fun couldBeNearDuplicate(a: BigramSignature, b: BigramSignature): Boolean {
+    if (a.length == 0 || b.length == 0) return false
+    val threshold = AppLimits.Memory.NEAR_DUP_SIMILARITY
+    val smallest = minOf(a.length, b.length)
+    val total = (a.length + b.length).toDouble()
+    if (smallest * (1 + threshold) < threshold * total) return false
+    val intersection = a.grams.count { it in b.grams }
+    val union = a.length + b.length - intersection
+    return union > 0 && intersection.toDouble() / union >= threshold
 }
 
 /** Input to [addShortTermMemory] (legacy `sourceData`). */
