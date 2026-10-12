@@ -28,7 +28,7 @@ class UpdateMemoryTool(private val memory: MemoryService) : AgentTool {
 
     override val definition = ToolDefinition(
         name = "update_memory",
-        description = "修正一条已存在的长期记忆（按ID）。仅当用户明确否认或纠正某条记忆时使用，例如\"那件事是我做的不是你做的\"\"记反了\"\"我不是那个意思\"。必须先调用 search_memory 或 list_memories 找到目标ID，再用用户纠正的原话作为 evidence。可改 subject（主体：user=用户 / character=角色自己 / relationship=双方 / world=背景设定）、value（内容，必须写明主体）、key、importance、promisor/promisee（约定的承诺方/受约方）。不要用它新建记忆（新建请用 longTerm 字段或 set_reminder）。",
+        description = "修正一条已存在的记忆（长期或短期，按ID）。仅当用户明确否认或纠正某条记忆时使用，例如\"那件事是我做的不是你做的\"\"记反了\"\"我不是那个意思\"。必须先调用 search_memory 或 list_memories 找到目标ID，再用用户纠正的原话作为 evidence。ID 以 short_ 开头的是**短期记忆**（只支持 value 与 eventTime）：改正后会重新排到队尾，等待下一轮被整理进长期记忆。其他 ID 是长期记忆，可改 subject（主体：user=用户 / character=角色自己 / relationship=双方 / world=背景设定）、value（内容，必须写明主体）、key、importance、promisor/promisee（约定的承诺方/受约方）。不要用它新建记忆（新建请用 longTerm 字段或 set_reminder）。",
         parametersJson = buildJsonObject {
             put("type", "object")
             put("additionalProperties", false)
@@ -39,7 +39,7 @@ class UpdateMemoryTool(private val memory: MemoryService) : AgentTool {
                     put("enum", buildJsonArray { listOf("user", "character", "relationship", "world").forEach { add(it) } })
                     put("description", "可选，修正主体")
                 })
-                put("value", buildJsonObject { put("type", "string"); put("description", "可选，修正后的内容；必须写明主体（用户写\"用户\"，角色写角色名或\"我（角色）\"）") })
+                put("value", buildJsonObject { put("type", "string"); put("description", "可选，修正后的内容（长期与短期记忆都用这个字段）；必须写明主体（用户写\"用户\"，角色写角色名或\"我（角色）\"）") })
                 put("key", buildJsonObject { put("type", "string"); put("description", "可选，修正后的记忆标识") })
                 put("importance", buildJsonObject { put("type", "integer"); put("minimum", 1); put("maximum", 10); put("description", "可选，修正重要性") })
                 put("promisor", buildJsonObject { put("type", "string"); put("description", "可选，约定的承诺方（user / character / relationship / 群组成员名）") })
@@ -71,11 +71,6 @@ class UpdateMemoryTool(private val memory: MemoryService) : AgentTool {
         val member = memberName?.let { MemoryToolSupport.resolveMember(character, it) }
         val host = if (member != null) MemoryToolSupport.memberAsCharacter(character, member) else character
 
-        val target = memory
-            .listMemories(character, "", "", memberName, Int.MAX_VALUE)
-            .firstOrNull { it.id == id }
-            ?: return AgentToolResult(errorJson("找不到该记忆ID（可能已被删除或合并），请重新检索后再试"))
-
         val sourceIds = ToolArgs.strings(args, "sourceMessageIds").map { it.trim() }.filter { it.isNotEmpty() }
         val evidence = ToolArgs.string(args, "evidence").trim()
         if (sourceIds.isEmpty() || evidence.isEmpty()) {
@@ -84,6 +79,49 @@ class UpdateMemoryTool(private val memory: MemoryService) : AgentTool {
         if (hasValidUserEvidence(character, sourceIds, evidence) == null) {
             return AgentToolResult(errorJson("evidence 必须是 sourceMessageIds 指定用户消息中的逐字原话；对不上时不修改"))
         }
+
+        // Short-term entries are correctable through the same tool: the window is injected
+        // in full, so a wrong entry would otherwise sit in front of the model until it
+        // slides out. Correcting it bumps its revision (so the fold re-reads it) and moves
+        // it to the tail — the fold pass walks the window from the front, so without the
+        // move the long-term copy would keep the old wording. Checked before the long-term
+        // lookup because that lookup is what rejects unknown ids.
+        character.shortTerm.firstOrNull { it.id == id }?.let { item ->
+            val now = ZonedDateTime.now()
+            val resolved = resolveTimeRef(ToolArgs.timeRef(args, "timeRef"), now)
+            val eventTimeRaw = ToolArgs.string(args, "eventTime").trim()
+            val nextEventTime = if (eventTimeRaw.isNotEmpty()) {
+                MemoryToolSupport.normalizeTimestamp(eventTimeRaw, null)
+            } else {
+                resolved?.iso
+            }
+            val timeBase = nextEventTime?.let { parseZoned(it) } ?: now
+            val nextContent = trimText(parseRelativeText(ToolArgs.string(args, "value"), timeBase), 900)
+            if (nextContent.isEmpty() && nextEventTime == null) {
+                return AgentToolResult(errorJson("短期记忆至少要修改 value（内容）或 eventTime 之一"))
+            }
+            val corrected = item.copy(
+                content = if (nextContent.isNotEmpty()) nextContent else item.content,
+                eventTime = nextEventTime ?: item.eventTime,
+                sourceMessageIds = (item.sourceMessageIds + sourceIds).distinct().take(8),
+                // A correction invalidates both consumers: neither has seen this revision.
+                revision = item.revision + 1,
+            )
+            val list = character.shortTerm.filterNot { it.id == id } + corrected
+            val payload = buildJsonObject {
+                put("ok", true)
+                put("id", id)
+                put("store", "shortTerm")
+                put("content", maskUserWord(character, trimText(corrected.content, 500)))
+                put("eventTime", corrected.eventTime ?: "")
+            }
+            return AgentToolResult(payload.toString(), updatedCharacter = character.copy(shortTerm = list))
+        }
+
+        val target = memory
+            .listMemories(character, "", "", memberName, Int.MAX_VALUE)
+            .firstOrNull { it.id == id }
+            ?: return AgentToolResult(errorJson("找不到该记忆ID（可能已被删除或合并），请重新检索后再试"))
 
         val subjectRaw = ToolArgs.string(args, "subject").trim()
         val subject = parseSubject(subjectRaw)

@@ -53,6 +53,21 @@ class DifferentialOracleTest {
      */
     private val NATIVE_TOOL_CONTRACT: Map<String, Pair<List<String>, List<String>>> = mapOf(
         "search_memory" to (emptyList<String>() to listOf("query", "date", "timeRef", "slot", "memberName")),
+        // The turn no longer writes short-term memory (the whole-window fold pass owns
+        // the window), so `shortTerm` is gone from the turn contract.
+        "submit_response" to (
+            listOf("reply", "quickReplies") to
+                listOf(
+                    "reply",
+                    "quickReplies",
+                    "longTerm",
+                    "dynamicState",
+                    "staticFields",
+                    "memberDynamicState",
+                    "promiseUpdates",
+                    "recall",
+                )
+            ),
     )
 
     private fun readResource(name: String): String =
@@ -251,6 +266,16 @@ class DifferentialOracleTest {
     private fun normalizePromiseStatus(text: String): String =
         text.replace("[进行中]", "[承诺状态]").replace("[待确认，已过期]", "[承诺状态]")
 
+    /**
+     * The volatile section is intentionally diverged from the legacy JS: the memory
+     * blocks are no longer budget-clipped, they are ordered oldest-first, and the recent
+     * short-term window moved out of it entirely (it is injected before the history so it
+     * rides inside the cached prefix). Only what follows the time base — the time block,
+     * the message-time metadata and the style tail — is still compared byte-for-byte.
+     */
+    private fun normalizeVolatileBlocks(text: String): String =
+        text.replace(Regex("^[\\s\\S]*?(?=【时间基准】)"), "【记忆区块】(正常化)\n\n")
+
     @Test
     fun `volatile context matches the legacy JS oracle`() = runBlocking {
         val now = json.parseToJsonElement(readResource("scenarios.json")).jsonObject["now"]!!.jsonPrimitive.content
@@ -270,9 +295,9 @@ class DifferentialOracleTest {
                 recentAssistantReplies = recentAssistant,
             )
             assertEquals(
-                "[${scenario.id}] volatile context must be byte-identical to legacy JS (skeleton/voice/dynamic normalized)",
-                normalizePromiseStatus(normalizeDynamicFields(normalizeVoiceContract(normalizeSkeleton(expected)))),
-                normalizePromiseStatus(normalizeDynamicFields(normalizeVoiceContract(normalizeSkeleton(actual)))),
+                "[${scenario.id}] volatile context must be byte-identical to legacy JS (skeleton/voice/dynamic/blocks normalized)",
+                normalizeVolatileBlocks(normalizePromiseStatus(normalizeDynamicFields(normalizeVoiceContract(normalizeSkeleton(expected))))),
+                normalizeVolatileBlocks(normalizePromiseStatus(normalizeDynamicFields(normalizeVoiceContract(normalizeSkeleton(actual))))),
             )
         }
     }

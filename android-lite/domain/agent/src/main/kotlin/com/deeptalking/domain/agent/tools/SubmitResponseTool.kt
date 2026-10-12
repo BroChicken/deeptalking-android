@@ -61,7 +61,6 @@ class SubmitResponseTool : AgentTool {
                             put("items", buildJsonObject { put("type", "string") })
                         },
                     )
-                    put("shortTerm", shortTermSchema())
                     put("longTerm", longTermSchema())
                     put(
                         "dynamicState",
@@ -203,27 +202,6 @@ class SubmitResponseTool : AgentTool {
             },
         )
         put("required", buildJsonArray { add("value") })
-    }
-
-    private fun shortTermSchema(): JsonElement = buildJsonObject {
-        put("type", "array")
-        put("description", "本轮事件流程摘要（对后续几轮有帮助的信息）；content必须写明谁做了什么并写绝对日期，不得写相对时间词；用户用相对时间表述时填timeRef")
-        put(
-            "items",
-            buildJsonObject {
-                put("type", "object")
-                put("additionalProperties", false)
-                put(
-                    "properties",
-                    buildJsonObject {
-                        put("content", buildJsonObject { put("type", "string") })
-                        put("sourceMessageIds", stringArraySchema())
-                        put("timeRef", timeRefSchema())
-                    },
-                )
-                put("required", buildJsonArray { add("content") })
-            },
-        )
     }
 
     private fun longTermSchema(): JsonElement = buildJsonObject {

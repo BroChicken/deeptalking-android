@@ -22,6 +22,7 @@ import com.deeptalking.core.model.SpeechSegment
 import com.deeptalking.core.model.extractSpeechSegments
 import com.deeptalking.core.model.extractSpeechText
 import com.deeptalking.domain.agent.OrchestratorResult
+import com.deeptalking.domain.agent.prompts.buildShortTermBlock
 import com.deeptalking.feature.characters.CharacterParity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -917,25 +918,13 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                     )
                 }
                 val history = core.data.chat.getMessages(id)
-                // Legacy `sendStickerAsUser` writes a sent sticker to `msg.images`, so it
-                // is delivered to the model as `input_image`. The persisted message keeps
-                // `Kind.Sticker` for rendering; this request-only copy promotes it to
-                // `Kind.Image`, which is the only kind the Responses transport forwards.
-                val requestHistory = history.map { message ->
-                    if (message.role == Role.User && message.attachments.any { it.kind == MessageAttachment.Kind.Sticker }) {
-                        message.copy(
-                            attachments = message.attachments.map {
-                                if (it.kind == MessageAttachment.Kind.Sticker) it.copy(kind = MessageAttachment.Kind.Image) else it
-                            },
-                        )
-                    } else {
-                        message
-                    }
-                }
-                // Mirror the live chat into `character.instant` (incl. the just-appended
-                // user message) so set_reminder validation + volatile context see it.
-                val character = (core.data.characters.get(id) ?: return@launch)
-                    .copy(instant = windowInstant(history))
+                // Grow the persisted `character.instant` window with the messages it has
+                // not seen yet (append-only): the fold pass drops it back to the low
+                // watermark, and each turn only appends. Re-deriving "the newest N" every
+                // turn instead would slide the window by one message per turn, which is
+                // exactly what made the cached request prefix miss on every request.
+                val stored = core.data.characters.get(id) ?: return@launch
+                val character = stored.copy(instant = growInstantWindow(stored.instant, history))
                 statusState.value = "生成中…"
                 streamingState.value = ""
 
@@ -967,7 +956,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                     }
                     val outcome = orchestrator.run(
                         character = character,
-                        history = requestHistory,
+                        history = character.instant,
                         userText = text.trim(),
                         onDelta = { delta ->
                             if (!receiveLogged && delta.isNotBlank()) {
@@ -1019,7 +1008,14 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 core.data.characters.upsert(withReminders)
                 quickRepliesState.value = finalResult.quickReplies
                 statusState.value = ""
-                recordMetrics(cfg, id, finalResult, requestHistory, System.currentTimeMillis() - requestStartedAt)
+                recordMetrics(
+                    cfg,
+                    id,
+                    finalResult,
+                    character.instant,
+                    buildShortTermBlock(character),
+                    System.currentTimeMillis() - requestStartedAt,
+                )
                 if (cfg.ttsEnabled && cfg.ttsAutoRead) speakReply(finalResult.reply, finalResult.updatedCharacter)
             } catch (error: Exception) {
                 streamingState.value = null
@@ -1031,9 +1027,24 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         }
     }
 
-    /** Trims a message list to the persisted `character.instant` window (legacy `memory.instant`). */
-    private fun windowInstant(messages: List<ChatMessage>): List<ChatMessage> =
-        if (messages.size > AppLimits.Memory.INSTANT) messages.takeLast(AppLimits.Memory.INSTANT) else messages
+    /**
+     * Materialises the persisted `character.instant` window as an append-only tail of the
+     * live chat: the window content is the state (the fold pass compacts it down to the
+     * low watermark), and a turn only appends the messages the window has not seen yet.
+     *
+     * Entries that are not (yet) rows of the chat table — the in-flight synthetic
+     * assistant turn — are dropped first, so the window stays an ordered subset of the
+     * chat tail and the reply cannot appear twice (once synthetic, once as its row).
+     */
+    private fun growInstantWindow(instant: List<ChatMessage>, room: List<ChatMessage>): List<ChatMessage> {
+        if (instant.isEmpty()) {
+            return if (room.size > AppLimits.Memory.INSTANT) room.takeLast(AppLimits.Memory.INSTANT) else room
+        }
+        val roomIds = room.map { it.id }.toSet()
+        val kept = instant.filter { it.id in roomIds }
+        val keptIds = kept.map { it.id }.toSet()
+        return kept + room.filter { it.id !in keptIds }
+    }
 
     /**
      * Native equivalent of a due reminder: for the active character's active
@@ -1104,16 +1115,26 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     /**
      * App-side request trace; the instructions/tools hashes come from the
      * domain (`OrchestratorResult`) since only it sees the assembled request.
+     *
+     * The short-term block is injected *before* the history, so it is part of the
+     * request prefix: it is tracked as the first pseudo-entry, otherwise a change there
+     * would be reported as `history-extended` while the provider actually saw a miss.
      */
     private fun requestTrace(
         characterId: String,
         history: List<ChatMessage>,
+        shortTermBlock: String,
         instructionsHash: String,
         toolsHash: String,
     ): RequestTrace {
-        val inputs = history.filter { !it.rejected }.map { message ->
-            message.role.name + "|" + message.content + "|" +
-                message.attachments.joinToString(",") { it.kind.name + ":" + it.uri }
+        val inputs = buildList {
+            if (shortTermBlock.isNotEmpty()) add("short_term|" + shortTermBlock)
+            history.filter { !it.rejected }.forEach { message ->
+                add(
+                    message.role.name + "|" + message.content + "|" +
+                        message.attachments.joinToString(",") { it.kind.name + ":" + it.uri },
+                )
+            }
         }
         val previous = requestPrefixSnapshots[characterId]
         var common = 0
@@ -1152,13 +1173,14 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         characterId: String,
         result: OrchestratorResult,
         requestHistory: List<ChatMessage>,
+        shortTermBlock: String,
         durationMs: Long,
     ) {
         val at = Instant.now().toString()
         val hitTokens = result.cachedTokens
         val missTokens = (result.inputTokens - hitTokens).coerceAtLeast(0)
         val hitRate = if (result.inputTokens > 0) hitTokens.toDouble() / result.inputTokens else 0.0
-        val trace = requestTrace(characterId, requestHistory, result.instructionsHash, result.toolsHash)
+        val trace = requestTrace(characterId, requestHistory, shortTermBlock, result.instructionsHash, result.toolsHash)
         val metric = RequestMetric(
             at = at,
             taskType = "chat",

@@ -11,20 +11,54 @@ object AppLimits {
 
         /**
          * Output cap for background/auxiliary calls, sent explicitly instead of
-         * relying on the provider default. The short→long analysis reply must echo
-         * every input id *and* carry the whole long-term payload; with no explicit cap
-         * an over-long reply is silently truncated, the JSON fails to parse, and the
-         * batch is discarded — which is exactly how analysis used to fail on every
+         * relying on the provider default. A whole-window analysis reply echoes the
+         * processed ids *and* carries the whole long-term payload; with no explicit
+         * cap an over-long reply is silently truncated, the JSON fails to parse, and
+         * the batch is discarded — which is exactly how analysis used to fail on every
          * pass while nothing was ever marked analyzed.
          */
-        const val AUXILIARY_MAX_OUTPUT_TOKENS = 4_096
+        const val AUXILIARY_MAX_OUTPUT_TOKENS = 8_192
     }
 
     object Memory {
-        const val INSTANT = 30
-        const val INSTANT_TRIM_FLOOR = 10
-        const val SHORT_TERM = 80
+        /**
+         * Instant (raw chat history) window — high/low watermark pair.
+         *
+         * The window grows append-only from [INSTANT_TRIM_FLOOR] to [INSTANT], is
+         * folded into short-term memory in one whole-window pass at the high
+         * watermark, and drops back to [INSTANT_TRIM_FLOOR]. Injecting the *whole*
+         * window is what keeps the request prefix append-only in between folds (the
+         * only cache-relevant cost is the single fold at the high watermark).
+         */
+        const val INSTANT = 60
+        const val INSTANT_TRIM_FLOOR = 20
+
+        /**
+         * Emergency ceiling: only reached when the fold keeps failing, in which case
+         * the oldest entries are dropped regardless of coverage and the reason is
+         * reported through `counters.analysisLastError`. Without it a permanently
+         * failing fold would grow the window without bound.
+         */
+        const val INSTANT_HARD_CAP = 120
+
+        /**
+         * Short-term window — same high/low watermark shape as [INSTANT] (40 → 20).
+         * The whole window is injected (it sits in the cached prefix) and the whole
+         * window is carried into each analysis pass, so the low-water leftovers are
+         * re-read as context of the next pass.
+         */
+        const val SHORT_TERM = 40
         const val SHORT_TERM_TRIM_FLOOR = 20
+
+        /** Emergency ceiling for short-term (see [INSTANT_HARD_CAP]). */
+        const val SHORT_TERM_HARD_CAP = 80
+
+        /**
+         * How many trailing short-term entries a new write may merge into. Keeping the
+         * merge local means a write never rewrites an entry in the middle of the block,
+         * so the injected window stays append-only between folds.
+         */
+        const val SHORT_TERM_MERGE_WINDOW = 5
 
         /**
          * Legacy hard per-category cap. No longer used to evict entries (long-term is
@@ -33,28 +67,27 @@ object AppLimits {
          */
         const val LONG_TERM_PER_CATEGORY = 40
         const val PENDING_RECALL = 6
-        const val ANALYSIS_BATCH = 20
-        const val SUMMARY_SOURCES = 20
 
         /**
-         * Short-term items one short→long analysis request carries. Deliberately much
-         * smaller than [ANALYSIS_BATCH]: the reply has to echo every input id and carry
-         * the full long-term payload, so a large request is the one that overruns the
-         * provider's output cap and gets truncated (see
-         * [AppLimits.Api.AUXILIARY_MAX_OUTPUT_TOKENS]).
+         * Short-term items one short→long analysis pass carries: the *whole* window
+         * ([SHORT_TERM]), so the low-water leftovers are re-read as context and the
+         * fold stays coherent. Only a backlog above the window (a stuck fold) makes a
+         * pass carry less than everything.
          */
-        const val ANALYSIS_ITEM_LIMIT = 8
+        const val ANALYSIS_BATCH = SHORT_TERM
+
+        /** Instant messages one extract pass carries: the whole window ([INSTANT]). */
+        const val SUMMARY_SOURCES = INSTANT
 
         /** Low-water mark: short-term is "consumed" once it settles at this size. */
         const val SHORT_TERM_LOW_WATER = SHORT_TERM_TRIM_FLOOR
 
         /**
-         * Analysis batches the cleanup drain runs per invocation. Deliberately small
-         * ("慢慢处理"): each batch converts up to [ANALYSIS_ITEM_LIMIT] short-term items
-         * into long-term memory, so the backlog shrinks gradually instead of being
-         * truncated away.
+         * Analysis passes the cleanup drain runs per invocation. One whole-window pass
+         * already folds everything pending, so a single pass converges; extra passes
+         * only matter for a backlog that is larger than the window itself.
          */
-        const val CLEANUP_BATCHES_PER_RUN = 5
+        const val CLEANUP_BATCHES_PER_RUN = 1
 
         /**
          * Character-bigram Jaccard similarity at which two memory texts are treated
@@ -112,7 +145,12 @@ object AppLimits {
          * How many recent messages keep their image attachments. Older messages
          * keep their text but lose the images (files are deleted), so history stays
          * readable while storage/export do not grow without bound.
+         *
+         * Must be >= [Memory.INSTANT]: pruning a message that is still inside the
+         * injected history window would rewrite an already-sent request prefix
+         * mid-stable-period (a cache miss) and silently drop an image the model had
+         * already seen.
          */
-        const val IMAGE_RETENTION_MESSAGES = 50
+        const val IMAGE_RETENTION_MESSAGES = Memory.INSTANT
     }
 }

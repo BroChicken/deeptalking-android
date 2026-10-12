@@ -167,11 +167,17 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 | 层 | 内容 | 上限 |
 |---|---|---|
 | `instant` | 最近原始消息 | 30 条（截断保底 10） |
-| `shortTerm` | 事件流程摘要 | 80 条（截断保底 20） |
+| `shortTerm` | 事件流程摘要 | 高水位 40 / 低水位 20（整窗注入，靠整窗折叠消化而非截断） |
 | `longTerm` | 分类长期记忆 | 无数量上限（仅 `applyMemoryDecay` 时效遗忘；旧版"每类 40 条"上限已移除） |
 | `scenes` | 场景概要 | 保留最近 8 条（`AppLimits.Scene.RETAIN`），注入最近 2 条 |
 
-**上下文窗口（有意偏离旧版）**：`INSTANT=30` / `INSTANT_TRIM_FLOOR=10`（旧版 160/40）。发给模型的原始历史窗口即当前 `instant`（最多 30 条原文，增长期不缺席）；满 30 触发 `extraction` 把较旧约 20 条总结进 `shortTerm`（volatile 注入的"摘要"），`instant` 裁到最近 10 条后再长回 30。更早内容由 volatile 的 `shortTerm` + `scenes` + 长期记忆承载。`Scene.SPAN=12`（旧版 24）。
+**上下文窗口（高/低水位 + 整窗折叠）**：`INSTANT=60` / `INSTANT_TRIM_FLOOR=20`、`SHORT_TERM=40` / `SHORT_TERM_TRIM_FLOOR=20`。两个窗口都是同一形态：
+
+- **窗口内容就是状态**，且是**追加式**的：每轮只把窗口没见过的消息追加进 `instant`（`AppViewModel.growInstantWindow`），只有折叠那一轮才把窗口压回低水位；`shortTerm` 同理——只有整窗抽取会追加、只有同一轮折叠会压缩，所以窗口在两次折叠之间**逐字不变**。
+- **到高水位整窗折叠**：`instant` 满 60 → 一次整窗抽取（输入=整个 60 条窗口；已抽取的头部只作上下文）→ 产出若干 `shortTerm` 条目追加到队尾 → `instant` 落回最新 20 条。`shortTerm` 满 40 → 一次整窗分析（输入=整个 40 条窗口）→ 产出 `longTerm` → 落回最新 20 条。低水位留下的 20 条会作为下一次折叠的上下文被**再读一遍**（连贯性），但只有一个消费者会话里 `analyzed=false` / `extracted=false` 的条目才产出新记忆。
+- **注入**：`instant` 整窗进历史；`shortTerm` 整窗进 **历史之前**的一条 user 块（见下文"请求装配"），因此它落在缓存前缀里。
+- **紧急上限**：`INSTANT_HARD_CAP=120` / `SHORT_TERM_HARD_CAP=80`，仅在折叠持续失败时生效（丢最旧的并在 `counters.analysisLastError` 写明原因，绝不静默）。
+- 更早内容由 `scenes` + 长期记忆 + `search_memory` 承载。`Scene.SPAN=12`（旧版 24）。
 
 ### longTerm 五类
 
@@ -181,6 +187,8 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 - `isValidAutomaticMemory()` 校验来源引用与证据逐字摘录，防止模型编造记忆。
 - 短期记忆在捕获时写入 `sourceRoles` 与 `userEvidence`（用户消息逐字摘录，`[{sourceMessageId,text}]`），短期→长期分析据此在源消息滚出 `instant` 后仍能校验 `evidence` 逐字来自声明的用户消息（对齐 `tasks.js:424` 的 `allowedUserEvidence`）。**`sourceRoles` 与 `sourceMessageIds` 是逐位对齐的平行数组**：合并来源必须走 `:core:model` 的 `alignSources`/`mergeSources` 逐位重建——历史 bug 把它当集合 `.distinct()`，角色塌缩成 `["user","assistant"]`，之后每个来源都变成无 role，`resolveMemorySources` 直接判失败。
 - 主对话的结构化写入（`submit_response` 的 `longTerm`/`staticFields`/`dynamicState`/`promiseUpdates`）同样过证据/意图校验（`ChatOrchestrator.applyMemory` → `upsertLongTermMemory` / `hasValidUserEvidence` / `hasStaticEditIntent` / `resolveDynamicStateSources`）。
+- **短期记忆不由主对话写**：`submit_response` 没有 `shortTerm` 字段（旧版 `<MEM_UPDATE>.shortTerm` 也已忽略），`ChatOrchestrator.applyShortTerm` / `BackgroundTasks.applyMemoryUpdate` 的短期分支均已删除——窗口唯一的写入者是整窗抽取（`extractInstantToShortTermTask`）。这样窗口在两次折叠之间不会被写在中部或提前压缩，注入块才能保持逐字稳定。
+- **短期条目可被修正/删除**：`update_memory`（`short_` 前缀 ID，支持 `value`/`eventTime`；改正后 `revision+1` 并移到队尾，等下一轮折叠写进长期记忆）与 `delete_memory`（同前缀）都能作用于短期；`search_memory` 的关键词召回也返回 `shortTerm` 命中。
 
 ### 相关度检索
 
@@ -192,7 +200,7 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 
 ### 注入与衰减
 
-- `buildVolatileContext(char, query, metadata)` — src/js/prompts/volatile.js:1：把最相关的记忆注入本轮 prompt（agent 模式只注入 `AGENT_TOOL_MEMORY_INJECT_LIMIT = 5` 条，其余提示模型用 `search_memory` 检索）。总长受 `CONTEXT_BUDGET.volatileChars`（6000）约束，按低→高优先级顺序 `add()`，超出时先丢低优先级块；`metadata` 回传本轮真正注入的召回 ID 与世界书条目，供主线在回复落盘后精确清除 `pendingRecall` 与累计 `mentions`（不依赖会被后台任务改写的全局字段）。检索查询经 `buildMemoryQuery()` 扩展：用户明显指代前文时附加最近对话，避免短指代召回不到正确记忆。
+- `buildVolatileContext(character, query, memory, now, proactiveTurn, recentAssistantReplies)` — 把最相关的记忆与本轮动态上下文注入本轮 prompt（只注入 `AppLimits.Agent.TOOL_MEMORY_INJECT_LIMIT = 5` 条长期记忆，其余提示模型用 `search_memory` 检索）。**没有任何区块预算**：这是主对话请求体，所有块整块注入（只保留"每条条目"级别的兜底上限，靠提示词的软限制让它尽量不触发）。区块顺序按"越靠后越近"排列：可选话题库 → 角色当前状态 → 待跟进承诺 → 世界书 → 群成员私人记忆 → 用户最新纠正 → 互动节奏 → 场景概要 → 长期召回 + 取用说明/主体约定 → 时间基准 → 消息时间元数据 → 风格尾块 + 本轮指令。`metadata` 回传本轮真正注入的召回 ID 与世界书条目，供主线在回复落盘后精确清除 `pendingRecall` 与累计 `mentions`（不依赖会被后台任务改写的全局字段）。检索查询经 `buildMemoryQuery()` 扩展：用户明显指代前文时附加最近对话，避免短指代召回不到正确记忆。
 - `applyMemoryDecay()` — src/js/memory/policy.js:143：按时间衰减 events/promises 的重要性与状态。
 - `computeEffectiveImportance()` — src/js/memory/policy.js:2：`(importance + learnedBonus) × decay`（0-10 封顶）。
 
@@ -282,19 +290,34 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 
 ### 记忆预算
 
-`CONTEXT_BUDGET` — src/js/core/config.js:173
+**volatile 不再有区块预算**（旧版 `CONTEXT_BUDGET` 与 `add(text, limit)` 已删除）：该段属于主对话请求体，所有块整块注入，取舍只剩"条数上限 × 每条兜底上限"。旧的预算池有两个问题：①`volatileChars`(6000) 里先被 `角色当前状态`/`世界书` 吃掉，短期摘要常被压到几百字、长期召回整块跳过；②检索与摘要共享额度，长期召回一变，短期块的**长度**也跟着变，前缀在稳定期内被无谓打破。
 
-| 常量 | 值 | 说明 |
+| 项 | 值 | 说明 |
 |---|---|---|
-| `retrievedChars` | 1200 | 检索记忆注入的字符预算 |
-| `summaryChars` | 1600 | 摘要记忆的基础预算 |
-| `sceneSummaries` | 2 | 注入几条场景概要 |
-| `sceneInjectionChars` | 600 | 场景概要的总字符预算 |
-| `sceneSpan` | 24 | 场景超过多少条消息就强制生成概要 |
-| `volatileChars` | 6000 | 本轮动态上下文（volatile）总字符上限 |
+| 短期窗口注入 | 整窗（20~40 条） | 注入到**历史之前**的独立 user 块，不进 volatile |
+| `TOOL_MEMORY_INJECT_LIMIT` | 5 | 每轮注入的长期记忆条数 |
+| 世界书注入 | `Lorebook.INJECT_ENTRIES`(6) 条 | 整条注入（条目写入时已受 `CONTENT_CHARS`(2000) 约束） |
+| 场景概要 | `Scene.SUMMARIES`(2) 条 | 整条注入（写入时已受 2000 约束） |
+| 每条兜底上限 | 短期正文/长期 value/群私人 1200、长期 key 120 | 仅为兜底；提示词软限制（短期 ≤120 字、长期 value ≤200 字、arc ≤300 字、世界书条目 ≤200 字、场景 ≤300 字）让它尽量不触发 |
 
-- 检索记忆与摘要记忆**共享一个预算池**：检索没用完的额度 `retrievedChars - 实际占用` 自动让给摘要（`buildVolatileContext`）。
-- 摘要记忆**从最新往前填充**（`for (shortIndex = length-1; …)` + `shortLines.reverse()`），额度用尽时丢掉的是最旧摘要。
+### 请求装配与缓存前缀
+
+一轮请求的形状（`RequestBuilder` + `ChatOrchestrator.run`）：
+
+```
+instructions（system，纯静态角色设定）
+input:
+  [0]     短期窗口块（user）    ← 【近期摘要记忆…】整窗
+  [1..n]  历史 = instant 窗口（20~60 条原文）
+  [n+1]   本轮用户消息
+  [n+2]   volatile 上下文（user，最后一条）
+tools: AUTO 阶段全部工具 / SUBMIT 阶段只有 submit_response
+```
+
+- **短期块放在历史之前**是有意的：它只在折叠那一轮变化，而折叠同时把历史 rebase 掉——即"它变的时候前缀本来就要断"。中间那段它逐字不变，于是和"追加式历史"一起待在缓存前缀里。
+- 前缀缓存的失配只应来自三处：`instructions-changed`（角色静态资料被改）、以及两个窗口各自的 `history-rebased`（折叠，约每 20 轮一次）。`AppViewModel.requestTrace` 把短期块作为首个伪条目纳入前缀快照，否则它的变化会被误报成 `history-extended`。
+- 历史**不再逐轮滑动**：`growInstantWindow` 只追加窗口没见过的消息（`ChatOrchestrator` 末尾也不再 `takeLast(INSTANT)`），所以"每轮从头部丢一条"那种每轮 100% 失配的形态被消除。
+- 图片保留窗口 `AppLimits.Media.IMAGE_RETENTION_MESSAGES`(60) 必须 ≥ `INSTANT`(60)：否则还在窗口内的消息会被剪掉图片，等于在稳定期中间改写前缀，还让模型"忘掉"刚看过的图。
 
 ### 提示词字符上限
 
@@ -352,8 +375,10 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 
 ### volatile 段落（按顺序）
 
-时间基准 → 消息时间元数据 → 角色当前状态 → 成员当前状态 → **世界书资料** → 本轮主动召回的相关长期记忆 + 记忆取用说明 + 记忆主体约定 → 成员私人记忆 → **场景概要** → 近期摘要记忆 → 待跟进承诺 → 互动节奏（重连/久别）→ 可选话题库 → 结尾多样性 → **本轮节奏骨架** → 冷场/话题切换指令 →（主动开场时）角色主动开场 → **快速回应视角提醒** → **违规纠正提醒** → **每 N 轮语气回顾** → **声音契约（单角色）/群聊声音锁定（群聊）**。
+可选话题库 → 角色当前状态（+群成员状态）→ **待跟进承诺** → **世界书资料** → 成员私人记忆 → 用户最新纠正 → 互动节奏（重连/久别）→ **场景概要** → 本轮主动召回的相关长期记忆 + 记忆取用说明 + 记忆主体约定 → 时间基准 → 消息时间元数据 → 结尾多样性 → **本轮节奏骨架** → 冷场/话题切换指令 →（主动开场时）角色主动开场 → **快速回应视角提醒** → **违规纠正提醒** → **每 N 轮语气回顾** → **声音契约（单角色）/群聊声音锁定（群聊）**。
 
+> 顺序原则是"越靠后越近"：更早的背景（话题库/状态/承诺/世界书）在前，较早情节（场景）→ 较早记忆（长期召回）→ 现在（时间基准/时间线）→ 本轮指令（尾块）在后。**短期窗口不在这里**：它整窗注入到历史之前（见"请求装配与缓存前缀"）。
+>
 > 记忆取用说明：提醒召回条目"按关键词与时间粗略召回，可能只有部分相关或已过时"，不得硬提旧事、不得当作用户刚说过的话。
 
 ### 语气/风格遵从（attention）
@@ -398,8 +423,8 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 | 世界书一次性迁移 `migrateWorldLoreForEntity` | src/js/storage/lorebook-migration.js:44 | 把旧数据 `description`/`background` 里的世界观拆成条目（≤6 条，只整理已有信息）；用户手写条目不受影响；可选同时精简原文（仅在确实变短时替换） |
 | 成员补全 `fillGroupMemberFields` | src/js/ui/character-editor.js:236 | **已有字段是绝对权威，不得改写/润色/替换**；只填空字段；说话方式须与群内其他成员显著不同；无把握则省略 |
 | 空字段补全 `fillStaticFieldsForJob` | src/js/characters/profile-completion.js:33 | 只补 `job.missing` 中的字段，绝不覆盖已有设定；缺 `speakingStyle` 时套用示例台词约束；群组成员再叠加"彼此不同" |
-| 即时→短期摘要 `extractInstantToShortTerm` | src/js/memory/tasks.js:259 | 按"日期+时段"合并；**只保留影响后续剧情的内容**（决策/地点物品伤势关系变化/发现/未决目标承诺威胁期限）；**每条 ≤120 字**；禁止文学化与对白原文；续写旧事件时**旧摘要中仍有效的信息必须原样保留**；必须覆盖全部输入消息 ID |
-| 短期→长期 `analyzeShortToLongTerm` | src/js/memory/tasks.js:345 | **价值判据**（可跨轮复用/影响后续/用户明确表达）才记，**证据不足宁可不记**；`arcOf` 命名一旦确定保持稳定；`sourceShortTermIds` / `evidence` 必须可回溯 |
+| 即时→短期摘要 `extractInstantToShortTerm` | src/js/memory/tasks.js:259 | **整窗折叠**：`instant` 满 60 触发，输入是**整个窗口**（已抽取的头部带 `extracted=true` 只作上下文），只为 `extracted=false` 的消息产出条目；按"日期+时段"合并；**只保留影响后续剧情的内容**（决策/地点物品伤势关系变化/发现/未决目标承诺威胁期限）；**每条 ≤120 字**；禁止文学化与对白原文；续写旧事件时**旧摘要中仍有效的信息必须原样保留**；必须连续覆盖全部待整理消息（从中断处重算连续前缀，绝不丢未总结的消息） |
+| 短期→长期 `analyzeShortToLongTerm` | src/js/memory/tasks.js:345 | **整窗折叠**：`shortTerm` 满 40 触发，输入是**整个窗口**（低水位留下的 20 条带 `analyzed=true` 只作上下文，保证跨轮连贯），只为 `analyzed=false` 的条目产出；**价值判据**（可跨轮复用/影响后续/用户明确表达）才记，**证据不足宁可不记**；`arcOf` 命名一旦确定保持稳定；`sourceShortTermIds` / `evidence` 必须可回溯；**每条 value ≤200 字、arc 叙事 ≤300 字** |
 | 场景概要 `summarizeScene` | src/js/memory/tasks.js:108 | 1-2 段 ≤300 字，只含剧情要点，不引对白、不编造、写绝对日期 |
 | 文风校对 `critiqueReplyStyle` | src/js/prompts/style.js:247 | **只改文风、不改剧情**（情节/事实/对话含义/人物关系不动，大体长度与段落数保持）；不得复述规则；只返回 `{"reply":"…"}`；空结果或长度比例异常一律回退原文 |
 | 快速回应换位生成 `generateQuickRepliesAsUser` | src/js/prompts/style.js:181 | 身份是**用户本人**（system：你就是这位用户本人…不要扮演角色）；只输出 `{"quickReplies":[...]}`；结果再过一遍 `detectQuickReplyIssues`，不通过就放弃（回退兜底） |
@@ -420,7 +445,7 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 - **摘要不被提前丢弃**：`trimShortTermList` 只在长期分析与世界书整理都消费了同一 `revision` 后才裁剪；世界书条目在写库前整批校验来源与字段，失败不推进 `lorebookScannedRevision`、也不累计 `misses`，避免一次坏输出造成误淘汰。
 - **检索相关性下限**：`rankMemories` 只保留至少命中一个非停用词的候选，并用特异性下限 `MIN_MATCH_SCORE`(1.5) 过滤"泛词"命中，避免纯高重要性但无关的旧记忆挤占注入；`pendingRecall`（模型主动召回）优先占位，即使候选取满也一定注入；短指代查询经 `buildMemoryQuery` 补上下文；**用户提到具体日期时，由模型用 `search_memory` 的 `date`/`timeRef` 按日期召回那天的原始对话与记忆**（口语日期→绝对日期由模型依据时间基准换算）。
 - **断言前先核对**：系统提示词要求模型在说"第一次/从来没/总是/每次/以前也…"这类**可被记忆证伪**的话之前先 `search_memory` 确认，查不到依据就不下断言（改说不确定或反问），禁止编造——治"明明不是第一次却说第一次"（关键词通道召回不到时，模型凭直觉断言）。
-- **短期记忆上限靠"消化"不靠"截断"**：`trimShortTerm` 只丢**已被分析且世界书消费过**的条目（内容已在长期记忆里），未消费的永不丢；`SHORT_TERM`(80) 靠分析逐批消化，稳态落在低水位 `SHORT_TERM_LOW_WATER`(20)。图片只保留最近 `AppLimits.Media.IMAGE_RETENTION_MESSAGES`(50) 条消息（更早的删附件与文件、正文保留）。**一次弹窗、之后自动跑完**：`checkMemoryCleanupPrompt` 只在短期 >80 或有超窗图片时询问一次；确认后 `NativeCore.pruneOldMessageImages` 立即剪图片，`drainShortTermBacklog` 分批把积压转成长期记忆（每次启动最多 `CLEANUP_BATCHES_PER_RUN`(5) 批、空闲每分钟 1 批），并把 `deeptalking_memory_cleanup_pending_v1` 置位**持续消化到 20 条**才清除标记 —— 同一批积压不会问第二次，绝不截断。**去重/修复这类 O(n²) 重活一律在 `Dispatchers.Default`/`IO` 上跑**（`viewModelScope.launch` 默认主线程；放主线程会 ANR 且修复标记写不进去 → 每次启动重跑）。
+- **短期记忆上限靠"整窗折叠"不靠"截断"**：`trimShortTerm` 只丢**已被分析且世界书消费过**的条目（内容已在长期记忆里），未消费的永不丢；窗口在高水位触发一次**整窗折叠**后落回低水位 `SHORT_TERM_LOW_WATER`(20)（`SHORT_TERM`=40），所以稳态就是 20~40，不存在"积压越滚越大"。图片只保留最近 `AppLimits.Media.IMAGE_RETENTION_MESSAGES`(60，**必须 ≥ `INSTANT`**，否则会在窗口内部剪图、改写前缀) 条消息（更早的删附件与文件、正文保留）。**一次弹窗、之后自动跑完**：`checkMemoryCleanupPrompt` 只在短期超出高水位或有超窗图片时询问一次；确认后 `NativeCore.pruneOldMessageImages` 立即剪图片，`drainShortTermBacklog` 把积压转成长期记忆（一次整窗折叠即收敛，`CLEANUP_BATCHES_PER_RUN`(1) 批、空闲每分钟 1 批），直到降到低水位 20 才清除标记 —— 同一批积压不会问第二次，绝不截断。**去重/修复这类 O(n²) 重活一律在 `Dispatchers.Default`/`IO` 上跑**（`viewModelScope.launch` 默认主线程；放主线程会 ANR 且修复标记写不进去 → 每次启动重跑）。
 - **时间精度**：`resolveTimeRef` 保留带时区/时分的 explicit ISO，仅"日期或时段"表达才落整点/时段起点，避免把明确时刻改写成正午。记忆衰减/排序的时间基准逐级回退（`Date.parse(lastRecalled) || Date.parse(updatedAt) || Date.parse(createdAt)`），`lastRecalled` 非空但不可解析时不会短路掉更新的时间戳、也不会被当成 1970 年。
 - **联网工具超时**：`fetchWithTimeout()`（src/js/api/web-content.js）给 B站 API、短链解析、Microlink、网页直连统一加超时，避免任意外部请求卡死工具循环（后台任务无重试兜底）。
 - **请求失败也留痕**：`performChatRequest` / `callAI` 的 fetch 失败或非 2xx 也会写入 `requestMetrics`（`status: 'failed'`），并取消未读完的流式 reader，便于诊断网络与限流问题。`buildApiHeaders` 在 apiKey 缺失时提前抛出明确错误，不发出 `Bearer undefined` 请求。
@@ -440,10 +465,10 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 | `MAX_TOOL_CALLS` | 12 | src/js/agent/tool-definitions.js:3 |
 | `AGENT_TOOL_MEMORY_INJECT_LIMIT` | 5 | src/js/agent/tool-definitions.js:4 |
 | `MAX_API_RETRIES` | 3（退避 1s/2s/4s） | src/js/api/retry.js:2 |
-| `MEMORY_LIMITS` | instant 30(保底 10) / shortTerm 80(保底/低水位 20，**靠分析消化而非截断**) / longTerm 无上限（仅时效 `applyMemoryDecay`） / pendingRecall 6 / analysisBatch 20(lorebook 窗口) / **analysisItemLimit 8(→4→2 降级)** / **auxiliaryMaxOutputTokens 4096** / summarySources 20 / nearDupSimilarity 0.72 / minMatchScore 1.5 / maxPerCategory 3 / imageRetentionMessages 50 / cleanupBatches 5（短期正文与长期 value 不再按字数截断） | src/js/core/config.js:104 |
+| `MEMORY_LIMITS` | instant **60**(低水位 20，紧急上限 120) / shortTerm **40**(低水位 20，紧急上限 80，**靠整窗折叠而非截断**，写入只允许追加、近似合并只看队尾 5 条) / longTerm 无上限（仅时效 `applyMemoryDecay`） / pendingRecall 6 / analysisBatch=shortTerm(40) / summarySources=instant(60) / **auxiliaryMaxOutputTokens 8192** / nearDupSimilarity 0.72 / minMatchScore 1.5 / maxPerCategory 3 / imageRetentionMessages **60**(=instant，必须在窗口之外) / cleanupBatches **1**（短期正文与长期 value 不再按字数截断） | src/js/core/config.js:104 |
 | `API_LIMITS` | auxiliaryTimeoutMs 90000 / requestMetrics 60 / prefixSnapshots 12 | src/js/core/config.js:98 |
 | `PROMPT_LIMITS` | roleChars 8000 / memberChars 900 | src/js/core/config.js:113 |
-| `CONTEXT_BUDGET` | retrievedChars 1200 / summaryChars 1600 / sceneSummaries 2 / sceneInjectionChars 600 / sceneSpan 12 / volatileChars 6000 | src/js/core/config.js:173 |
+| ~~`CONTEXT_BUDGET`~~ | **已删除**：volatile 不再有区块预算（旧 retrievedChars 1200 / summaryChars 1600 / sceneSummaries 2 / sceneInjectionChars 600 / volatileChars 6000），改为整块注入 + 每条兜底上限 + 提示词软限制；场景条数走 `AppLimits.Scene.SUMMARIES`(2) | src/js/core/config.js:173 |
 | `LOREBOOK_LIMITS` | entries 200 / keywordsPerEntry 20 / nameChars 60 / contentChars 2000 / injectEntries 6 / injectChars 1400 / scanMessages 6 / autoEntriesPerPass 3 / evictionMisses 3 / consolidateSpan 8 / maxAlwaysActive 6 / nameSimilarity 0.5 / contentSimilarity 0.45 / mergeSentenceSimilarity 0.6 | src/js/core/config.js:159 |
 | `NARRATIVE_PATTERNS` | 10 条节奏骨架 | src/js/core/config.js:144 |
 | `DYNAMIC_STATE_FIELDS` | 6 个动态字段（原生：currentTone 取代 currentRelationship/currentImportantOthers） | src/js/core/config.js:119 |

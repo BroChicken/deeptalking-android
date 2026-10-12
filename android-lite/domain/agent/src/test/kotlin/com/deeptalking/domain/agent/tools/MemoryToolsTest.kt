@@ -127,6 +127,82 @@ class MemoryToolsTest {
     }
 
     @Test
+    fun `update_memory corrects a short term entry and requeues it`() = runBlocking {
+        val character = Character(
+            id = "c1",
+            instant = listOf(userTurn("u1", "不是那样，是你记错了")),
+            shortTerm = listOf(
+                ShortTermMemory(
+                    id = "s1",
+                    content = "用户2026-08-01上午把咖啡洒在角色身上",
+                    sourceMessageIds = listOf("u0"),
+                    eventTime = "2026-08-01T10:00:00Z",
+                ),
+                ShortTermMemory(
+                    id = "s2",
+                    content = "用户2026-08-01中午的另一件事",
+                    sourceMessageIds = listOf("u0"),
+                    eventTime = "2026-08-01T12:00:00Z",
+                ),
+            ),
+        )
+        val args = """{"id":"s1","value":"用户2026-08-01上午把水洒在角色身上","sourceMessageIds":["u1"],"evidence":"是你记错了"}"""
+        val result = UpdateMemoryTool(memory).execute(call("update_memory", args), context(character))
+
+        assertTrue(result.contentJson.contains("\"ok\":true"))
+        assertTrue(result.contentJson.contains("shortTerm"))
+        val updated = result.updatedCharacter!!
+        assertEquals(2, updated.shortTerm.size)
+        // Moved to the tail so the fold pass (which walks the window from the front)
+        // re-reads the corrected wording instead of keeping the old long-term copy.
+        assertEquals("s2", updated.shortTerm.first().id)
+        val corrected = updated.shortTerm.last()
+        assertEquals("s1", corrected.id)
+        assertTrue(corrected.content.contains("水"))
+        assertTrue("a correction invalidates both consumers", corrected.revision > 1)
+    }
+
+    @Test
+    fun `update_memory still requires the user's verbatim evidence for short term`() = runBlocking {
+        val character = Character(
+            id = "c1",
+            instant = listOf(userTurn("u1", "不是那样，是你记错了")),
+            shortTerm = listOf(ShortTermMemory(id = "s1", content = "用户洒了咖啡")),
+        )
+        val args = """{"id":"s1","value":"用户洒了水","sourceMessageIds":["u1"],"evidence":"我从没说过这句"}"""
+        val result = UpdateMemoryTool(memory).execute(call("update_memory", args), context(character))
+        assertTrue(result.contentJson.contains("\"ok\":false"))
+    }
+
+    @Test
+    fun `delete_memory removes a short term entry`() = runBlocking {
+        val character = Character(
+            id = "c1",
+            shortTerm = listOf(ShortTermMemory(id = "s1", content = "用户被记错的偏好")),
+        )
+        val result = DeleteMemoryTool(memory).execute(call("delete_memory", """{"id":"s1"}"""), context(character))
+        assertTrue(result.contentJson.contains("\"store\":\"shortTerm\""))
+        assertEquals(0, result.updatedCharacter!!.shortTerm.size)
+    }
+
+    @Test
+    fun `search_memory keyword recall also returns short term hits`() = runBlocking {
+        val character = Character(
+            id = "c1",
+            shortTerm = listOf(
+                ShortTermMemory(
+                    id = "s1",
+                    content = "用户2026-08-01下午提到下周要去看牙医",
+                    sourceMessageIds = listOf("u1"),
+                ),
+            ),
+        )
+        val result = SearchMemoryTool(memory).execute(call("search_memory", """{"query":"牙医"}"""), context(character))
+        assertTrue(result.contentJson.contains("\"shortTerm\""))
+        assertTrue(result.contentJson.contains("\"s1\""))
+    }
+
+    @Test
     fun `update_character_field rejects static fields on groups`() = runBlocking {
         val group = Character(id = "g1", isGroup = true)
         val args = """{"field":"gender","value":"女","sourceMessageIds":["m1"],"evidence":"改成女"}"""

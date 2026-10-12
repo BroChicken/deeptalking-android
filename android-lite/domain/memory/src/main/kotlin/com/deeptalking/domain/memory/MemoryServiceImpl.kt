@@ -81,7 +81,11 @@ class MemoryServiceImpl : MemoryService {
         longTerm: List<LongTermMemory>,
         memberLongTerm: Map<String, List<LongTermMemory>>,
     ): Character {
-        val mergedShortTerm = trimShortTerm(dedupeShortTerm(character.shortTerm + shortTerm))
+        // Append-only on purpose: the short-term window is only compacted by the fold
+        // pass (trimShortTerm at the high watermark). Compacting here would mutate the
+        // window mid-stable-period, so the injected block would change for a reason the
+        // request prefix cannot predict and the cache would miss on every write.
+        val mergedShortTerm = character.shortTerm + shortTerm
         val mergedLongTerm = mergeStores(character.longTerm, longTerm)
         val members = if (character.members.isEmpty()) {
             character.members

@@ -600,10 +600,16 @@ fun addShortTermMemory(
     val location = draft.location.trim().take(160)
     val identity = eventIdentity(eventTime)
     if (identity.isNotEmpty()) {
-        val existingIndex = list.indexOfFirst { item ->
+        // Local merge only: look for the same event in the newest few entries. Scanning
+        // the whole window would rewrite an entry in the middle of the block, and the
+        // injected short-term block must stay byte-stable between folds (a write in the
+        // middle invalidates the cached request prefix for a reason nothing can predict).
+        val mergeFrom = (list.size - AppLimits.Memory.SHORT_TERM_MERGE_WINDOW).coerceAtLeast(0)
+        val existingIndex = (mergeFrom until list.size).firstOrNull { index ->
+            val item = list[index]
             eventIdentity(item.eventTime) == identity &&
                 (item.content == text || areNearDuplicate(item.content, text))
-        }
+        } ?: -1
         if (existingIndex >= 0) {
             val existing = list[existingIndex]
             val mergedIds = (existing.sourceMessageIds + sourceIds).distinct()
@@ -634,7 +640,7 @@ fun addShortTermMemory(
         sourceRoles = sourceRoles,
         userEvidence = userEvidence,
     )
-    return ShortTermAddResult(trimShortTerm(list + item), true)
+    return ShortTermAddResult(list + item, true)
 }
 
 // ---- long-term upsert -----------------------------------------------------------------

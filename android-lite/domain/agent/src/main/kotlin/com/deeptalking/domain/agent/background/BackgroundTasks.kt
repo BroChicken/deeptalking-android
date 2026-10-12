@@ -45,7 +45,6 @@ import com.deeptalking.domain.memory.resolveDynamicStateSources
 import com.deeptalking.domain.memory.selfLearnMemoryImportance
 import com.deeptalking.domain.memory.parseRelativeText
 import com.deeptalking.domain.memory.resolveTimeRef
-import com.deeptalking.domain.memory.shouldCaptureUserTurn
 import com.deeptalking.domain.memory.TimeRef
 import com.deeptalking.domain.memory.trimInstant
 import com.deeptalking.domain.memory.trimShortTerm
@@ -79,6 +78,12 @@ internal data class ExtractSource(
     val role: String,
     val content: String,
     val timestamp: String? = null,
+    /**
+     * True when this message was already folded into short-term memory in an
+     * earlier pass. It still rides along as context (continuity), but the model must
+     * not produce a new entry for it.
+     */
+    val extracted: Boolean = false,
 )
 
 @Serializable
@@ -98,6 +103,12 @@ internal data class AnalysisInput(
     val participants: List<String> = emptyList(),
     val location: String = "",
     val userEvidence: List<SourceEvidence> = emptyList(),
+    /**
+     * True when this entry was already folded into long-term memory in an earlier
+     * pass. It still rides along as context (continuity), but the model must not
+     * produce a new long-term entry for it.
+     */
+    val analyzed: Boolean = false,
 )
 
 private data class PreparedPoint(
@@ -280,17 +291,6 @@ data class MemoryTaskGuard(
     val lastMessageId: String?,
 )
 
-/**
- * Batch sizes the short→long analysis escalates down through. The first rung is the
- * normal size; the others only run after a failure, because a smaller request yields
- * a smaller reply that cannot be cut off by the provider's output cap.
- */
-private val ANALYSIS_BATCH_LADDER = listOf(
-    AppLimits.Memory.ANALYSIS_ITEM_LIMIT,
-    AppLimits.Memory.ANALYSIS_ITEM_LIMIT / 2,
-    AppLimits.Memory.ANALYSIS_ITEM_LIMIT / 4,
-).filter { it > 0 }
-
 /** Outcome of one backlog-drain pass: the updated character plus whether it consumed a batch. */
 data class DrainOutcome(val character: Character, val progressed: Boolean)
 
@@ -358,13 +358,6 @@ class BackgroundTasks(
     private fun acknowledgedOf(root: JsonObject, analyzableIds: Set<String>): Set<String> =
         stringList(root["analyzedShortTermIds"]).map { it.trim() }.filter { it in analyzableIds }.toSet()
 
-    /**
-     * True when retrying with a smaller batch could plausibly help: the reply itself was
-     * unusable (cut off, or the id list was lost), as opposed to a transport failure.
-     */
-    private fun isRetryableAnalysisError(text: String): Boolean =
-        text.substringBefore(" | ") in setOf("unparsable", "no-acknowledged-ids")
-
     fun detectStyleViolations(
         reply: String,
         character: Character,
@@ -405,12 +398,17 @@ class BackgroundTasks(
         character: Character,
         migration: Boolean,
     ): Pair<TaskStatus, Character> {
-        if (character.instant.size <= 8) return TaskStatus.Failure to character
-        val extractableLimit = (character.instant.size - AppLimits.Memory.INSTANT_TRIM_FLOOR).coerceAtLeast(0)
-        val sourceMessages = character.instant.take(extractableLimit)
-            .filter { !it.isLoading && it.extractedAt == null }
+        // Whole-window pass (high/low watermark): the window is folded in one go at
+        // the high watermark, so the already-extracted head only rides along as
+        // context and the pending tail is what produces entries. Trim safety relies on
+        // coverage being a contiguous run starting at the first pending message, so an
+        // unfinished reply can never drop a message that was never summarised.
+        val window = character.instant
+            .filter { !it.isLoading }
             .take(AppLimits.Memory.SUMMARY_SOURCES)
-        if (sourceMessages.isEmpty()) return TaskStatus.Failure to character
+        val pendingStart = window.indexOfFirst { it.extractedAt == null }
+        if (pendingStart < 0 || window.size - pendingStart < 2) return TaskStatus.Failure to character
+        val sourceMessages = window
 
         val recentIdentities = character.shortTerm
             .sortedByDescending { parseZoned(it.eventTime)?.toInstant()?.toEpochMilli() ?: 0L }
@@ -429,6 +427,7 @@ class BackgroundTasks(
                 role = message.role.name.lowercase(),
                 content = trimText(message.content, 600),
                 timestamp = message.timestamp,
+                extracted = message.extractedAt != null,
             )
         }
         val countClause = if (migration) EXTRACTION_COUNT_UNLIMITED else EXTRACTION_COUNT_LIMITED
@@ -471,14 +470,16 @@ class BackgroundTasks(
         }
         if (covered.isEmpty()) return TaskStatus.Failure to character
 
-        var coveredPrefixLength = 0
-        while (coveredPrefixLength < sourceMessages.size && covered.contains(sourceMessages[coveredPrefixLength].id)) {
-            coveredPrefixLength++
+        // Only the pending zone is folded. Coverage must be a contiguous run starting
+        // at the first pending message; a point counts when it covers at least one
+        // contiguously covered pending message (it may additionally cite context
+        // messages for an ongoing event).
+        var coveredEnd = pendingStart
+        while (coveredEnd < sourceMessages.size && covered.contains(sourceMessages[coveredEnd].id)) {
+            coveredEnd++
         }
-        val filtered = if (coveredPrefixLength > 0) {
-            prepared.filter { it.firstIndex < coveredPrefixLength }
-        } else {
-            prepared
+        val filtered = prepared.filter { point ->
+            point.sourceMessageIds.any { id -> (sourceIndexes[id] ?: -1) in pendingStart until coveredEnd }
         }
         if (filtered.isEmpty()) return TaskStatus.Failure to character
 
@@ -558,32 +559,18 @@ class BackgroundTasks(
         }
     }
 
-    private suspend fun analyzeShortToLongTermTask(character: Character): Pair<TaskStatus, Character> {
-        // Escalating batches: a smaller request produces a smaller reply, which is how
-        // a reply cut off by the provider's output cap is still processed. Before this
-        // ladder the oversized reply failed the pass every time, nothing was ever
-        // stamped `analyzedAt`, and short-term memory could never be trimmed.
-        var firstFailure: Pair<TaskStatus, Character>? = null
-        for (batchSize in ANALYSIS_BATCH_LADDER) {
-            val (status, updated) = analyzeShortTermBatch(character, batchSize)
-            if (status == TaskStatus.Success || status == TaskStatus.Stale) return status to updated
-            // Keep the first (most specific) diagnostic rather than overwriting it with
-            // the less informative failure of a later, smaller attempt.
-            if (firstFailure == null) firstFailure = status to updated
-            if (!isRetryableAnalysisError(updated.counters.analysisLastError)) break
-        }
-        return firstFailure ?: (TaskStatus.Failure to character)
-    }
+    private suspend fun analyzeShortToLongTermTask(character: Character): Pair<TaskStatus, Character> =
+        analyzeShortTermBatch(character)
 
-    /** One analysis request over at most [batchSize] short-term items. */
-    private suspend fun analyzeShortTermBatch(character: Character, batchSize: Int): Pair<TaskStatus, Character> {
-        val analyzeLimit = (character.shortTerm.size - AppLimits.Memory.SHORT_TERM_TRIM_FLOOR).coerceAtLeast(0)
-        val items = character.shortTerm.take(analyzeLimit)
-            .filter { it.analyzedAt == null || it.analyzedRevision != it.revision }
-            .take(batchSize)
-        if (items.isEmpty()) return TaskStatus.Failure to character
+    /** One whole-window analysis request over the short-term window (see [AppLimits.Memory.ANALYSIS_BATCH]). */
+    private suspend fun analyzeShortTermBatch(character: Character): Pair<TaskStatus, Character> {
+        // Whole-window pass: the window is carried in full so the low-water leftovers
+        // are re-read as context (continuity); only the pending items produce entries.
+        val window = character.shortTerm.take(AppLimits.Memory.ANALYSIS_BATCH)
+        val pending = window.filter { it.analyzedAt == null || it.analyzedRevision != it.revision }
+        if (pending.isEmpty()) return TaskStatus.Failure to character
 
-        val inputs = items.map { item ->
+        val inputs = window.map { item ->
             AnalysisInput(
                 id = item.id,
                 content = item.content,
@@ -592,6 +579,7 @@ class BackgroundTasks(
                 participants = item.participants,
                 location = item.location,
                 userEvidence = item.userEvidence,
+                analyzed = item.analyzedAt != null && item.analyzedRevision == item.revision,
             )
         }
         val prompt = ANALYSIS_PROMPT_HEAD + json.encodeToString(inputs) + ANALYSIS_PROMPT_TAIL
@@ -605,7 +593,7 @@ class BackgroundTasks(
         if (parsed != null && parsed["status"] != null && !parsed.string("status").equals("ok", ignoreCase = true)) {
             return TaskStatus.Failure to character.withAnalysisError("status=" + parsed.string("status"), raw)
         }
-        val analyzableIds = items.map { it.id }.toSet()
+        val analyzableIds = pending.map { it.id }.toSet()
         fun hasElements(candidate: JsonObject): Boolean =
             (candidate["longTerm"] as? JsonArray)?.isNotEmpty() == true
         fun hasAck(candidate: JsonObject): Boolean =
@@ -641,7 +629,7 @@ class BackgroundTasks(
             val item = parseLongTerm(obj)
             val sourceShortTermIds = stringList(obj["sourceShortTermIds"]).map { it.trim() }.filter { it.isNotEmpty() }.distinct()
             if (sourceShortTermIds.isEmpty() || sourceShortTermIds.any { it !in acknowledged }) continue
-            val claimed = items.filter { it.id in sourceShortTermIds }
+            val claimed = window.filter { it.id in sourceShortTermIds }
             val allowedMessageIds = claimed.flatMap { it.sourceMessageIds }.toSet()
             val itemMessageIds = item.sourceMessageIds.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
             if (itemMessageIds.isEmpty() || itemMessageIds.any { it !in allowedMessageIds }) continue
@@ -687,11 +675,31 @@ class BackgroundTasks(
     /** Outcome of a memory sub-task: Success updates state, Failure retries, Stale aborts. */
     enum class TaskStatus { Success, Failure, Stale }
 
-    /** Applies the legacy window trims (instant FIFO + short-term retention). */
-    private fun trimMemory(character: Character): Character = character.copy(
-        instant = trimInstant(character.instant),
-        shortTerm = trimShortTerm(character.shortTerm),
-    )
+    /**
+     * Applies the high/low watermark trims (instant FIFO + short-term retention) plus
+     * the emergency ceilings.
+     *
+     * The ceilings are only reached when a fold keeps failing: without them a
+     * permanently failing pass would grow the window without bound (the historical
+     * pile-up). Hitting one is reported through `counters.analysisLastError`, so
+     * dropped content is never silent.
+     */
+    private fun trimMemory(character: Character): Character {
+        val instantOverflow = (character.instant.size - AppLimits.Memory.INSTANT_HARD_CAP).coerceAtLeast(0)
+        val shortOverflow = (character.shortTerm.size - AppLimits.Memory.SHORT_TERM_HARD_CAP).coerceAtLeast(0)
+        var working = character
+        if (instantOverflow > 0) working = working.copy(instant = working.instant.drop(instantOverflow))
+        if (shortOverflow > 0) working = working.copy(shortTerm = working.shortTerm.drop(shortOverflow))
+        if (instantOverflow > 0 || shortOverflow > 0) {
+            working = working.withAnalysisError(
+                "window-overflow: dropped $instantOverflow instant / $shortOverflow short-term (fold failing)",
+            )
+        }
+        return working.copy(
+            instant = trimInstant(working.instant),
+            shortTerm = trimShortTerm(working.shortTerm),
+        )
+    }
 
     /** Captures the revision/last-message snapshot for the stale guard (legacy `captureMemoryTask`). */
     private fun captureGuard(character: Character): MemoryTaskGuard = MemoryTaskGuard(
@@ -898,8 +906,10 @@ class BackgroundTasks(
 
     /**
      * Applies one parsed memory-update object (legacy `applyMemoryUpdate`):
-     * short-term writes go through [addShortTermMemory], long-term through
-     * [upsertLongTermMemory], and `dynamicState` through the source-evidence gate.
+     * long-term writes go through [upsertLongTermMemory] and `dynamicState` through
+     * the source-evidence gate. Short-term writes are deliberately *not* handled here:
+     * the window is only appended to by the single whole-window extraction pass (see
+     * `scheduleTurn`), so `shortTerm` in a model reply update is ignored.
      * `staticFields` / `memberDynamicState` / `promiseUpdates` are handled by the
      * orchestrator, not here.
      */
@@ -911,24 +921,6 @@ class BackgroundTasks(
     ): Character {
         var working = character
         val nowBase = ZonedDateTime.now()
-        (update["shortTerm"] as? JsonArray)?.forEach { element ->
-            val obj = element as? JsonObject ?: return@forEach
-            val rawIds = stringList(obj["sourceMessageIds"])
-            val ids = if (allowedSourceIds == null) rawIds else rawIds.filter { it in allowedSourceIds }
-            val draft = ShortTermDraft(
-                content = obj.string("content"),
-                sourceMessageIds = ids,
-                eventTime = resolveEventTime(
-                    (obj["eventTime"] as? JsonPrimitive)?.contentOrNull,
-                    ResponseParser.parseTimeRef(obj),
-                    nowBase,
-                ),
-                participants = stringList(obj["participants"]),
-                location = obj.string("location"),
-            )
-            val result = addShortTermMemory(working.shortTerm, draft, null, knownSources(working))
-            if (result.accepted) working = working.copy(shortTerm = result.list)
-        }
         (update["longTerm"] as? JsonArray)?.forEach { element ->
             val obj = element as? JsonObject ?: return@forEach
             var item = resolveLongTermTimeRef(parseLongTerm(obj), ResponseParser.parseTimeRef(obj), nowBase)
@@ -1407,8 +1399,10 @@ class BackgroundTasks(
         val nowMillis = System.currentTimeMillis()
         val lastUser = working.instant.lastOrNull { it.role == Role.User && !it.isLoading }
 
-        // Extraction (only at the legacy high watermark), with backoff on failure.
-        var extractedSomething = false
+        // Extraction: the *only* producer of short-term memory (the single whole-window
+        // pass at the high watermark). Nothing else may append to the window in
+        // between, which is what keeps the injected short-term block byte-stable while
+        // the history grows (cache hit) and lets its changes ride along with the fold.
         if (working.instant.size >= AppLimits.Memory.INSTANT &&
             canRunMemoryTask(counters, MemoryTaskKind.Extraction, nowMillis)
         ) {
@@ -1416,7 +1410,6 @@ class BackgroundTasks(
             when (extractStatus) {
                 TaskStatus.Success -> {
                     working = extracted
-                    extractedSomething = true
                     counters = resetMemoryRetry(counters, MemoryTaskKind.Extraction)
                 }
                 TaskStatus.Failure -> counters = scheduleMemoryRetry(counters, MemoryTaskKind.Extraction, nowMillis)
@@ -1425,31 +1418,15 @@ class BackgroundTasks(
         }
 
         // Prose reply fallback (legacy `convertProseToJson` + `extractProseTurnMemory`):
-        // a non-structured reply still gets its memory extracted in the background.
+        // a non-structured reply still gets its long-term facts / dynamic state
+        // extracted in the background. Short-term writes were removed here on purpose —
+        // entries would land mid-window and break the append-only property.
         if (proseFallback && lastUser != null) {
             val assistantMsg = messages.lastOrNull { it.role == Role.Assistant && !it.isLoading }
             if (assistantMsg != null) {
                 val proseUpdated = extractProseTurnMemory(working, lastUser, reply, assistantMsg)
-                if (proseUpdated != working) {
-                    working = proseUpdated
-                    extractedSomething = true
-                }
+                if (proseUpdated != working) working = proseUpdated
             }
-        }
-
-        // Fallback capture when even the prose pass produced nothing (legacy `shouldCaptureUserTurn`).
-        if (!extractedSomething && lastUser != null && shouldCaptureUserTurn(lastUser.content)) {
-            val capture = addShortTermMemory(
-                list = working.shortTerm,
-                draft = ShortTermDraft(
-                    content = "本轮事件：用户表示“" + lastUser.content + "”。尚未形成更完整的事件经过。",
-                    sourceMessageIds = listOf(lastUser.id),
-                    eventTime = lastUser.timestamp,
-                ),
-                timestamp = lastUser.timestamp,
-                sources = knownSources(working),
-            )
-            if (capture.accepted) working = working.copy(shortTerm = capture.list)
         }
 
         // Consolidate short-term events into long-term memories (legacy analyzeShortToLongTerm).
@@ -1646,15 +1623,15 @@ class BackgroundTasks(
         const val EXTRACTION_COUNT_UNLIMITED = "不限事件数量，尽可能完整覆盖本批全部消息。"
 
         const val EXTRACTION_PROMPT_HEAD =
-            "分析以下带消息ID和时间戳的即时对话，压缩为事件流程摘要。事件按“日期+时段”划分：时段只有深夜、凌晨、清晨、早晨、上午、中午、下午、傍晚、晚上、夜里十种，且一天从02:00起算（00:00-02:00算前一天的深夜）；同一天同一时段的多个事情视为同一事件，按时间线集中叙述（如“2026-08-01 下午在家先…晚上…”）。同一时段也可能有不同事件，按事实或持续话题区分，不得把无关事件强行合并；同一事件内用时间线连接各阶段，保留仍然有效的关键细节、结果与未决事项。**只保留会影响后续剧情的内容**：谁做了什么、学到或决定了什么，地点/物品/伤势/关系的变化，新的发现或线索，以及仍未解决的目标、承诺、威胁与期限；一次性的寒暄、当下的情绪起伏、闲聊过程一律不记。**每条content不超过120字**，用平实的叙述句写成，禁止文学化描写、比喻、形容词铺陈与对白原文。eventTime写该事件的真实ISO时间，participants为参与人列表，location写地点（没有明确地点写“未说明”）。若内容是“最近短期事件”中某事件的延续，必须原样复用该事件的eventTime、participants和location，并把旧摘要与本批新进展重新组织成一段完整的更新后摘要；系统保留已有摘要并追加新事实，因此不能只返回新增片段：旧摘要中**仍然有效**的信息（未过期的约定、未解决的事、仍然成立的关系与状态）必须原样保留，只丢弃已经过时或已被推翻的部分。content按时间和因果顺序书写，不要逐字摘录。content必须写明是谁做的：涉及用户写“用户”，涉及角色写角色名（群组写具体成员名），双方共同的事写清各自做了什么，禁止使用“我、你、TA、他、她”这类指代不清的代词。content中禁止使用“今天、昨天、明天、今晚、今晚、刚刚、刚才、现在、最近、这几天”等相对时间词，一律使用具体日期（如“8月1日下午”）或事件本身描述。每条sourceMessageIds只能引用本批输入消息ID，旧摘要的来源由系统保留。必须覆盖全部输入消息：从第一条到最后一个已处理消息之间的每个消息ID都必须至少出现在一个事件的sourceMessageIds中，不能跳过中间消息，不得遗漏。"
+            "分析以下带消息ID和时间戳的即时对话，压缩为事件流程摘要。事件按“日期+时段”划分：时段只有深夜、凌晨、清晨、早晨、上午、中午、下午、傍晚、晚上、夜里十种，且一天从02:00起算（00:00-02:00算前一天的深夜）；同一天同一时段的多个事情视为同一事件，按时间线集中叙述（如“2026-08-01 下午在家先…晚上…”）。同一时段也可能有不同事件，按事实或持续话题区分，不得把无关事件强行合并；同一事件内用时间线连接各阶段，保留仍然有效的关键细节、结果与未决事项。**只保留会影响后续剧情的内容**：谁做了什么、学到或决定了什么，地点/物品/伤势/关系的变化，新的发现或线索，以及仍未解决的目标、承诺、威胁与期限；一次性的寒暄、当下的情绪起伏、闲聊过程一律不记。**每条content不超过120字**，用平实的叙述句写成，禁止文学化描写、比喻、形容词铺陈与对白原文。eventTime写该事件的真实ISO时间，participants为参与人列表，location写地点（没有明确地点写“未说明”）。若内容是“最近短期事件”中某事件的延续，必须原样复用该事件的eventTime、participants和location，并把旧摘要与本批新进展重新组织成一段完整的更新后摘要；系统保留已有摘要并追加新事实，因此不能只返回新增片段：旧摘要中**仍然有效**的信息（未过期的约定、未解决的事、仍然成立的关系与状态）必须原样保留，只丢弃已经过时或已被推翻的部分。content按时间和因果顺序书写，不要逐字摘录。content必须写明是谁做的：涉及用户写“用户”，涉及角色写角色名（群组写具体成员名），双方共同的事写清各自做了什么，禁止使用“我、你、TA、他、她”这类指代不清的代词。content中禁止使用“今天、昨天、明天、今晚、今晚、刚刚、刚才、现在、最近、这几天”等相对时间词，一律使用具体日期（如“8月1日下午”）或事件本身描述。每条sourceMessageIds只能引用该条目实际依据的消息ID，旧摘要的来源由系统保留。输入中每条消息带 extracted 标记：**只为 extracted=false 的消息产出事件条目**；extracted=true 的是前一轮已整理过的上下文，只用于理解剧情连贯，不得引用它们的ID，也不得为它们产出条目。必须覆盖全部 extracted=false 的消息：它们之间的每个消息ID都必须至少出现在一个事件的sourceMessageIds中，不能跳过中间消息，不得遗漏。"
 
         const val EXTRACTION_PROMPT_TAIL =
             "返回JSON数组：[{\"content\":\"一段完整的更新后事件流程摘要\",\"eventTime\":\"ISO时间\",\"participants\":[\"用户\",\"角色名\"],\"location\":\"地点或未说明\",\"sourceMessageIds\":[\"msg_id\"]}]。\n最近短期事件:\n"
 
         const val ANALYSIS_PROMPT_HEAD =
-            "分析以下带短期ID、来源消息ID、userEvidence及时间/人物/地点三要素的事件流程摘要，提取未来仍有价值的稳定事实。**价值判据**：只有能跨轮复用、会影响后续对话或关系、或用户明确表达过的信息才记（长期偏好、重要人物与关系、承诺与约定、反复出现的习惯、持续的情节线）；一次性的寒暄客套、当下的情绪起伏、可以随口重说的闲聊、纯场景描写一律不记。**证据不足宁可不记**，不要为了产出而脑补或推演。必须检查全部输入条目，并在analyzedShortTermIds中原样返回全部输入的短期ID；不得遗漏、增加或重复。合并重复或冲突条目；事件、承诺保留必要日期；普通寒暄不要进入长期记忆。每条长期记忆必须在sourceShortTermIds中列出它实际使用的短期条目id；每个列出的短期条目都必须至少贡献一个sourceMessageIds中的消息ID，否则不要列出该短期ID。sourceMessageIds只选择直接支持该事实的消息，不要复制短期条目的全部来源；userProfile和habits只能选择用户消息。evidence只能逐字引用被选择消息对应的userEvidence.text，不能引用摘要或改写。没有可引用的userEvidence时不要输出该条。events按“日期+时段+事实主题”区分：同一天同一时段（深夜/凌晨/清晨/早晨/上午/中午/下午/傍晚/晚上/夜里，一天从02:00起算）的短期事件合并为一条长期事件，同一时段的独立事实不得互相覆盖，key须标明稳定事实主题；合并时eventTime取最早的ISO时间，participants取并集，location取最新（无明确地点写“未说明”）。剧情弧线：若若干短期事件属于同一持续情节或话题线（同一人物线、同一持续事件、同一反复出现的话题），除按时间合并外，还应在其中一条事件条目上标注arcOf（该情节的持续话题或人物线名称，稳定可复用）与arcStage（只能是起始/发展/转折/现状之一，按情节推进阶段标注），arcOf命名一旦确定就保持稳定——同一情节线不得每轮改名或另起新名，续写时沿用已有名称；并将value整合成按时间顺序、带情绪起伏的叙事摘要；同一arcOf只允许一条带弧线标注的条目，其余同线条目按普通事件输出。无论是否提取出长期记忆，成功完成分析都必须返回status:\"ok\"；没有长期价值时仍需返回完整analyzedShortTermIds和空longTerm。\n分类规则：userProfile/habits仅限用户事实，subject=user；relationship仅限双方关系，subject=relationship；events只记录用户陈述或共同事件；promises只记录用户明确承诺或双方明确约定。promises在此处只能新建为active；完成或取消由主对话的promiseUpdates按承诺ID处理。存在明确期限才填写dueAt。\n条目:\n"
+            "分析以下带短期ID、来源消息ID、userEvidence及时间/人物/地点三要素的事件流程摘要，提取未来仍有价值的稳定事实。输入中每条条目带 analyzed 标记：**只为 analyzed=false 的条目产出长期记忆**；analyzed=true 的是前一轮已整理过的上下文，只用于保持情节连贯（可据此合并或修正），不得为它们重复产出条目，也不要在 analyzedShortTermIds 中返回它们。**价值判据**：只有能跨轮复用、会影响后续对话或关系、或用户明确表达过的信息才记（长期偏好、重要人物与关系、承诺与约定、反复出现的习惯、持续的情节线）；一次性的寒暄客套、当下的情绪起伏、可以随口重说的闲聊、纯场景描写一律不记。**证据不足宁可不记**，不要为了产出而脑补或推演。必须检查全部 analyzed=false 的条目，并在analyzedShortTermIds中原样返回它们的短期ID；不得遗漏、增加或重复。**每条 value 不超过200字，arc 叙事摘要不超过300字**，写成平实叙述，不堆砌形容词。合并重复或冲突条目；事件、承诺保留必要日期；普通寒暄不要进入长期记忆。每条长期记忆必须在sourceShortTermIds中列出它实际使用的短期条目id；每个列出的短期条目都必须至少贡献一个sourceMessageIds中的消息ID，否则不要列出该短期ID。sourceMessageIds只选择直接支持该事实的消息，不要复制短期条目的全部来源；userProfile和habits只能选择用户消息。evidence只能逐字引用被选择消息对应的userEvidence.text，不能引用摘要或改写。没有可引用的userEvidence时不要输出该条。events按“日期+时段+事实主题”区分：同一天同一时段（深夜/凌晨/清晨/早晨/上午/中午/下午/傍晚/晚上/夜里，一天从02:00起算）的短期事件合并为一条长期事件，同一时段的独立事实不得互相覆盖，key须标明稳定事实主题；合并时eventTime取最早的ISO时间，participants取并集，location取最新（无明确地点写“未说明”）。剧情弧线：若若干短期事件属于同一持续情节或话题线（同一人物线、同一持续事件、同一反复出现的话题），除按时间合并外，还应在其中一条事件条目上标注arcOf（该情节的持续话题或人物线名称，稳定可复用）与arcStage（只能是起始/发展/转折/现状之一，按情节推进阶段标注），arcOf命名一旦确定就保持稳定——同一情节线不得每轮改名或另起新名，续写时沿用已有名称；并将value整合成按时间顺序、带情绪起伏的叙事摘要；同一arcOf只允许一条带弧线标注的条目，其余同线条目按普通事件输出。无论是否提取出长期记忆，成功完成分析都必须返回status:\"ok\"；没有长期价值时仍需返回完整analyzedShortTermIds和空longTerm。\n分类规则：userProfile/habits仅限用户事实，subject=user；relationship仅限双方关系，subject=relationship；events只记录用户陈述或共同事件；promises只记录用户明确承诺或双方明确约定。promises在此处只能新建为active；完成或取消由主对话的promiseUpdates按承诺ID处理。存在明确期限才填写dueAt。\n条目:\n"
 
         const val ANALYSIS_PROMPT_TAIL =
-            "\n\n返回JSON格式:\n{\"status\":\"ok\",\"analyzedShortTermIds\":[\"全部输入的short_id\"],\"longTerm\": [{\"category\": \"...\", \"subject\": \"user|relationship|world\", \"key\": \"稳定且可复用的标识\", \"value\": \"...\", \"tags\": [...], \"importance\": 1-10, \"sourceShortTermIds\":[\"short_id\"], \"sourceMessageIds\": [\"msg_id\"], \"evidence\": \"被选择用户消息中的逐字原话\", \"eventTime\": \"ISO时间\", \"participants\":[\"参与者\"],\"location\":\"地点或未说明\",\"status\": \"active\", \"dueAt\": \"ISO时间\", \"arcOf\": \"可选，持续情节线名称\", \"arcStage\": \"可选，起始/发展/转折/现状\"}]}\ncategory可选: userProfile, relationship, events, promises, habits。value同样必须写明主体：涉及用户写“用户”，涉及角色写角色名（群组写具体成员名），禁止“我/你/TA”这类指代不清的代词。key与value中的时间一律写绝对日期（YYYY-MM-DD 或 YYYY-MM-DD 时段），禁止“明天/明晚/上周/上个月/三天后”这类相对时间词。这里只提取用户的约定（promises 的 promisor=user、promisor与promisee只能是 user 或 character）；角色单方承诺由主对话记录，不在此处提取。"
+            "\n\n返回JSON格式:\n{\"status\":\"ok\",\"analyzedShortTermIds\":[\"全部 analyzed=false 的 short_id\"],\"longTerm\": [{\"category\": \"...\", \"subject\": \"user|relationship|world\", \"key\": \"稳定且可复用的标识\", \"value\": \"...\", \"tags\": [...], \"importance\": 1-10, \"sourceShortTermIds\":[\"short_id\"], \"sourceMessageIds\": [\"msg_id\"], \"evidence\": \"被选择用户消息中的逐字原话\", \"eventTime\": \"ISO时间\", \"participants\":[\"参与者\"],\"location\":\"地点或未说明\",\"status\": \"active\", \"dueAt\": \"ISO时间\", \"arcOf\": \"可选，持续情节线名称\", \"arcStage\": \"可选，起始/发展/转折/现状\"}]}\ncategory可选: userProfile, relationship, events, promises, habits。value同样必须写明主体：涉及用户写“用户”，涉及角色写角色名（群组写具体成员名），禁止“我/你/TA”这类指代不清的代词。key与value中的时间一律写绝对日期（YYYY-MM-DD 或 YYYY-MM-DD 时段），禁止“明天/明晚/上周/上个月/三天后”这类相对时间词。这里只提取用户的约定（promises 的 promisor=user、promisor与promisee只能是 user 或 character）；角色单方承诺由主对话记录，不在此处提取。"
     }
 }

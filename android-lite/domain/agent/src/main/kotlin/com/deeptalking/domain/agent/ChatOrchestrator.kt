@@ -15,6 +15,7 @@ import com.deeptalking.domain.agent.prompts.DYNAMIC_STATE_FIELDS
 import com.deeptalking.domain.agent.prompts.PersonaInputs
 import com.deeptalking.domain.agent.prompts.RequestBuilder
 import com.deeptalking.domain.agent.prompts.STATIC_PROFILE_FIELDS
+import com.deeptalking.domain.agent.prompts.buildShortTermBlock
 import com.deeptalking.domain.agent.prompts.buildSystemPrompt
 import com.deeptalking.domain.agent.prompts.buildVolatileContext
 import com.deeptalking.domain.agent.prompts.withDynamicField
@@ -134,7 +135,17 @@ class ChatOrchestrator(
             role = Role.User,
             content = "【系统提供的本轮上下文，仅供角色理解，不代表用户陈述】\n" + volatileContext,
         )
-        val input = mapped + contextMessage
+        // The short-term window is prepended, *before* the history. The window is only
+        // appended to by the fold pass, so between folds the block is byte-identical and
+        // the cached request prefix covers it; when it does change the history was
+        // rebased by that same fold, so the prefix was already broken (see
+        // `buildShortTermBlock`).
+        val shortTermBlock = buildShortTermBlock(character)
+        val input = if (shortTermBlock.isNotEmpty()) {
+            listOf(ChatMessage(role = Role.User, content = shortTermBlock)) + mapped + contextMessage
+        } else {
+            mapped + contextMessage
+        }
 
         val autoTools = tools.definitions(context)
         val submitTool = SubmitResponseTool().definition
@@ -162,12 +173,12 @@ class ChatOrchestrator(
             else -> ResponseParser.parseTurnFromText(outcome.text)
         }
         // Prose/salvage turns may still carry a legacy `<MEM_UPDATE>` block; parse and
-        // fold it in before applying memory (legacy `parseMemoryFromText`).
+        // fold its long-term / dynamic-state parts in (legacy `parseMemoryFromText`).
+        // `shortTerm` inside such a block is ignored: the short-term window is only
+        // appended to by the whole-window extraction pass.
         val memUpdate = if (parsedBase.raw == null) ResponseParser.parseMemoryFromText(outcome.text) else null
         val parsed = if (memUpdate != null) {
             parsedBase.copy(
-                shortTerm = memUpdate.shortTerm,
-                shortTermTimeRefs = memUpdate.shortTermTimeRefs,
                 longTerm = memUpdate.longTerm,
                 longTermTimeRefs = memUpdate.longTermTimeRefs,
                 dynamicState = memUpdate.dynamicState,
@@ -247,9 +258,11 @@ class ChatOrchestrator(
             content = displayReply,
             styleViolations = styleViolations,
         )
-        val instantWindow = (history.filter { !it.rejected } + assistantMessage).let {
-            if (it.size > AppLimits.Memory.INSTANT) it.takeLast(AppLimits.Memory.INSTANT) else it
-        }
+        // Append-only: the window grows with the turn and is only compacted by the fold
+        // pass (`trimInstant` at the high watermark). Clamping here would drop the oldest
+        // message outside a fold — before it was ever folded (silent loss) and in the
+        // middle of a stable period (a cache miss the request prefix cannot predict).
+        val instantWindow = history.filter { !it.rejected } + assistantMessage
         val characterWithInstant = updated.copy(instant = instantWindow, revision = character.revision + 1)
 
         if (backgroundTasks != null && runBackgroundTasks) {
@@ -352,7 +365,10 @@ class ChatOrchestrator(
         assistantMessage: ChatMessage,
     ): Character {
         val nowBase = ZonedDateTime.now()
-        var updated = applyShortTerm(character, parsed, nowBase)
+        // Short-term memory is *not* written from the turn: `parsed.shortTerm` is
+        // ignored so the window is only appended to by the whole-window extraction
+        // pass (which is what keeps the injected block stable between folds).
+        var updated = character
         val sources = knownSources(updated)
 
         updated = applyLongTerm(updated, parsed, sources, assistantMessage, nowBase)
@@ -406,46 +422,6 @@ class ChatOrchestrator(
         }
 
         return resolveMemoryConflicts(updated)
-    }
-
-    /**
-     * Validated short-term writes through [addShortTermMemory] (legacy `addShortTermMemory`
-     * from the main turn): every cited source must resolve to a real message, relative
-     * time wording is normalized, and `timeRef` is resolved to an absolute event time.
-     */
-    private fun applyShortTerm(character: Character, parsed: ParsedTurn, nowBase: ZonedDateTime): Character {
-        if (parsed.shortTerm.isEmpty()) return character
-        val nowIso = nowBase.toInstant().toString()
-        var working = character
-        parsed.shortTerm.forEachIndexed { index, item ->
-            val eventTime = resolveEventTime(item.eventTime, parsed.shortTermTimeRefs.getOrNull(index), nowBase, nowIso)
-            val result = addShortTermMemory(
-                list = working.shortTerm,
-                draft = ShortTermDraft(
-                    content = item.content,
-                    sourceMessageIds = item.sourceMessageIds,
-                    eventTime = eventTime,
-                    participants = item.participants,
-                    location = item.location,
-                ),
-                timestamp = nowIso,
-                sources = knownSources(working),
-            )
-            if (result.accepted) working = working.copy(shortTerm = result.list)
-        }
-        return working
-    }
-
-    /** Resolves a short-term `timeRef` against its declared/now event time (legacy write order). */
-    private fun resolveEventTime(
-        eventTime: String?,
-        timeRef: TimeRef?,
-        nowBase: ZonedDateTime,
-        nowIso: String,
-    ): String {
-        val base = parseZoned(eventTime) ?: nowBase
-        resolveTimeRef(timeRef, base)?.iso?.let { return it }
-        return parseZoned(eventTime)?.toInstant()?.toString() ?: nowIso
     }
 
     /** Applies one `dynamicState` object through the field cleaning + evidence gate. */

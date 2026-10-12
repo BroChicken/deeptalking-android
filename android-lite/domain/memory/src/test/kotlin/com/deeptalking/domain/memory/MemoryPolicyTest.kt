@@ -1,5 +1,6 @@
 package com.deeptalking.domain.memory
 
+import com.deeptalking.core.common.AppLimits
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.LongTermMemory
@@ -18,6 +19,77 @@ import java.time.Instant
 class MemoryPolicyTest {
 
     private fun user(id: String, content: String) = ChatMessage(id = id, role = Role.User, content = content)
+
+    @Test
+    fun trimInstantDropsToTheLowWatermarkOnlyAtTheHighWatermark() {
+        val items = (1..AppLimits.Memory.INSTANT).map { i ->
+            ChatMessage(id = "m$i", role = Role.User, content = "消息$i", extractedAt = "done")
+        }
+        // At the high watermark the whole already-extracted head drops to the low watermark
+        // in one pass (this is the fold: the history is rebased once, not every turn).
+        assertEquals(
+            AppLimits.Memory.INSTANT_TRIM_FLOOR,
+            trimInstant(items).size,
+        )
+        // Below the high watermark nothing is dropped at all.
+        val under = items.dropLast(1)
+        assertEquals(under.size, trimInstant(under).size)
+    }
+
+    @Test
+    fun addShortTermMemoryNeverCompactsTheWindowOnWrite() {
+        val character = Character(id = "c1", instant = listOf(user("u1", "用户喜欢咖啡")))
+        val full = (1..AppLimits.Memory.SHORT_TERM).map { i ->
+            ShortTermMemory(
+                id = "s$i",
+                content = "用户2026-08-0${(i % 9) + 1}上午的事件$i",
+                sourceMessageIds = listOf("u1"),
+                eventTime = "2026-08-01T0${i % 10}:00:00Z",
+            )
+        }
+        val result = addShortTermMemory(
+            list = full,
+            draft = ShortTermDraft(content = "用户2026-08-01下午的新事件", sourceMessageIds = listOf("u1")),
+            timestamp = "2026-08-01T15:00:00Z",
+            sources = knownSources(character),
+        )
+        assertTrue(result.accepted)
+        // Compaction belongs to the fold pass: a write must only append, or the injected
+        // window would change mid-stable-period (and the cached prefix would miss).
+        assertEquals(full.size + 1, result.list.size)
+    }
+
+    @Test
+    fun addShortTermMemoryMergesOnlyWithinTheTailWindow() {
+        val character = Character(id = "c1", instant = listOf(user("u1", "用户在家看书")))
+        val sources = knownSources(character)
+        val head = ShortTermMemory(
+            id = "s0",
+            content = "用户在家看书",
+            sourceMessageIds = listOf("u1"),
+            eventTime = "2026-08-01T10:00:00Z",
+        )
+        val filler = (1..AppLimits.Memory.SHORT_TERM_MERGE_WINDOW + 1).map { i ->
+            ShortTermMemory(
+                id = "f$i",
+                content = "用户2026-08-0${(i % 9) + 1}上午的另一件事",
+                sourceMessageIds = listOf("u1"),
+                eventTime = "2026-08-0${(i % 9) + 1}T11:00:00Z",
+            )
+        }
+        val draft = ShortTermDraft(
+            content = "用户在家看书",
+            sourceMessageIds = listOf("u1"),
+            eventTime = "2026-08-01T10:00:00Z",
+        )
+        // Far from the tail: appends instead of rewriting the middle of the block.
+        val appended = addShortTermMemory(listOf(head) + filler, draft, "2026-08-01T10:00:00Z", sources)
+        assertTrue(appended.accepted)
+        assertEquals(filler.size + 2, appended.list.size)
+        // At the tail the same event still merges in place.
+        val merged = addShortTermMemory(filler + head, draft, "2026-08-01T10:00:00Z", sources)
+        assertEquals(filler.size + 1, merged.list.size)
+    }
 
     @Test
     fun applyMemoryDecayForgetsOldEventsButKeepsProfile() {

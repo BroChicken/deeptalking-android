@@ -1,6 +1,7 @@
 package com.deeptalking.domain.agent.tools
 
 import com.deeptalking.core.model.LongTermMemory
+import com.deeptalking.core.model.ShortTermMemory
 import com.deeptalking.domain.agent.AgentContext
 import com.deeptalking.domain.agent.AgentTool
 import com.deeptalking.domain.agent.AgentToolResult
@@ -40,7 +41,7 @@ class SearchMemoryTool(private val memory: MemoryService) : AgentTool {
 
     override val definition = ToolDefinition(
         name = "search_memory",
-        description = "检索记忆库。两种用法：①**按日期召回**——用户问起某个具体日期/某天发生的事时（如“九号晚上”“三号”“上周五”“那天记不记得”），用 date 或 timeRef 按日期召回，会返回那天的**原始对话**、当天摘要与当天长期记忆，比凭摘要回忆更准确；date 写 YYYY-MM-DD，请依据系统给的时间基准把用户的口语日期换算成绝对日期，相对说法（昨天/上周五/三天前）改用 timeRef。②**按关键词检索**——回忆过往约定、用户喜好与习惯、共同经历、关系事实时用 query。query/date/timeRef 至少给一个。默认检索全员共享记忆；群组对话中若想检索某位成员的私人记忆，可传入 memberName（该成员自己的记忆，如\"张三\"。注意：若该成员的私人记忆里没有，也可能是共享记忆，必要时可再不带 memberName 检索一次）。",
+        description = "检索记忆库。两种用法：①**按日期召回**——用户问起某个具体日期/某天发生的事时（如“九号晚上”“三号”“上周五”“那天记不记得”），用 date 或 timeRef 按日期召回，会返回那天的**原始对话**、当天摘要与当天长期记忆，比凭摘要回忆更准确；date 写 YYYY-MM-DD，请依据系统给的时间基准把用户的口语日期换算成绝对日期，相对说法（昨天/上周五/三天前）改用 timeRef。②**按关键词检索**——回忆过往约定、用户喜好与习惯、共同经历、关系事实，或**刚滑出近期摘要窗口的事**时用 query；返回 results（长期记忆）与 shortTerm（短期摘要，id 以 short_ 开头，可直接交给 update_memory / delete_memory 修正）。query/date/timeRef 至少给一个。默认检索全员共享记忆；群组对话中若想检索某位成员的私人记忆，可传入 memberName（该成员自己的记忆，如\"张三\"。注意：若该成员的私人记忆里没有，也可能是共享记忆，必要时可再不带 memberName 检索一次）。",
         parametersJson = """{"type":"object","properties":{"query":{"type":"string","description":"要检索的关键词或短语（按主题检索时使用）"},"date":{"type":"string","description":"按日期召回：YYYY-MM-DD，须依据时间基准把口语日期换算成绝对日期"},"timeRef":{"type":"object","description":"按日期召回：相对时间词元（昨天/上周五/三天前等），由客户端换算成绝对日期","additionalProperties":false,"properties":{"anchor":{"type":"string","description":"相对基准：today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year"},"offsetDays":{"type":"integer","description":"在anchor基础上的天数偏移(-60~60)"},"weekday":{"type":"string","description":"星期：mon/tue/wed/thu/fri/sat/sun"},"slot":{"type":"string","description":"时段：深夜/凌晨/清晨/早晨/上午/中午/下午/傍晚/晚上/夜里"},"explicit":{"type":"string","description":"已是绝对时间（ISO 或 YYYY-MM-DD），填了则忽略其余"}}},"slot":{"type":"string","description":"可选，限定当天的时段：深夜/凌晨/清晨/早晨/上午/中午/下午/傍晚/晚上/夜里"},"memberName":{"type":"string","description":"可选，群组对话中指定检索某位成员的私人记忆（不传则检索共享记忆）"}},"additionalProperties":false}""",
     )
 
@@ -99,11 +100,23 @@ class SearchMemoryTool(private val memory: MemoryService) : AgentTool {
         val items = buildJsonArray {
             candidates.take(MAX_RESULTS).forEach { (item, score) -> add(longTermJson(host, item, score)) }
         }
+        // The recent window is injected in full every turn, but anything that slid out of
+        // it is otherwise unreachable without a date: keyword recall used to search
+        // long-term only, so "我上次说的那件事" could not find a recent short-term entry.
+        val shorts = host.shortTerm
+            .map { it to shortTermScore(query, it.content) }
+            .filter { it.second >= MIN_SHORT_TERM_MATCH_SCORE }
+            .sortedByDescending { it.second }
+            .take(MAX_SHORT)
+        val shortItems = buildJsonArray {
+            shorts.forEach { (item, score) -> add(shortTermJson(host, item, score)) }
+        }
         val payload = buildJsonObject {
             put("ok", true)
             put("query", query)
-            put("total", items.size)
+            put("total", items.size + shortItems.size)
             put("results", items)
+            put("shortTerm", shortItems)
         }
         return AgentToolResult(payload.toString(), updatedCharacter = updated)
     }
@@ -132,7 +145,7 @@ class SearchMemoryTool(private val memory: MemoryService) : AgentTool {
                         put("id", message.id)
                         put("role", message.role.name.lowercase())
                         put("time", MemoryToolSupport.formatContextTime(message.timestamp))
-                        put("content", maskUserWord(character, trimText(message.content, 360)))
+                        put("content", maskUserWord(character, trimText(message.content, 1200)))
                     },
                 )
             }
@@ -142,16 +155,7 @@ class SearchMemoryTool(private val memory: MemoryService) : AgentTool {
             .filter { isoMatches(it.eventTime ?: it.createdAt, date, slot) }
             .filter { needle.isEmpty() || it.content.lowercase().contains(needle) }
             .takeLast(MAX_SHORT)
-        val shortItems = buildJsonArray {
-            shorts.forEach { item ->
-                add(
-                    buildJsonObject {
-                        put("time", MemoryToolSupport.formatContextTime(item.eventTime ?: item.createdAt))
-                        put("content", maskUserWord(host, trimText(item.content, 320)))
-                    },
-                )
-            }
-        }
+        val shortItems = buildJsonArray { shorts.forEach { add(shortTermJson(host, it, 0.0)) } }
 
         val longs = host.longTerm
             .filter { isoMatches(it.eventTime ?: it.createdAt, date, slot) }
@@ -183,11 +187,35 @@ class SearchMemoryTool(private val memory: MemoryService) : AgentTool {
         put("category", item.category.legacyKey)
         put("subject", item.subject.name.lowercase())
         put("subjectLabel", MemoryToolSupport.actorLabel(host, item.subject))
-        put("key", maskUserWord(host, trimText(item.key, 80)))
-        put("value", maskUserWord(host, trimText(item.value, 420)))
+        put("key", maskUserWord(host, trimText(item.key, 120)))
+        put("value", maskUserWord(host, trimText(item.value, 1200)))
         put("eventTime", MemoryToolSupport.formatContextTime(item.eventTime ?: item.createdAt))
         put("importance", item.importance)
         if (score > 0.0) put("relevance", round(score * 100) / 100)
+    }
+
+    private fun shortTermJson(host: com.deeptalking.core.model.Character, item: ShortTermMemory, score: Double) = buildJsonObject {
+        put("id", item.id)
+        put("store", "shortTerm")
+        put("time", MemoryToolSupport.formatContextTime(item.eventTime ?: item.createdAt))
+        put("content", maskUserWord(host, trimText(item.content, 1200)))
+        if (score > 0.0) put("relevance", round(score * 100) / 100)
+    }
+
+    /**
+     * Lightweight relevance for short-term text (long-term ranking uses tags/keys, which
+     * short-term entries do not have): full containment scores 1.0, otherwise the share
+     * of the query's character bigrams that appear in the text.
+     */
+    private fun shortTermScore(query: String, content: String): Double {
+        val q = query.lowercase().trim()
+        if (q.isEmpty()) return 0.0
+        val text = content.lowercase()
+        if (text.contains(q)) return 1.0
+        val chars = q.replace(Regex("[\\s，。！？、,.;:：\"'“”]"), "")
+        if (chars.length < 2) return 0.0
+        val grams = chars.windowed(2)
+        return grams.count { text.contains(it) }.toDouble() / grams.size
     }
 
     private fun searchableText(item: LongTermMemory): String =
@@ -250,5 +278,10 @@ class SearchMemoryTool(private val memory: MemoryService) : AgentTool {
         const val MAX_RAW_MESSAGES = 12
         const val MAX_SHORT = 8
         const val MAX_LONG = 12
+        /**
+         * Short-term relevance is scored on a 0..1 scale (bigram overlap), while the
+         * long-term ranker uses the legacy >1 scale — so it needs its own floor.
+         */
+        const val MIN_SHORT_TERM_MATCH_SCORE = 0.5
     }
 }

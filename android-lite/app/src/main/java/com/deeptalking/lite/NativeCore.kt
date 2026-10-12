@@ -272,7 +272,9 @@ class NativeCore(context: Context) {
         data.characters.all().forEach { character ->
             val size = character.shortTerm.size
             if (size > AppLimits.Memory.SHORT_TERM) overLimit = true
-            val over = (size - AppLimits.Memory.SHORT_TERM_LOW_WATER).coerceAtLeast(0)
+            // "Backlog" means *above the high watermark*: a window sitting between the low
+            // and the high watermark is normal operation (it is about to be folded).
+            val over = (size - AppLimits.Memory.SHORT_TERM).coerceAtLeast(0)
             val staleImages = staleImageCount(data.chat.getMessages(character.id))
             if (over > 0 || staleImages > 0) {
                 characters++
@@ -324,12 +326,12 @@ class NativeCore(context: Context) {
     }
 
     /**
-     * Gradually drains the short-term backlog towards
-     * [AppLimits.Memory.SHORT_TERM_LOW_WATER]: runs up to [maxBatches] passes, each
-     * converting up to [AppLimits.Memory.ANALYSIS_ITEM_LIMIT] items into long-term
-     * memory (which is what lets the trim drop them). Deliberately bounded so a single
-     * invocation never spends a burst of API calls; stops as soon as a pass makes no
-     * progress. The caller persists the "still pending" flag and continues on the next
+     * Drains the short-term backlog towards [AppLimits.Memory.SHORT_TERM_LOW_WATER]:
+     * runs up to [maxBatches] whole-window passes. One pass already folds everything
+     * pending (the window *is* the unit), so a single invocation converges; extra passes
+     * only matter for a backlog larger than the window itself. Bounded so a single
+     * invocation never spends a burst of API calls, and it stops as soon as a pass makes
+     * no progress. The caller persists the "still pending" flag and continues on the next
      * launch, so one confirmation is enough.
      */
     suspend fun drainShortTermBacklog(

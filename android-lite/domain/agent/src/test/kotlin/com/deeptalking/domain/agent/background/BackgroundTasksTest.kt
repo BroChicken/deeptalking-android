@@ -322,10 +322,14 @@ class BackgroundTasksTest {
             id = "c1",
             instant = listOf(ChatMessage(id = "u1", role = Role.User, content = "用户喜欢咖啡")),
         )
-        val reply = """<MEM_UPDATE>{"shortTerm":[{"content":"用户喜欢咖啡","sourceMessageIds":["u1"]}]}</MEM_UPDATE>"""
+        val reply = """<MEM_UPDATE>{"shortTerm":[{"content":"用户喜欢咖啡","sourceMessageIds":["u1"]}],""" +
+            """"longTerm":[{"category":"userProfile","subject":"user","key":"用户饮品偏好","value":"用户喜欢咖啡","sourceMessageIds":["u1"],"evidence":"用户喜欢咖啡"}]}</MEM_UPDATE>"""
         val updated = background.parseMemoryFromText(character, reply, null)
         assertTrue(updated != null)
-        assertEquals(1, updated!!.shortTerm.size)
+        // Only the long-term part of a legacy block folds now: the short-term window is
+        // owned by the whole-window extraction pass.
+        assertTrue(updated!!.longTerm.any { it.value.contains("咖啡") })
+        assertTrue("legacy block must not write short-term", updated.shortTerm.isEmpty())
         assertEquals(null, background.parseMemoryFromText(character, "无标签", null))
     }
 
@@ -462,15 +466,16 @@ class BackgroundTasksTest {
     }
 
     @Test
-    fun analyzeEscalatesToASmallerBatchBeforeGivingUp() = runBlocking {
-        // First reply is unusable; the retry with a smaller batch is good. Escalation is
-        // what turns a truncated reply into a slow success instead of a permanent failure.
+    fun analyzeSendsOneWholeWindowRequestAndKeepsTheFailure() = runBlocking {
+        // The fold is a single whole-window pass (no batch ladder): a failed reply leaves
+        // everything unmarked and is retried by the caller's backoff, never by shrinking
+        // the request — the window is the unit, so a partial batch would break continuity.
         val good = """{"status":"ok","analyzedShortTermIds":["s1"],"longTerm":[]}"""
         val (background, llm) = tasks(listOf("抱歉，我无法完成。", good))
         val (status, updated) = background.analyzeShortToLongTermStatus(analyzableCharacter())
-        assertEquals(BackgroundTasks.TaskStatus.Success, status)
-        assertEquals(2, llm.requests.size)
-        assertTrue(updated.shortTerm.first { it.id == "s1" }.analyzedAt != null)
+        assertEquals(BackgroundTasks.TaskStatus.Failure, status)
+        assertEquals(1, llm.requests.size)
+        assertEquals(null, updated.shortTerm.first { it.id == "s1" }.analyzedAt)
     }
 
     @Test
@@ -496,5 +501,80 @@ class BackgroundTasksTest {
         val outcome = background.drainMemoryBacklog(analyzableCharacter())
         assertFalse(outcome.progressed)
         assertTrue(outcome.character.counters.analysisLastError.isNotBlank())
+    }
+
+    @Test
+    fun extractionFoldsTheWholeWindowAndDropsToTheLowWatermark() = runBlocking {
+        val (background, llm) = tasks(
+            listOf(
+                """[{"content":"用户2026-08-01下午在家看书","eventTime":"2026-08-01T15:00:00Z",""" +
+                    """"participants":["用户"],"location":"家","sourceMessageIds":["m2"]}]""",
+            ),
+        )
+        // The window is full (high watermark): the head was folded in an earlier pass and
+        // rides along as context, the tail is what this pass must summarise.
+        val instant = buildList {
+            repeat(AppLimits.Memory.INSTANT - 2) { i ->
+                add(
+                    ChatMessage(
+                        id = "old$i",
+                        role = Role.User,
+                        content = "旧消息$i",
+                        timestamp = "2026-08-01T10:00:00Z",
+                        extractedAt = "done",
+                    ),
+                )
+            }
+            add(ChatMessage(id = "m2", role = Role.User, content = "我今天在家看书", timestamp = "2026-08-01T15:00:00Z"))
+            add(ChatMessage(id = "m3", role = Role.Assistant, content = "嗯，挺好的", timestamp = "2026-08-01T15:01:00Z"))
+        }
+        val character = Character(id = "c1", instant = instant)
+        val (status, updated) = background.extractMemoryStatus(character, instant)
+
+        assertEquals(BackgroundTasks.TaskStatus.Success, status)
+        // The request carried the whole window, and only the pending tail is actionable.
+        val prompt = llm.requests.single().input.last().content
+        assertTrue(prompt.contains("\"extracted\":true"))
+        assertTrue(prompt.contains("\"extracted\":false"))
+        assertEquals(1, updated.shortTerm.size)
+        // Only the covered message is stamped; an uncovered one stays pending for retry.
+        assertTrue(updated.instant.first { it.id == "m2" }.extractedAt != null)
+        assertEquals(null, updated.instant.first { it.id == "m3" }.extractedAt)
+        // The fold compacted the window down to the low watermark.
+        assertEquals(AppLimits.Memory.INSTANT_TRIM_FLOOR, updated.instant.size)
+    }
+
+    @Test
+    fun analysisCarriesTheWholeWindowAndOnlyFoldsPendingItems() = runBlocking {
+        val (background, llm) = tasks(listOf("""{"status":"ok","analyzedShortTermIds":["s1"],"longTerm":[]}"""))
+        val character = Character(
+            id = "c1",
+            shortTerm = listOf(
+                ShortTermMemory(
+                    id = "s0",
+                    content = "用户2026-08-01上午已经整理过的事",
+                    sourceMessageIds = listOf("m0"),
+                    eventTime = "2026-08-01T10:00:00Z",
+                    analyzedAt = "done",
+                    analyzedRevision = 1,
+                ),
+                ShortTermMemory(
+                    id = "s1",
+                    content = "用户2026-08-01下午待整理的事",
+                    sourceMessageIds = listOf("m1"),
+                    eventTime = "2026-08-01T15:00:00Z",
+                    revision = 1,
+                ),
+            ),
+        )
+        val (status, updated) = background.analyzeShortToLongTermStatus(character)
+
+        assertEquals(BackgroundTasks.TaskStatus.Success, status)
+        // The low-water leftovers are re-read as context (continuity) but produce nothing.
+        val prompt = llm.requests.single().input.last().content
+        assertTrue(prompt.contains("\"analyzed\":true"))
+        assertTrue(prompt.contains("\"analyzed\":false"))
+        assertEquals("done", updated.shortTerm.first { it.id == "s0" }.analyzedAt)
+        assertTrue(updated.shortTerm.first { it.id == "s1" }.analyzedAt != null)
     }
 }
