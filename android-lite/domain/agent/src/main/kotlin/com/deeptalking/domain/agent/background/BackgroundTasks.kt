@@ -499,6 +499,23 @@ class BackgroundTasks(
     suspend fun analyzeShortToLongTermStatus(character: Character): Pair<TaskStatus, Character> =
         analyzeShortToLongTermTask(character)
 
+    /**
+     * One backlog-drain pass for the one-time cleanup: force an analysis batch
+     * (ignoring the size trigger and the retry backoff), then run the world-book /
+     * scene maintenance that acknowledges the same revision. Both consumers must
+     * acknowledge an item before [trimShortTerm] may drop it, so this is what lets a
+     * piled-up short-term backlog shrink *gradually* instead of being truncated.
+     *
+     * Returns the updated character on progress, or null when there is nothing left
+     * to analyze / the pass failed (so the caller stops instead of spinning).
+     */
+    suspend fun drainMemoryBacklog(character: Character): Character? {
+        val (status, analyzed) = analyzeShortToLongTermStatus(character)
+        if (status != TaskStatus.Success) return null
+        val maintained = runMemoryMaintenance(analyzed)
+        return if (maintained != analyzed) maintained else analyzed
+    }
+
     private suspend fun analyzeShortToLongTermTask(character: Character): Pair<TaskStatus, Character> {
         val analyzeLimit = (character.shortTerm.size - AppLimits.Memory.SHORT_TERM_TRIM_FLOOR).coerceAtLeast(0)
         val items = character.shortTerm.take(analyzeLimit)
@@ -540,44 +557,37 @@ class BackgroundTasks(
         data class Prepared(val item: LongTermMemory, val shortTermIds: List<String>)
         val sources = knownSources(character)
         val prepared = mutableListOf<Prepared>()
+        // Per-item tolerance: one malformed entry must never fail the whole batch.
+        // The same oldest batch is retried until it is acknowledged, so a single
+        // entry that cannot pass validation used to "poison" the queue and
+        // permanently dead-lock short-term memory (nothing ever gets analyzed, so
+        // nothing ever gets trimmed). Structural problems (unparseable JSON,
+        // status != ok, a mismatched analyzedShortTermIds) still fail the batch.
         for (element in longTermArray) {
-            val obj = element as? JsonObject ?: return TaskStatus.Failure to character
+            val obj = element as? JsonObject ?: continue
             val item = parseLongTerm(obj)
             val sourceShortTermIds = stringList(obj["sourceShortTermIds"]).map { it.trim() }.filter { it.isNotEmpty() }.distinct()
-            if (sourceShortTermIds.isEmpty() || sourceShortTermIds.any { it !in analyzableIds }) {
-                return TaskStatus.Failure to character
-            }
+            if (sourceShortTermIds.isEmpty() || sourceShortTermIds.any { it !in analyzableIds }) continue
             val claimed = items.filter { it.id in sourceShortTermIds }
             val allowedMessageIds = claimed.flatMap { it.sourceMessageIds }.toSet()
             val itemMessageIds = item.sourceMessageIds.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
-            if (itemMessageIds.isEmpty() || itemMessageIds.any { it !in allowedMessageIds }) {
-                return TaskStatus.Failure to character
-            }
-            if (claimed.any { short -> short.sourceMessageIds.none { it in itemMessageIds } }) {
-                return TaskStatus.Failure to character
-            }
+            if (itemMessageIds.isEmpty() || itemMessageIds.any { it !in allowedMessageIds }) continue
+            if (claimed.any { short -> short.sourceMessageIds.none { it in itemMessageIds } }) continue
             if (item.category == MemoryCategory.Events) {
                 val identity = eventIdentity(item.eventTime)
-                if (identity.isEmpty() || claimed.any { eventIdentity(it.eventTime) != identity }) {
-                    return TaskStatus.Failure to character
-                }
+                if (identity.isEmpty() || claimed.any { eventIdentity(it.eventTime) != identity }) continue
             }
             val allowedUserEvidence = claimed.flatMap { it.userEvidence }
             if (allowedUserEvidence.none {
                     it.sourceMessageId in itemMessageIds && evidenceMatchesSource(it.text, item.evidence)
                 }
-            ) {
-                return TaskStatus.Failure to character
-            }
+            ) continue
             if (item.key.isBlank() || item.value.isBlank() ||
                 !isValidAutomaticMemory(character, item, sources, null)
-            ) {
-                return TaskStatus.Failure to character
-            }
+            ) continue
             prepared += Prepared(item, sourceShortTermIds)
         }
 
-        val longTermSnapshot = character.longTerm
         var working = character
         for (entry in prepared) {
             val (newList, ok) = upsertLongTermMemory(
@@ -587,7 +597,7 @@ class BackgroundTasks(
                 sources = sources,
                 assistantMessage = null,
             )
-            if (!ok) return TaskStatus.Failure to character.copy(longTerm = longTermSnapshot)
+            if (!ok) continue
             working = working.copy(longTerm = newList)
         }
 

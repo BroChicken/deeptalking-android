@@ -6,6 +6,7 @@ import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.LongTermMemory
 import com.deeptalking.core.model.MemoryCategory
 import com.deeptalking.core.model.MemorySubject
+import com.deeptalking.core.model.alignSources
 import java.time.Instant
 
 /**
@@ -68,14 +69,15 @@ fun knownSources(character: Character): Map<String, SourceRef> {
         }
     }
     character.shortTerm.forEach { item ->
-        item.sourceMessageIds.forEachIndexed { index, id ->
+        // `sourceRoles` is index-aligned with `sourceMessageIds`; a legacy malformed
+        // entry may carry a short list, so resolve roles through [alignSources]
+        // rather than reading `sourceRoles[index]` directly (which would leave the
+        // source role-less and make every memory citing it unresolvable).
+        val aligned = alignSources(item.sourceMessageIds, item.sourceRoles, item.userEvidence)
+        aligned.sourceMessageIds.forEachIndexed { index, id ->
             if (!sources.containsKey(id)) {
-                val evidence = item.userEvidence.firstOrNull { it.sourceMessageId == id }
-                val role = when {
-                    evidence != null -> "user"
-                    item.sourceRoles.getOrNull(index) == "assistant" -> "assistant"
-                    else -> ""
-                }
+                val evidence = aligned.userEvidence.firstOrNull { it.sourceMessageId == id }
+                val role = aligned.sourceRoles.getOrNull(index).orEmpty()
                 sources[id] = SourceRef(id, role, evidence?.text ?: item.content)
             }
         }

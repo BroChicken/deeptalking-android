@@ -25,6 +25,7 @@ import com.deeptalking.core.model.ShortTermMemory
 import com.deeptalking.core.model.StaticFillMeta
 import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.core.model.Sticker
+import com.deeptalking.core.model.mergeSources
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -779,10 +780,15 @@ fun reconcileLegacyMemories(character: Character): MemoryReconciliation {
             return@forEachIndexed
         }
         val old = primary.second
+        val mergedSources = mergeSources(
+            Triple(old.sourceMessageIds, old.sourceRoles, old.userEvidence),
+            Triple(item.sourceMessageIds, item.sourceRoles, item.userEvidence),
+            limit = 8,
+        )
         val merged = ShortTermMemory(
             id = old.id,
             content = mergeTimelineContent(old.eventTime, old.content, item.eventTime, item.content),
-            sourceMessageIds = (old.sourceMessageIds + item.sourceMessageIds).distinct().take(8),
+            sourceMessageIds = mergedSources.sourceMessageIds,
             timeRef = old.timeRef,
             eventTime = earlierTimestamp(old.eventTime, item.eventTime),
             createdAt = earlierTimestamp(old.createdAt, item.createdAt),
@@ -790,8 +796,8 @@ fun reconcileLegacyMemories(character: Character): MemoryReconciliation {
             participants = mergeParticipants(old.participants, item.participants),
             location = mergeLocations(old.location, item.location),
             lorebookScannedAt = null,
-            sourceRoles = (old.sourceRoles + item.sourceRoles).distinct(),
-            userEvidence = (old.userEvidence + item.userEvidence).distinctBy { it.sourceMessageId to it.text },
+            sourceRoles = mergedSources.sourceRoles,
+            userEvidence = mergedSources.userEvidence,
         )
         short[primary.first] = merged
         seen[identity] = primary.first to merged
@@ -815,18 +821,23 @@ fun reconcileLegacyMemories(character: Character): MemoryReconciliation {
         for (entryIndex in group.drop(1)) {
             val old = long[primaryIndex]
             val newer = long[entryIndex]
+            val mergedLongSources = mergeSources(
+                Triple(old.sourceMessageIds, old.sourceRoles, old.userEvidence),
+                Triple(newer.sourceMessageIds, newer.sourceRoles, newer.userEvidence),
+                limit = 8,
+            )
             long[primaryIndex] = old.copy(
                 value = mergeTimelineContent(old.eventTime, old.value, newer.eventTime, newer.value),
                 tags = (old.tags + newer.tags).distinct().take(8),
                 importance = maxOf(old.importance, newer.importance),
-                sourceMessageIds = (old.sourceMessageIds + newer.sourceMessageIds).distinct().take(8),
+                sourceMessageIds = mergedLongSources.sourceMessageIds,
                 evidence = old.evidence.ifEmpty { newer.evidence },
                 eventTime = earlierTimestamp(old.eventTime, newer.eventTime),
                 participants = mergeParticipants(old.participants, newer.participants),
                 location = mergeLocations(old.location, newer.location),
                 updatedAt = newer.updatedAt ?: old.updatedAt,
-                sourceRoles = (old.sourceRoles + newer.sourceRoles).distinct(),
-                userEvidence = (old.userEvidence + newer.userEvidence).distinctBy { it.sourceMessageId to it.text },
+                sourceRoles = mergedLongSources.sourceRoles,
+                userEvidence = mergedLongSources.userEvidence,
             )
             droppedLong += entryIndex
             repaired++

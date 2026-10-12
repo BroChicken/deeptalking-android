@@ -569,11 +569,14 @@ class ChatOrchestrator(
         }
         if (shared == null && member == null) return character
         val now = Instant.now().toString()
+        // `sourceRoles` is index-aligned with `sourceMessageIds`; both must be cut
+        // the same way (a `.distinct()` on roles would leave later ids role-less).
+        val limitedSources = resolved.take(8)
         return memory.updateMemory(character, update.promiseId, member?.name) { promise ->
             promise.copy(
                 status = status,
-                sourceMessageIds = resolved.map { it.id }.take(8),
-                sourceRoles = resolved.map { it.role }.distinct(),
+                sourceMessageIds = limitedSources.map { it.id },
+                sourceRoles = limitedSources.map { it.role },
                 evidence = update.evidence.trimTo(300),
                 updatedAt = now,
             )

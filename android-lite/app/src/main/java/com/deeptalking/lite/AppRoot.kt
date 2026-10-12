@@ -105,6 +105,8 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
     val lorebookMigrationCount by vm.lorebookMigrationPrompt.collectAsState()
     val avatarRepairPrompt by vm.avatarRepairPrompt.collectAsState()
     val avatarRepairProgress by vm.avatarRepairProgress.collectAsState()
+    val memoryCleanupPrompt by vm.memoryCleanupPrompt.collectAsState()
+    val memoryCleanupProgress by vm.memoryCleanupProgress.collectAsState()
     val tts by vm.tts.collectAsState()
 
     val activeCharacter = characters.firstOrNull { it.id == activeId }
@@ -362,6 +364,60 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                 },
             )
         }
+    }
+
+    // One-time cleanup of the short-term pile-up + over-window images. Nothing is
+    // truncated: old images are pruned (text stays) and the backlog is *processed*
+    // into long-term memory in bounded batches.
+    if (fieldMigrationCount == null && lorebookMigrationCount == null) {
+        memoryCleanupPrompt?.let { target ->
+            var skipForever by remember { mutableStateOf(false) }
+            AlertDialog(
+                onDismissRequest = { vm.dismissMemoryCleanup() },
+                title = { Text("整理记忆与图片") },
+                text = {
+                    Column {
+                        val lines = mutableListOf<String>()
+                        if (target.shortTerm > 0) {
+                            lines += "短期记忆积压了 ${target.shortTerm} 条（长期分析曾失败，没能整理掉）。"
+                        }
+                        if (target.images > 0) {
+                            lines += "有 ${target.images} 张较旧的聊天图片可以清理（只删图片，聊天文字保留）。"
+                        }
+                        Text(lines.joinToString("\n"))
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            "整理会把短期记忆分批转成长期记忆，不会删除内容；每次打开最多处理 " +
+                                "${com.deeptalking.core.common.AppLimits.Memory.CLEANUP_BATCHES_PER_RUN} 批，直到恢复正常。",
+                            fontSize = 13.sp,
+                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(checked = skipForever, onCheckedChange = { skipForever = it })
+                            Text("以后不再询问", fontSize = 13.sp)
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        if (skipForever) vm.skipMemoryCleanupForever() else vm.runMemoryCleanup()
+                    }) { Text("开始整理") }
+                },
+                dismissButton = {
+                    TextButton(onClick = {
+                        if (skipForever) vm.skipMemoryCleanupForever() else vm.dismissMemoryCleanup()
+                    }) { Text("以后再说") }
+                },
+            )
+        }
+    }
+
+    if (memoryCleanupProgress) {
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text("正在整理短期记忆…") },
+            text = { Text("分批转成长期记忆，请稍候。") },
+            confirmButton = {},
+        )
     }
 
     // Legacy `repairAllAvatars`: a confirmation before the manual batch, then a

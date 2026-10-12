@@ -11,6 +11,8 @@ import com.deeptalking.core.model.MemorySubject
 import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.ShortTermMemory
 import com.deeptalking.core.model.SourceEvidence
+import com.deeptalking.core.model.alignSources
+import com.deeptalking.core.model.mergeSources
 import java.time.Instant
 import java.time.LocalDateTime
 import java.time.OffsetDateTime
@@ -412,21 +414,64 @@ fun dedupeLongTerm(items: List<LongTermMemory>, category: MemoryCategory): List<
  * the accumulated duplicates left by earlier re-extraction loops.
  */
 fun repairMemories(character: Character): Character {
+    fun repairShort(list: List<ShortTermMemory>): List<ShortTermMemory> =
+        dedupeShortTerm(list).map { item ->
+            val aligned = alignSources(item.sourceMessageIds, item.sourceRoles, item.userEvidence)
+            if (!alignedChanged(aligned, item.sourceMessageIds, item.sourceRoles, item.userEvidence)) {
+                item
+            } else {
+                // Sources changed, so any prior analysis no longer matches them.
+                item.copy(
+                    sourceMessageIds = aligned.sourceMessageIds,
+                    sourceRoles = aligned.sourceRoles,
+                    userEvidence = aligned.userEvidence,
+                    analyzedAt = null,
+                )
+            }
+        }
     fun repairLong(list: List<LongTermMemory>): List<LongTermMemory> =
         MemoryCategory.entries.flatMap { category ->
             dedupeLongTerm(list.filter { it.category == category }, category)
+        }.map { item ->
+            val aligned = alignSources(item.sourceMessageIds, item.sourceRoles, item.userEvidence)
+            if (!alignedChanged(aligned, item.sourceMessageIds, item.sourceRoles, item.userEvidence)) {
+                item
+            } else {
+                item.copy(
+                    sourceMessageIds = aligned.sourceMessageIds,
+                    sourceRoles = aligned.sourceRoles,
+                    userEvidence = aligned.userEvidence,
+                )
+            }
         }
     return character.copy(
-        shortTerm = dedupeShortTerm(character.shortTerm),
+        shortTerm = repairShort(character.shortTerm),
         longTerm = repairLong(character.longTerm),
         members = character.members.map {
-            it.copy(shortTerm = dedupeShortTerm(it.shortTerm), longTerm = repairLong(it.longTerm))
+            it.copy(shortTerm = repairShort(it.shortTerm), longTerm = repairLong(it.longTerm))
         },
     )
 }
 
+/**
+ * True when [aligned] differs from the stored triple in a way worth persisting.
+ * An alignment that would wipe every source is ignored, so the repair can only
+ * narrow a citation list, never erase it.
+ */
+private fun alignedChanged(
+    aligned: com.deeptalking.core.model.AlignedSources,
+    ids: List<String>,
+    roles: List<String>,
+    evidence: List<SourceEvidence>,
+): Boolean {
+    if (aligned.sourceMessageIds.isEmpty() && ids.isNotEmpty()) return false
+    return aligned.sourceMessageIds != ids ||
+        aligned.sourceRoles != roles ||
+        aligned.userEvidence != evidence
+}
+
 /** Current target of the one-time deterministic memory repair. */
-const val MEMORY_REPAIR_VERSION = 2
+const val MEMORY_REPAIR_VERSION = 3
 
 /**
  * Deterministic near-duplicate pass over short-term memory: items whose content is
@@ -444,13 +489,17 @@ fun dedupeShortTerm(items: List<ShortTermMemory>): List<ShortTermMemory> {
             continue
         }
         val existing = result[dupIndex]
+        // Align each side first: `sourceRoles` is index-aligned with
+        // `sourceMessageIds`, so it must never be de-duplicated as a set.
+        val sources = mergeSources(
+            Triple(existing.sourceMessageIds, existing.sourceRoles, existing.userEvidence),
+            Triple(item.sourceMessageIds, item.sourceRoles, item.userEvidence),
+        )
         result[dupIndex] = existing.copy(
             content = if (item.content.length > existing.content.length) item.content else existing.content,
-            sourceMessageIds = (existing.sourceMessageIds + item.sourceMessageIds).distinct()
-                .takeLast(AppLimits.Memory.SUMMARY_SOURCES),
-            sourceRoles = (existing.sourceRoles + item.sourceRoles).distinct(),
-            userEvidence = (existing.userEvidence + item.userEvidence)
-                .distinctBy { it.sourceMessageId to it.text },
+            sourceMessageIds = sources.sourceMessageIds,
+            sourceRoles = sources.sourceRoles,
+            userEvidence = sources.userEvidence,
             participants = normalizeParticipantsList(existing.participants + item.participants),
             location = if (item.location.isNotBlank()) item.location else existing.location,
             eventTime = earlierTimestamp(existing.eventTime, item.eventTime) ?: existing.eventTime,

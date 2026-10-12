@@ -3,6 +3,7 @@ package com.deeptalking.domain.agent.tools
 import com.deeptalking.core.model.LongTermMemory
 import com.deeptalking.core.model.MemoryCategory
 import com.deeptalking.core.model.MemorySubject
+import com.deeptalking.core.model.mergeSources
 import com.deeptalking.domain.agent.AgentContext
 import com.deeptalking.domain.agent.AgentTool
 import com.deeptalking.domain.agent.AgentToolResult
@@ -121,6 +122,13 @@ class UpdateMemoryTool(private val memory: MemoryService) : AgentTool {
         val changed = mutableListOf<String>()
         val updatedAt = Instant.now().toString()
         val updatedCharacter = memory.updateMemory(character, id, memberName) { old ->
+            // `sourceRoles` is index-aligned with `sourceMessageIds`; align the
+            // existing sources first, then append the new (user) ones.
+            val merged = mergeSources(
+                Triple(old.sourceMessageIds, old.sourceRoles, old.userEvidence),
+                Triple(sourceIds, sourceIds.map { "user" }, emptyList()),
+                limit = 8,
+            )
             val next = old.copy(
                 subject = if (subject != null) subject.also { changed += "subject" } else old.subject,
                 value = if (nextValue.isNotEmpty()) nextValue.also { changed += "value" } else old.value,
@@ -131,8 +139,8 @@ class UpdateMemoryTool(private val memory: MemoryService) : AgentTool {
                 eventTime = if (nextEventTime != null) nextEventTime.also { changed += "eventTime" } else old.eventTime,
                 dueAt = if (nextDueAt != null) nextDueAt.also { changed += "dueAt" } else old.dueAt,
                 evidence = evidence,
-                sourceMessageIds = (old.sourceMessageIds + sourceIds).distinct().take(8),
-                sourceRoles = (old.sourceRoles + "user").distinct().take(8),
+                sourceMessageIds = merged.sourceMessageIds,
+                sourceRoles = merged.sourceRoles,
                 updatedAt = updatedAt,
                 // A manual correction settles any accumulated conflict and keeps the
                 // replaced value in the corrections history (legacy `applyMemoryUpdate`).

@@ -269,17 +269,20 @@ class BackgroundTasksTest {
     }
 
     @Test
-    fun analyzeRollsBackWhenSourceIsInvalid() = runBlocking {
+    fun analyzeSkipsEntryWithUnresolvableSourceButConsumesTheBatch() = runBlocking {
+        // A malformed entry must not fail the whole batch — that used to poison the
+        // queue permanently (the same oldest batch is retried forever). It is
+        // dropped and the batch is still acknowledged.
         val response = """{"status":"ok","analyzedShortTermIds":["s1"],"longTerm":[{"category":"userProfile","subject":"user","key":"饮品","value":"用户喜欢喝美式咖啡。","sourceShortTermIds":["s1"],"sourceMessageIds":["ghost"],"evidence":"用户喜欢喝美式咖啡。"}]}"""
         val (background, _) = tasks(listOf(response))
         val character = analyzableCharacter()
         val updated = background.analyzeShortToLongTerm(character)
         assertTrue(updated.longTerm.isEmpty())
-        assertEquals(null, updated.shortTerm.first { it.id == "s1" }.analyzedAt)
+        assertTrue(updated.shortTerm.first { it.id == "s1" }.analyzedAt != null)
     }
 
     @Test
-    fun analyzeRejectsEvidenceNotPresentInUserEvidence() = runBlocking {
+    fun analyzeSkipsEntryWhoseEvidenceIsNotInUserEvidence() = runBlocking {
         val response = """{"status":"ok","analyzedShortTermIds":["s1"],"longTerm":[{"category":"userProfile","subject":"user","key":"饮品","value":"用户喜欢喝茶。","sourceShortTermIds":["s1"],"sourceMessageIds":["u1"],"evidence":"用户喜欢喝茶。"}]}"""
         val (background, _) = tasks(listOf(response))
         val target = ShortTermMemory(
@@ -300,7 +303,8 @@ class BackgroundTasksTest {
             )
         }
         // `instant` still resolves evidence "用户喜欢喝茶。", but no claimed short-term
-        // item carries it in userEvidence, so the analysis must be rejected.
+        // item carries it in userEvidence, so this entry is dropped (the batch is
+        // still consumed rather than retried forever).
         val character = Character(
             id = "c1",
             instant = listOf(ChatMessage(id = "u1", role = Role.User, content = "用户喜欢喝茶。")),
@@ -308,7 +312,7 @@ class BackgroundTasksTest {
         )
         val updated = background.analyzeShortToLongTerm(character)
         assertTrue(updated.longTerm.isEmpty())
-        assertEquals(null, updated.shortTerm.first { it.id == "s1" }.analyzedAt)
+        assertTrue(updated.shortTerm.first { it.id == "s1" }.analyzedAt != null)
     }
 
     @Test

@@ -11,6 +11,7 @@ import com.deeptalking.core.model.BuiltinPlatforms
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.GroupMember
+import com.deeptalking.core.model.MessageAttachment
 import com.deeptalking.core.model.RequestMetric
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.StaticProfile
@@ -52,6 +53,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.time.Instant
@@ -226,6 +228,112 @@ class NativeCore(context: Context) {
                 }
             }
         }
+    }
+
+    /** What the one-time memory cleanup would do; `null` when nothing needs it. */
+    data class MemoryCleanupTarget(
+        val characters: Int,
+        val shortTerm: Int,
+        val images: Int,
+    )
+
+    /**
+     * Detects the two unbounded-growth leftovers: short-term memory piled up past
+     * [AppLimits.Memory.SHORT_TERM] (the analysis task could not drain it) and image
+     * attachments older than [AppLimits.Media.IMAGE_RETENTION_MESSAGES] messages.
+     */
+    suspend fun memoryCleanupTarget(): MemoryCleanupTarget {
+        var characters = 0
+        var shortTerm = 0
+        var images = 0
+        data.characters.all().forEach { character ->
+            val over = (character.shortTerm.size - AppLimits.Memory.SHORT_TERM).coerceAtLeast(0)
+            val staleImages = staleImageCount(data.chat.getMessages(character.id))
+            if (over > 0 || staleImages > 0) {
+                characters++
+                shortTerm += over
+                images += staleImages
+            }
+        }
+        return MemoryCleanupTarget(characters, shortTerm, images)
+    }
+
+    private fun staleImageCount(messages: List<ChatMessage>): Int {
+        val cutoff = messages.size - AppLimits.Media.IMAGE_RETENTION_MESSAGES
+        if (cutoff <= 0) return 0
+        return messages.take(cutoff).sumOf { message ->
+            message.attachments.count { it.kind == MessageAttachment.Kind.Image }
+        }
+    }
+
+    /**
+     * Drops image attachments (and their files) from messages older than the
+     * retention window. Message text is untouched, so history stays readable.
+     * Returns the number of attachments removed.
+     */
+    suspend fun pruneOldMessageImages(): Int {
+        var removed = 0
+        val referenced = mutableSetOf<String>()
+        data.characters.all().forEach { character ->
+            val messages = data.chat.getMessages(character.id)
+            if (messages.isEmpty()) return@forEach
+            val cutoff = (messages.size - AppLimits.Media.IMAGE_RETENTION_MESSAGES).coerceAtLeast(0)
+            val updated = messages.mapIndexed { index, message ->
+                val stale = message.attachments.filter { it.kind == MessageAttachment.Kind.Image }
+                if (index < cutoff && stale.isNotEmpty()) {
+                    removed += stale.size
+                    message.copy(attachments = message.attachments - stale.toSet())
+                } else {
+                    message
+                }
+            }
+            if (updated != messages) data.chat.replace(character.id, updated)
+            updated.forEach { message -> message.attachments.forEach { referenced += it.uri } }
+        }
+        val directory = File(appContext.filesDir, "images")
+        directory.listFiles()?.forEach { file ->
+            if ("images/${file.name}" !in referenced) runCatching { file.delete() }
+        }
+        return removed
+    }
+
+    /**
+     * Gradually drains the short-term backlog: runs up to [maxBatches] passes, each
+     * converting up to [AppLimits.Memory.ANALYSIS_BATCH] items into long-term memory
+     * (which is what lets the trim drop them). Deliberately bounded so the cleanup
+     * never spends a burst of API calls; stops as soon as a pass makes no progress.
+     * Returns the number of passes that made progress.
+     */
+    suspend fun drainShortTermBacklog(
+        config: AppConfig,
+        maxBatches: Int = AppLimits.Memory.CLEANUP_BATCHES_PER_RUN,
+    ): Int {
+        if (apiKeyFor(config.apiPlatform).isNullOrBlank()) return 0
+        val tasks = backgroundTasks(config)
+        var passes = 0
+        repeat(maxBatches) {
+            var progressed = false
+            for (character in data.characters.all()) {
+                if (character.shortTerm.size <= AppLimits.Memory.SHORT_TERM) continue
+                val updated = tasks.drainMemoryBacklog(character) ?: continue
+                val fresh = data.characters.get(character.id) ?: character
+                data.characters.upsert(
+                    fresh.copy(
+                        shortTerm = updated.shortTerm,
+                        longTerm = updated.longTerm,
+                        members = updated.members,
+                        scenes = updated.scenes,
+                        sceneState = updated.sceneState,
+                        lorebook = updated.lorebook,
+                        counters = updated.counters,
+                    ),
+                )
+                progressed = true
+            }
+            if (!progressed) return passes
+            passes++
+        }
+        return passes
     }
 
     /** One-time world-book migration for characters whose background has not been migrated. */

@@ -129,6 +129,75 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         }
     }
 
+    // --------------------------------------------------- one-time memory cleanup
+
+    /** Non-null when the one-time memory cleanup dialog should show. */
+    private val memoryCleanupState = MutableStateFlow<NativeCore.MemoryCleanupTarget?>(null)
+    val memoryCleanupPrompt: StateFlow<NativeCore.MemoryCleanupTarget?> = memoryCleanupState
+
+    /** True while the short-term drain runs (progress dialog). */
+    private val memoryCleanupProgressState = MutableStateFlow(false)
+    val memoryCleanupProgress: StateFlow<Boolean> = memoryCleanupProgressState
+
+    /**
+     * Detects the leftovers of the short-term pile-up (short-term memory past its cap
+     * because analysis could not drain it) and images older than the retention
+     * window. Silent when there is nothing to clean or the user opted out.
+     */
+    private suspend fun checkMemoryCleanupPrompt() {
+        if (core.data.settings.getBoolean(MEMORY_CLEANUP_SKIP_KEY)) return
+        val target = runCatching { core.memoryCleanupTarget() }.getOrNull() ?: return
+        if (target.shortTerm <= 0 && target.images <= 0) return
+        memoryCleanupState.value = target
+    }
+
+    fun dismissMemoryCleanup() {
+        memoryCleanupState.value = null
+    }
+
+    fun skipMemoryCleanupForever() {
+        memoryCleanupState.value = null
+        viewModelScope.launch { core.data.settings.putBoolean(MEMORY_CLEANUP_SKIP_KEY, true) }
+    }
+
+    /**
+     * Confirms the cleanup: prune stale images immediately, then drain short-term in
+     * bounded passes (up to [AppLimits.Memory.CLEANUP_BATCHES_PER_RUN]). Nothing is
+     * truncated — the backlog is *processed* into long-term memory, so it shrinks
+     * over successive runs instead of losing facts.
+     */
+    fun runMemoryCleanup() {
+        memoryCleanupState.value = null
+        viewModelScope.launch {
+            val removedImages = runCatching { core.pruneOldMessageImages() }.getOrDefault(0)
+            val cfg = runCatching { core.currentConfig() }.getOrNull()
+            val canAnalyze = cfg != null && core.hasApiKey(cfg.apiPlatform)
+            val batches = if (canAnalyze) {
+                memoryCleanupProgressState.value = true
+                runCatching { core.drainShortTermBacklog(cfg!!) }
+                    .getOrDefault(0)
+                    .also { memoryCleanupProgressState.value = false }
+            } else {
+                0
+            }
+            val parts = mutableListOf<String>()
+            if (removedImages > 0) parts += "清理了 $removedImages 张旧图片"
+            if (batches > 0) parts += "整理了 $batches 批短期记忆"
+            val remaining = runCatching { core.memoryCleanupTarget() }.getOrNull()
+            val tail = if (remaining != null && (remaining.shortTerm > 0 || remaining.images > 0)) {
+                "，仍有 ${remaining.shortTerm} 条短期记忆待整理，下次打开会继续"
+            } else {
+                ""
+            }
+            val head = when {
+                parts.isNotEmpty() -> parts.joinToString("，")
+                !canAnalyze -> "已清理图片；短期记忆需要 API Key 才能整理"
+                else -> "没有需要清理的内容"
+            }
+            eventsState.tryEmit(UiEvent(head + tail))
+        }
+    }
+
     fun runFieldMigration() {
         fieldMigrationState.value = null
         viewModelScope.launch {
@@ -1280,6 +1349,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 core.runStartupMaintenance(cfg)
             }.onFailure { DeepTalkingApp.recordError(it) }
             runCatching { checkMigrationPrompts() }.onFailure { DeepTalkingApp.recordError(it) }
+            runCatching { checkMemoryCleanupPrompt() }.onFailure { DeepTalkingApp.recordError(it) }
             autoRepairAvatars()
         }
     }
@@ -1332,6 +1402,9 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         const val PROACTIVE_IDLE_MS = 60_000L
         const val FIELD_MIGRATION_SKIP_KEY = "deeptalking_field_migration_skip_v1"
         const val LOREBOOK_MIGRATION_SKIP_KEY = "deeptalking_lorebook_migration_skip_v1"
+
+        /** Set when the user chose "以后不再询问" on the one-time memory cleanup. */
+        const val MEMORY_CLEANUP_SKIP_KEY = "deeptalking_memory_cleanup_skip_v1"
         /** How long the bubble shows the "done" tick before reverting to idle. */
         const val TTS_DONE_LINGER_MS = 1_000L
     }
@@ -1629,6 +1702,10 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         // Legacy one-time migration prompts (field schema, then world book).
         viewModelScope.launch {
             runCatching { checkMigrationPrompts() }.onFailure { DeepTalkingApp.recordError(it) }
+        }
+        // One-time memory cleanup prompt (short-term backlog + stale images).
+        viewModelScope.launch {
+            runCatching { checkMemoryCleanupPrompt() }.onFailure { DeepTalkingApp.recordError(it) }
         }
         // Legacy silent avatar auto-repair for damaged placeholders.
         autoRepairAvatars()

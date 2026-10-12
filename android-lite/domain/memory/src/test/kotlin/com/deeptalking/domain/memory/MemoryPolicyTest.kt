@@ -8,6 +8,7 @@ import com.deeptalking.core.model.MemorySubject
 import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.ShortTermMemory
+import com.deeptalking.core.model.SourceEvidence
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -283,5 +284,25 @@ class MemoryPolicyTest {
         val repaired = repairMemories(character)
         assertEquals(1, repaired.shortTerm.size)
         assertEquals(1, repaired.longTerm.size)
+    }
+
+    @Test
+    fun repairMemoriesRealignsShortTermSourceRoles() {
+        // The old merge bug collapsed `sourceRoles` to ["user","assistant"] while
+        // keeping 3 ids, leaving the third role-less and dead-locking analysis.
+        val poisoned = ShortTermMemory(
+            id = "s1",
+            content = "某事件",
+            sourceMessageIds = listOf("m1", "m2", "m3"),
+            sourceRoles = listOf("user", "assistant"),
+            userEvidence = listOf(SourceEvidence(sourceMessageId = "m1", text = "你好")),
+        )
+        val repaired = repairMemories(Character(id = "c1", shortTerm = listOf(poisoned)))
+        val fixed = repaired.shortTerm.single()
+        assertEquals(3, fixed.sourceMessageIds.size)
+        assertEquals(fixed.sourceMessageIds.size, fixed.sourceRoles.size)
+        assertTrue(fixed.sourceRoles.none { it.isBlank() })
+        // Sources changed, so the prior analysis is invalidated.
+        assertEquals(null, fixed.analyzedAt)
     }
 }

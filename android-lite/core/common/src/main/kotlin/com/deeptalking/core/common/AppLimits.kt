@@ -27,6 +27,14 @@ object AppLimits {
         const val SUMMARY_SOURCES = 20
 
         /**
+         * Analysis batches the one-time short-term backlog drain runs per invocation.
+         * Deliberately small ("慢慢处理"): each batch converts up to
+         * [ANALYSIS_BATCH] short-term items into long-term memory, so the backlog
+         * shrinks gradually instead of being truncated away.
+         */
+        const val CLEANUP_BATCHES_PER_RUN = 5
+
+        /**
          * Character-bigram Jaccard similarity at which two memory texts are treated
          * as near-duplicates and merged (deterministic pass).
          */
@@ -77,5 +85,12 @@ object AppLimits {
     object Media {
         const val MAX_IMAGE_DIMENSION = 1280
         const val MAX_IMAGE_BYTES = 2 * 1024 * 1024
+
+        /**
+         * How many recent messages keep their image attachments. Older messages
+         * keep their text but lose the images (files are deleted), so history stays
+         * readable while storage/export do not grow without bound.
+         */
+        const val IMAGE_RETENTION_MESSAGES = 50
     }
 }
