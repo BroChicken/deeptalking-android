@@ -281,10 +281,11 @@ class CharacterParityTest {
     }
 
     @Test
-    fun newLorebookEntryDefaultsToAlwaysActive() {
-        val entry = CharacterParity.newUserLorebookEntry()
+    fun newLorebookEntryDefaultsToAlwaysActiveAndAiMaintained() {
+        // A fresh entry starts AI-maintained (the editor's owner chip switches it to 人工).
+        val entry = CharacterParity.newLorebookEntry()
         assertTrue(entry.alwaysActive)
-        assertEquals(LorebookOrigin.User, entry.origin)
+        assertEquals(LorebookOrigin.Model, entry.origin)
         assertTrue(entry.enabled)
     }
 

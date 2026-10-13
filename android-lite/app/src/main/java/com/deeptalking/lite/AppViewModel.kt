@@ -10,7 +10,6 @@ import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.GroupMember
 import com.deeptalking.core.model.LorebookEntry
-import com.deeptalking.core.model.LorebookOrigin
 import com.deeptalking.core.model.MemoryCategory
 import com.deeptalking.core.model.MessageAttachment
 import com.deeptalking.core.model.PromiseStatus
@@ -395,6 +394,9 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             eventsState.tryEmit(
                 UiEvent(cleanupSummary(removedImages, drain, remaining, canAnalyze, stillPending)),
             )
+            // Hand over to the next startup prompt (world-book rewrite, …): the chain used
+            // to dead-end here, so confirming the cleanup was the last thing that ever ran.
+            continueStartupPrompts()
         }
     }
 
@@ -775,14 +777,10 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             eventsState.tryEmit(UiEvent("世界书条目已达上限（200 条）"))
             return
         }
-        val entry = LorebookEntry(
-            id = UUID.randomUUID().toString(),
-            name = "",
-            content = "",
-            alwaysActive = true,
-            origin = LorebookOrigin.User,
-            createdAt = Instant.now().toString(),
-        )
+        // A new entry is AI-maintained by default (the owner chip in the editor switches it
+        // to 人工维护); it is always active, matching the legacy `addLorebookEntry`.
+        val entry = com.deeptalking.feature.characters.CharacterParity.newLorebookEntry()
+            .copy(createdAt = Instant.now().toString())
         updateCharacter(character.copy(lorebook = character.lorebook + entry))
     }
 

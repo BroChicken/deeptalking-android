@@ -120,14 +120,22 @@ class MemoryPolicyTest {
     }
 
     @Test
-    fun trimShortTermKeepsUnprocessedOlderItems() {
-        val items = listOf(
-            ShortTermMemory(id = "oldDone", analyzedAt = "t", lorebookScannedAt = "t"),
-            ShortTermMemory(id = "oldPending", analyzedAt = null),
-            ShortTermMemory(id = "recent", analyzedAt = "t", lorebookScannedAt = "t"),
-        )
-        val trimmed = trimShortTerm(items, floor = 1)
-        assertEquals(listOf("oldPending", "recent"), trimmed.map { it.id })
+    fun shortTermIsConsumedByPositionNotByBookkeeping() {
+        // There is no per-entry "已分析 / 已扫过" marker any more: the pass consumes the
+        // oldest entries above the low-water floor and drops exactly those. This test pins
+        // the contract that made the old marker scheme dead-lock the window: an entry the
+        // window still holds is work, an entry that left the window is done.
+        val items = (0 until 30).map { index ->
+            ShortTermMemory(id = "s$index", content = "事件$index")
+        }
+        val floor = AppLimits.Memory.SHORT_TERM_TRIM_FLOOR
+        val consumable = (items.size - floor).coerceAtLeast(0)
+        val batch = items.take(minOf(consumable, AppLimits.Memory.ANALYSIS_BATCH))
+        val left = items.filterNot { it.id in batch.map { entry -> entry.id }.toSet() }
+        assertEquals(10, batch.size)
+        assertEquals(floor, left.size)
+        assertEquals(listOf("s0"), batch.map { it.id }.take(1))
+        assertEquals("s10", left.first().id)
     }
 
     @Test
@@ -348,34 +356,8 @@ class MemoryPolicyTest {
         assertEquals(3, fixed.sourceMessageIds.size)
         assertEquals(fixed.sourceMessageIds.size, fixed.sourceRoles.size)
         assertTrue(fixed.sourceRoles.none { it.isBlank() })
-        // Sources changed, so the prior analysis is invalidated.
-        assertEquals(null, fixed.analyzedAt)
-    }
-
-    @Test
-    fun trimShortTermDropsConsumedItemsButNeverAnUnconsumedOne() {
-        // A consumed item (analyzed AND world-book scanned) may be dropped once it is
-        // older than the newest floor; the floor itself is always kept.
-        val consumed = (1..30).map { index ->
-            ShortTermMemory(id = "s$index", content = "事件$index", analyzedAt = "done", lorebookScannedAt = "done")
-        }
-        assertEquals(20, trimShortTerm(consumed).size)
-
-        val pending = ShortTermMemory(id = "pending", content = "还没消化")
-        val trimmed = trimShortTerm(listOf(pending) + consumed)
-        assertEquals(21, trimmed.size)
-        assertTrue(trimmed.any { it.id == "pending" })
-        assertTrue(trimmed.none { it.id == "s1" || it.id == "s10" })
-        assertTrue(trimmed.any { it.id == "s11" })
-    }
-
-    @Test
-    fun trimShortTermKeepsAnItemTheLorebookHasNotScannedYet() {
-        // Analysis alone is not enough: this is exactly the state the pile-up sat in
-        // (analyzed but never scanned, so nothing could ever be dropped).
-        val items = (1..30).map { index ->
-            ShortTermMemory(id = "s$index", content = "事件$index", analyzedAt = "done")
-        }
-        assertEquals(30, trimShortTerm(items).size)
+        // Sources changed, so the entry is read again by the next pass (positional
+        // consumption needs no marker to be cleared for that).
+        assertEquals(1, fixed.revision)
     }
 }

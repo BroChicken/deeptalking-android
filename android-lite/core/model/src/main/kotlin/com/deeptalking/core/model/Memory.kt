@@ -365,20 +365,16 @@ data class ShortTermMemory(
     val timeRef: String? = null,
     val eventTime: String? = null,
     val createdAt: String? = null,
-    /** When this item was folded into long-term memory (legacy `analyzedAt`). */
-    val analyzedAt: String? = null,
     /** Participants of the event (legacy `participants`). */
     val participants: List<String> = emptyList(),
     /** Event location (legacy `location`). */
     val location: String = "",
-    /** When this item was last handed to the lorebook consolidation pass. */
-    val lorebookScannedAt: String? = null,
-    /** Revision counter, bumped when the summary is rewritten (legacy `revision`, min 1). */
+    /**
+     * Bumped when this summary is rewritten in place (`update_memory`). The window is
+     * consumed by position, so this is only used to hold an entry back when a correction
+     * lands while an analysis request is in flight (see `analyzeShortTermBatch`).
+     */
     val revision: Int = 1,
-    /** Revision the analysis consumer last processed (legacy `analyzedRevision`). */
-    val analyzedRevision: Int = 0,
-    /** Revision the lorebook consumer last processed (legacy `lorebookScannedRevision`). */
-    val lorebookScannedRevision: Int = 0,
     /** Source message timestamp used for same-day reconciliation (legacy `_sourceTs`). */
     @SerialName("_sourceTs") val sourceTs: String? = null,
     /** Roles of the source messages (legacy `sourceRoles`, e.g. `user`/`assistant`). */

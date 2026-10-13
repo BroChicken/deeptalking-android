@@ -347,11 +347,7 @@ class BackupService(
         put("id", memory.id)
         put("content", memory.content)
         memory.createdAt?.let { put("timestamp", it) }
-        memory.analyzedAt?.let { put("analyzedAt", it) }
-        memory.lorebookScannedAt?.let { put("lorebookScannedAt", it) }
         put("revision", memory.revision)
-        put("analyzedRevision", memory.analyzedRevision)
-        put("lorebookScannedRevision", memory.lorebookScannedRevision)
         memory.sourceTs?.let { put("_sourceTs", it) }
         memory.eventTime?.let { put("eventTime", it) }
         if (memory.sourceMessageIds.isNotEmpty()) {

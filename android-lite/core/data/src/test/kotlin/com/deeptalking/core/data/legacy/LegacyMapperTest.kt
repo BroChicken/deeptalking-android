@@ -421,8 +421,6 @@ class LegacyMapperTest {
         """.trimIndent()
         val character = mapCharacter(parse(json).characters!!.getValue("c1"), null)
         val short = character.shortTerm.single()
-        assertEquals("2026-01-02T00:00:00.000Z", short.analyzedAt)
-        assertEquals("2026-01-03T00:00:00.000Z", short.lorebookScannedAt)
         assertEquals(listOf("Bob", "Aria"), short.participants)
         assertEquals("forest", short.location)
         val long = character.longTerm.single()

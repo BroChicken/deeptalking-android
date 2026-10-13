@@ -19,9 +19,8 @@ private val salvageJson = Json {
  *
  * The contract asks for `{"status","analyzedShortTermIds":[...],"longTerm":[...]}`.
  * A truncated reply fails strict parsing, and the whole batch used to be discarded —
- * so the same items were retried on every pass and nothing was ever stamped
- * `analyzedAt`, which meant short-term memory could never be trimmed (it piled up for
- * months while the analysis kept failing silently).
+ * so the same items were retried on every pass and the window could never be consumed
+ * (it piled up for months while the analysis kept failing silently).
  *
  * Here we keep whatever did arrive: every `longTerm` element that parses on its own,
  * plus the echoed ids — or, when the cut happened before the id list, the short ids

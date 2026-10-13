@@ -13,9 +13,12 @@ import com.deeptalking.core.model.MemorySubject
 import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.SceneSummary
+import com.deeptalking.core.model.ShortTermMemory
 import com.deeptalking.core.model.SourceEvidence
 import com.deeptalking.core.model.StaticFillMeta
+import com.deeptalking.domain.agent.ApiRetry
 import com.deeptalking.domain.agent.ResponseParser
+import com.deeptalking.domain.agent.isTransientApiError
 import com.deeptalking.domain.agent.tools.MemoryToolSupport
 import com.deeptalking.domain.agent.prompts.DYNAMIC_STATE_FIELDS
 import com.deeptalking.domain.agent.prompts.GROUP_SHARED_DYNAMIC_FIELDS
@@ -48,7 +51,6 @@ import com.deeptalking.domain.memory.selfLearnMemoryImportance
 import com.deeptalking.domain.memory.parseRelativeText
 import com.deeptalking.domain.memory.resolveTimeRef
 import com.deeptalking.domain.memory.TimeRef
-import com.deeptalking.domain.memory.trimShortTerm
 import com.deeptalking.domain.memory.upsertLongTermMemory
 import com.deeptalking.domain.memory.upsertLorebookEntry
 import com.deeptalking.domain.memory.upsertLorebookEntryForCharacter
@@ -57,6 +59,7 @@ import com.deeptalking.engine.ondevice.LlmRequest
 import com.deeptalking.engine.ondevice.TokenUsage
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -307,6 +310,12 @@ class BackgroundTasks(
     private val onStatus: (String) -> Unit = {},
     /** Token usage of auxiliary calls, for the app's usage meter (legacy `recordCacheUsage`). */
     private val onAuxiliaryUsage: (String, TokenUsage) -> Unit = { _, _ -> },
+    /**
+     * Reason of an auxiliary call that ultimately failed, for the app's request log.
+     * Background failures used to leave no trace at all, which made "整理没成功" impossible
+     * to diagnose from a save.
+     */
+    private val onAuxiliaryFailure: suspend (String, String) -> Unit = { _, _ -> },
 ) {
 
     private val json = Json {
@@ -453,8 +462,12 @@ class BackgroundTasks(
             json.encodeToString(existingEvents) + "\n对话内容:\n" + json.encodeToString(payload)
 
         onStatus("正在提取短期记忆…")
-        val raw = complete(EXTRACTION_SYSTEM, prompt, sessionId = sessionIdFor(character), taskType = "extraction")
-        if (raw.isBlank()) return TaskStatus.Failure to character
+        val reply = completeDetailed(EXTRACTION_SYSTEM, prompt, sessionId = sessionIdFor(character), taskType = "extraction")
+        val raw = reply.text
+        if (raw.isBlank()) {
+            if (reply.error.isNotBlank()) onAuxiliaryFailure("extraction", reply.error)
+            return TaskStatus.Failure to character
+        }
 
         val root = ResponseParser.parseJsonLenient(raw)
         var points = (root as? JsonArray)?.mapNotNull { it as? JsonObject }.orEmpty()
@@ -543,55 +556,66 @@ class BackgroundTasks(
     }
 
     /**
-     * Folds unanalyzed short-term events into long-term memory (legacy
-     * `analyzeShortToLongTerm`). The analyzed set must be acknowledged in full and
-     * every entry re-validated against its declared short-term sources; on any
-     * failure the character is returned unchanged so nothing is marked analyzed.
+     * Folds the consumable part of the short-term window into long-term memory (legacy
+     * `analyzeShortToLongTerm`). Every entry is re-validated against its declared
+     * short-term sources; on failure the character is otherwise returned unchanged, so a
+     * failed pass consumes nothing and the same batch is retried under the retry gate.
      */
     suspend fun analyzeShortToLongTerm(character: Character): Character {
-        val (status, updated) = analyzeShortToLongTermTask(character)
-        // On failure only the counters change (nothing is ever marked analyzed), but the
+        val outcome = analyzeShortToLongTermTask(character)
+        // On failure only the counters change (nothing is ever consumed), but the
         // diagnostic is carried through so the caller can persist and show it.
-        return if (status == TaskStatus.Stale) character else updated
+        return if (outcome.status == TaskStatus.Stale) character else outcome.character
     }
 
     /** Analysis with an explicit status (legacy `analyzeShortToLongTerm`), including `Stale`. */
-    suspend fun analyzeShortToLongTermStatus(character: Character): Pair<TaskStatus, Character> =
+    suspend fun analyzeShortToLongTermStatus(character: Character): AnalysisOutcome =
         analyzeShortToLongTermTask(character)
 
     /**
-     * One backlog-drain pass for the cleanup: force an analysis batch (ignoring the
-     * size trigger and the retry backoff), then run the world-book / scene maintenance
-     * that acknowledges the same revision. Both consumers must acknowledge an item
-     * before [trimShortTerm] may drop it, so this is what lets a piled-up short-term
-     * backlog shrink *gradually* instead of being truncated.
+     * One backlog-drain pass for the cleanup: force an analysis batch (ignoring the size
+     * trigger and the retry backoff), then run the rest of the maintenance on that same
+     * batch. The window is consumed by position, so a pass that reads a batch drops it —
+     * this is what lets a piled-up backlog shrink *gradually* instead of being truncated.
      */
     suspend fun drainMemoryBacklog(character: Character): DrainOutcome {
-        val (status, analyzed) = analyzeShortToLongTermStatus(character)
-        return when (status) {
-            // Guard tripped: a newer turn superseded this snapshot, so give up quietly.
-            TaskStatus.Stale -> DrainOutcome(character, progressed = false)
-            // Failure changed only the counters; hand them back so the reason is saved.
-            TaskStatus.Failure -> DrainOutcome(analyzed, progressed = false)
-            TaskStatus.Success -> {
-                val maintained = runMemoryMaintenance(analyzed)
-                DrainOutcome(if (maintained != analyzed) maintained else analyzed, progressed = true)
-            }
-        }
+        val outcome = analyzeShortToLongTermStatus(character)
+        if (outcome.status == TaskStatus.Stale) return DrainOutcome(character, progressed = false)
+        // The world book / scene steps run even after a failed analysis: each has its own
+        // retry gate, and the old "analysis failed → skip everything" short-circuit is how
+        // a stuck analysis silently stopped the world book from ever being updated.
+        val maintained = runMemoryMaintenance(outcome.character, outcome.consumed)
+        return DrainOutcome(
+            character = maintained,
+            progressed = outcome.status == TaskStatus.Success && outcome.consumed.isNotEmpty(),
+        )
     }
 
-    private suspend fun analyzeShortToLongTermTask(character: Character): Pair<TaskStatus, Character> =
+    private suspend fun analyzeShortToLongTermTask(character: Character): AnalysisOutcome =
         analyzeShortTermBatch(character)
 
-    /** One whole-window analysis request over the short-term window (see [AppLimits.Memory.ANALYSIS_BATCH]). */
-    private suspend fun analyzeShortTermBatch(character: Character): Pair<TaskStatus, Character> {
-        // Whole-window pass: the window is carried in full so the low-water leftovers
-        // are re-read as context (continuity); only the pending items produce entries.
-        val window = character.shortTerm.take(AppLimits.Memory.ANALYSIS_BATCH)
-        val pending = window.filter { it.analyzedAt == null || it.analyzedRevision != it.revision }
-        if (pending.isEmpty()) return TaskStatus.Failure to character
+    /**
+     * One analysis pass over the *consumable* part of the short-term window.
+     *
+     * The window is a high/low watermark pair (see [AppLimits.Memory.SHORT_TERM]) and it is
+     * consumed **by position**: everything older than the newest
+     * [AppLimits.Memory.SHORT_TERM_TRIM_FLOOR] entries is this pass's batch (at most
+     * [AppLimits.Memory.ANALYSIS_BATCH] entries), the newer leftovers ride along as context
+     * (continuity) without producing entries, and on success exactly the acknowledged batch
+     * is dropped. "Already consumed" is therefore simply "no longer in the window" — there
+     * is no per-entry marker, so a failed pass loses nothing: the batch is still there and
+     * the retry gate re-runs it.
+     */
+    private suspend fun analyzeShortTermBatch(character: Character): AnalysisOutcome {
+        val consumable = (character.shortTerm.size - AppLimits.Memory.SHORT_TERM_TRIM_FLOOR).coerceAtLeast(0)
+        // Nothing to do is *not* a failure: the window is at (or below) its low-water mark.
+        if (consumable <= 0) return AnalysisOutcome(TaskStatus.Success, character)
+        val batch = character.shortTerm.take(minOf(consumable, AppLimits.Memory.ANALYSIS_BATCH))
+        val batchIds = batch.mapTo(HashSet()) { it.id }
+        val context = character.shortTerm.takeLast(AppLimits.Memory.SHORT_TERM_TRIM_FLOOR)
+            .filter { it.id !in batchIds }
 
-        val inputs = window.map { item ->
+        val inputs = (batch.map { it to false } + context.map { it to true }).map { (item, isContext) ->
             AnalysisInput(
                 id = item.id,
                 content = item.content,
@@ -600,21 +624,25 @@ class BackgroundTasks(
                 participants = item.participants,
                 location = item.location,
                 userEvidence = item.userEvidence,
-                analyzed = item.analyzedAt != null && item.analyzedRevision == item.revision,
+                analyzed = isContext,
             )
         }
         val prompt = ANALYSIS_PROMPT_HEAD + json.encodeToString(inputs) + ANALYSIS_PROMPT_TAIL
         val guard = captureGuard(character)
         onStatus("正在分析长期记忆…")
-        val raw = complete(ANALYSIS_SYSTEM, prompt, sessionId = sessionIdFor(character), taskType = "analysis")
-        if (!isGuardCurrent(guard)) return TaskStatus.Stale to character
-        if (raw.isBlank()) return TaskStatus.Failure to character.withAnalysisError("empty-reply")
+        val reply = completeDetailed(ANALYSIS_SYSTEM, prompt, sessionId = sessionIdFor(character), taskType = "analysis")
+        val raw = reply.text
+        if (!isGuardCurrent(guard)) return AnalysisOutcome(TaskStatus.Stale, character)
+        if (raw.isBlank()) {
+            val code = if (reply.error.isNotBlank()) "call: " + reply.error else "empty-reply"
+            return AnalysisOutcome(TaskStatus.Failure, character.withAnalysisError(code))
+        }
 
         val parsed = ResponseParser.parseJsonLenient(raw) as? JsonObject
         if (parsed != null && parsed["status"] != null && !parsed.string("status").equals("ok", ignoreCase = true)) {
-            return TaskStatus.Failure to character.withAnalysisError("status=" + parsed.string("status"), raw)
+            return AnalysisOutcome(TaskStatus.Failure, character.withAnalysisError("status=" + parsed.string("status"), raw))
         }
-        val analyzableIds = pending.map { it.id }.toSet()
+        val analyzableIds = batchIds
         fun hasElements(candidate: JsonObject): Boolean =
             (candidate["longTerm"] as? JsonArray)?.isNotEmpty() == true
         fun hasAck(candidate: JsonObject): Boolean =
@@ -625,32 +653,32 @@ class BackgroundTasks(
         val root = parsed?.takeIf { hasAck(it) && hasElements(it) }
             ?: salvaged?.takeIf { hasAck(it) }
             ?: parsed?.takeIf { hasAck(it) }
-            ?: return TaskStatus.Failure to character.withAnalysisError("unparsable", raw)
+            ?: return AnalysisOutcome(TaskStatus.Failure, character.withAnalysisError("unparsable", raw))
         val longTermArray = root["longTerm"] as? JsonArray ?: JsonArray(emptyList())
-        // Tolerant acknowledgement: the model only has to echo *some* of this batch's
-        // ids correctly. Missing ids simply stay unanalyzed (retried on the next pass)
+        // Tolerant acknowledgement: the model only has to echo *some* of this batch's ids
+        // correctly. Missing ids simply stay in the window (read again by the next pass)
         // and foreign ids are ignored — demanding an exact set was another way a single
         // imperfect reply dead-locked the queue forever.
         val acknowledged = acknowledgedOf(root, analyzableIds)
         if (acknowledged.isEmpty()) {
-            return TaskStatus.Failure to character.withAnalysisError("no-acknowledged-ids", raw)
+            return AnalysisOutcome(TaskStatus.Failure, character.withAnalysisError("no-acknowledged-ids", raw))
         }
 
         data class Prepared(val item: LongTermMemory, val shortTermIds: List<String>)
         val sources = knownSources(character)
         val prepared = mutableListOf<Prepared>()
-        // Per-item tolerance: one malformed entry must never fail the whole batch.
-        // The same oldest batch is retried until it is acknowledged, so a single
-        // entry that cannot pass validation used to "poison" the queue and
-        // permanently dead-lock short-term memory (nothing ever gets analyzed, so
-        // nothing ever gets trimmed). Structural problems (unparseable JSON,
-        // status != ok, a mismatched analyzedShortTermIds) still fail the batch.
+        // Per-item tolerance: one malformed entry must never fail the whole batch. The
+        // batch stays in the window until it is acknowledged, so a single entry that
+        // cannot pass validation used to "poison" the queue and permanently dead-lock
+        // short-term memory (nothing ever gets consumed, so the window never shrinks).
+        // Structural problems (unparseable JSON, status != ok, no acknowledged ids) still
+        // fail the batch.
         for (element in longTermArray) {
             val obj = element as? JsonObject ?: continue
             var item = parseLongTerm(obj)
             val sourceShortTermIds = stringList(obj["sourceShortTermIds"]).map { it.trim() }.filter { it.isNotEmpty() }.distinct()
             if (sourceShortTermIds.isEmpty() || sourceShortTermIds.any { it !in acknowledged }) continue
-            val claimed = window.filter { it.id in sourceShortTermIds }
+            val claimed = batch.filter { it.id in sourceShortTermIds }
             // The chain is anchored on the short-term entries, not on raw message ids:
             // the evidence must be one of the verbatim user lines those entries carry
             // (collected at fold time, so it survives the source message leaving the
@@ -681,46 +709,53 @@ class BackgroundTasks(
             working = working.copy(longTerm = newList)
         }
 
-        val nowIso = Instant.now().toString()
-        working = working.copy(
-            shortTerm = working.shortTerm.map {
-                if (it.id in acknowledged) it.copy(analyzedAt = nowIso, analyzedRevision = it.revision) else it
-            },
-        )
+        // Consume the batch: drop exactly what this pass read. The live row is the base for
+        // the resulting list, so an entry a correction rewrote while the request was in
+        // flight keeps its NEW text (and is held back rather than dropped unread), and any
+        // entry added meanwhile survives. The newest entries are never part of the batch,
+        // so the window keeps its low-water context.
+        val live = liveCharacter(character.id)
+        val snapshotRevision = batch.associate { it.id to it.revision }
+        val liveRevision = live?.shortTerm?.associate { it.id to it.revision }.orEmpty()
+        val drop = acknowledged
+            .filter { snapshotRevision[it] == (liveRevision[it] ?: snapshotRevision[it]) }
+            .toSet()
+        working = working.copy(shortTerm = (live ?: character).shortTerm.filterNot { it.id in drop })
+        val consumed = character.shortTerm.filter { it.id in drop }
         // Success clears the diagnostic, so a stale reason never lingers in the save.
-        return TaskStatus.Success to trimMemory(working.withAnalysisError(""))
+        return AnalysisOutcome(TaskStatus.Success, trimMemory(working.withAnalysisError("")), consumed)
     }
+
+    /**
+     * Outcome of one analysis pass: the status, the updated character, and the entries the
+     * pass consumed (the world-book pass reads exactly this batch, one step later).
+     */
+    data class AnalysisOutcome(
+        val status: TaskStatus,
+        val character: Character,
+        val consumed: List<ShortTermMemory> = emptyList(),
+    )
 
     /** Outcome of a memory sub-task: Success updates state, Failure retries, Stale aborts. */
     enum class TaskStatus { Success, Failure, Stale }
 
     /**
-     * Applies the high/low watermark trims (instant FIFO + short-term retention) plus
-     * the emergency ceilings.
+     * Applies the emergency short-term ceiling.
      *
-     * The ceilings are only reached when a fold keeps failing: without them a
-     * permanently failing pass would grow the window without bound (the historical
-     * pile-up). Hitting one is reported through `counters.analysisLastError`, so
-     * dropped content is never silent.
-     */
-    /**
-     * Applies the short-term retention trim plus its emergency ceiling.
-     *
-     * The instant window is deliberately NOT touched here. The fold consumes exactly
-     * the messages it read (see [foldWindow]) and an oversized legacy window is owned by
-     * [migrateOversizedWindow], so a positional trim here could only ever drop messages
-     * no pass had read yet — which is exactly how the old backlog used to vanish.
+     * The instant window and the ordinary short-term retention are deliberately NOT touched
+     * here: both windows are consumed by the pass that read them (the fold drops the
+     * messages it folded, the analysis drops the batch it analyzed), so a positional trim
+     * here could only ever drop entries no pass had read yet — which is exactly how the old
+     * backlog used to vanish. The ceiling is only reached when that keeps failing, and
+     * hitting it is reported through `counters.analysisLastError`, so dropped content is
+     * never silent.
      */
     private fun trimMemory(character: Character): Character {
         val shortOverflow = (character.shortTerm.size - AppLimits.Memory.SHORT_TERM_HARD_CAP).coerceAtLeast(0)
-        var working = character
-        if (shortOverflow > 0) {
-            working = working.copy(shortTerm = working.shortTerm.drop(shortOverflow))
-            working = working.withAnalysisError(
-                "window-overflow: dropped $shortOverflow short-term (fold failing)",
-            )
-        }
-        return working.copy(shortTerm = trimShortTerm(working.shortTerm))
+        if (shortOverflow <= 0) return character
+        return character
+            .copy(shortTerm = character.shortTerm.drop(shortOverflow))
+            .withAnalysisError("window-overflow: dropped $shortOverflow short-term (analysis failing)")
     }
 
     /** Captures the revision/last-message snapshot for the stale guard (legacy `captureMemoryTask`). */
@@ -812,19 +847,15 @@ class BackgroundTasks(
         )
     }
 
-    /** True when lorebook consolidation is due for [character]. */
-    fun lorebookDue(character: Character): Boolean {
-        val pending = character.shortTerm.filter { it.lorebookScannedAt == null || it.lorebookScannedRevision != it.revision }
-        return pending.size >= AppLimits.Lorebook.CONSOLIDATE_SPAN || pending.any { it.analyzedAt != null }
-    }
-
     /**
-     * Consolidates settled short-term facts into the world book and retires stale
-     * AI entries (legacy `consolidateLorebook`). Returns `Failure` unchanged when
-     * the model output is malformed, so no markers/counters are touched.
+     * Consolidates settled facts into the world book and retires stale AI entries (legacy
+     * `consolidateLorebook`). [fresh] is the batch the analysis pass just consumed: the
+     * world book reads exactly those events, one step later, which is why there is no
+     * per-entry "已扫过" marker any more. A structurally malformed reply returns `Failure`
+     * (retried by the gate); a single unusable entry is skipped and the rest of the batch
+     * still lands, with the reason reported — the text is never truncated.
      */
-    suspend fun consolidateLorebook(character: Character): Pair<TaskStatus, Character> {
-        val fresh = character.shortTerm.filter { it.lorebookScannedAt == null || it.lorebookScannedRevision != it.revision }.take(AppLimits.Memory.ANALYSIS_BATCH)
+    suspend fun consolidateLorebook(character: Character, fresh: List<ShortTermMemory>): Pair<TaskStatus, Character> {
         if (fresh.isEmpty()) return TaskStatus.Success to character
 
         val books = mutableListOf(character.lorebook)
@@ -854,28 +885,40 @@ class BackgroundTasks(
 
         val guard = captureGuard(character)
         onStatus("正在整理世界书…")
-        val raw = complete(LOREBOOK_SYSTEM, prompt, sessionId = sessionIdFor(character), taskType = "lorebook")
+        val reply = completeDetailed(LOREBOOK_SYSTEM, prompt, sessionId = sessionIdFor(character), taskType = "lorebook")
+        val raw = reply.text
         if (!isGuardCurrent(guard)) return TaskStatus.Stale to character
-        if (raw.isBlank()) return TaskStatus.Failure to character
+        if (raw.isBlank()) {
+            if (reply.error.isNotBlank()) onAuxiliaryFailure("lorebook", reply.error)
+            return TaskStatus.Failure to character
+        }
         val root = ResponseParser.parseJsonLenient(raw) as? JsonObject ?: return TaskStatus.Failure to character
         val entries = root["entries"] as? JsonArray ?: return TaskStatus.Failure to character
 
         val allowed = fresh.map { it.id }.toSet()
-        val items = entries.take(AppLimits.Lorebook.AUTO_ENTRIES_PER_PASS)
-        for (entry in items) {
-            val obj = entry as? JsonObject ?: return TaskStatus.Failure to character
-            val name = obj.string("name")
-            val content = obj.string("content")
-            val ids = stringList(obj["sourceShortTermIds"]).map { it.trim() }.filter { it.isNotEmpty() }
-            if (name.isBlank() || content.isBlank() || ids.isEmpty() || ids.any { it !in allowed }) {
-                return TaskStatus.Failure to character
+        // Per-entry validation: one entry the model wrote too long (or cited nothing /
+        // invented a source) is skipped, and the rest of the batch still lands. Rejecting
+        // the whole batch is what made the world book silently stop updating — the cap is
+        // a writing rule, never a knife, so nothing here is ever cut.
+        val items = mutableListOf<JsonObject>()
+        var skipped = 0
+        for (entry in entries.take(AppLimits.Lorebook.AUTO_ENTRIES_PER_PASS)) {
+            val obj = entry as? JsonObject
+            val name = obj?.string("name").orEmpty()
+            val content = obj?.string("content").orEmpty()
+            val ids = obj?.let { candidate ->
+                stringList(candidate["sourceShortTermIds"]).map { it.trim() }.filter { it.isNotEmpty() }
+            }.orEmpty()
+            if (obj == null || name.isBlank() || content.isBlank() || ids.isEmpty() ||
+                ids.any { it !in allowed } || content.trim().length > AppLimits.Lorebook.CONTENT_CHARS
+            ) {
+                skipped++
+                continue
             }
-            // The cap is a writing rule, not a knife: cutting the model's text would
-            // silently drop its tail. Reject the whole batch instead (the prompt tells the
-            // model that over-long entries are discarded) and let the retry re-ask.
-            if (content.trim().length > AppLimits.Lorebook.CONTENT_CHARS) {
-                return TaskStatus.Failure to character
-            }
+            items += obj
+        }
+        if (skipped > 0) {
+            onAuxiliaryFailure("lorebook", "skipped $skipped invalid/over-long entries")
         }
 
         // Eviction only runs after the batch parsed cleanly (legacy order).
@@ -883,8 +926,7 @@ class BackgroundTasks(
             lorebook = evictStaleLorebookEntries(character.lorebook).kept,
             members = character.members.map { it.copy(lorebook = evictStaleLorebookEntries(it.lorebook).kept) },
         )
-        items.forEach { entry ->
-            val obj = entry as JsonObject
+        items.forEach { obj ->
             val proposal = LorebookProposal(
                 name = obj.string("name"),
                 content = obj.string("content"),
@@ -897,15 +939,8 @@ class BackgroundTasks(
         working = working.copy(
             lorebook = dedupeLorebook(working.lorebook),
             members = working.members.map { it.copy(lorebook = dedupeLorebook(it.lorebook)) },
-        )
-        val now = Instant.now().toString()
-        val freshIds = fresh.map { it.id }.toSet()
-        working = working.copy(
-            shortTerm = working.shortTerm.map {
-                if (it.id in freshIds) it.copy(lorebookScannedAt = now, lorebookScannedRevision = it.revision) else it
-            },
             counters = working.counters.copy(
-                lorebookScannedCount = working.counters.lorebookScannedCount + minOf(fresh.size, AppLimits.Memory.ANALYSIS_BATCH),
+                lorebookScannedCount = working.counters.lorebookScannedCount + fresh.size,
             ),
         )
         return TaskStatus.Success to working
@@ -1015,7 +1050,18 @@ class BackgroundTasks(
         }
     }
 
-    suspend fun runMemoryMaintenance(character: Character): Character {
+    /**
+     * Scene summaries + world-book consolidation + adaptive importance.
+     *
+     * [freshlyAnalyzed] is the batch the analysis pass just consumed: the world book reads
+     * exactly those events (one step later), so nothing has to be tracked per entry and a
+     * world-book failure simply means those events are not world-booked — by design there
+     * is no backstop for it.
+     */
+    suspend fun runMemoryMaintenance(
+        character: Character,
+        freshlyAnalyzed: List<ShortTermMemory> = emptyList(),
+    ): Character {
         var working = ensureMessageSequences(character)
         working = applyMemoryDecay(working)
         working = selfLearnMemoryImportance(working)
@@ -1032,8 +1078,8 @@ class BackgroundTasks(
             }
         }
 
-        if (lorebookDue(working) && canRunMemoryTask(counters, MemoryTaskKind.Lorebook, nowMillis)) {
-            val (status, afterLore) = consolidateLorebook(working)
+        if (freshlyAnalyzed.isNotEmpty() && canRunMemoryTask(counters, MemoryTaskKind.Lorebook, nowMillis)) {
+            val (status, afterLore) = consolidateLorebook(working, freshlyAnalyzed)
             counters = when (status) {
                 TaskStatus.Success -> {
                     working = afterLore
@@ -1604,17 +1650,21 @@ class BackgroundTasks(
             }
         }
 
-        // Consolidate short-term events into long-term memories (legacy analyzeShortToLongTerm).
-        val unanalyzedCount = working.shortTerm.count { it.analyzedAt == null }
-        val hasAnalyzable = working.shortTerm.size >= AppLimits.Memory.SHORT_TERM &&
-            unanalyzedCount >= (AppLimits.Memory.SHORT_TERM - AppLimits.Memory.SHORT_TERM_TRIM_FLOOR)
-        if (hasAnalyzable && canRunMemoryTask(counters, MemoryTaskKind.Analysis, nowMillis)) {
-            val (analysisStatus, analyzed) = analyzeShortToLongTermStatus(working)
+        // Consolidate the consumable part of the short-term window into long-term memories
+        // (legacy analyzeShortToLongTerm). The batch is what sits above the low-water mark,
+        // and the same batch is handed to the world-book pass, so both consumers read
+        // exactly the same events.
+        val consumable = (working.shortTerm.size - AppLimits.Memory.SHORT_TERM_TRIM_FLOOR).coerceAtLeast(0)
+        val analyzeSpan = AppLimits.Memory.SHORT_TERM - AppLimits.Memory.SHORT_TERM_TRIM_FLOOR
+        var freshlyAnalyzed: List<ShortTermMemory> = emptyList()
+        if (consumable >= analyzeSpan && canRunMemoryTask(counters, MemoryTaskKind.Analysis, nowMillis)) {
+            val outcome = analyzeShortToLongTermStatus(working)
             // Carry the failure diagnostic (or its clearing) into the persisted counters.
-            counters = counters.copy(analysisLastError = analyzed.counters.analysisLastError)
-            when (analysisStatus) {
+            counters = counters.copy(analysisLastError = outcome.character.counters.analysisLastError)
+            when (outcome.status) {
                 TaskStatus.Success -> {
-                    working = analyzed
+                    working = outcome.character
+                    freshlyAnalyzed = outcome.consumed
                     counters = resetMemoryRetry(counters, MemoryTaskKind.Analysis)
                 }
                 TaskStatus.Failure -> counters = scheduleMemoryRetry(counters, MemoryTaskKind.Analysis, nowMillis)
@@ -1624,7 +1674,7 @@ class BackgroundTasks(
         working = working.withCounters(counters)
 
         // Scene summaries + world-book consolidation + adaptive importance.
-        val maintained = runMemoryMaintenance(working)
+        val maintained = runMemoryMaintenance(working, freshlyAnalyzed)
         if (maintained != working) working = maintained
 
         if (working != character) onCharacterUpdated(working)
@@ -1685,14 +1735,56 @@ class BackgroundTasks(
             apiPlatform = apiPlatform,
             sessionId = sessionId ?: "deeptalking-general",
         )
-        return try {
-            val result = llm.complete(request)
-            result.usage?.let { onAuxiliaryUsage(taskType, it) }
-            result.text
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (_: Throwable) {
-            ""
+        return completeDetailed(system, user, sessionId, taskType).text
+    }
+
+    /** Text of one auxiliary call, plus the failure reason when it produced no text. */
+    private data class Completion(val text: String, val error: String = "")
+
+    /**
+     * One auxiliary call with the shared transient-failure policy: network errors,
+     * timeouts and HTTP 429/5xx are retried up to [ApiRetry.MAX_API_RETRIES] times with the
+     * legacy backoff, everything else fails immediately. The reason is handed back (and
+     * recorded in the request log) instead of being swallowed — every background task used
+     * to report the same "网络或接口异常" no matter what actually went wrong.
+     */
+    private suspend fun completeDetailed(
+        system: String,
+        user: String,
+        sessionId: String? = null,
+        taskType: String = "auxiliary",
+    ): Completion {
+        val request = LlmRequest(
+            model = model,
+            instructions = system,
+            input = listOf(ChatMessage(role = Role.User, content = user)),
+            temperature = normalizeTemperature(config.temperature),
+            maxOutputTokens = AppLimits.Api.AUXILIARY_MAX_OUTPUT_TOKENS,
+            stream = false,
+            reasoningEffort = "none",
+            apiPlatform = apiPlatform,
+            sessionId = sessionId ?: "deeptalking-general",
+        )
+        var attempt = 0
+        while (true) {
+            try {
+                val result = llm.complete(request)
+                result.usage?.let { onAuxiliaryUsage(taskType, it) }
+                return Completion(result.text)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (t: Throwable) {
+                attempt++
+                val reason = t.message?.replace(Regex("\\s+"), " ")?.trim()?.take(160)
+                    ?.takeIf { it.isNotEmpty() }
+                    ?: t::class.simpleName
+                    ?: "call failed"
+                if (attempt > ApiRetry.MAX_API_RETRIES || !isTransientApiError(t)) {
+                    onAuxiliaryFailure(taskType, reason)
+                    return Completion("", reason)
+                }
+                delay(ApiRetry.delayFor(attempt))
+            }
         }
     }
 

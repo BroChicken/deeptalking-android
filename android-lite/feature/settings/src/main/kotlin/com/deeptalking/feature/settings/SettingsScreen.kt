@@ -518,6 +518,8 @@ private fun DebugInfoPanel(config: AppConfig, context: Context) {
                 val entry = JSONObject()
                 entry.put("at", metric.at)
                 entry.put("taskType", metric.taskType)
+                entry.put("status", metric.status)
+                if (metric.phase.isNotBlank()) entry.put("reason", metric.phase)
                 entry.put("characterId", metric.characterId ?: JSONObject.NULL)
                 entry.put("inputTokens", metric.inputTokens ?: JSONObject.NULL)
                 entry.put("hitTokens", metric.hitTokens ?: JSONObject.NULL)

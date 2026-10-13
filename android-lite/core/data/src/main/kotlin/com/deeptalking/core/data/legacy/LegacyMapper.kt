@@ -284,16 +284,10 @@ private fun mapShortTerm(dto: LegacyShortTerm): ShortTermMemory = ShortTermMemor
     timeRef = dto.timeRef?.anchor,
     eventTime = dto.eventTime,
     createdAt = dto.timestamp,
-    analyzedAt = dto.analyzedAt,
-    lorebookScannedAt = dto.lorebookScannedAt,
     participants = (dto.participants ?: emptyList()).take(MAX_PARTICIPANTS),
     location = dto.location ?: "",
     sourceRoles = dto.sourceRoles ?: emptyList(),
     revision = (dto.revision ?: 1).coerceAtLeast(1),
-    analyzedRevision = (dto.analyzedRevision ?: 0).takeIf { it != 0 }
-        ?: if (dto.analyzedAt != null) 1 else 0,
-    lorebookScannedRevision = (dto.lorebookScannedRevision ?: 0).takeIf { it != 0 }
-        ?: if (dto.lorebookScannedAt != null) 1 else 0,
     sourceTs = dto.sourceTs,
     userEvidence = dto.userEvidence.take(160),
 )
@@ -796,12 +790,13 @@ fun reconcileLegacyMemories(character: Character): MemoryReconciliation {
             timeRef = old.timeRef,
             eventTime = earlierTimestamp(old.eventTime, item.eventTime),
             createdAt = earlierTimestamp(old.createdAt, item.createdAt),
-            analyzedAt = null,
             participants = mergeParticipants(old.participants, item.participants),
             location = mergeLocations(old.location, item.location),
-            lorebookScannedAt = null,
             sourceRoles = mergedSources.sourceRoles,
             userEvidence = mergedSources.userEvidence,
+            // The window is consumed by position, so the merged text simply gets read by
+            // the next pass; a bump keeps an in-flight request from dropping it.
+            revision = old.revision + 1,
         )
         short[primary.first] = merged
         seen[identity] = primary.first to merged

@@ -47,42 +47,59 @@ class BackgroundTasksTest {
     }
 
     @Test
-    fun consolidatesLorebookAndMarksScanned() = runBlocking {
+    fun consolidatesLorebookFromTheAnalyzedBatch() = runBlocking {
         val (background, llm) = tasks(
             listOf("""{"entries":[{"name":"银月商会","keywords":["银月"],"content":"银月商会在西街，经营药材","sourceShortTermIds":["s1"]}]}"""),
         )
         val character = Character(
             id = "c1",
             shortTerm = listOf(
-                ShortTermMemory(id = "s1", content = "银月商会在西街，经营药材", sourceMessageIds = listOf("m1"), analyzedAt = "done"),
+                ShortTermMemory(id = "s1", content = "银月商会在西街，经营药材", sourceMessageIds = listOf("m1")),
             ),
         )
-        val (status, updated) = background.consolidateLorebook(character)
+        // The world book reads the batch the analysis pass just consumed.
+        val (status, updated) = background.consolidateLorebook(character, character.shortTerm)
         assertEquals(BackgroundTasks.TaskStatus.Success, status)
         assertEquals(1, updated.lorebook.size)
         assertEquals("银月商会", updated.lorebook[0].name)
         assertEquals(1, llm.requests.size)
-        assertTrue(updated.shortTerm[0].lorebookScannedAt != null)
+        assertEquals(1, updated.counters.lorebookScannedCount)
     }
 
     @Test
-    fun overLongLorebookEntryRejectsWholeBatchAndMarksNothing() = runBlocking {
-        // 400+ characters: the cap is a writing rule, so the batch is rejected instead of
-        // silently cutting the model's text.
-        val (background, _) = tasks(
-            listOf(
-                """{"entries":[{"name":"银月商会","keywords":["银月"],""" +
-                    """"content":"${"多雾的旧设定".repeat(70)}","sourceShortTermIds":["s1"]}]}""",
+    fun lorebookPassDoesNothingWithoutABatch() = runBlocking {
+        val (background, llm) = tasks(emptyList())
+        val character = Character(id = "c1", shortTerm = listOf(ShortTermMemory(id = "s1", content = "已消费")))
+        val (status, updated) = background.consolidateLorebook(character, emptyList())
+        assertEquals(BackgroundTasks.TaskStatus.Success, status)
+        assertEquals(character, updated)
+        assertEquals(0, llm.requests.size)
+    }
+
+    @Test
+    fun overLongLorebookEntryIsSkippedInsteadOfFailingTheBatch() = runBlocking {
+        // 400+ characters: the cap is a writing rule, so the entry is dropped (never cut)
+        // and the rest of the batch still lands — rejecting everything here is what used to
+        // stop the world book from being updated at all.
+        val failures = mutableListOf<Pair<String, String>>()
+        val llm = ScriptedLlm(
+            mutableListOf(
+                """{"entries":[""" +
+                    """{"name":"银月商会","keywords":["银月"],"content":"${"多雾的旧设定".repeat(70)}","sourceShortTermIds":["s1"]},""" +
+                    """{"name":"西街","keywords":["西街"],"content":"西街有一家药材铺","sourceShortTermIds":["s1"]}]}""",
             ),
         )
+        val background = BackgroundTasks(llm, MemoryServiceImpl(), onAuxiliaryFailure = { task, reason -> failures += task to reason })
         val character = Character(
             id = "c1",
-            shortTerm = listOf(ShortTermMemory(id = "s1", content = "银月商会在西街", analyzedAt = "done")),
+            shortTerm = listOf(ShortTermMemory(id = "s1", content = "银月商会在西街", sourceMessageIds = listOf("m1"))),
         )
-        val (status, updated) = background.consolidateLorebook(character)
-        assertEquals(BackgroundTasks.TaskStatus.Failure, status)
-        assertTrue(updated.lorebook.isEmpty())
-        assertTrue(updated.shortTerm[0].lorebookScannedAt == null)
+        val (status, updated) = background.consolidateLorebook(character, character.shortTerm)
+        assertEquals(BackgroundTasks.TaskStatus.Success, status)
+        assertEquals(listOf("西街"), updated.lorebook.map { it.name })
+        assertEquals(1, failures.size)
+        assertEquals("lorebook", failures[0].first)
+        assertTrue(failures[0].second.contains("skipped"))
     }
 
     @Test
@@ -91,25 +108,24 @@ class BackgroundTasksTest {
         val character = Character(
             id = "c1",
             lorebook = emptyList(),
-            shortTerm = listOf(ShortTermMemory(id = "s1", content = "已知地点", analyzedAt = "done")),
+            shortTerm = listOf(ShortTermMemory(id = "s1", content = "已知地点", sourceMessageIds = listOf("m1"))),
         )
-        val (status, updated) = background.consolidateLorebook(character)
+        val (status, updated) = background.consolidateLorebook(character, character.shortTerm)
         assertEquals(BackgroundTasks.TaskStatus.Failure, status)
         assertTrue(updated.lorebook.isEmpty())
-        assertTrue(updated.shortTerm[0].lorebookScannedAt == null)
     }
 
     @Test
-    fun unknownSourceIdRejectsWholeBatch() = runBlocking {
+    fun unknownSourceIdIsSkipped() = runBlocking {
         val (background, _) = tasks(
             listOf("""{"entries":[{"name":"X","keywords":["x"],"content":"内容","sourceShortTermIds":["ghost"]}]}"""),
         )
         val character = Character(
             id = "c1",
-            shortTerm = listOf(ShortTermMemory(id = "s1", content = "真实内容", analyzedAt = "done")),
+            shortTerm = listOf(ShortTermMemory(id = "s1", content = "真实内容")),
         )
-        val (status, updated) = background.consolidateLorebook(character)
-        assertEquals(BackgroundTasks.TaskStatus.Failure, status)
+        val (status, updated) = background.consolidateLorebook(character, character.shortTerm)
+        assertEquals(BackgroundTasks.TaskStatus.Success, status)
         assertTrue(updated.lorebook.isEmpty())
     }
 
@@ -258,7 +274,8 @@ class BackgroundTasksTest {
 
     private fun analyzableCharacter(): Character {
         // The source message has already been evicted from `instant`; analysis must
-        // resolve it from the short-term item's captured userEvidence.
+        // resolve it from the short-term item's captured userEvidence. The 20 fillers are
+        // the low-water window: they ride along as context and are never consumed.
         val target = ShortTermMemory(
             id = "s1",
             content = "用户喜欢喝美式咖啡。",
@@ -273,19 +290,20 @@ class BackgroundTasksTest {
                 content = "占位$index",
                 sourceMessageIds = listOf("u1"),
                 eventTime = "2026-08-01T12:00:00Z",
-                analyzedAt = "done",
             )
         }
         return Character(id = "c1", shortTerm = listOf(target) + filler)
     }
 
     @Test
-    fun analyzeWritesValidatedLongTermAndMarksAnalyzed() = runBlocking {
+    fun analyzeWritesValidatedLongTermAndConsumesTheBatch() = runBlocking {
         val response = """{"status":"ok","analyzedShortTermIds":["s1"],"longTerm":[{"category":"userProfile","subject":"user","key":"饮品","value":"用户喜欢喝美式咖啡。","sourceShortTermIds":["s1"],"sourceMessageIds":["u1"],"evidence":"用户喜欢喝美式咖啡。"}]}"""
         val (background, _) = tasks(listOf(response))
         val updated = background.analyzeShortToLongTerm(analyzableCharacter())
         assertEquals(1, updated.longTerm.size)
-        assertTrue(updated.shortTerm.first { it.id == "s1" }.analyzedAt != null)
+        // The batch is consumed by position: the analyzed entry leaves the window.
+        assertTrue(updated.shortTerm.none { it.id == "s1" })
+        assertEquals(20, updated.shortTerm.size)
     }
 
     @Test
@@ -299,7 +317,7 @@ class BackgroundTasksTest {
         val updated = background.analyzeShortToLongTerm(character)
         assertEquals(1, updated.longTerm.size)
         assertEquals(listOf("u1"), updated.longTerm.single().sourceMessageIds)
-        assertTrue(updated.shortTerm.first { it.id == "s1" }.analyzedAt != null)
+        assertTrue(updated.shortTerm.none { it.id == "s1" })
     }
 
     @Test
@@ -320,7 +338,6 @@ class BackgroundTasksTest {
                 content = "占位$index",
                 sourceMessageIds = listOf("u1"),
                 eventTime = "2026-08-01T12:00:00Z",
-                analyzedAt = "done",
             )
         }
         // `instant` still resolves evidence "用户喜欢喝茶。", but no claimed short-term
@@ -333,7 +350,7 @@ class BackgroundTasksTest {
         )
         val updated = background.analyzeShortToLongTerm(character)
         assertTrue(updated.longTerm.isEmpty())
-        assertTrue(updated.shortTerm.first { it.id == "s1" }.analyzedAt != null)
+        assertTrue(updated.shortTerm.none { it.id == "s1" })
     }
 
     @Test
@@ -481,9 +498,9 @@ class BackgroundTasksTest {
             liveCharacter = { Character(id = "c1", revision = 99) },
         )
         val character = analyzableCharacter()
-        val (status, updated) = background.analyzeShortToLongTermStatus(character)
-        assertEquals(BackgroundTasks.TaskStatus.Stale, status)
-        assertEquals(character, updated)
+        val outcome = background.analyzeShortToLongTermStatus(character)
+        assertEquals(BackgroundTasks.TaskStatus.Stale, outcome.status)
+        assertEquals(character, outcome.character)
     }
 
     @Test
@@ -492,9 +509,10 @@ class BackgroundTasksTest {
         val llm = ScriptedLlm(mutableListOf(response))
         val character = analyzableCharacter()
         val background = BackgroundTasks(llm, MemoryServiceImpl(), liveCharacter = { character })
-        val (status, updated) = background.analyzeShortToLongTermStatus(character)
-        assertEquals(BackgroundTasks.TaskStatus.Success, status)
-        assertTrue(updated.shortTerm.first { it.id == "s1" }.analyzedAt != null)
+        val outcome = background.analyzeShortToLongTermStatus(character)
+        assertEquals(BackgroundTasks.TaskStatus.Success, outcome.status)
+        assertTrue(outcome.character.shortTerm.none { it.id == "s1" })
+        assertEquals(listOf("s1"), outcome.consumed.map { it.id })
     }
 
     @Test
@@ -545,15 +563,75 @@ class BackgroundTasksTest {
             content = "占位$index",
             sourceMessageIds = listOf("u1"),
             eventTime = "2026-08-01T12:00:00Z",
-            analyzedAt = "done",
         )
+    }
+
+    @Test
+    fun analysisWithNothingToConsumeSucceedsWithoutFailures() = runBlocking {
+        // A window at (or below) its low-water mark has no work — that is a success, not a
+        // failed pass. Reporting "no pending items" as a failure is what used to burn the
+        // retry gate and show "整理失败" for a window that was simply fine.
+        val (background, llm) = tasks(emptyList())
+        val character = Character(id = "c1", shortTerm = filler(1, 20))
+        val outcome = background.analyzeShortToLongTermStatus(character)
+        assertEquals(BackgroundTasks.TaskStatus.Success, outcome.status)
+        assertEquals(character, outcome.character)
+        assertTrue(outcome.consumed.isEmpty())
+        assertEquals(0, llm.requests.size)
+    }
+
+    @Test
+    fun analysisConsumesTheOldestBatchAndKeepsTheLowWaterContext() = runBlocking {
+        // The shape a legacy pile-up leaves behind: 76 entries, the oldest ones already
+        // turned into long-term memory by an older build. The batch is the oldest
+        // `ANALYSIS_BATCH` entries; the newest 20 ride along as context and stay.
+        val items = (1..76).map { index ->
+            ShortTermMemory(
+                id = "s$index",
+                content = "事件$index",
+                sourceMessageIds = listOf("u1"),
+                eventTime = "2026-08-01T12:00:00Z",
+            )
+        }
+        val acked = items.take(40).joinToString(",", "[", "]") { "\"" + it.id + "\"" }
+        val (background, llm) = tasks(listOf("""{"status":"ok","analyzedShortTermIds":$acked,"longTerm":[]}"""))
+        val outcome = background.analyzeShortToLongTermStatus(Character(id = "c1", shortTerm = items))
+
+        assertEquals(BackgroundTasks.TaskStatus.Success, outcome.status)
+        assertEquals(40, outcome.consumed.size)
+        assertEquals("s1", outcome.consumed.first().id)
+        assertEquals(36, outcome.character.shortTerm.size)
+        assertEquals("s41", outcome.character.shortTerm.first().id)
+        val prompt = llm.requests.single().input.last().content
+        assertTrue(prompt.contains("\"analyzed\":false"))
+        assertTrue(prompt.contains("\"analyzed\":true"))
+        assertTrue(prompt.contains("\"s76\""))
+    }
+
+    @Test
+    fun aCorrectionDuringThePassKeepsTheEntryForTheNextPass() = runBlocking {
+        // `update_memory` rewrote the entry while the request was in flight (its revision
+        // moved). Dropping it would silently discard the correction.
+        val response = """{"status":"ok","analyzedShortTermIds":["s1"],"longTerm":[]}"""
+        val llm = ScriptedLlm(mutableListOf(response))
+        val character = analyzableCharacter()
+        val live = character.copy(
+            shortTerm = character.shortTerm.map {
+                if (it.id == "s1") it.copy(content = "改过的事实", revision = 2) else it
+            },
+        )
+        val background = BackgroundTasks(llm, MemoryServiceImpl(), liveCharacter = { live })
+        val outcome = background.analyzeShortToLongTermStatus(character)
+        assertEquals(BackgroundTasks.TaskStatus.Success, outcome.status)
+        assertTrue(outcome.character.shortTerm.any { it.id == "s1" })
+        assertTrue(outcome.consumed.isEmpty())
     }
 
     @Test
     fun analyzeAcceptsAPartialAcknowledgement() = runBlocking {
         // The model echoed only one of the two ids it was given: the acknowledged item
         // is consumed and the other stays for a later pass. Requiring an exact set made
-        // every imperfect reply fail the pass, so nothing was ever marked analyzed.
+        // every imperfect reply fail the pass, so nothing was ever consumed.
         val (background, _) = tasks(listOf("""{"status":"ok","analyzedShortTermIds":["s1"],"longTerm":[]}"""))
         val character = Character(
             id = "c1",
@@ -562,10 +640,10 @@ class BackgroundTasksTest {
                 ShortTermMemory(id = "s2", content = "事件二", sourceMessageIds = listOf("u1"), eventTime = "2026-08-01T13:00:00Z"),
             ) + filler(3, 22),
         )
-        val (status, updated) = background.analyzeShortToLongTermStatus(character)
-        assertEquals(BackgroundTasks.TaskStatus.Success, status)
-        assertTrue(updated.shortTerm.first { it.id == "s1" }.analyzedAt != null)
-        assertEquals(null, updated.shortTerm.first { it.id == "s2" }.analyzedAt)
+        val outcome = background.analyzeShortToLongTermStatus(character)
+        assertEquals(BackgroundTasks.TaskStatus.Success, outcome.status)
+        assertTrue(outcome.character.shortTerm.none { it.id == "s1" })
+        assertTrue(outcome.character.shortTerm.any { it.id == "s2" })
     }
 
     @Test
@@ -573,9 +651,9 @@ class BackgroundTasksTest {
         val (background, _) = tasks(
             listOf("""{"status":"ok","analyzedShortTermIds":["s1","ghost"],"longTerm":[]}"""),
         )
-        val (status, updated) = background.analyzeShortToLongTermStatus(analyzableCharacter())
-        assertEquals(BackgroundTasks.TaskStatus.Success, status)
-        assertTrue(updated.shortTerm.first { it.id == "s1" }.analyzedAt != null)
+        val outcome = background.analyzeShortToLongTermStatus(analyzableCharacter())
+        assertEquals(BackgroundTasks.TaskStatus.Success, outcome.status)
+        assertTrue(outcome.character.shortTerm.none { it.id == "s1" })
     }
 
     @Test
@@ -587,31 +665,31 @@ class BackgroundTasksTest {
         val truncated = """{"status":"ok","analyzedShortTermIds":["s1"],"longTerm":[$element,""" +
             """{"category":"events","subject":"legacy","key":"未完"""
         val (background, _) = tasks(listOf(truncated))
-        val (status, updated) = background.analyzeShortToLongTermStatus(analyzableCharacter())
-        assertEquals(BackgroundTasks.TaskStatus.Success, status)
-        assertEquals(1, updated.longTerm.size)
-        assertTrue(updated.shortTerm.first { it.id == "s1" }.analyzedAt != null)
+        val outcome = background.analyzeShortToLongTermStatus(analyzableCharacter())
+        assertEquals(BackgroundTasks.TaskStatus.Success, outcome.status)
+        assertEquals(1, outcome.character.longTerm.size)
+        assertTrue(outcome.character.shortTerm.none { it.id == "s1" })
     }
 
     @Test
     fun analyzeSendsOneWholeWindowRequestAndKeepsTheFailure() = runBlocking {
-        // The fold is a single whole-window pass (no batch ladder): a failed reply leaves
-        // everything unmarked and is retried by the caller's backoff, never by shrinking
-        // the request — the window is the unit, so a partial batch would break continuity.
+        // The pass is a single request (no batch ladder): a failed reply leaves the window
+        // untouched and is retried by the caller's backoff, never by shrinking the request
+        // — the batch is the unit, so a partial batch would break continuity.
         val good = """{"status":"ok","analyzedShortTermIds":["s1"],"longTerm":[]}"""
         val (background, llm) = tasks(listOf("抱歉，我无法完成。", good))
-        val (status, updated) = background.analyzeShortToLongTermStatus(analyzableCharacter())
-        assertEquals(BackgroundTasks.TaskStatus.Failure, status)
+        val outcome = background.analyzeShortToLongTermStatus(analyzableCharacter())
+        assertEquals(BackgroundTasks.TaskStatus.Failure, outcome.status)
         assertEquals(1, llm.requests.size)
-        assertEquals(null, updated.shortTerm.first { it.id == "s1" }.analyzedAt)
+        assertTrue(outcome.character.shortTerm.any { it.id == "s1" })
     }
 
     @Test
-    fun analysisFailureIsRecordedInCountersAndNothingIsMarked() = runBlocking {
+    fun analysisFailureIsRecordedInCountersAndTheWindowIsUntouched() = runBlocking {
         val (background, _) = tasks(listOf("抱歉，我无法完成。"))
         val updated = background.analyzeShortToLongTerm(analyzableCharacter())
         assertTrue(updated.counters.analysisLastError.contains("unparsable"))
-        assertEquals(null, updated.shortTerm.first { it.id == "s1" }.analyzedAt)
+        assertTrue(updated.shortTerm.any { it.id == "s1" })
     }
 
     @Test
@@ -621,6 +699,27 @@ class BackgroundTasksTest {
         val failed = character.copy(counters = character.counters.copy(analysisLastError = "unparsable | x"))
         val updated = background.analyzeShortToLongTerm(failed)
         assertEquals("", updated.counters.analysisLastError)
+    }
+
+    @Test
+    fun aFailedAnalysisStillLetsTheWorldBookRun() = runBlocking {
+        // The cleanup path used to skip the world book whenever the analysis failed, so one
+        // broken analysis silently stopped the world book from ever being updated.
+        val (background, _) = tasks(listOf("抱歉，我无法完成。"))
+        val character = Character(
+            id = "c1",
+            shortTerm = filler(1, 20) + ShortTermMemory(
+                id = "s1",
+                content = "银月商会在西街",
+                sourceMessageIds = listOf("u1"),
+                eventTime = "2026-08-01T12:00:00Z",
+            ),
+        )
+        val outcome = background.drainMemoryBacklog(character)
+        assertFalse(outcome.progressed)
+        // The scene step of the maintenance ran (the scene state was normalized), which is
+        // what proves the maintenance is no longer short-circuited.
+        assertTrue(outcome.character.sceneState != null)
     }
 
     @Test
@@ -671,36 +770,30 @@ class BackgroundTasksTest {
     }
 
     @Test
-    fun analysisCarriesTheWholeWindowAndOnlyFoldsPendingItems() = runBlocking {
+    fun analysisSendsTheBatchAndCarriesTheLowWaterEntriesAsContext() = runBlocking {
+        // 21 entries: the oldest one is the batch, the newest 20 ride along as context
+        // (`analyzed: true`) and are never consumed.
         val (background, llm) = tasks(listOf("""{"status":"ok","analyzedShortTermIds":["s1"],"longTerm":[]}"""))
         val character = Character(
             id = "c1",
             shortTerm = listOf(
                 ShortTermMemory(
-                    id = "s0",
-                    content = "用户2026-08-01上午已经整理过的事",
-                    sourceMessageIds = listOf("m0"),
-                    eventTime = "2026-08-01T10:00:00Z",
-                    analyzedAt = "done",
-                    analyzedRevision = 1,
-                ),
-                ShortTermMemory(
                     id = "s1",
                     content = "用户2026-08-01下午待整理的事",
                     sourceMessageIds = listOf("m1"),
                     eventTime = "2026-08-01T15:00:00Z",
-                    revision = 1,
                 ),
-            ),
+            ) + filler(2, 21),
         )
-        val (status, updated) = background.analyzeShortToLongTermStatus(character)
+        val outcome = background.analyzeShortToLongTermStatus(character)
 
-        assertEquals(BackgroundTasks.TaskStatus.Success, status)
+        assertEquals(BackgroundTasks.TaskStatus.Success, outcome.status)
         // The low-water leftovers are re-read as context (continuity) but produce nothing.
         val prompt = llm.requests.single().input.last().content
         assertTrue(prompt.contains("\"analyzed\":true"))
         assertTrue(prompt.contains("\"analyzed\":false"))
-        assertEquals("done", updated.shortTerm.first { it.id == "s0" }.analyzedAt)
-        assertTrue(updated.shortTerm.first { it.id == "s1" }.analyzedAt != null)
+        assertTrue(outcome.character.shortTerm.none { it.id == "s1" })
+        assertEquals(20, outcome.character.shortTerm.size)
+        assertTrue(outcome.character.shortTerm.all { it.id.startsWith("f") })
     }
 }

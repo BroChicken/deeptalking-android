@@ -217,7 +217,7 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 
 `scheduleMemoryRetry()` 统一指数退避（5 分钟 → 30 分钟封顶）；`resetMemoryRetry()` 成功后清零。`checkMemoryTriggers()` — src/js/memory/tasks.js:199 依次调度这四个任务。
 
-**摘要生命周期（`revision` 标记）**：每条短期摘要带 `revision` / `analyzedRevision` / `lorebookScannedRevision`。长期分析只标记 `analyzedRevision`、世界书整理只标记 `lorebookScannedRevision`；`trimShortTermList()` 只有在**两个消费者都处理过同一 revision**、且超出 `shortTermTrimFloor` 时才允许裁剪，避免"世界书还没读到摘要就被删掉"（历史 bug）。摘要被改写时 `revision + 1`，两个标记同时失效、重新排队。`summarizeScene()` 跳过 `sequence ≤ sceneState.startSequence` 的旧消息，裁剪后仍能稳定统计"距上次场景已过多少条"。（原生 `ShortTermMemory` 与 `SceneState` 已带同名字段，行为一致。）
+**短期摘要按位置消费（没有逐条标记）**：短期窗口是高低水位对（40 → 20），**位置就是状态**——比最新 `shortTermTrimFloor`(20) 条更老的那一段（每批最多 `ANALYSIS_BATCH`(40) 条）就是本批要消化的，分析成功即**原样丢掉这一批**，最新 20 条留作下一批（以及注入块）的上下文。因此不再有 `analyzedAt` / `analyzedRevision` / `lorebookScannedAt` / `lorebookScannedRevision` 这套"两个消费者都确认同一 revision 才允许裁剪"的记账（它一旦和位置错位就会死锁：标记说"都处理过" → 每轮都判"没有待办" → 窗口只涨不降、弹窗反复出现）。`revision` 只剩一个用途：条目被 `update_memory` 改写时自增，用来把**请求飞行期间刚改过**的条目扣在窗口里、下一轮再读。`summarizeScene()` 跳过 `sequence ≤ sceneState.startSequence` 的旧消息，消费后仍能稳定统计"距上次场景已过多少条"。
 
 **证据与时间精度**：`evidenceMatchesSummary()` 要求证据与实际回复有 ≥2 个双字片段重叠（≥35%），不再"满 8 字即采信"，防止无关文本改写情绪/静态设定；`applyStaticFieldUpdates` 与 `update_character_field` 都额外要求 `hasStaticEditIntent()`（用户原话提到该字段且是修改意图）。`resolveTimeRef` 对带时分秒的 explicit ISO 原样保留（含时区偏移），只给"仅日期有理"的结果补时段起点，不再把明确时刻改写成"当天 12:00"。
 
@@ -234,7 +234,7 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 **定位：世界层设定的唯一去处**（时代与世界观、地点、组织、专有名词、历史、规则）。静态字段只承载"人/群组本人"的设定（群组 `description` = 群组前提、单角色 `basicInfo.background` = 个人背景），世界观一律不写进静态字段——这解决了旧版"世界观写描述还是写世界书"的两处重复。
 
 - **两种模式**：`alwaysActive: true`（常驻，每轮都注入，用于世界前提/规则）与关键词命中（被提到才注入，省 token）。**没关键词的条目不再被拒收**：系统改用**条目名当触发词**，条目照样会在名字被提到时注入（模型写世界前提/规则时仍可把 `alwaysActive` 设为 true，常驻数量受 `MAX_ALWAYS_ACTIVE`(6) 约束）。
-- **来源与保护**：`origin: 'user' | 'ai'`。用户手写的条目（含老数据，默认按 `user` 处理）**不会被模型覆盖，也不参与自动淘汰**；用户一旦手改 AI 条目（改名字/关键词/内容，**或勾「启用」「常驻」**），该条目即转为 `user`，模型从此动不了它——勾选框此前不算手改，导致用户勾上的常驻会被模型改回去。
+- **来源与保护**：`origin: 'user' | 'ai'`（编辑界面显示为「人工维护」/「AI 维护」，点一下即可切换）。`user` 的条目**不会被模型覆盖，也不参与自动淘汰**；`ai` 的条目模型可维护（更新=整条替换）。**归属只由这个开关决定**：编辑名字/关键词/内容、勾「启用」「常驻」都不再改变归属（旧实现一改就自动打成 `user` 并永久定死，用户想交回模型也交不回去）；界面新建条目默认 `ai`。
 - **模型维护（三入口）**：
   1. 建卡/群组升级时由模型产出初始条目（`quickGenerateCharacter` / `upgradeToGroup` 的 `lorebook` 字段，2-4 条，`normalizeGeneratedLorebook()` 标记 `ai`）。无关键词条目按常驻处理，但常驻数量同样受 `maxAlwaysActive` 约束（显式 `alwaysActive` 的条目优先占位，超出的无名条目保持非常驻）。
   2. 主循环工具 `upsert_lorebook_entry`（`executeToolCall`）——先按 `entryId`/`name` 精确匹配：**精确命中时用新 `content` 替换该条目原有内容**（模型点名即"更新这一条"，故须写全完整内容），未命中再用 `findSimilarLorebookEntry()` 按名称 bigram 相似度（≥`nameSimilarity`）、共享关键词、内容 bigram 相似度（≥`contentSimilarity`）找**同一事物的近似条目**并**整条替换**（用这次写的完整内容覆盖该条目：允许变短、允许把 `alwaysActive` 改回 false——"逐句追加"与"常驻只增不减"都已删除），只有确实没有近似条目才新建；要求 `sourceMessageIds` + `evidence` 可回溯到已存在的消息，且**不得覆盖 `origin:user` 条目**（精确/近似命中用户条目时返回 `mergedIntoUser`，不新建重复条目）。
@@ -444,10 +444,10 @@ tools: AUTO 阶段全部工具 / SUBMIT 阶段只有 submit_response
 - **每轮一个工具 + 上限**：DeepSeek thinking 模式不支持并行 `function_call` 回传，每轮只执行并回传第一个信息类工具；`MAX_TOOL_CALLS` 约束整轮总数；跨轮复用 `call_id` 时自动改用新 `call_id`，保证回传项内 `call_id` 唯一。
 - **记忆任务重试**：`memoryTaskKeys(task)` — src/js/memory/tasks.js:34 统一映射 `extraction` / `analysis` / `scene` / `lorebook` 四组计数器（`*Failures` / `*RetryAt`），`scheduleMemoryRetry` 指数退避（5→30 分钟封顶）。
 - **后台任务过期保护**：`captureMemoryTask(char)` 记录角色引用、`memory.revision` 与末条消息 ID；`isMemoryTaskCurrent()` 在后台调用返回后校验，过期（角色被删、轮次推进、分支被删）就直接丢弃。`extractProseTurnMemory` 在快照副本上运行 `convertProseToJson`，不修改真实 `lastInjectedRecallIds`；回写前要求 `revision` 未变、原 assistant 消息仍在，并只接受引用本轮用户消息或本轮回复的记忆。快速回应换位生成、空字段补全同样带 guard。
-- **摘要不被提前丢弃**：`trimShortTermList` 只在长期分析与世界书整理都消费了同一 `revision` 后才裁剪；世界书条目在写库前整批校验来源与字段，失败不推进 `lorebookScannedRevision`、也不累计 `misses`，避免一次坏输出造成误淘汰。
+- **摘要不被提前丢弃**：消费只发生在读它的那一趟之后——分析失败的批次原样留在窗口里、由退避门控重试；世界书整理读的是分析刚消费的同一批，逐条校验来源与字段，坏条目跳过（其余照常入库）并记录原因，避免一次坏输出造成误淘汰。
 - **检索相关性下限**：`rankMemories` 只保留至少命中一个非停用词的候选，并用特异性下限 `MIN_MATCH_SCORE`(1.5) 过滤"泛词"命中，避免纯高重要性但无关的旧记忆挤占注入；`pendingRecall`（模型主动召回）优先占位，即使候选取满也一定注入；短指代查询经 `buildMemoryQuery` 补上下文；**用户提到具体日期时，由模型用 `search_memory` 的 `date`/`timeRef` 按日期召回那天的原始对话与记忆**（口语日期→绝对日期由模型依据时间基准换算）。
 - **断言前先核对**：系统提示词要求模型在说"第一次/从来没/总是/每次/以前也…"这类**可被记忆证伪**的话之前先 `search_memory` 确认，查不到依据就不下断言（改说不确定或反问），禁止编造——治"明明不是第一次却说第一次"（关键词通道召回不到时，模型凭直觉断言）。
-- **短期记忆上限靠"整窗折叠"不靠"截断"**：`trimShortTerm` 只丢**已被分析且世界书消费过**的条目（内容已在长期记忆里），未消费的永不丢；窗口在高水位触发一次**整窗折叠**后落回低水位 `SHORT_TERM_LOW_WATER`(20)（`SHORT_TERM`=40），所以稳态就是 20~40，不存在"积压越滚越大"。图片只保留最近 `AppLimits.Media.IMAGE_RETENTION_MESSAGES`(60，**必须 ≥ `INSTANT`**，否则会在窗口内部剪图、改写前缀) 条消息（更早的删附件与文件、正文保留）。**一次弹窗、之后自动跑完**：`checkMemoryCleanupPrompt` 只在短期超出高水位或有超窗图片时询问一次；确认后 `NativeCore.pruneOldMessageImages` 立即剪图片，`drainShortTermBacklog` 把积压转成长期记忆（一次整窗折叠即收敛，`CLEANUP_BATCHES_PER_RUN`(1) 批、空闲每分钟 1 批），直到降到低水位 20 才清除标记 —— 同一批积压不会问第二次，绝不截断。**去重/修复这类 O(n²) 重活一律在 `Dispatchers.Default`/`IO` 上跑**（`viewModelScope.launch` 默认主线程；放主线程会 ANR 且修复标记写不进去 → 每次启动重跑）。
+- **短期记忆上限靠"消费即丢"不靠"截断"**：分析一趟读走**低水位之上的那一段**（每批最多 `ANALYSIS_BATCH`(40) 条），成功后原样丢掉；**没读到的（最新 `SHORT_TERM_TRIM_FLOOR`(20) 条）永不丢**，所以稳态就是 20~40，不存在"积压越滚越大"。图片只保留最近 `AppLimits.Media.IMAGE_RETENTION_MESSAGES`(60，**必须 ≥ `INSTANT`**，否则会在窗口内部剪图、改写前缀) 条消息（更早的删附件与文件、正文保留）。**一次弹窗、之后自动跑完**：`checkMemoryCleanupPrompt` 只在短期超出高水位或有超窗图片时询问一次；确认后 `NativeCore.pruneOldMessageImages` 立即剪图片，`drainShortTermBacklog` 把积压消费成长期记忆（每批最多 40 条，`CLEANUP_BATCHES_PER_RUN`(1) 批、空闲每分钟 1 批），直到降到低水位 20 才清除标记 —— 同一批积压不会问第二次，绝不截断。**去重/修复这类 O(n²) 重活一律在 `Dispatchers.Default`/`IO` 上跑**（`viewModelScope.launch` 默认主线程；放主线程会 ANR 且修复标记写不进去 → 每次启动重跑）。
 - **时间精度**：`resolveTimeRef` 保留带时区/时分的 explicit ISO，仅"日期或时段"表达才落整点/时段起点，避免把明确时刻改写成正午。记忆衰减/排序的时间基准逐级回退（`Date.parse(lastRecalled) || Date.parse(updatedAt) || Date.parse(createdAt)`），`lastRecalled` 非空但不可解析时不会短路掉更新的时间戳、也不会被当成 1970 年。
 - **联网工具超时**：`fetchWithTimeout()`（src/js/api/web-content.js）给 B站 API、短链解析、Microlink、网页直连统一加超时，避免任意外部请求卡死工具循环（后台任务无重试兜底）。
 - **请求失败也留痕**：`performChatRequest` / `callAI` 的 fetch 失败或非 2xx 也会写入 `requestMetrics`（`status: 'failed'`），并取消未读完的流式 reader，便于诊断网络与限流问题。`buildApiHeaders` 在 apiKey 缺失时提前抛出明确错误，不发出 `Bearer undefined` 请求。
@@ -484,7 +484,7 @@ tools: AUTO 阶段全部工具 / SUBMIT 阶段只有 submit_response
 | `APP_VERSION` | 由 `versionName` 写入（`tools/sync-version.mjs`） | src/js/core/config.js:73 |
 | JSON 示例 | 固定使用 `JSON_EXAMPLE_BRIEF`（不再随轮切换），保证 system 前缀从首轮起稳定 | src/js/core/normalization.js:2 |
 | `max_output_tokens` | 8192 | src/js/api/responses.js:63 |
-| 摘要生命周期字段 | `revision` / `analyzedRevision` / `lorebookScannedRevision`；消息 `sequence`；场景 `sceneState.startSequence` | src/js/memory/tasks.js / src/js/storage/schema.js |
+| 摘要消费字段 | 短期条目 `revision`（仅用于扣住飞行期被改写的条目）；消息 `sequence`；场景 `sceneState.startSequence` | src/js/memory/tasks.js / src/js/storage/schema.js |
 | 请求追踪字段 | `requestMetrics[]`（taskType/platform/phase/tokens/hitRate/durationMs/prefixChange/commonHistoryMessages/hashes） | src/js/api/responses.js:227 |
 
 

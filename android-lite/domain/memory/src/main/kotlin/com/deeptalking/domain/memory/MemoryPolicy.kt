@@ -24,7 +24,7 @@ import kotlin.random.Random
  *
  * Every function returns new lists and never mutates its inputs. Several JS
  * branches depend on fields the native model does not carry yet (participants,
- * location, sourceRoles, userEvidence, learnedBonus, revision/analyzedAt);
+ * location, sourceRoles, userEvidence, learnedBonus, revision);
  * those branches are documented as SIMPLIFIED below and degrade to the fields
  * available on [LongTermMemory] / [ShortTermMemory].
  */
@@ -127,26 +127,14 @@ fun pruneLongTerm(
 }
 
 /**
- * Trims short-term memory (legacy `trimShortTermList`): keep the newest [floor]
- * entries plus any older entry that either consumer has not yet acknowledged for
- * its current `revision`.
+ * Short-term memory is a high/low watermark pair and is consumed **by position** (see
+ * `analyzeShortTermBatch`): everything older than the newest
+ * [AppLimits.Memory.SHORT_TERM_TRIM_FLOOR] entries is one batch, and the batch is dropped
+ * when the pass that read it succeeds. There is deliberately no per-entry "已分析 /
+ * 已扫过" bookkeeping any more — that gate used to dead-lock the whole pipeline (an entry
+ * whose marker said "done" was never re-read, every pass then found "nothing to do",
+ * and the window could never shrink).
  */
-fun trimShortTerm(
-    items: List<ShortTermMemory>,
-    limit: Int = AppLimits.Memory.SHORT_TERM,
-    floor: Int = AppLimits.Memory.SHORT_TERM_TRIM_FLOOR,
-): List<ShortTermMemory> {
-    if (items.isEmpty()) return items
-    val recentStart = (items.size - floor).coerceAtLeast(0)
-    return items.filterIndexed { index, item ->
-        val revision = if (item.revision == 0) 1 else item.revision
-        val analyzedRevision = if (item.analyzedRevision == 0) 1 else item.analyzedRevision
-        val scannedRevision = if (item.lorebookScannedRevision == 0) 1 else item.lorebookScannedRevision
-        val analyzed = item.analyzedAt != null && analyzedRevision == revision
-        val scanned = item.lorebookScannedAt != null && scannedRevision == revision
-        index >= recentStart || !analyzed || !scanned
-    }
-}
 
 /**
  * Legacy `ensureMessageSequences`: assign each instant message a monotonic
@@ -400,12 +388,12 @@ fun repairMemories(character: Character): Character {
             if (!alignedChanged(aligned, item.sourceMessageIds, item.sourceRoles, item.userEvidence)) {
                 item
             } else {
-                // Sources changed, so any prior analysis no longer matches them.
+                // Sources changed, so the entry must be read again by the next pass.
+                // (Consumption is positional, so nothing has to be cleared for that.)
                 item.copy(
                     sourceMessageIds = aligned.sourceMessageIds,
                     sourceRoles = aligned.sourceRoles,
                     userEvidence = aligned.userEvidence,
-                    analyzedAt = null,
                 )
             }
         }
@@ -499,8 +487,10 @@ fun dedupeShortTerm(items: List<ShortTermMemory>): List<ShortTermMemory> {
             location = if (item.location.isNotBlank()) item.location else existing.location,
             eventTime = earlierTimestamp(existing.eventTime, item.eventTime) ?: existing.eventTime,
             createdAt = earlierTimestamp(existing.createdAt, item.createdAt) ?: existing.createdAt,
-            // Merged content invalidates the prior analysis, so force a re-analysis.
-            analyzedAt = null,
+            // Merged content is new content: the pass consumes the window by position, so
+            // the merged entry is simply read again on the next analysis (bump the
+            // revision so an in-flight request does not drop it).
+            revision = existing.revision + 1,
         )
         result[dupIndex] = merged
         signatures[dupIndex] = bigramSignature(merged.content)
@@ -615,7 +605,6 @@ fun addShortTermMemory(
         sourceMessageIds = knownIds,
         eventTime = eventTime,
         createdAt = timestamp ?: nowIso,
-        analyzedAt = null,
         participants = participants,
         location = location,
         sourceRoles = sourceRoles,

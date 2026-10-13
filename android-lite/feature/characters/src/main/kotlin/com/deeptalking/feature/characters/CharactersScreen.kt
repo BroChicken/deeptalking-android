@@ -732,25 +732,23 @@ private fun LorebookTab(
                     LegacyField(
                         value = entry.name,
                         onValueChange = { name ->
-                            onUpdateLorebook(draft, entry.copy(name = CharacterParity.capLorebookName(name), origin = LorebookOrigin.User))
+                            onUpdateLorebook(draft, entry.copy(name = CharacterParity.capLorebookName(name)))
                         },
                         placeholder = "条目名（如：赤月王国）",
                         modifier = Modifier.weight(1f),
                     )
                     Spacer(Modifier.width(6.dp))
-                    Text(
-                        if (entry.origin == LorebookOrigin.User) "手写" else "AI 写入",
-                        fontSize = 12.sp,
-                        color = if (entry.origin == LorebookOrigin.User) legacy.warning else legacy.textMuted,
-                    )
+                    LorebookOwnerChip(entry.origin) { origin ->
+                        onUpdateLorebook(draft, entry.copy(origin = origin))
+                    }
                     TextButton(onClick = { onRemoveLorebook(draft, entry.id) }) { Text("删除", fontSize = 12.sp, color = legacy.textSecondary) }
                 }
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     LegacyCheck("启用", entry.enabled) { checked ->
-                        onUpdateLorebook(draft, entry.copy(enabled = checked, origin = LorebookOrigin.User))
+                        onUpdateLorebook(draft, entry.copy(enabled = checked))
                     }
                     LegacyCheck("常驻", entry.alwaysActive) { checked ->
-                        onUpdateLorebook(draft, entry.copy(alwaysActive = checked, origin = LorebookOrigin.User))
+                        onUpdateLorebook(draft, entry.copy(alwaysActive = checked))
                     }
                     Text(lorebookMention(entry), fontSize = 12.sp, color = legacy.textMuted)
                 }
@@ -758,13 +756,13 @@ private fun LorebookTab(
                     value = entry.keywords.joinToString("、"),
                     onValueChange = { raw ->
                         val keywords = CharacterParity.splitLorebookKeywords(raw)
-                        // 关键词与常驻的自动联动只对 AI 条目生效：用户手写条目保留其勾选结果。
+                        // 关键词与常驻的自动联动只对 AI 维护的条目生效。
                         val alwaysActive = if (entry.origin == LorebookOrigin.User) {
                             entry.alwaysActive
                         } else {
                             CharacterParity.keywordsToAlwaysActive(entry.alwaysActive, keywords)
                         }
-                        onUpdateLorebook(draft, entry.copy(keywords = keywords, alwaysActive = alwaysActive, origin = LorebookOrigin.User))
+                        onUpdateLorebook(draft, entry.copy(keywords = keywords, alwaysActive = alwaysActive))
                     },
                     placeholder = "触发关键词（用、或逗号分隔；常驻条目可留空）",
                 )
@@ -773,7 +771,7 @@ private fun LorebookTab(
                     onValueChange = { content ->
                         // 不截断：超过单条上限的本次输入直接丢弃，文本框保持原值。
                         if (content.length <= AppLimits.Lorebook.CONTENT_CHARS) {
-                            onUpdateLorebook(draft, entry.copy(content = content, origin = LorebookOrigin.User))
+                            onUpdateLorebook(draft, entry.copy(content = content))
                         }
                     },
                     placeholder = "命中后注入的设定内容",
@@ -787,6 +785,27 @@ private fun LorebookTab(
             }
         }
         LegacyButton("+ 添加条目", primary = false, onClick = { onAddLorebook(draft) })
+    }
+}
+
+/**
+ * 条目归属：AI 维护 ↔ 人工维护。来源只由这个开关决定——**人工**的条目模型不会改动（也不会被
+ * 建卡/整理重写），切回 **AI** 之后模型就能继续维护它。编辑内容本身不再改变归属。
+ */
+@Composable
+private fun LorebookOwnerChip(origin: LorebookOrigin, onSwitch: (LorebookOrigin) -> Unit) {
+    val legacy = MaterialTheme.legacy
+    val manual = origin == LorebookOrigin.User
+    val accent = if (manual) legacy.warning else legacy.textMuted
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(if (manual) legacy.warning.copy(alpha = 0.18f) else legacy.panel)
+            .border(1.dp, if (manual) legacy.warning else legacy.inputBorder, RoundedCornerShape(6.dp))
+            .clickable { onSwitch(if (manual) LorebookOrigin.Model else LorebookOrigin.User) }
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+    ) {
+        Text(if (manual) "人工维护" else "AI 维护", fontSize = 12.sp, color = accent)
     }
 }
 

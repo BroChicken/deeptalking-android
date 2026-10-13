@@ -50,10 +50,14 @@ object AppLimits {
         const val INSTANT_MIGRATION_THRESHOLD = INSTANT_HARD_CAP
 
         /**
-         * Short-term window — same high/low watermark shape as [INSTANT] (40 → 20).
-         * The whole window is injected (it sits in the cached prefix) and the whole
-         * window is carried into each analysis pass, so the low-water leftovers are
-         * re-read as context of the next pass.
+         * Short-term window — the same high/low watermark shape as [INSTANT] (40 → 20).
+         *
+         * The window is consumed **by position**, never by per-entry bookkeeping:
+         * everything older than the newest [SHORT_TERM_TRIM_FLOOR] entries is one batch,
+         * it is analyzed and then dropped, and the newest floor entries stay as the
+         * context the next batch (and the injected block) reads. Consumption therefore
+         * needs no "已分析 / 已扫过" marker, and a failed pass loses nothing: the batch is
+         * simply still there for the retry.
          */
         const val SHORT_TERM = 40
         const val SHORT_TERM_TRIM_FLOOR = 20
@@ -119,8 +123,8 @@ object AppLimits {
          * keep entries at roughly 50–200 characters; 400 is the generous ceiling for
          * auto-generated entries, small enough that a normal hit set fits
          * [INJECT_CHARS] instead of the entries starving each other. The write path
-         * truncates to this, and anything already over it is rewritten by the
-         * one-time lorebook rebuild.
+         * rejects anything over it (never truncates), and anything already over it is
+         * rewritten by the one-time lorebook rebuild.
          */
         const val CONTENT_CHARS = 400
         const val INJECT_ENTRIES = 6
@@ -128,8 +132,6 @@ object AppLimits {
         const val MAX_ALWAYS_ACTIVE = 6
         /** Max entries a single consolidation pass may add/update. */
         const val AUTO_ENTRIES_PER_PASS = 3
-        /** Fresh short-term items that trigger a consolidation pass. */
-        const val CONSOLIDATE_SPAN = 8
     }
 
     object Scene {

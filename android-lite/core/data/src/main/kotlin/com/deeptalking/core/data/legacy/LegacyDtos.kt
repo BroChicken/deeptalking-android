@@ -194,8 +194,6 @@ data class LegacyShortTerm(
     @SerialName("id") val id: String? = null,
     @SerialName("content") val content: String? = null,
     @SerialName("timestamp") val timestamp: String? = null,
-    @SerialName("analyzedAt") val analyzedAt: String? = null,
-    @SerialName("lorebookScannedAt") val lorebookScannedAt: String? = null,
     @SerialName("eventTime") val eventTime: String? = null,
     @SerialName("sourceMessageIds") val sourceMessageIds: List<String>? = null,
     @SerialName("participants") val participants: List<String>? = null,
@@ -204,10 +202,6 @@ data class LegacyShortTerm(
     @SerialName("sourceRoles") val sourceRoles: List<String>? = null,
     /** Legacy revision counter, min 1. */
     @SerialName("revision") val revision: Int? = null,
-    /** Revision the analysis consumer last processed. */
-    @SerialName("analyzedRevision") val analyzedRevision: Int? = null,
-    /** Revision the lorebook consumer last processed. */
-    @SerialName("lorebookScannedRevision") val lorebookScannedRevision: Int? = null,
     /** Source message timestamp used for same-day reconciliation. */
     @SerialName("_sourceTs") val sourceTs: String? = null,
     /** Legacy wrote an array of `{sourceMessageId,text}`; an early native build wrote a `String`. */

@@ -247,7 +247,29 @@ class NativeCore(context: Context) {
             backgroundQueue,
             config,
             liveCharacter = { id -> data.characters.get(id) },
+            onAuxiliaryFailure = { taskType, reason ->
+                lastAuxFailure = AuxFailure(taskType, reason, Instant.now().toEpochMilli())
+                recordAuxMetric(config, taskType, System.currentTimeMillis(), null, "failed", reason)
+            },
         )
+
+    /** Task type, reason and time of the most recent failed background call. */
+    private data class AuxFailure(val taskType: String, val reason: String, val atMillis: Long)
+
+    @Volatile
+    private var lastAuxFailure: AuxFailure? = null
+
+    /**
+     * The reason of the most recent background failure for [taskType] (when it happened
+     * within the last ten minutes), so a dialog can say *why* a pass stopped instead of the
+     * blanket "网络或接口异常". Empty when the last failure was another task or too old.
+     */
+    private fun lastFailureNote(taskType: String): String {
+        val failure = lastAuxFailure ?: return ""
+        if (failure.taskType != taskType) return ""
+        if (System.currentTimeMillis() - failure.atMillis > 10 * 60_000L) return ""
+        return failure.reason
+    }
 
     /**
      * Startup maintenance mirroring the legacy on-load tasks: silently fill empty
@@ -375,13 +397,14 @@ class NativeCore(context: Context) {
             val size = character.shortTerm.size
             if (size > AppLimits.Memory.SHORT_TERM) overLimit = true
             // "Backlog" means *above the high watermark*: a window sitting between the low
-            // and the high watermark is normal operation (it is about to be folded).
+            // and the high watermark is normal operation (it is about to be consumed).
             val over = (size - AppLimits.Memory.SHORT_TERM).coerceAtLeast(0)
             val staleImages = staleImageCount(data.chat.getMessages(character.id))
             if (over > 0 || staleImages > 0) {
                 characters++
                 total += size
-                pending += over
+                // What the analysis still has to consume: everything above the low-water mark.
+                pending += (size - AppLimits.Memory.SHORT_TERM_TRIM_FLOOR).coerceAtLeast(0)
                 images += staleImages
             }
         }
@@ -491,6 +514,18 @@ class NativeCore(context: Context) {
     data class MigrationResult(val batches: Int, val error: String = "")
 
     /**
+     * Failure text for a one-time pass: the reason the background call itself reported
+     * when there is one, otherwise a plain "stopped early" message. The pass always keeps
+     * what it already did, and a retry resumes instead of repeating it.
+     */
+    private fun migrationFailure(what: String, reason: String): String =
+        if (reason.isBlank()) {
+            "${what}未完成，已整理的部分已保存"
+        } else {
+            "${what}未完成：$reason（已整理的部分已保存）"
+        }
+
+    /**
      * One-time catch-up of every oversized window: batches, oldest first, run to
      * completion (the UI blocks on it, as requested). Stops early only when a batch
      * fails — everything already folded is persisted first, so a retry resumes instead
@@ -513,7 +548,7 @@ class NativeCore(context: Context) {
             }
             if (updated != character) persistMemory(character, updated)
             if (status == BackgroundTasks.TaskStatus.Failure) {
-                return@withContext MigrationResult(batches, "整理中途失败（网络或接口异常），已整理的部分已保存")
+                return@withContext MigrationResult(batches, migrationFailure("提取记忆", lastFailureNote("extraction")))
             }
         }
         MigrationResult(batches)
@@ -545,7 +580,7 @@ class NativeCore(context: Context) {
             if (status == BackgroundTasks.TaskStatus.Failure) {
                 return@withContext MigrationResult(
                     processed + doneHere,
-                    "整理世界书中途失败（网络或接口异常），已整理的部分已保存",
+                    migrationFailure("整理世界书", lastFailureNote("lorebook")),
                 )
             }
             processed += doneHere
@@ -804,7 +839,7 @@ class NativeCore(context: Context) {
             recordAuxMetric(config, taskType, startedAt, result.usage, "completed")
             result
         } catch (t: Throwable) {
-            recordAuxMetric(config, taskType, startedAt, null, "failed")
+            recordAuxMetric(config, taskType, startedAt, null, "failed", t.message?.take(160).orEmpty())
             throw t
         }
     }
@@ -816,6 +851,7 @@ class NativeCore(context: Context) {
         startedAt: Long,
         usage: TokenUsage?,
         status: String,
+        reason: String = "",
     ) {
         val input = usage?.inputTokens?.takeIf { it > 0 }
         val hit = usage?.cachedTokens
@@ -826,6 +862,9 @@ class NativeCore(context: Context) {
             model = config.modelName,
             platform = config.apiPlatform,
             status = status,
+            // The debug block shows `status` and `phase`; a failed background call keeps
+            // its reason here, so the log answers "为什么整理没成功" on the device.
+            phase = reason,
             durationMs = System.currentTimeMillis() - startedAt,
             inputTokens = input,
             outputTokens = usage?.outputTokens,

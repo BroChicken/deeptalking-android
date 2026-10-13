@@ -313,12 +313,16 @@ object CharacterParity {
 
     // ------------------------------------------------------------ lorebook
 
-    /** Legacy `addLorebookEntry` default: a fresh user entry is always active. */
-    fun newUserLorebookEntry(): LorebookEntry = LorebookEntry(
+    /**
+     * A fresh entry added from the editor. It starts as an **AI-maintained** entry (the
+     * user switches it to 人工维护 if they want to keep the model's hands off it) and is
+     * always active by default (legacy `addLorebookEntry`).
+     */
+    fun newLorebookEntry(): LorebookEntry = LorebookEntry(
         id = UUID.randomUUID().toString(),
         enabled = true,
         alwaysActive = true,
-        origin = LorebookOrigin.User,
+        origin = LorebookOrigin.Model,
     )
 
     fun splitLorebookKeywords(raw: String): List<String> =
