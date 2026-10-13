@@ -402,11 +402,12 @@ class NativeCore(context: Context) {
             val staleImages = staleImageCount(data.chat.getMessages(character.id))
             if (over > 0 || staleImages > 0) {
                 characters++
-                total += size
-                // What the analysis still has to consume: everything above the low-water mark.
-                pending += (size - AppLimits.Memory.SHORT_TERM_TRIM_FLOOR).coerceAtLeast(0)
                 images += staleImages
             }
+            // Reported unconditionally: the prompt/summary says how much is still waiting
+            // to be consumed, whether or not the window is over the high watermark.
+            total += size
+            pending += (size - AppLimits.Memory.SHORT_TERM_TRIM_FLOOR).coerceAtLeast(0)
         }
         MemoryCleanupTarget(characters, total, pending, images, overLimit)
     }
