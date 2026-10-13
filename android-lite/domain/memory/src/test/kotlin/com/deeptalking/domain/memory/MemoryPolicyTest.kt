@@ -21,22 +21,6 @@ class MemoryPolicyTest {
     private fun user(id: String, content: String) = ChatMessage(id = id, role = Role.User, content = content)
 
     @Test
-    fun trimInstantDropsToTheLowWatermarkOnlyAtTheHighWatermark() {
-        val items = (1..AppLimits.Memory.INSTANT).map { i ->
-            ChatMessage(id = "m$i", role = Role.User, content = "消息$i", extractedAt = "done")
-        }
-        // At the high watermark the whole already-extracted head drops to the low watermark
-        // in one pass (this is the fold: the history is rebased once, not every turn).
-        assertEquals(
-            AppLimits.Memory.INSTANT_TRIM_FLOOR,
-            trimInstant(items).size,
-        )
-        // Below the high watermark nothing is dropped at all.
-        val under = items.dropLast(1)
-        assertEquals(under.size, trimInstant(under).size)
-    }
-
-    @Test
     fun addShortTermMemoryNeverCompactsTheWindowOnWrite() {
         val character = Character(id = "c1", instant = listOf(user("u1", "用户喜欢咖啡")))
         val full = (1..AppLimits.Memory.SHORT_TERM).map { i ->
@@ -136,20 +120,6 @@ class MemoryPolicyTest {
     }
 
     @Test
-    fun trimInstantHonorsExtractedAt() {
-        val items = (1..5).map { index ->
-            ChatMessage(
-                id = "m$index",
-                role = Role.User,
-                content = "x",
-                extractedAt = if (index <= 3) "done" else null,
-            )
-        }
-        val trimmed = trimInstant(items, limit = 4, floor = 2)
-        assertEquals(listOf("m4", "m5"), trimmed.map { it.id })
-    }
-
-    @Test
     fun trimShortTermKeepsUnprocessedOlderItems() {
         val items = listOf(
             ShortTermMemory(id = "oldDone", analyzedAt = "t", lorebookScannedAt = "t"),
@@ -161,24 +131,28 @@ class MemoryPolicyTest {
     }
 
     @Test
-    fun addShortTermMemoryRequiresResolvableSource() {
+    fun addShortTermMemoryAcceptsAnEntryWithoutAResolvableSource() {
+        // The fold summarizes the whole window, so a beat the character narrated alone
+        // legitimately has no user line behind it; unknown ids are dropped, not fatal
+        // (that gate used to discard an entire fold over one bad citation).
         val character = Character(id = "c1", instant = listOf(user("u1", "用户喜欢咖啡")))
-        val rejected = addShortTermMemory(
+        val accepted = addShortTermMemory(
             list = emptyList(),
-            draft = ShortTermDraft(content = "用户喜欢咖啡", sourceMessageIds = listOf("ghost")),
+            draft = ShortTermDraft(content = "角色独自去了阳台", sourceMessageIds = listOf("ghost")),
             timestamp = null,
             sources = knownSources(character),
         )
-        assertFalse(rejected.accepted)
+        assertTrue(accepted.accepted)
+        assertTrue(accepted.list.single().sourceMessageIds.isEmpty())
 
-        val accepted = addShortTermMemory(
-            list = emptyList(),
+        val withSource = addShortTermMemory(
+            list = accepted.list,
             draft = ShortTermDraft(content = "用户喜欢咖啡", sourceMessageIds = listOf("u1")),
             timestamp = "2026-08-01T12:00:00Z",
             sources = knownSources(character),
         )
-        assertTrue(accepted.accepted)
-        assertEquals(listOf("u1"), accepted.list[0].sourceMessageIds)
+        assertTrue(withSource.accepted)
+        assertEquals(listOf("u1"), withSource.list.last().sourceMessageIds)
     }
 
     @Test

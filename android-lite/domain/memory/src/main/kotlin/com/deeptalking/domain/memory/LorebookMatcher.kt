@@ -8,8 +8,9 @@ import java.text.Collator
 import java.util.Locale
 
 /**
- * Lorebook selection, similarity merge/dedup and eviction helpers ported from
- * `src/js/memory/lorebook.js`. Pure and deterministic: inputs are never mutated.
+ * Lorebook selection, similarity-based replacement/dedup and eviction helpers
+ * ported from `src/js/memory/lorebook.js`. Pure and deterministic: inputs are
+ * never mutated.
  *
  * Ordering honours the legacy `order` field through [matchLorebookEntries]'s
  * `orderOf` selector; the native [LorebookEntry] does not carry `order` yet, so
@@ -20,7 +21,7 @@ import java.util.Locale
 /** Legacy entry `order` fallback when the field is absent (`normalizeLorebook`). */
 const val DEFAULT_LOREBOOK_ORDER = 100
 
-/** Tunable limits for lorebook matching/merge. Defaults come from [AppLimits]. */
+/** Tunable limits for lorebook matching/replacement. Defaults come from [AppLimits]. */
 data class LorebookLimits(
     val injectEntries: Int = AppLimits.Lorebook.INJECT_ENTRIES,
     val injectChars: Int = AppLimits.Lorebook.INJECT_CHARS,
@@ -29,7 +30,6 @@ data class LorebookLimits(
     val contentChars: Int = AppLimits.Lorebook.CONTENT_CHARS,
     val nameSimilarity: Double = 0.5,
     val contentSimilarity: Double = 0.45,
-    val mergeSentenceSimilarity: Double = 0.6,
     val evictionMisses: Int = 3,
     /** How many recent instant messages feed the keyword haystack (legacy `scanMessages`). */
     val scanMessages: Int = 6,
@@ -109,48 +109,45 @@ fun findSimilarLorebookEntry(
     limits: LorebookLimits = LorebookLimits(),
 ): LorebookEntry? = list.firstOrNull { lorebookEntriesSimilar(payload, it, limits) }
 
-private fun splitSentences(text: String): List<String> {
-    val parts = text.split(Regex("(?<=[。！？!?；;\\n])"))
-    return parts.map { it.trim() }.filter { it.isNotEmpty() }
-}
-
 /**
- * Appends sentences from [incoming] that are not already present (verbatim or
- * near-duplicate) in [existing], truncated to [LorebookLimits.contentChars].
+ * Replaces the updateable fields of [existing] with the complete current content
+ * of [incoming]. Updating a world-book entry is a **replacement**, never a merge:
+ * [incoming]'s content is the entry's whole new body (it may be shorter than
+ * before) and every sentence-appending / concatenating merge has been removed.
+ * Only the fields [incoming] legitimately owns are taken; identity and
+ * bookkeeping (`id`, `createdAt`, `mentions`, `lastMentionedAt`, `order`,
+ * `memberName`) stay with [existing]. Returns a new entry; neither argument is
+ * modified.
+ *
+ * - name: kept from [existing] unless it is empty, then [incoming]'s.
+ * - content: [incoming]'s verbatim. `LorebookLimits.contentChars` is a *writing* rule
+ *   enforced before the call (an over-long body is rejected, not cut) — see
+ *   `upsertLorebookEntry`.
+ * - keywords: [incoming]'s (deduped, capped); kept from [existing] when
+ *   [incoming] carries none, so a replacement never becomes unhittable.
+ * - alwaysActive: taken verbatim from [incoming] (it can flip back to false).
+ * - `enabled = true`, `misses = 0`, `updatedAt = incoming.updatedAt ?: existing`.
  */
-fun mergeLorebookContent(
-    existing: String?,
-    incoming: String?,
-    limits: LorebookLimits = LorebookLimits(),
-): String {
-    val base = existing.orEmpty().trim()
-    val known = splitSentences(base).toMutableList()
-    val added = mutableListOf<String>()
-    for (sentence in splitSentences(incoming.orEmpty())) {
-        if (sentence.length < 2 || base.contains(sentence)) continue
-        val duplicate = (known + added).any { similarity(it, sentence) >= limits.mergeSentenceSimilarity }
-        if (!duplicate) added += sentence
-    }
-    return (base + added.joinToString("")).trimTo(limits.contentChars)
-}
-
-/**
- * Merges [incoming] into [existing] (content, keywords, always-active flag).
- * Returns a new entry; neither argument is modified.
- */
-fun mergeLorebookEntry(
+fun replaceLorebookEntry(
     existing: LorebookEntry,
     incoming: LorebookEntry,
     limits: LorebookLimits = LorebookLimits(),
 ): LorebookEntry = existing.copy(
-    content = mergeLorebookContent(existing.content, incoming.content, limits),
-    keywords = (existing.keywords + incoming.keywords).distinct().take(limits.keywordsPerEntry),
-    alwaysActive = existing.alwaysActive || incoming.alwaysActive,
+    name = existing.name.ifEmpty { incoming.name },
+    content = incoming.content,
+    keywords = incoming.keywords.distinct().take(limits.keywordsPerEntry).ifEmpty { existing.keywords },
+    alwaysActive = incoming.alwaysActive,
     enabled = true,
     misses = 0,
     updatedAt = incoming.updatedAt ?: existing.updatedAt,
 )
 
+/**
+ * Applies the injection char budget. An entry that no longer fits is **skipped**
+ * rather than stopping the pass, so one long entry can no longer starve every
+ * shorter entry behind it. An individual line over [maxChars] is still truncated
+ * to `maxChars + "…"` as a fallback, and the first hit is always attempted.
+ */
 private fun applyCharCap(hits: List<LorebookEntry>, maxChars: Int): List<LorebookEntry> {
     val used = mutableListOf<LorebookEntry>()
     var chars = 0
@@ -159,7 +156,7 @@ private fun applyCharCap(hits: List<LorebookEntry>, maxChars: Int): List<Loreboo
         val content = entry.content.trim()
         var line = "- " + (if (name.isNotEmpty()) "$name：" else "") + content
         if (line.length > maxChars) line = line.take(maxChars) + "…"
-        if (chars + line.length > maxChars) break
+        if (chars + line.length > maxChars) continue
         chars += line.length
         used += entry
     }
@@ -170,7 +167,9 @@ private fun applyCharCap(hits: List<LorebookEntry>, maxChars: Int): List<Loreboo
  * Raw hits from `matchLorebookEntries`: always-active entries are unconditional,
  * keyword entries match the haystack built from [query] plus the last
  * [LorebookLimits.scanMessages] of [recentMessages] (case-insensitive). Sorted by
- * always-active, then [orderOf], then name, and capped at [LorebookLimits.injectEntries].
+ * always-active, then [orderOf] ascending, then most recently updated first
+ * (entries without an [LorebookEntry.updatedAt] sort last), then name as a final
+ * tie-break, and capped at [LorebookLimits.injectEntries].
  *
  * The char budget is intentionally not applied here (legacy `buildLorebookLines`
  * does that); [select] wraps this and applies it.
@@ -200,10 +199,26 @@ fun matchLorebookEntries(
             alwaysDiff
         } else {
             val orderDiff = orderOf(a) - orderOf(b)
-            if (orderDiff != 0) orderDiff else collator.compare(a.name, b.name)
+            if (orderDiff != 0) {
+                orderDiff
+            } else {
+                val updatedDiff = compareUpdatedAtDescending(a.updatedAt, b.updatedAt)
+                if (updatedDiff != 0) updatedDiff else collator.compare(a.name, b.name)
+            }
         }
     }
     return hits.take(limits.injectEntries)
+}
+
+/**
+ * Most recently updated first; entries without a timestamp sort after every dated
+ * one. ISO-8601 timestamps compare correctly as plain strings.
+ */
+private fun compareUpdatedAtDescending(a: String?, b: String?): Int = when {
+    a == b -> 0
+    a.isNullOrBlank() -> 1
+    b.isNullOrBlank() -> -1
+    else -> b.compareTo(a)
 }
 
 /**

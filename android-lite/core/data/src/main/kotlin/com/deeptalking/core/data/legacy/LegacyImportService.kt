@@ -4,6 +4,7 @@ import com.deeptalking.core.data.CharacterRepository
 import com.deeptalking.core.data.ChatRepository
 import com.deeptalking.core.data.ConfigRepository
 import com.deeptalking.core.model.Character
+import com.deeptalking.core.model.ChatMessage
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -45,6 +46,7 @@ class LegacyImportService(
             ?: return ImportSummary(0, 0, 0, false)
 
         val mapped = ArrayList<Character>()
+        val archives = LinkedHashMap<String, List<ChatMessage>>()
         var skipped = 0
         val characterEntries = root["characters"] as? JsonObject
         if (characterEntries != null) {
@@ -57,7 +59,14 @@ class LegacyImportService(
                     continue
                 }
                 runCatching { mapCharacter(dto.copy(id = dto.id ?: key), stickerSink) }
-                    .onSuccess { mapped.add(it) }
+                    .onSuccess { character ->
+                        mapped.add(character)
+                        // `history` is the split-format archive (A). Every older backup
+                        // put the whole chat in `memory.instant`, which is then the
+                        // archive as well as the window, so old files still restore.
+                        val archive = if (dto.history != null) dto.history else dto.memory?.instant
+                        archives[character.id] = mapInstantMessages(archive, stickerSink)
+                    }
                     .onFailure { skipped++ }
             }
         }
@@ -97,13 +106,13 @@ class LegacyImportService(
             chat.clearAll()
             characters.replaceAll(reconciled)
             for (character in reconciled) {
-                for (message in character.instant) {
+                for (message in archives[character.id].orEmpty()) {
                     chat.append(character.id, message)
                 }
             }
         }.onSuccess {
             characterCount = reconciled.size
-            messageCount = reconciled.sumOf { it.instant.size }
+            messageCount = reconciled.sumOf { archives[it.id]?.size ?: 0 }
             stickerCount = reconciled.sumOf { it.stickers.size }
         }
 
@@ -124,6 +133,15 @@ class LegacyImportService(
                     ttsVoiceFile = current.ttsVoiceFile,
                     ttsStyle = current.ttsStyle,
                     ttsSpeed = current.ttsSpeed,
+                    ttsBackend = current.ttsBackend,
+                    ttsRemoteUrl = current.ttsRemoteUrl,
+                    ttsRemoteModel = current.ttsRemoteModel,
+                    ttsRemoteVoice = current.ttsRemoteVoice,
+                    ttsRemoteSampleRate = current.ttsRemoteSampleRate,
+                    ttsRemoteChunkTokens = current.ttsRemoteChunkTokens,
+                    ttsRemoteTemperature = current.ttsRemoteTemperature,
+                    ttsRemoteTopK = current.ttsRemoteTopK,
+                    ttsRemoteTopP = current.ttsRemoteTopP,
                     dohEnabled = current.dohEnabled,
                     dohProvider = current.dohProvider,
                     lastReplyDebug = current.lastReplyDebug,

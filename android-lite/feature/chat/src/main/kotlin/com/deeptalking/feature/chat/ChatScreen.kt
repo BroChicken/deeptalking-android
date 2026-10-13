@@ -68,6 +68,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -76,6 +77,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.isShiftPressed
@@ -94,6 +98,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
+import com.deeptalking.core.common.AppLimits
 import com.deeptalking.core.data.legacy.MediaRef
 import com.deeptalking.core.designsystem.appColors
 import com.deeptalking.core.designsystem.legacy
@@ -152,6 +157,21 @@ fun ChatScreen(
 
     val visibleMessages = messages.filterNot { it.internalOnly }
     val lastAssistantId = visibleMessages.lastOrNull { it.role == Role.Assistant && !it.isLoading }?.id
+    // The archive is bounded (`AppLimits.History.ARCHIVE_MESSAGES`) but still long: render
+    // the newest page and prepend older pages when the list is scrolled to the very top.
+    var pageSize by remember(character?.id) { androidx.compose.runtime.mutableIntStateOf(AppLimits.History.PAGE) }
+    val shown = if (visibleMessages.size <= pageSize) visibleMessages else visibleMessages.takeLast(pageSize)
+    val shownCount by androidx.compose.runtime.rememberUpdatedState(shown.size)
+    val totalCount by androidx.compose.runtime.rememberUpdatedState(visibleMessages.size)
+    LaunchedEffect(listState, character?.id) {
+        androidx.compose.runtime.snapshotFlow {
+            listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset
+        }.collect { (index, offset) ->
+            if (index == 0 && offset <= 0 && shownCount < totalCount) {
+                pageSize += AppLimits.History.PAGE
+            }
+        }
+    }
 
     var initialScrollDone by remember(character?.id) { mutableStateOf(false) }
     // Legacy `isNearChatBottom`: only follow new content when the viewport is
@@ -167,9 +187,9 @@ fun ChatScreen(
                     last.offset + last.size <= info.viewportEndOffset + 8)
         }
     }
-    LaunchedEffect(character?.id, visibleMessages.size) {
-        if (visibleMessages.isEmpty()) return@LaunchedEffect
-        val last = visibleMessages.size - 1
+    LaunchedEffect(character?.id, shown.size) {
+        if (shown.isEmpty()) return@LaunchedEffect
+        val last = shown.size - 1
         if (!initialScrollDone) {
             runCatching { listState.scrollToItem(last) }
             initialScrollDone = true
@@ -177,9 +197,9 @@ fun ChatScreen(
             runCatching { listState.animateScrollToItem(last) }
         }
     }
-    LaunchedEffect(visibleMessages.lastOrNull()?.content) {
-        if (isSending && visibleMessages.isNotEmpty() && autoFollow) {
-            runCatching { listState.scrollToItem(visibleMessages.size - 1) }
+    LaunchedEffect(shown.lastOrNull()?.content) {
+        if (isSending && shown.isNotEmpty() && autoFollow) {
+            runCatching { listState.scrollToItem(shown.size - 1) }
         }
     }
 
@@ -194,7 +214,7 @@ fun ChatScreen(
                     verticalArrangement = Arrangement.spacedBy(16.dp),
                     contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 16.dp, vertical = 14.dp),
                 ) {
-                    items(visibleMessages, key = { it.id }) { message ->
+                    items(shown, key = { it.id }) { message ->
                         BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
                             val bubbleMaxWidth = maxWidth * 0.8f
                             Column(modifier = Modifier.fillMaxWidth()) {
@@ -325,7 +345,29 @@ fun ChatScreen(
             modifier = Modifier.fillMaxSize().background(Color(0xD9000000)).clickable { imagePreview = null },
             contentAlignment = Alignment.Center,
         ) {
-            AsyncImage(model = MediaRef.model(context, path), contentDescription = "图片", contentScale = ContentScale.Fit, modifier = Modifier.fillMaxWidth().padding(24.dp))
+            // Pinch to zoom / drag to pan; tap the dark background to close.
+            var imageScale by remember(path) { androidx.compose.runtime.mutableFloatStateOf(1f) }
+            var imageOffset by remember(path) { mutableStateOf(Offset.Zero) }
+            AsyncImage(
+                model = MediaRef.model(context, path),
+                contentDescription = "图片",
+                contentScale = ContentScale.Fit,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(24.dp)
+                    .graphicsLayer(
+                        scaleX = imageScale,
+                        scaleY = imageScale,
+                        translationX = imageOffset.x,
+                        translationY = imageOffset.y,
+                    )
+                    .pointerInput(path) {
+                        detectTransformGestures { _, pan, zoom, _ ->
+                            imageScale = (imageScale * zoom).coerceIn(1f, 6f)
+                            imageOffset = if (imageScale <= 1f) Offset.Zero else imageOffset + pan
+                        }
+                    },
+            )
         }
     }
 

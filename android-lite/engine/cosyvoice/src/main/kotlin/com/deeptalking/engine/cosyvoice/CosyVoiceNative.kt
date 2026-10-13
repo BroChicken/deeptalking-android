@@ -35,6 +35,16 @@ internal interface CosyVoiceLib : Library {
     fun cosyvoice_prompt_init_from_prompt_speech(ctx: Pointer, promptSpeech: Pointer): Pointer?
     fun cosyvoice_prompt_free(prompt: Pointer)
 
+    // -------- runtime knobs shared with the PC server --------
+    /** Applies sampling/length limits to the active worker (`cosyvoice_generation_config_t`). */
+    fun cosyvoice_set_generation_config(ctx: Pointer, config: Pointer): Boolean
+    /** Seeds the built-in sampler so both engines can reproduce the same take. */
+    fun cosyvoice_set_sampler_seed(ctx: Pointer, seed: Int): Boolean
+    /** Tokens per token->wav chunk (the phone and the server use the same value). */
+    fun cosyvoice_set_chunk_tokens(ctx: Pointer, nTokens: Int)
+    /** Reads back the *effective* context params (used to verify the v3 struct layout). */
+    fun cosyvoice_get_context_params(ctx: Pointer, params: Pointer)
+
     // -------- tts session --------
     fun cosyvoice_tts_context_new(ctx: Pointer, prompt: Pointer): Pointer?
     fun cosyvoice_tts_context_free(tts: Pointer)

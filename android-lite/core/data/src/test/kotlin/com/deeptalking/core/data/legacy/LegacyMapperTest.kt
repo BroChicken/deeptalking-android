@@ -503,7 +503,6 @@ class LegacyMapperTest {
                         content = "hi",
                         timestamp = "2026-01-01T00:00:00Z",
                         sequence = 5,
-                        extractedAt = "2026-01-02T00:00:00Z",
                     ),
                 ),
                 scenes = listOf(
@@ -531,7 +530,7 @@ class LegacyMapperTest {
         assertEquals("forest", ((memory["sceneState"] as JsonObject)["key"] as JsonPrimitive).content)
         assertEquals(1, (memory["pendingRecall"] as JsonArray).size)
         val instant = (memory["instant"] as JsonArray)[0] as JsonObject
-        assertEquals("\"2026-01-02T00:00:00Z\"", instant["extractedAt"].toString())
+        assertEquals("\"hi\"", instant["content"].toString())
 
         val freshDao = FakeCharacterDao()
         val fresh = LegacyImportService(
@@ -551,8 +550,43 @@ class LegacyMapperTest {
         assertEquals(3, restored.sceneState?.startCount)
         assertEquals(1, restored.scenes.size)
         assertEquals("forest", restored.scenes.single().key)
-        assertEquals("2026-01-02T00:00:00Z", restored.instant.single().extractedAt)
+        assertEquals("hi", restored.instant.single().content)
         assertEquals(2, restored.staticFillMeta?.failures)
+    }
+
+    @Test
+    fun exportSplitsTheChatArchiveFromTheMemoryWindow() = runTest {
+        val characterDao = FakeCharacterDao()
+        val characters = CharacterRepository(characterDao)
+        val chat = ChatRepository(FakeMessageDao())
+        val config = ConfigRepository(FakeConfigDao())
+        // The archive holds the whole chat; the window holds only the recent slice.
+        chat.append("c1", ChatMessage(id = "h1", role = Role.User, content = "第一条", timestamp = "2026-01-01T00:00:00Z"))
+        chat.append("c1", ChatMessage(id = "h2", role = Role.Assistant, content = "第二条", timestamp = "2026-01-01T00:01:00Z"))
+        characters.upsert(
+            Character(
+                id = "c1",
+                name = "Aria",
+                instant = listOf(ChatMessage(id = "h2", role = Role.Assistant, content = "第二条", timestamp = "2026-01-01T00:01:00Z")),
+            ),
+        )
+
+        val exported = BackupService(characters, chat, config).exportJson(activeCharacterId = "c1")
+        val root = Json { ignoreUnknownKeys = true }.parseToJsonElement(exported) as JsonObject
+        val characterJson = (root["characters"] as JsonObject)["c1"] as JsonObject
+        // `history` is the archive (A); `memory.instant` is the window (B).
+        assertEquals(2, (characterJson["history"] as JsonArray).size)
+        assertEquals(1, ((characterJson["memory"] as JsonObject)["instant"] as JsonArray).size)
+
+        val freshChatDao = FakeMessageDao()
+        val fresh = LegacyImportService(
+            CharacterRepository(FakeCharacterDao()),
+            ChatRepository(freshChatDao),
+            ConfigRepository(FakeConfigDao()),
+            null,
+        )
+        assertEquals(1, fresh.importJson(exported).characters)
+        assertEquals(listOf("h1", "h2"), ChatRepository(freshChatDao).getMessages("c1").map { it.id })
     }
 
     @Test
@@ -790,7 +824,7 @@ class LegacyMapperTest {
     }
 
     @Test
-    fun mapInstantFiltersLabelsAndNormalizesExtractedAt() {
+    fun mapInstantFiltersLabelsAndIgnoresLegacyExtractedAt() {
         val json = """
             {
               "characters": {
@@ -809,11 +843,8 @@ class LegacyMapperTest {
         """.trimIndent()
         val character = mapCharacter(parse(json).characters!!.getValue("c"), null)
         val m1 = character.instant.first { it.id == "m1" }
-        assertNull(m1.extractedAt)
         assertEquals(listOf("metaTalk"), m1.styleViolations)
         assertEquals(listOf("missing"), m1.quickReplyIssues)
-        val m2 = character.instant.first { it.id == "m2" }
-        assertEquals("2026-01-01T00:00:00Z", m2.extractedAt)
     }
 
     @Test
@@ -942,6 +973,13 @@ class LegacyMapperTest {
 
         override suspend fun deleteForCharacter(characterId: String) {
             rows.entries.removeAll { it.value.characterId == characterId }
+        }
+
+        override suspend fun deleteOldestBeyond(characterId: String, keep: Int) {
+            rows.values.filter { it.characterId == characterId }
+                .sortedBy { it.timestamp }
+                .dropLast(keep)
+                .forEach { rows.remove(it.id) }
         }
 
         override suspend fun deleteAll() {

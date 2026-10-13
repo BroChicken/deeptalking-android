@@ -40,6 +40,10 @@ object CharacterParity {
             "要体现口头禅、句尾助词、标点习惯与对用户的称呼，三条之间差异明显（能看出是同一个人、但场景不同）；" +
             "**禁止换行，三条之间只能用 \" / \" 分隔**，整个字段不超过 200 字。"
 
+    /** 世界书条目内容规则：单条内容上限 [AppLimits.Lorebook.CONTENT_CHARS]，超限条目会被丢弃。 */
+    private val LOREBOOK_CONTENT_RULE =
+        "lorebook 每条 content 精炼、一条只讲一件事，**不超过 ${AppLimits.Lorebook.CONTENT_CHARS} 字**；超长会被丢弃。"
+
     private val DYNAMIC_FIELD_KEYS = setOf(
         "currentSituation", "currentLocation", "currentMood", "currentOccupation",
         "currentGoal", "currentTone",
@@ -66,8 +70,8 @@ object CharacterParity {
 
     /** Full one-sentence generation prompt (legacy `quickGenerateCharacter`). */
     fun buildQuickGeneratePrompt(desc: String, isGroup: Boolean): String =
-        if (isGroup) GROUP_PROMPT_PREFIX + CHARACTER_QUALITY_RULE + SPEAKING_STYLE_SAMPLES_RULE + "\n描述: " + desc
-        else CHARACTER_PROMPT_PREFIX + CHARACTER_QUALITY_RULE + SPEAKING_STYLE_SAMPLES_RULE + "\n描述: " + desc
+        if (isGroup) GROUP_PROMPT_PREFIX + CHARACTER_QUALITY_RULE + SPEAKING_STYLE_SAMPLES_RULE + LOREBOOK_CONTENT_RULE + "\n描述: " + desc
+        else CHARACTER_PROMPT_PREFIX + CHARACTER_QUALITY_RULE + SPEAKING_STYLE_SAMPLES_RULE + LOREBOOK_CONTENT_RULE + "\n描述: " + desc
 
     private val GROUP_PROMPT_PREFIX = buildString {
         append("根据以下描述生成一个角色群组。只返回JSON：")
@@ -329,12 +333,19 @@ object CharacterParity {
 
     fun capLorebookName(value: String): String = value.take(AppLimits.Lorebook.NAME_CHARS)
 
+    /**
+     * 硬输入上限：[AppLimits.Lorebook.CONTENT_CHARS]。
+     *
+     * **写入路径不要用它截断模型/用户内容**——超限应当丢弃（模型草稿）或拒收该次输入（编辑器），
+     * 宁可没有，也不要半句。此函数仅作为硬输入上限/兼容调用保留。
+     */
     fun capLorebookContent(value: String): String = value.take(AppLimits.Lorebook.CONTENT_CHARS)
 
     /**
      * Local name-based near-duplicate compaction for AI-generated entries
      * (legacy `dedupeLorebook`): a later model entry whose normalized name
-     * matches an earlier model entry is merged into it. User entries are
+     * matches an earlier model entry replaces it — the later entry's content
+     * and `alwaysActive` win, no content is concatenated. User entries are
      * never touched.
      */
     fun dedupeGeneratedLorebook(entries: List<LorebookEntry>): List<LorebookEntry> {
@@ -356,13 +367,9 @@ object CharacterParity {
     }
 
     private fun mergeGeneratedLorebook(existing: LorebookEntry, incoming: LorebookEntry): LorebookEntry = existing.copy(
-        content = when {
-            existing.content.isBlank() -> incoming.content
-            incoming.content.isBlank() || existing.content.contains(incoming.content) -> existing.content
-            else -> existing.content + "\n" + incoming.content
-        },
-        keywords = (existing.keywords + incoming.keywords).distinct().take(AppLimits.Lorebook.KEYWORDS_PER_ENTRY),
-        alwaysActive = existing.alwaysActive || incoming.alwaysActive,
+        content = incoming.content.ifBlank { existing.content },
+        keywords = (incoming.keywords + existing.keywords).distinct().take(AppLimits.Lorebook.KEYWORDS_PER_ENTRY),
+        alwaysActive = incoming.alwaysActive,
         enabled = true,
     )
 
@@ -373,17 +380,21 @@ object CharacterParity {
 
     fun parseGeneratedLorebook(element: JsonElement?): List<LorebookEntry> {
         val array = element as? JsonArray ?: return emptyList()
-        val entries = array.mapNotNull { it as? JsonObject }.take(AppLimits.Lorebook.ENTRIES).map { obj ->
-            LorebookEntry(
-                id = UUID.randomUUID().toString(),
-                name = trimEllipsis(obj.str("name"), AppLimits.Lorebook.NAME_CHARS),
-                content = trimEllipsis(obj.str("content"), AppLimits.Lorebook.CONTENT_CHARS),
-                keywords = keywordsOf(obj["keywords"]),
-                enabled = (obj["enabled"] as? JsonPrimitive)?.booleanOrNull != false,
-                alwaysActive = (obj["alwaysActive"] as? JsonPrimitive)?.booleanOrNull == true,
-                origin = LorebookOrigin.Model,
-            )
-        }
+        val entries = array.mapNotNull { it as? JsonObject }
+            // 不截断：模型给的 content 超过单条上限时直接丢弃该条（宁可没有，也不要半句）。
+            .filter { it.str("content").length <= AppLimits.Lorebook.CONTENT_CHARS }
+            .take(AppLimits.Lorebook.ENTRIES)
+            .map { obj ->
+                LorebookEntry(
+                    id = UUID.randomUUID().toString(),
+                    name = trimEllipsis(obj.str("name"), AppLimits.Lorebook.NAME_CHARS),
+                    content = obj.str("content"),
+                    keywords = keywordsOf(obj["keywords"]),
+                    enabled = (obj["enabled"] as? JsonPrimitive)?.booleanOrNull != false,
+                    alwaysActive = (obj["alwaysActive"] as? JsonPrimitive)?.booleanOrNull == true,
+                    origin = LorebookOrigin.Model,
+                )
+            }
         var activeCount = entries.count { it.alwaysActive }
         return entries.map { entry ->
             if (!entry.alwaysActive && entry.keywords.isEmpty() && activeCount < AppLimits.Lorebook.MAX_ALWAYS_ACTIVE) {

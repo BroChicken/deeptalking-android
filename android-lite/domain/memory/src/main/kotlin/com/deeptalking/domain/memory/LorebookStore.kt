@@ -14,6 +14,9 @@ import kotlinx.serialization.Serializable
  * `lorebookEvidenceOverlaps`, `markLorebookMentions`). Used by the automatic
  * consolidation task; the `upsert_lorebook_entry` tool keeps its own matching
  * implementation.
+ *
+ * Entry updates are **replacements**, not merges: an AI entry is rewritten whole
+ * from the latest proposal (see [replaceLorebookEntry]); no content is appended.
  */
 
 data class LorebookUpsertResult(
@@ -84,8 +87,9 @@ fun resolveLorebookSources(character: Character, sourceIds: List<String>, eviden
 }
 
 /**
- * Inserts or merges [proposal] into [list]. AI near-duplicates merge; user-written
- * entries are protected; a new entry needs a keyword or explicit `alwaysActive`.
+ * Inserts or replaces [proposal] into [list]. A matching or near-duplicate AI
+ * entry is rewritten whole (see [replaceLorebookEntry]); user-written entries are
+ * protected; an entry with no keywords falls back to its own name as the trigger.
  */
 fun upsertLorebookEntry(
     list: List<LorebookEntry>,
@@ -94,9 +98,18 @@ fun upsertLorebookEntry(
     nowIso: String = Instant.now().toString(),
 ): LorebookUpsertResult {
     val name = proposal.name.trim().take(AppLimits.Lorebook.NAME_CHARS)
-    val content = proposal.content.trim().take(AppLimits.Lorebook.CONTENT_CHARS)
+    val content = proposal.content.trim()
     if (name.isEmpty() || content.isEmpty()) {
         return LorebookUpsertResult(false, "条目名与内容不能为空")
+    }
+    // `CONTENT_CHARS` is a *writing* rule the model is told to obey, not a knife: an
+    // over-long body is rejected (and the model asked to shorten it) instead of being
+    // cut, so a stored entry is always the model's whole text — never half a sentence.
+    if (content.length > AppLimits.Lorebook.CONTENT_CHARS) {
+        return LorebookUpsertResult(
+            false,
+            "内容超过 ${AppLimits.Lorebook.CONTENT_CHARS} 字，请精简成一条只讲一件事的条目后重写",
+        )
     }
     val keywords = proposal.keywords.map { it.trim() }.filter { it.isNotEmpty() }
         .take(AppLimits.Lorebook.KEYWORDS_PER_ENTRY)
@@ -110,7 +123,7 @@ fun upsertLorebookEntry(
             name = exact.name.ifEmpty { name },
             content = content,
             keywords = if (keywords.isNotEmpty()) keywords else exact.keywords,
-            alwaysActive = exact.alwaysActive || proposal.alwaysActive,
+            alwaysActive = proposal.alwaysActive,
             misses = 0,
             updatedAt = nowIso,
         )
@@ -122,13 +135,16 @@ fun upsertLorebookEntry(
         if (similar.origin != LorebookOrigin.Model) {
             return LorebookUpsertResult(true, list = list, entry = similar, mergedIntoUser = true)
         }
-        val merged = mergeLorebookEntry(similar, LorebookEntry(name = name, content = content, keywords = keywords, updatedAt = nowIso))
-        return LorebookUpsertResult(true, list = replaceEntry(list, similar.id, merged), entry = merged)
+        val replaced = replaceLorebookEntry(
+            similar,
+            LorebookEntry(name = name, content = content, keywords = keywords, updatedAt = nowIso),
+        )
+        return LorebookUpsertResult(true, list = replaceEntry(list, similar.id, replaced), entry = replaced)
     }
 
-    if (keywords.isEmpty() && !proposal.alwaysActive) {
-        return LorebookUpsertResult(false, "条目需要关键词或显式常驻")
-    }
+    // An entry with no keywords that is not always-on would never be injected at all;
+    // fall back to its own name as the trigger instead of rejecting the entry.
+    val triggerKeywords = keywords.ifEmpty { listOf(name) }
     if (proposal.alwaysActive &&
         list.count { it.origin == LorebookOrigin.Model && it.alwaysActive } >= AppLimits.Lorebook.MAX_ALWAYS_ACTIVE
     ) {
@@ -141,7 +157,7 @@ fun upsertLorebookEntry(
         id = "lore_" + System.currentTimeMillis() + "_" + (0..0xFFFFFF).random().toString(16),
         name = name,
         content = content,
-        keywords = keywords,
+        keywords = triggerKeywords,
         alwaysActive = proposal.alwaysActive,
         origin = LorebookOrigin.Model,
         createdAt = nowIso,
@@ -178,7 +194,13 @@ fun upsertLorebookEntryForCharacter(
     return character.copy(lorebook = result.list) to result
 }
 
-/** Local near-duplicate compaction: merges model entries, preserves user entries. */
+/**
+ * Local near-duplicate compaction for AI entries: within a cluster of similar
+ * model entries only the **latest** one survives (its position stays that of the
+ * first), with the earlier entries' keywords unioned in so nothing becomes
+ * unhittable. Content is taken from the latest entry wholesale — no appending.
+ * User-written entries are never touched.
+ */
 fun dedupeLorebook(list: List<LorebookEntry>): List<LorebookEntry> {
     val kept = mutableListOf<LorebookEntry>()
     for (entry in list) {
@@ -190,14 +212,19 @@ fun dedupeLorebook(list: List<LorebookEntry>): List<LorebookEntry> {
         if (target < 0) {
             kept += entry
         } else {
-            kept[target] = mergeLorebookContentEntry(kept[target], entry)
+            val previous = kept[target]
+            kept[target] = entry.copy(
+                keywords = (entry.keywords + previous.keywords).distinct().take(AppLimits.Lorebook.KEYWORDS_PER_ENTRY),
+                alwaysActive = entry.alwaysActive,
+            )
         }
     }
     return kept
 }
 
-private fun mergeLorebookContentEntry(existing: LorebookEntry, incoming: LorebookEntry): LorebookEntry =
-    mergeLorebookEntry(existing, incoming)
+/** True when an AI entry is over the per-entry cap and still needs the one-time rewrite. */
+fun needsLorebookRewrite(entry: LorebookEntry): Boolean =
+    entry.origin == LorebookOrigin.Model && entry.content.length > AppLimits.Lorebook.CONTENT_CHARS
 
 private fun findEntry(list: List<LorebookEntry>, entryId: String, name: String): LorebookEntry? {
     val id = entryId.trim()

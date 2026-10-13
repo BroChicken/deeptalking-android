@@ -55,6 +55,17 @@ interface MessageDao {
     @Query("DELETE FROM messages WHERE characterId = :characterId")
     suspend fun deleteForCharacter(characterId: String)
 
+    /**
+     * Keeps the newest [keep] rows (by timestamp) for one conversation and deletes the
+     * rest — the archive cap. Ordering matches [getForCharacter], so what survives is
+     * exactly what the chat list shows.
+     */
+    @Query(
+        "DELETE FROM messages WHERE characterId = :characterId AND id NOT IN " +
+            "(SELECT id FROM messages WHERE characterId = :characterId ORDER BY timestamp DESC LIMIT :keep)",
+    )
+    suspend fun deleteOldestBeyond(characterId: String, keep: Int)
+
     @Query("DELETE FROM messages")
     suspend fun deleteAll()
 

@@ -34,7 +34,11 @@ include(":domain:memory")
 
 // On-device inference interfaces
 include(":engine:ondevice")
+// Shared PCM playback + byte-format helpers (used by both TTS engines)
+include(":engine:audio")
 include(":engine:cosyvoice")
+// Remote (HTTP) TTS backend
+include(":engine:remote-tts")
 
 // Features
 include(":feature:chat")

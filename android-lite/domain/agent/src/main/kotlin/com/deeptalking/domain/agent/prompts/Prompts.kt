@@ -26,6 +26,7 @@ import com.deeptalking.domain.agent.background.getLastStyleViolations
 import com.deeptalking.domain.memory.MemoryService
 import com.deeptalking.domain.memory.formatAbsoluteDate
 import com.deeptalking.domain.memory.logicalDay
+import com.deeptalking.domain.memory.parseZoned
 import com.deeptalking.engine.ondevice.LlmRequest
 import com.deeptalking.engine.ondevice.ToolChoice
 import com.deeptalking.engine.ondevice.ToolDefinition
@@ -138,20 +139,33 @@ internal fun normalizeUserAddress(value: String?): String =
     value.orEmpty().replace(Regex("\\s+"), "").take(20)
 
 /**
- * Date label for an injected short-term line. Falls back to the earliest cited
- * source message's timestamp when the summary carries no time of its own, so an
- * injected line never reaches the model without a date to anchor it.
+ * Date label for an injected short-term line.
+ *
+ * Rendered as the device's local clock **plus** the logical day + time slot it belongs
+ * to (e.g. `2026-10-12 00:30（10月11日 深夜）`): the exact time is preserved (nothing is
+ * truncated) and the annotation is what stops `00:30` from being read as that day's
+ * afternoon instead of the previous day's night. Storage stays UTC — only this
+ * rendering is local. Falls back to the earliest cited source message's timestamp when
+ * the summary carries no time of its own, so a line never reaches the model undated.
  */
 private fun shortTermDate(character: Character, item: ShortTermMemory): String {
-    val direct = trimText(item.eventTime ?: item.createdAt, 10)
-    if (direct.isNotBlank()) return direct
+    val direct = item.eventTime ?: item.createdAt
+    if (!direct.isNullOrBlank()) return localStampWithSlot(direct)
     val ids = item.sourceMessageIds.toSet()
     if (ids.isEmpty()) return ""
     val earliest = character.instant
         .filter { it.id in ids && !it.timestamp.isNullOrBlank() }
         .minByOrNull { it.timestamp.orEmpty() }
         ?.timestamp
-    return trimText(earliest, 10)
+    return localStampWithSlot(earliest)
+}
+
+/** UTC ISO → `yyyy-MM-dd HH:mm（逻辑日 时段）`; unparseable input is shown verbatim. */
+private fun localStampWithSlot(raw: String?): String {
+    if (raw.isNullOrBlank()) return ""
+    val zdt = parseZoned(raw) ?: return raw
+    val clock = zdt.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"))
+    return "$clock（${formatAbsoluteDate(logicalDay(zdt))} ${TimeContext.timeSlot(zdt)}）"
 }
 
 /** Never send the literal word “用户” to the model. */

@@ -18,6 +18,7 @@ class LorebookMatcherTest {
         content: String = "内容",
         misses: Int = 0,
         mentions: Int = 0,
+        updatedAt: String? = null,
     ): LorebookEntry = LorebookEntry(
         id = id,
         name = name,
@@ -27,6 +28,7 @@ class LorebookMatcherTest {
         origin = LorebookOrigin.Model,
         misses = misses,
         mentions = mentions,
+        updatedAt = updatedAt,
     )
 
     @Test
@@ -90,6 +92,36 @@ class LorebookMatcherTest {
         val ordered = matchLorebookEntries(listOf(zhao, a), "k")
 
         assertEquals(listOf("a", "zhao"), ordered.map { it.id })
+    }
+
+    @Test
+    fun selectionOrdersMostRecentlyUpdatedFirstAndUndatedLast() {
+        // Names would order these the other way round ("阿" < "李" < "赵").
+        val older = entry("older", "阿", keywords = listOf("k"), updatedAt = "2026-01-01T00:00:00Z")
+        val newer = entry("newer", "赵", keywords = listOf("k"), updatedAt = "2026-06-01T00:00:00Z")
+        val undated = entry("undated", "李", keywords = listOf("k"))
+
+        val ordered = matchLorebookEntries(listOf(older, newer, undated), "k")
+
+        assertEquals(listOf("newer", "older", "undated"), ordered.map { it.id })
+    }
+
+    @Test
+    fun selectSkipsOverLongEntryAndKeepsLaterShortOnes() {
+        // Pin the long entry first so the check never depends on name collation.
+        val long = entry("long", "长条目", alwaysActive = true, content = "长".repeat(80))
+        val shortA = entry("a", "甲", alwaysActive = true, content = "短内容")
+        val shortB = entry("b", "乙", alwaysActive = true, content = "短内容")
+
+        val selected = select(
+            listOf(shortA, long, shortB),
+            "",
+            emptyList(),
+            LorebookLimits(injectChars = 20),
+            orderOf = { when (it.id) { "long" -> 0; "a" -> 1; else -> 2 } },
+        )
+
+        assertEquals(listOf("a", "b"), selected.map { it.id })
     }
 
     @Test

@@ -57,6 +57,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.deeptalking.core.common.AppLimits
 import com.deeptalking.core.designsystem.legacy
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.GroupMember
@@ -746,10 +747,10 @@ private fun LorebookTab(
                 }
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     LegacyCheck("启用", entry.enabled) { checked ->
-                        onUpdateLorebook(draft, entry.copy(enabled = checked))
+                        onUpdateLorebook(draft, entry.copy(enabled = checked, origin = LorebookOrigin.User))
                     }
                     LegacyCheck("常驻", entry.alwaysActive) { checked ->
-                        onUpdateLorebook(draft, entry.copy(alwaysActive = checked))
+                        onUpdateLorebook(draft, entry.copy(alwaysActive = checked, origin = LorebookOrigin.User))
                     }
                     Text(lorebookMention(entry), fontSize = 12.sp, color = legacy.textMuted)
                 }
@@ -757,7 +758,12 @@ private fun LorebookTab(
                     value = entry.keywords.joinToString("、"),
                     onValueChange = { raw ->
                         val keywords = CharacterParity.splitLorebookKeywords(raw)
-                        val alwaysActive = CharacterParity.keywordsToAlwaysActive(entry.alwaysActive, keywords)
+                        // 关键词与常驻的自动联动只对 AI 条目生效：用户手写条目保留其勾选结果。
+                        val alwaysActive = if (entry.origin == LorebookOrigin.User) {
+                            entry.alwaysActive
+                        } else {
+                            CharacterParity.keywordsToAlwaysActive(entry.alwaysActive, keywords)
+                        }
                         onUpdateLorebook(draft, entry.copy(keywords = keywords, alwaysActive = alwaysActive, origin = LorebookOrigin.User))
                     },
                     placeholder = "触发关键词（用、或逗号分隔；常驻条目可留空）",
@@ -765,10 +771,18 @@ private fun LorebookTab(
                 LegacyField(
                     value = entry.content,
                     onValueChange = { content ->
-                        onUpdateLorebook(draft, entry.copy(content = CharacterParity.capLorebookContent(content), origin = LorebookOrigin.User))
+                        // 不截断：超过单条上限的本次输入直接丢弃，文本框保持原值。
+                        if (content.length <= AppLimits.Lorebook.CONTENT_CHARS) {
+                            onUpdateLorebook(draft, entry.copy(content = content, origin = LorebookOrigin.User))
+                        }
                     },
                     placeholder = "命中后注入的设定内容",
                     minLines = 2,
+                )
+                Text(
+                    "${entry.content.length}/${AppLimits.Lorebook.CONTENT_CHARS}",
+                    fontSize = 12.sp,
+                    color = if (entry.content.length >= AppLimits.Lorebook.CONTENT_CHARS) legacy.warning else legacy.textMuted,
                 )
             }
         }

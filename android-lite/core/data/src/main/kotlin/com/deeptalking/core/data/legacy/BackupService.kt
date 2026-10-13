@@ -70,6 +70,13 @@ fun decodeImportBytes(bytes: ByteArray): String {
 /** Reads a stored media reference back into a `data:image/...;base64,...` URI for export. */
 fun interface MediaSource {
     fun toDataUri(ref: String): String?
+
+    /**
+     * Compact preview used for the exported chat archive: only this travels in the
+     * backup, the original file stays on-device. Defaults to the full payload when the
+     * platform cannot downscale, so an image is never silently dropped.
+     */
+    fun toThumbnailDataUri(ref: String): String? = toDataUri(ref)
 }
 
 /**
@@ -146,7 +153,7 @@ class BackupService(
         put(
             "memory",
             memoryToJson(
-                instant = messages.ifEmpty { character.instant },
+                instant = character.instant,
                 shortTerm = character.shortTerm,
                 longTerm = character.longTerm,
                 scenes = character.scenes,
@@ -157,6 +164,13 @@ class BackupService(
                 revision = character.revision,
             ),
         )
+        // Two independent stores. `memory.instant` above is the high/low-watermark
+        // window (B, the character's working memory); `history` here is the bounded chat
+        // archive (A) used only to look back. Keeping them in separate fields is what
+        // stops an import from rebuilding the window out of the archive.
+        if (messages.isNotEmpty()) {
+            putJsonArray("history") { messages.forEach { add(instantToJson(it)) } }
+        }
         putJsonArray("lorebook") { character.lorebook.forEach { add(lorebookToJson(it)) } }
         putJsonArray("stickers") { character.stickers.forEach { add(stickerToJson(it)) } }
         if (character.fieldsMigrationVersion.isNotBlank()) {
@@ -308,11 +322,10 @@ class BackupService(
         put("content", message.content)
         if (message.sequence != 0) put("sequence", message.sequence)
         message.timestamp?.let { put("timestamp", it) }
-        message.extractedAt?.let { put("extractedAt", it) }
         if (message.internalOnly) put("internalOnly", true)
         val images = message.attachments
             .filter { it.kind == MessageAttachment.Kind.Image }
-            .map { mediaSource?.toDataUri(it.uri) ?: it.uri }
+            .map { mediaSource?.toThumbnailDataUri(it.uri) ?: it.uri }
         if (images.isNotEmpty()) {
             putJsonArray("images") { images.forEach { add(it) } }
         }

@@ -7,6 +7,7 @@ import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.GroupMember
 import com.deeptalking.core.model.LongTermMemory
 import com.deeptalking.core.model.LorebookEntry
+import com.deeptalking.core.model.LorebookOrigin
 import com.deeptalking.core.model.MemoryCategory
 import com.deeptalking.core.model.MemorySubject
 import com.deeptalking.core.model.PromiseStatus
@@ -40,13 +41,13 @@ import com.deeptalking.domain.memory.getTimeSlot
 import com.deeptalking.domain.memory.isValidAutomaticMemory
 import com.deeptalking.domain.memory.knownSources
 import com.deeptalking.domain.memory.logicalDay
+import com.deeptalking.domain.memory.needsLorebookRewrite
 import com.deeptalking.domain.memory.parseZoned
 import com.deeptalking.domain.memory.resolveDynamicStateSources
 import com.deeptalking.domain.memory.selfLearnMemoryImportance
 import com.deeptalking.domain.memory.parseRelativeText
 import com.deeptalking.domain.memory.resolveTimeRef
 import com.deeptalking.domain.memory.TimeRef
-import com.deeptalking.domain.memory.trimInstant
 import com.deeptalking.domain.memory.trimShortTerm
 import com.deeptalking.domain.memory.upsertLongTermMemory
 import com.deeptalking.domain.memory.upsertLorebookEntry
@@ -78,12 +79,6 @@ internal data class ExtractSource(
     val role: String,
     val content: String,
     val timestamp: String? = null,
-    /**
-     * True when this message was already folded into short-term memory in an
-     * earlier pass. It still rides along as context (continuity), but the model must
-     * not produce a new entry for it.
-     */
-    val extracted: Boolean = false,
 )
 
 @Serializable
@@ -393,26 +388,50 @@ class BackgroundTasks(
         migration: Boolean = false,
     ): Pair<TaskStatus, Character> = extractInstantToShortTermTask(character, migration)
 
-    /** Extraction with an explicit status (legacy `extractInstantToShortTerm`). */
+    /**
+     * Normal fold (legacy `extractInstantToShortTerm`): the window *is* the unit.
+     *
+     * It grows append-only from the low watermark to the high watermark, is summarized
+     * in one pass over **the whole window as it stands** (60, 61, 62 … — never cut to a
+     * fixed 60), and afterwards keeps only the newest
+     * [AppLimits.Memory.INSTANT_TRIM_FLOOR] messages as verbatim context for the next
+     * fold. The low-water leftovers ride along and are read again (continuity);
+     * duplication is prevented by showing the model the entries that already exist,
+     * not by per-message bookkeeping.
+     *
+     * This path never batches. A window far above the watermark is a legacy/anomalous
+     * backlog owned by [migrateOversizedWindow].
+     */
     private suspend fun extractInstantToShortTermTask(
         character: Character,
-        migration: Boolean,
-    ): Pair<TaskStatus, Character> {
-        // Whole-window pass (high/low watermark): the window is folded in one go at
-        // the high watermark, so the already-extracted head only rides along as
-        // context and the pending tail is what produces entries. Trim safety relies on
-        // coverage being a contiguous run starting at the first pending message, so an
-        // unfinished reply can never drop a message that was never summarised.
-        val window = character.instant
-            .filter { !it.isLoading }
-            .take(AppLimits.Memory.SUMMARY_SOURCES)
-        val pendingStart = window.indexOfFirst { it.extractedAt == null }
-        if (pendingStart < 0 || window.size - pendingStart < 2) return TaskStatus.Failure to character
-        val sourceMessages = window
+        migration: Boolean = false,
+    ): Pair<TaskStatus, Character> =
+        foldWindow(character, if (migration) FoldMode.Migration else FoldMode.Normal)
 
-        val recentIdentities = character.shortTerm
+    /** Which slice of the window one pass consumes. */
+    private enum class FoldMode { Normal, Migration }
+
+    /**
+     * One fold pass. `Normal` sends the whole window and keeps the newest
+     * [AppLimits.Memory.INSTANT_TRIM_FLOOR] messages as context; `Migration` sends only
+     * the oldest [AppLimits.Memory.INSTANT] messages (a huge legacy window cannot be
+     * sent at once) and drops exactly those, so the backlog is walked oldest-first.
+     *
+     * The result is merged into the **live** character, not into the captured snapshot:
+     * a turn that arrives while the model works keeps its new messages and the fold
+     * still lands, instead of the whole pass being thrown away.
+     */
+    private suspend fun foldWindow(character: Character, mode: FoldMode): Pair<TaskStatus, Character> {
+        val window = character.instant.filter { !it.isLoading }
+        if (window.size < AppLimits.Memory.INSTANT) return TaskStatus.Failure to character
+        // Normal sends the window as it stands (never cut to a fixed 60); migration takes
+        // only the oldest batch so a legacy backlog is walked without sending it all.
+        val batch = if (mode == FoldMode.Migration) window.take(AppLimits.Memory.INSTANT) else window
+        val sourceMessages = batch
+
+        val existingEvents = character.shortTerm
             .sortedByDescending { parseZoned(it.eventTime)?.toInstant()?.toEpochMilli() ?: 0L }
-            .take(4)
+            .take(AppLimits.Memory.SHORT_TERM_TRIM_FLOOR)
             .map {
                 RecentEventIdentity(
                     eventTime = it.eventTime,
@@ -427,74 +446,66 @@ class BackgroundTasks(
                 role = message.role.name.lowercase(),
                 content = trimText(message.content, 600),
                 timestamp = message.timestamp,
-                extracted = message.extractedAt != null,
             )
         }
-        val countClause = if (migration) EXTRACTION_COUNT_UNLIMITED else EXTRACTION_COUNT_LIMITED
+        val countClause = if (mode == FoldMode.Migration) EXTRACTION_COUNT_UNLIMITED else EXTRACTION_COUNT_LIMITED
         val prompt = EXTRACTION_PROMPT_HEAD + countClause + EXTRACTION_PROMPT_TAIL +
-            json.encodeToString(recentIdentities) + "\n对话内容:\n" + json.encodeToString(payload)
+            json.encodeToString(existingEvents) + "\n对话内容:\n" + json.encodeToString(payload)
 
-        val guard = captureGuard(character)
         onStatus("正在提取短期记忆…")
         val raw = complete(EXTRACTION_SYSTEM, prompt, sessionId = sessionIdFor(character), taskType = "extraction")
-        if (!isGuardCurrent(guard)) return TaskStatus.Stale to character
         if (raw.isBlank()) return TaskStatus.Failure to character
 
         val root = ResponseParser.parseJsonLenient(raw)
         var points = (root as? JsonArray)?.mapNotNull { it as? JsonObject }.orEmpty()
-        if (!migration) points = points.take(15)
+        if (mode == FoldMode.Normal) points = points.take(15)
         if (points.isEmpty()) return TaskStatus.Failure to character
 
-        val sourceIdSet = sourceMessages.map { it.id }.toSet()
-        val sourceIndexes = sourceMessages.withIndex().associate { it.value.id to it.index }
-        val covered = mutableSetOf<String>()
+        // The evidence anchor is collected client-side: an event owns the user lines
+        // that fall in the same logical day + time slot. No message ids are demanded
+        // from the model, so one bad citation can no longer discard the whole fold, and
+        // a beat the character narrated alone still gets an entry (with no user quote).
+        val userMessages = sourceMessages.filter { it.role == Role.User && it.content.isNotBlank() }
         val prepared = mutableListOf<PreparedPoint>()
-
         for (point in points) {
-            val ids = stringList(point["sourceMessageIds"]).map { it.trim() }.filter { it.isNotEmpty() }.distinct()
             val content = point.string("content")
             val eventTime = point.string("eventTime")
-            if (content.isBlank()) return TaskStatus.Failure to character
-            if (eventIdentity(eventTime).isEmpty() || ids.isEmpty()) return TaskStatus.Failure to character
-            if (ids.any { it !in sourceIdSet }) return TaskStatus.Failure to character
-            val firstIndex = ids.minOf { sourceIndexes[it] ?: Int.MAX_VALUE }
-            covered += ids
+            if (content.isBlank()) continue
+            val identity = eventIdentity(eventTime)
+            if (identity.isEmpty()) continue
+            val ids = userMessages.filter { eventIdentity(it.timestamp) == identity }
+                .map { it.id }
+                .take(AppLimits.Memory.SUMMARY_SOURCES)
             prepared += PreparedPoint(
                 content = content,
                 eventTime = eventTime,
                 sourceMessageIds = ids,
-                firstIndex = firstIndex,
+                firstIndex = 0,
                 participants = normalizeParticipants(stringList(point["participants"])),
                 location = point.string("location").trim(),
             )
         }
-        if (covered.isEmpty()) return TaskStatus.Failure to character
+        if (prepared.isEmpty()) return TaskStatus.Failure to character
 
-        // Only the pending zone is folded. Coverage must be a contiguous run starting
-        // at the first pending message; a point counts when it covers at least one
-        // contiguously covered pending message (it may additionally cite context
-        // messages for an ongoing event).
-        var coveredEnd = pendingStart
-        while (coveredEnd < sourceMessages.size && covered.contains(sourceMessages[coveredEnd].id)) {
-            coveredEnd++
-        }
-        val filtered = prepared.filter { point ->
-            point.sourceMessageIds.any { id -> (sourceIndexes[id] ?: -1) in pendingStart until coveredEnd }
-        }
-        if (filtered.isEmpty()) return TaskStatus.Failure to character
+        // Merge-write. The drafts land on the *live* character, never on the captured
+        // snapshot, so a turn that arrives during the request keeps its own new messages
+        // and the fold still advances (the old all-or-nothing stale guard discarded the
+        // whole pass whenever the user typed again during those seconds).
+        // Stale only when the conversation moved on without us: the batch is gone.
+        val live = liveCharacter(character.id) ?: character
+        val liveIds = live.instant.mapTo(HashSet()) { it.id }
+        if (sourceMessages.none { it.id in liveIds }) return TaskStatus.Stale to character
 
         val nowIso = Instant.now().toString()
-        var working = character
-        val markedIds = mutableSetOf<String>()
-        for (point in filtered) {
+        var working = live
+        var accepted = 0
+        for (point in prepared) {
             var pointTime = normalizeTimestamp(point.eventTime, "")
             if (pointTime.isEmpty()) {
-                var latestSourceTime = ""
-                point.sourceMessageIds.forEach { id ->
-                    val sourceTime = sourceMessages.firstOrNull { it.id == id }?.timestamp.orEmpty()
-                    if (sourceTime > latestSourceTime) latestSourceTime = sourceTime
-                }
-                pointTime = latestSourceTime
+                pointTime = point.sourceMessageIds
+                    .mapNotNull { id -> sourceMessages.firstOrNull { it.id == id }?.timestamp }
+                    .maxOrNull()
+                    .orEmpty()
             }
             if (pointTime.isEmpty()) pointTime = nowIso
             val result = addShortTermMemory(
@@ -511,13 +522,23 @@ class BackgroundTasks(
             )
             if (result.accepted) {
                 working = working.copy(shortTerm = result.list)
-                markedIds += point.sourceMessageIds
+                accepted++
             }
         }
-        if (markedIds.isEmpty()) return TaskStatus.Failure to character
-        working = working.copy(
-            instant = working.instant.map { if (it.id in markedIds) it.copy(extractedAt = nowIso) else it },
-        )
+        if (accepted == 0) return TaskStatus.Failure to character
+
+        // Consume exactly what this pass folded — never "keep the newest 20 by position",
+        // which on a legacy backlog would throw away messages no pass had ever read.
+        // Normal keeps the newest window slice as verbatim context; migration drops the
+        // whole batch (there is more backlog behind it). Anything that arrived during
+        // the request is untouched.
+        val consumed = sourceMessages.mapTo(HashSet()) { it.id }
+        val keep: Set<String> = if (mode == FoldMode.Normal) {
+            sourceMessages.takeLast(AppLimits.Memory.INSTANT_TRIM_FLOOR).mapTo(HashSet()) { it.id }
+        } else {
+            emptySet()
+        }
+        working = working.copy(instant = working.instant.filterNot { it.id in consumed && it.id !in keep })
         return TaskStatus.Success to trimMemory(working)
     }
 
@@ -626,23 +647,21 @@ class BackgroundTasks(
         // status != ok, a mismatched analyzedShortTermIds) still fail the batch.
         for (element in longTermArray) {
             val obj = element as? JsonObject ?: continue
-            val item = parseLongTerm(obj)
+            var item = parseLongTerm(obj)
             val sourceShortTermIds = stringList(obj["sourceShortTermIds"]).map { it.trim() }.filter { it.isNotEmpty() }.distinct()
             if (sourceShortTermIds.isEmpty() || sourceShortTermIds.any { it !in acknowledged }) continue
             val claimed = window.filter { it.id in sourceShortTermIds }
-            val allowedMessageIds = claimed.flatMap { it.sourceMessageIds }.toSet()
-            val itemMessageIds = item.sourceMessageIds.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
-            if (itemMessageIds.isEmpty() || itemMessageIds.any { it !in allowedMessageIds }) continue
-            if (claimed.any { short -> short.sourceMessageIds.none { it in itemMessageIds } }) continue
-            if (item.category == MemoryCategory.Events) {
-                val identity = eventIdentity(item.eventTime)
-                if (identity.isEmpty() || claimed.any { eventIdentity(it.eventTime) != identity }) continue
-            }
-            val allowedUserEvidence = claimed.flatMap { it.userEvidence }
-            if (allowedUserEvidence.none {
-                    it.sourceMessageId in itemMessageIds && evidenceMatchesSource(it.text, item.evidence)
-                }
-            ) continue
+            // The chain is anchored on the short-term entries, not on raw message ids:
+            // the evidence must be one of the verbatim user lines those entries carry
+            // (collected at fold time, so it survives the source message leaving the
+            // window). The item is then re-anchored on that exact line, so the validated
+            // write below cannot fail on a message id the model invented.
+            val evidence = claimed.flatMap { it.userEvidence }
+                .firstOrNull { evidenceMatchesSource(it.text, item.evidence) } ?: continue
+            item = item.copy(
+                evidence = evidence.text.take(300),
+                sourceMessageIds = listOf(evidence.sourceMessageId),
+            )
             if (item.key.isBlank() || item.value.isBlank() ||
                 !isValidAutomaticMemory(character, item, sources, null)
             ) continue
@@ -684,21 +703,24 @@ class BackgroundTasks(
      * pile-up). Hitting one is reported through `counters.analysisLastError`, so
      * dropped content is never silent.
      */
+    /**
+     * Applies the short-term retention trim plus its emergency ceiling.
+     *
+     * The instant window is deliberately NOT touched here. The fold consumes exactly
+     * the messages it read (see [foldWindow]) and an oversized legacy window is owned by
+     * [migrateOversizedWindow], so a positional trim here could only ever drop messages
+     * no pass had read yet — which is exactly how the old backlog used to vanish.
+     */
     private fun trimMemory(character: Character): Character {
-        val instantOverflow = (character.instant.size - AppLimits.Memory.INSTANT_HARD_CAP).coerceAtLeast(0)
         val shortOverflow = (character.shortTerm.size - AppLimits.Memory.SHORT_TERM_HARD_CAP).coerceAtLeast(0)
         var working = character
-        if (instantOverflow > 0) working = working.copy(instant = working.instant.drop(instantOverflow))
-        if (shortOverflow > 0) working = working.copy(shortTerm = working.shortTerm.drop(shortOverflow))
-        if (instantOverflow > 0 || shortOverflow > 0) {
+        if (shortOverflow > 0) {
+            working = working.copy(shortTerm = working.shortTerm.drop(shortOverflow))
             working = working.withAnalysisError(
-                "window-overflow: dropped $instantOverflow instant / $shortOverflow short-term (fold failing)",
+                "window-overflow: dropped $shortOverflow short-term (fold failing)",
             )
         }
-        return working.copy(
-            instant = trimInstant(working.instant),
-            shortTerm = trimShortTerm(working.shortTerm),
-        )
+        return working.copy(shortTerm = trimShortTerm(working.shortTerm))
     }
 
     /** Captures the revision/last-message snapshot for the stale guard (legacy `captureMemoryTask`). */
@@ -807,11 +829,23 @@ class BackgroundTasks(
 
         val books = mutableListOf(character.lorebook)
         character.members.forEach { books += it.lorebook }
-        val existingLines = books.flatMap { book ->
-            book.map { entry ->
-                "- " + entry.name + "｜关键词: " + entry.keywords.joinToString("、") +
-                    (if (entry.alwaysActive) "｜常驻" else "") + "｜内容: " + trimText(entry.content, 160)
-            }
+        val flat = books.flatten()
+        // The model can only merge/rewrite an entry it has actually read, so the most
+        // recently updated entries carry their FULL content; the rest are name +
+        // keywords only, and the prompt forbids updating those this round. Showing just
+        // the first 160 characters is exactly what made the model "update" entries by
+        // appending what it could not see — growing them into a mush of unrelated facts.
+        var detailBudget = LOREBOOK_EXISTING_FULL_CHARS
+        val detailed = mutableSetOf<String>()
+        for (entry in flat.sortedByDescending { it.updatedAt.orEmpty() }.take(LOREBOOK_EXISTING_FULL_ENTRIES)) {
+            if (entry.content.length > detailBudget) continue
+            detailBudget -= entry.content.length
+            detailed += entry.id
+        }
+        val existingLines = flat.map { entry ->
+            "- " + entry.name + "｜关键词: " + entry.keywords.joinToString("、") +
+                (if (entry.alwaysActive) "｜常驻" else "") +
+                if (entry.id in detailed) "｜内容: " + entry.content else "｜内容（略，本轮不要更新此条）"
         }
         val sourceLines = fresh.map { "[" + it.id + "] " + trimText(it.content, 600) }
         val speakerName = character.name.ifBlank { "角色" }
@@ -834,6 +868,12 @@ class BackgroundTasks(
             val content = obj.string("content")
             val ids = stringList(obj["sourceShortTermIds"]).map { it.trim() }.filter { it.isNotEmpty() }
             if (name.isBlank() || content.isBlank() || ids.isEmpty() || ids.any { it !in allowed }) {
+                return TaskStatus.Failure to character
+            }
+            // The cap is a writing rule, not a knife: cutting the model's text would
+            // silently drop its tail. Reject the whole batch instead (the prompt tells the
+            // model that over-long entries are discarded) and let the retry re-ask.
+            if (content.trim().length > AppLimits.Lorebook.CONTENT_CHARS) {
                 return TaskStatus.Failure to character
             }
         }
@@ -869,6 +909,110 @@ class BackgroundTasks(
             ),
         )
         return TaskStatus.Success to working
+    }
+
+    /** AI entries over the per-entry cap that still need the one-time rewrite (root + members). */
+    fun oversizedLorebookCount(character: Character): Int =
+        character.lorebook.count { needsLorebookRewrite(it) } +
+            character.members.sumOf { member -> member.lorebook.count { needsLorebookRewrite(it) } }
+
+    /**
+     * One-time rewrite of the oversized AI lorebook entries older versions accumulated.
+     *
+     * Each oversized entry is handed to the model **in full** and rewritten into 1..3
+     * concise entries (one concept each, within `AppLimits.Lorebook.CONTENT_CHARS`),
+     * replacing the original — the first result keeps the original id so injection and
+     * mention history stay attached. User-written entries are never sent or touched.
+     *
+     * Runs to completion in one call (the caller shows progress). `Failure` keeps
+     * whatever was already rewritten, so a retry resumes rather than repeating work.
+     */
+    suspend fun rebuildOversizedLorebook(
+        character: Character,
+        onProgress: (done: Int, remaining: Int) -> Unit = { _, _ -> },
+    ): Pair<TaskStatus, Character> {
+        val targets = mutableListOf<Pair<String, String>>()
+        character.lorebook.filter { needsLorebookRewrite(it) }.forEach { targets += "" to it.id }
+        character.members.forEach { member ->
+            member.lorebook.filter { needsLorebookRewrite(it) }.forEach { targets += member.name to it.id }
+        }
+        if (targets.isEmpty()) return TaskStatus.Success to character
+        var working = character
+        var done = 0
+        for ((memberName, entryId) in targets) {
+            val (status, updated) = rewriteLorebookEntry(working, memberName, entryId)
+            if (status != TaskStatus.Success) return status to working
+            working = updated
+            done++
+            onProgress(done, targets.size - done)
+        }
+        return TaskStatus.Success to working
+    }
+
+    /** Rewrites one oversized entry into 1..3 concise ones, replacing it in place. */
+    private suspend fun rewriteLorebookEntry(
+        character: Character,
+        memberName: String,
+        entryId: String,
+    ): Pair<TaskStatus, Character> {
+        val memberIndex = if (memberName.isBlank()) -1 else character.members.indexOfFirst { it.name == memberName }
+        val list = if (memberIndex < 0) character.lorebook else character.members[memberIndex].lorebook
+        val entry = list.firstOrNull { it.id == entryId } ?: return TaskStatus.Success to character
+        if (!needsLorebookRewrite(entry)) return TaskStatus.Success to character
+
+        val speakerName = character.name.ifBlank { "角色" }
+        val prompt = LOREBOOK_REBUILD_PROMPT +
+            "\n\n（角色名：" + speakerName + "）\n原条目：\n名称：" + entry.name +
+            "\n关键词：" + entry.keywords.joinToString("、").ifEmpty { "（无）" } +
+            "\n常驻：" + if (entry.alwaysActive) "true" else "false" +
+            "\n内容：\n" + entry.content
+        onStatus("正在精简世界书…")
+        val raw = complete(LOREBOOK_REBUILD_SYSTEM, prompt, sessionId = sessionIdFor(character), taskType = "lorebook")
+        if (raw.isBlank()) return TaskStatus.Failure to character
+        val root = ResponseParser.parseJsonLenient(raw) as? JsonObject ?: return TaskStatus.Failure to character
+        val items = root["entries"] as? JsonArray ?: return TaskStatus.Failure to character
+
+        val now = Instant.now().toString()
+        var activeCount = list.count { it.origin == LorebookOrigin.Model && it.alwaysActive }
+        val rewritten = mutableListOf<LorebookEntry>()
+        for ((index, item) in items.take(LOREBOOK_REBUILD_MAX_ENTRIES).withIndex()) {
+            val obj = item as? JsonObject ?: continue
+            val name = obj.string("name").trim().take(AppLimits.Lorebook.NAME_CHARS)
+            val content = obj.string("content").trim()
+            if (name.isEmpty() || content.isEmpty()) continue
+            // Keep the original entry instead of storing a half-entry: the prompt demands
+            // ≤ CONTENT_CHARS, and a retry re-asks against the same source text.
+            if (content.length > AppLimits.Lorebook.CONTENT_CHARS) return TaskStatus.Failure to character
+            val wantsActive = obj.string("alwaysActive").equals("true", ignoreCase = true) ||
+                (obj["alwaysActive"] as? JsonPrimitive)?.contentOrNull == "true"
+            val alwaysActive = wantsActive && activeCount < AppLimits.Lorebook.MAX_ALWAYS_ACTIVE
+            if (alwaysActive) activeCount++
+            rewritten += LorebookEntry(
+                id = if (index == 0) entry.id else newId("lore"),
+                name = name,
+                content = content,
+                keywords = stringList(obj["keywords"]).map { it.trim() }.filter { it.isNotEmpty() }
+                    .take(AppLimits.Lorebook.KEYWORDS_PER_ENTRY),
+                alwaysActive = alwaysActive,
+                origin = LorebookOrigin.Model,
+                memberName = entry.memberName,
+                createdAt = entry.createdAt ?: now,
+                updatedAt = now,
+                order = entry.order,
+            )
+        }
+        if (rewritten.isEmpty()) return TaskStatus.Failure to character
+        val replaced = list.flatMap { if (it.id == entry.id) rewritten else listOf(it) }
+            .take(AppLimits.Lorebook.ENTRIES)
+        return TaskStatus.Success to if (memberIndex < 0) {
+            character.copy(lorebook = replaced)
+        } else {
+            character.copy(
+                members = character.members.mapIndexed { index, member ->
+                    if (index == memberIndex) member.copy(lorebook = replaced) else member
+                },
+            )
+        }
     }
 
     suspend fun runMemoryMaintenance(character: Character): Character {
@@ -1035,29 +1179,49 @@ class BackgroundTasks(
     }
 
     /**
-     * One-time migration of an oversized legacy conversation into short-term
-     * memory (legacy `runInitialMemoryMigration`). No-op when the instant window
-     * is already within the cap.
+     * True when the window is a legacy/anomalous backlog: far above anything a normal
+     * run can produce, so it must be compressed by [migrateOversizedWindow] instead of
+     * the normal whole-window fold. Checked when the app opens and before each fold.
      */
-    suspend fun runInitialMemoryMigration(character: Character): Character {
-        if (character.instant.size <= AppLimits.Memory.INSTANT) return character
-        return performMigrationExtraction(character)
+    fun hasOversizedWindow(character: Character): Boolean =
+        character.instant.count { !it.isLoading } > AppLimits.Memory.INSTANT_MIGRATION_THRESHOLD
+
+    /**
+     * One-time catch-up for an oversized window: folds it in batches, oldest first,
+     * dropping each folded batch, until it is back inside the normal window range.
+     *
+     * Runs to completion in a single call — the caller shows a blocking progress
+     * overlay, so walking the whole backlog in one go is exactly what is wanted. The
+     * status is `Failure` (character left untouched) when a batch could not be folded,
+     * so the caller can report why and offer a retry.
+     */
+    suspend fun migrateOversizedWindow(
+        character: Character,
+        onProgress: (batchesDone: Int, remaining: Int) -> Unit = { _, _ -> },
+    ): Pair<TaskStatus, Character> {
+        var working = character
+        var size = working.instant.count { !it.isLoading }
+        if (size <= AppLimits.Memory.INSTANT_MIGRATION_THRESHOLD) return TaskStatus.Success to working
+        var done = 0
+        while (size > AppLimits.Memory.INSTANT) {
+            val (status, updated) = foldWindow(working, FoldMode.Migration)
+            if (status != TaskStatus.Success) return status to working
+            val next = updated.instant.count { !it.isLoading }
+            // No forward progress would spin forever; leave the rest for the next attempt.
+            if (next >= size) return TaskStatus.Failure to working
+            working = updated
+            size = next
+            done++
+            onProgress(done, size)
+        }
+        return TaskStatus.Success to working
     }
 
-    /** Runs up to six bounded extraction rounds (legacy `performMigrationExtraction`). */
-    suspend fun performMigrationExtraction(character: Character): Character {
-        var working = character
-        repeat(6) {
-            if (working.instant.size <= AppLimits.Memory.INSTANT) return working
-            val limit = (working.instant.size - AppLimits.Memory.INSTANT_TRIM_FLOOR).coerceAtLeast(0)
-            val extractable = working.instant.take(limit).filter { !it.isLoading && it.extractedAt == null }
-            if (extractable.isEmpty()) return working
-            val (status, updated) = extractInstantToShortTermTask(working, migration = true)
-            if (status != TaskStatus.Success) return working
-            working = updated
-        }
-        return working
-    }
+    /** Legacy alias for [migrateOversizedWindow] (no-op unless the window is oversized). */
+    suspend fun runInitialMemoryMigration(
+        character: Character,
+        onProgress: (batchesDone: Int, remaining: Int) -> Unit = { _, _ -> },
+    ): Pair<TaskStatus, Character> = migrateOversizedWindow(character, onProgress)
 
     /** Whether an auto static-field fill may be attempted for [meta] right now. */
     fun canAttemptStaticFill(meta: StaticFillMeta?, nowMillis: Long = System.currentTimeMillis()): Boolean {
@@ -1403,7 +1567,18 @@ class BackgroundTasks(
         // pass at the high watermark). Nothing else may append to the window in
         // between, which is what keeps the injected short-term block byte-stable while
         // the history grows (cache hit) and lets its changes ride along with the fold.
-        if (working.instant.size >= AppLimits.Memory.INSTANT &&
+        // Oversized window (legacy/anomalous backlog): walk it in batches, oldest first,
+        // until it is back inside the normal range. The whole-window fold below cannot
+        // send hundreds of messages at once, so the two paths are kept strictly apart.
+        if (hasOversizedWindow(working) && canRunMemoryTask(counters, MemoryTaskKind.Extraction, nowMillis)) {
+            val (status, migrated) = migrateOversizedWindow(working)
+            working = migrated
+            counters = when (status) {
+                TaskStatus.Success -> resetMemoryRetry(counters, MemoryTaskKind.Extraction)
+                TaskStatus.Failure -> scheduleMemoryRetry(counters, MemoryTaskKind.Extraction, nowMillis)
+                TaskStatus.Stale -> counters
+            }
+        } else if (working.instant.size >= AppLimits.Memory.INSTANT &&
             canRunMemoryTask(counters, MemoryTaskKind.Extraction, nowMillis)
         ) {
             val (extractStatus, extracted) = extractMemoryStatus(working, messages)
@@ -1602,12 +1777,26 @@ class BackgroundTasks(
 
         const val LOREBOOK_SYSTEM = "你是世界书整理助手。只返回 JSON，不要任何额外文字。"
         const val LOREBOOK_PROMPT_HEAD =
-            "下面是一段角色扮演对话里已经发生的事件摘要，以及现有的世界书条目清单（含内容）。\n" +
+            "下面是一段角色扮演对话里已经发生的事件摘要，以及现有的世界书条目清单。\n" +
                 "请找出其中**已经出现、值得日后复用**的世界层设定（时代/世界观、地点、组织、专有名词、历史、规则、背景事实），整理成世界书条目。\n" +
-                "要求：①只写已经出现或已被明确说出的内容，禁止推测、扩写或发明新设定；②**同一件事物只能有一条**：对照现有条目的名称、关键词与内容，凡与已有条目讲的是同一件事（名称相近、关键词相同、内容重叠），必须复用它的名字来更新合并，绝不新建近似条目；同理，本批不同摘要里指向同一件事的也只输出一条；③只沉淀会反复复用的世界层设定，一次性的小事、可从上下文直接看出的细节不要单独立条；④每条 content 只写该条目本身的信息，不写理由、解释或出处；⑤keywords 写剧情里可能出现的称呼；若这条是世界前提/规则这类需要每轮生效的设定，把 alwaysActive 设为 true；⑥最多 3 条；没有值得沉淀的就返回空数组。\n" +
+                "要求：①只写已经出现或已被明确说出的内容，禁止推测、扩写或发明新设定；②**同一件事物只能有一条**：对照现有条目的名称、关键词与内容，凡与已有条目讲的是同一件事（名称相近、关键词相同、内容重叠），必须复用它的名字、用你这次总结的内容**整条替换**它，绝不新建近似条目；同理，本批不同摘要里指向同一件事的也只输出一条；③只沉淀会反复复用的世界层设定，一次性的小事、可从上下文直接看出的细节不要单独立条；④每条 content 只写该条目本身的信息，不写理由、解释或出处，**一条只讲一件事**；**每条 content 硬性不超过 400 字**，超了整批会被丢弃重来，宁可少写也要在 400 字内写完；⑤更新一条已有条目时，把它下面给出的**完整原有内容**与你掌握的新事实**重新总结成一条**：仍然有效的信息必须原样保留，重复的、过时的、与本条主题无关的内容删掉，允许比原来短——**只写增量会丢掉原有信息**；⑥清单里标注「内容（略）」的条目本轮不要更新（你看不到它的完整内容）；⑦keywords 写剧情里可能出现的称呼，不超过 8 个；若这条是世界前提/规则这类需要每轮生效的设定，把 alwaysActive 设为 true，否则一律 false；⑧最多 3 条；没有值得沉淀的就返回空数组。\n" +
                 "只返回 JSON：{\"entries\":[{\"name\":\"条目名\",\"keywords\":[\"触发词\"],\"content\":\"设定内容\",\"alwaysActive\":false,\"sourceShortTermIds\":[\"上面的摘要ID\"]}]}。sourceShortTermIds 必须是上面出现过的摘要ID，至少要有一个；没有可引用ID的条目不要返回。\n\n" +
                 "现有条目清单：\n"
         const val LOREBOOK_PROMPT_TAIL = "\n\n事件摘要"
+
+        /** Existing entries whose full content is shown to the consolidation prompt. */
+        const val LOREBOOK_EXISTING_FULL_ENTRIES = 12
+
+        /** Total character budget for those full contents (the rest are name-only). */
+        const val LOREBOOK_EXISTING_FULL_CHARS = 6_000
+
+        /** Max entries one rewrite of an oversized entry may produce. */
+        const val LOREBOOK_REBUILD_MAX_ENTRIES = 3
+        const val LOREBOOK_REBUILD_SYSTEM = "你是世界书整理助手。只返回 JSON，不要任何额外文字。"
+        const val LOREBOOK_REBUILD_PROMPT =
+            "下面是一条已经积累得过长、把好几件不同的事混在一起的世界书条目。请把它**重新整理**成 1~3 条各自只讲一件事的条目。\n" +
+                "要求：①只使用原文里已有的信息，**禁止新增、推测或扩写任何设定**；②按主题拆分：读起来是不同话题的内容必须拆成不同条目，同一话题的合并成一条；③删掉重复的说法、已经过时或彼此矛盾的旧信息和与条目主题无关的内容；④每条的 content 都要写成完整、精炼的句子，**硬性不超过 400 字**（超了这次重写会被丢弃、原条目原样保留），只写该条目本身的信息，不写理由或出处；⑤沿用原文的专有名词写法，条目名简洁（不超过 20 字）；⑥keywords 写剧情里可能出现的称呼，不超过 8 个，不要写泛词；⑦只有确实是世界前提/规则这类需要每轮生效的才把 alwaysActive 设为 true，其余一律 false；⑧原文里**仍然有效的信息要尽量保留**，不要因为压缩而丢事实。\n" +
+                "只返回 JSON：{\"entries\":[{\"name\":\"条目名\",\"keywords\":[\"触发词\"],\"content\":\"设定内容\",\"alwaysActive\":false}]}"
 
         const val FILL_SYSTEM = "你是角色卡补全助手。只返回JSON。"
         const val SPEAKING_STYLE_SAMPLES_RULE =
@@ -1623,10 +1812,10 @@ class BackgroundTasks(
         const val EXTRACTION_COUNT_UNLIMITED = "不限事件数量，尽可能完整覆盖本批全部消息。"
 
         const val EXTRACTION_PROMPT_HEAD =
-            "分析以下带消息ID和时间戳的即时对话，压缩为事件流程摘要。事件按“日期+时段”划分：时段只有深夜、凌晨、清晨、早晨、上午、中午、下午、傍晚、晚上、夜里十种，且一天从02:00起算（00:00-02:00算前一天的深夜）；同一天同一时段的多个事情视为同一事件，按时间线集中叙述（如“2026-08-01 下午在家先…晚上…”）。同一时段也可能有不同事件，按事实或持续话题区分，不得把无关事件强行合并；同一事件内用时间线连接各阶段，保留仍然有效的关键细节、结果与未决事项。**只保留会影响后续剧情的内容**：谁做了什么、学到或决定了什么，地点/物品/伤势/关系的变化，新的发现或线索，以及仍未解决的目标、承诺、威胁与期限；一次性的寒暄、当下的情绪起伏、闲聊过程一律不记。**每条content不超过120字**，用平实的叙述句写成，禁止文学化描写、比喻、形容词铺陈与对白原文。eventTime写该事件的真实ISO时间，participants为参与人列表，location写地点（没有明确地点写“未说明”）。若内容是“最近短期事件”中某事件的延续，必须原样复用该事件的eventTime、participants和location，并把旧摘要与本批新进展重新组织成一段完整的更新后摘要；系统保留已有摘要并追加新事实，因此不能只返回新增片段：旧摘要中**仍然有效**的信息（未过期的约定、未解决的事、仍然成立的关系与状态）必须原样保留，只丢弃已经过时或已被推翻的部分。content按时间和因果顺序书写，不要逐字摘录。content必须写明是谁做的：涉及用户写“用户”，涉及角色写角色名（群组写具体成员名），双方共同的事写清各自做了什么，禁止使用“我、你、TA、他、她”这类指代不清的代词。content中禁止使用“今天、昨天、明天、今晚、今晚、刚刚、刚才、现在、最近、这几天”等相对时间词，一律使用具体日期（如“8月1日下午”）或事件本身描述。每条sourceMessageIds只能引用该条目实际依据的消息ID，旧摘要的来源由系统保留。输入中每条消息带 extracted 标记：**只为 extracted=false 的消息产出事件条目**；extracted=true 的是前一轮已整理过的上下文，只用于理解剧情连贯，不得引用它们的ID，也不得为它们产出条目。必须覆盖全部 extracted=false 的消息：它们之间的每个消息ID都必须至少出现在一个事件的sourceMessageIds中，不能跳过中间消息，不得遗漏。"
+            "把下面这段即时对话整体压缩为事件流程摘要，覆盖整段对话、不要遗漏内容。事件按“日期+时段”划分：时段只有深夜、凌晨、清晨、早晨、上午、中午、下午、傍晚、晚上、夜里十种，且一天从02:00起算（00:00-02:00算前一天的深夜）；同一天同一时段的多个事情视为同一事件，按时间线集中叙述（如“2026-08-01 下午在家先…晚上…”）。同一时段也可能有不同事件，按事实或持续话题区分，不得把无关事件强行合并；同一事件内用时间线连接各阶段，保留仍然有效的关键细节、结果与未决事项。**只保留会影响后续剧情的内容**：谁做了什么、学到或决定了什么，地点/物品/伤势/关系的变化，新的发现或线索，以及仍未解决的目标、承诺、威胁与期限；一次性的寒暄、当下的情绪起伏、闲聊过程一律不记。**每条content不超过120字**，用平实的叙述句写成，禁止文学化描写、比喻、形容词铺陈与对白原文。eventTime写该事件的真实ISO时间，participants为参与人列表，location写地点（没有明确地点写“未说明”）。若本次某事件是“已有短期事件”中某事件的延续或更新，不要另起一条：把它并进对应事件（沿用同一事件的时间与地点），并在输出里直接给出合并后的完整摘要，旧摘要中**仍然有效**的信息（未过期的约定、未解决的事、仍然成立的关系与状态）必须原样保留，只丢弃已经过时或已被推翻的部分。content按时间和因果顺序书写，不要逐字摘录。content必须写明是谁做的：涉及用户写“用户”，涉及角色写角色名（群组写具体成员名），双方共同的事写清各自做了什么，禁止使用“我、你、TA、他、她”这类指代不清的代词。content中禁止使用“今天、昨天、明天、今晚、刚刚、刚才、现在、最近、这几天”等相对时间词，一律使用具体日期（如“8月1日下午”）或事件本身描述。不要输出任何消息ID。"
 
         const val EXTRACTION_PROMPT_TAIL =
-            "返回JSON数组：[{\"content\":\"一段完整的更新后事件流程摘要\",\"eventTime\":\"ISO时间\",\"participants\":[\"用户\",\"角色名\"],\"location\":\"地点或未说明\",\"sourceMessageIds\":[\"msg_id\"]}]。\n最近短期事件:\n"
+            "返回JSON数组：[{\"content\":\"一段完整的事件流程摘要\",\"eventTime\":\"ISO时间\",\"participants\":[\"用户\",\"角色名\"],\"location\":\"地点或未说明\"}]。\n已有短期事件（不要重复，只在需要延续或更新时合并进去）:\n"
 
         const val ANALYSIS_PROMPT_HEAD =
             "分析以下带短期ID、来源消息ID、userEvidence及时间/人物/地点三要素的事件流程摘要，提取未来仍有价值的稳定事实。输入中每条条目带 analyzed 标记：**只为 analyzed=false 的条目产出长期记忆**；analyzed=true 的是前一轮已整理过的上下文，只用于保持情节连贯（可据此合并或修正），不得为它们重复产出条目，也不要在 analyzedShortTermIds 中返回它们。**价值判据**：只有能跨轮复用、会影响后续对话或关系、或用户明确表达过的信息才记（长期偏好、重要人物与关系、承诺与约定、反复出现的习惯、持续的情节线）；一次性的寒暄客套、当下的情绪起伏、可以随口重说的闲聊、纯场景描写一律不记。**证据不足宁可不记**，不要为了产出而脑补或推演。必须检查全部 analyzed=false 的条目，并在analyzedShortTermIds中原样返回它们的短期ID；不得遗漏、增加或重复。**每条 value 不超过200字，arc 叙事摘要不超过300字**，写成平实叙述，不堆砌形容词。合并重复或冲突条目；事件、承诺保留必要日期；普通寒暄不要进入长期记忆。每条长期记忆必须在sourceShortTermIds中列出它实际使用的短期条目id；每个列出的短期条目都必须至少贡献一个sourceMessageIds中的消息ID，否则不要列出该短期ID。sourceMessageIds只选择直接支持该事实的消息，不要复制短期条目的全部来源；userProfile和habits只能选择用户消息。evidence只能逐字引用被选择消息对应的userEvidence.text，不能引用摘要或改写。没有可引用的userEvidence时不要输出该条。events按“日期+时段+事实主题”区分：同一天同一时段（深夜/凌晨/清晨/早晨/上午/中午/下午/傍晚/晚上/夜里，一天从02:00起算）的短期事件合并为一条长期事件，同一时段的独立事实不得互相覆盖，key须标明稳定事实主题；合并时eventTime取最早的ISO时间，participants取并集，location取最新（无明确地点写“未说明”）。剧情弧线：若若干短期事件属于同一持续情节或话题线（同一人物线、同一持续事件、同一反复出现的话题），除按时间合并外，还应在其中一条事件条目上标注arcOf（该情节的持续话题或人物线名称，稳定可复用）与arcStage（只能是起始/发展/转折/现状之一，按情节推进阶段标注），arcOf命名一旦确定就保持稳定——同一情节线不得每轮改名或另起新名，续写时沿用已有名称；并将value整合成按时间顺序、带情绪起伏的叙事摘要；同一arcOf只允许一条带弧线标注的条目，其余同线条目按普通事件输出。无论是否提取出长期记忆，成功完成分析都必须返回status:\"ok\"；没有长期价值时仍需返回完整analyzedShortTermIds和空longTerm。\n分类规则：userProfile/habits仅限用户事实，subject=user；relationship仅限双方关系，subject=relationship；events只记录用户陈述或共同事件；promises只记录用户明确承诺或双方明确约定。promises在此处只能新建为active；完成或取消由主对话的promiseUpdates按承诺ID处理。存在明确期限才填写dueAt。\n条目:\n"

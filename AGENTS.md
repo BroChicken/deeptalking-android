@@ -9,10 +9,10 @@
 | 功能 | 位置 | 结论 |
 |---|---|---|
 | **像素头像**（16×16 网格） | `archive/experimental_failures/pixel_test/` | 失败品：网格常缺行/缺色；不再渲染，头像走 emoji |
-| **TTS 语音合成** | 曾归档于 `archive/experimental_failures/tts/` | **已解禁**：不再是禁区。目标为端侧本地 TTS，但**当前只保留接口**（`:engine:ondevice` 的 `TtsBackend`），具体实现需单独立项评审后再做 |
+| **TTS 语音合成** | 曾归档于 `archive/experimental_failures/tts/` | **已解禁并落地**。端侧 `:engine:cosyvoice`（CosyVoice3 GGUF）已完整实现；另有可选的远程引擎 `:engine:remote-tts`（PC 合成 / 手机播放，链路见 `docs/REMOTE_TTS.md`）。朗读统一经 `:engine:ondevice` 的 `TtsSpeaker` 接口，引擎由 `AppConfig.ttsBackend` 选择 |
 
 ## 2. 模块架构与接口（必须遵守）
-- 端侧推理能力统一走 `:engine:ondevice` 的接口：`LlmBackend / EmbeddingBackend / AsrBackend / TtsBackend`，由 `InferenceRegistry` 聚合。**调用方只依赖接口**；新增端侧模型 = 新增实现 + 在 `:app` 的 `NativeCore` 注册，不改上层。当前仅 `LlmBackend` 有实现（`:core:network` 的 `ResponsesLlmBackend`），其余为 `null`。
+- 端侧推理能力统一走 `:engine:ondevice` 的接口：`LlmBackend / EmbeddingBackend / AsrBackend / TtsBackend`，由 `InferenceRegistry` 聚合；朗读播放另走同模块的 `TtsSpeaker`。**调用方只依赖接口**；新增端侧模型 = 新增实现 + 在 `:app` 的 `NativeCore` 注册，不改上层。`LlmBackend` 由 `:core:network` 的 `ResponsesLlmBackend` 实现，`TtsSpeaker` 由 `:engine:cosyvoice`（端侧）与 `:engine:remote-tts`（远程）两个实现按配置分派；`EmbeddingBackend/AsrBackend` 为 `null`。
 - Agent 工具走 `:domain:agent` 的 `AgentTool` + `ToolRegistry`。**新增工具 = 新增类 + 注册**，不改 `AgentLoop`。
 - 数据唯一入口是 `:core:data` 的仓库层（Room + DataStore）。**禁止绕过仓库直接访问数据库**。
 - API Key 存 `:core:security` 的 `SecretStore`（Keystore）。**禁止把密钥写入数据库、日志或导出文件**。
@@ -33,7 +33,7 @@
 统一入口：`powershell -File tools/native-verify.ps1`（自动解析 JDK17/Android SDK/Gradle，见 `tools/native/env.ps1`）。
 它等价于：
 0. `gradle :app:assembleDebug` —— 全模块编译通过。
-1. `gradle :engine:ondevice:test :domain:agent:test :domain:memory:test :core:data:testDebugUnitTest :core:model:test :feature:richtext:testDebugUnitTest` —— 单元测试全绿。
+1. `gradle :engine:ondevice:test :engine:audio:testDebugUnitTest :engine:cosyvoice:testDebugUnitTest :engine:remote-tts:testDebugUnitTest :domain:agent:test :core:network:test :domain:memory:test :core:data:testDebugUnitTest :core:model:test :feature:richtext:testDebugUnitTest` —— 单元测试全绿。
    - 新增工具/记忆/解析/迁移逻辑时必须同步补测试。
 2. 端侧接口新增实现时，在 `:engine:ondevice` 或对应模块补一个"假后端可插拔"测试。
 3. `docs/`（尤其 `docs/AGENT_ARCHITECTURE.md`、`docs/NATIVE_MODULES.md`）已同步更新。

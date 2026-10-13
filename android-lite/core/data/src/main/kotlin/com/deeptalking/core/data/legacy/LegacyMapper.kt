@@ -298,8 +298,15 @@ private fun mapShortTerm(dto: LegacyShortTerm): ShortTermMemory = ShortTermMemor
     userEvidence = dto.userEvidence.take(160),
 )
 
-private fun mapInstant(dto: LegacyInstantMessage, imageSink: StickerSink?): ChatMessage = ChatMessage(
-    id = dto.id ?: "",
+/**
+ * Maps a legacy message list to native messages, skipping in-flight rows. Used for the
+ * memory window (`memory.instant`) and, in the split format, for the chat archive
+ * (`history`).
+ */
+internal fun mapInstantMessages(list: List<LegacyInstantMessage>?, imageSink: StickerSink?): List<ChatMessage> =
+    (list ?: emptyList()).filter { it.isLoading != true }.map { mapInstant(it, imageSink) }
+
+private fun mapInstant(dto: LegacyInstantMessage, imageSink: StickerSink?): ChatMessage = ChatMessage(    id = dto.id ?: "",
     role = mapRole(dto.role),
     content = dto.content ?: "",
     timestamp = dto.timestamp,
@@ -316,7 +323,6 @@ private fun mapInstant(dto: LegacyInstantMessage, imageSink: StickerSink?): Chat
             MessageAttachment(kind = MessageAttachment.Kind.Image, uri = ref)
         },
     internalOnly = dto.internalOnly == true,
-    extractedAt = normalizeTimestamp(dto.extractedAt),
     staticChanges = dto.staticChanges ?: emptyList(),
     lorebookChanges = dto.lorebookChanges ?: emptyList(),
     styleViolations = (dto.styleViolations ?: emptyList()).filter { it in STYLE_VIOLATION_LABELS },
@@ -542,10 +548,7 @@ fun mapCharacter(dto: LegacyCharacter, stickerSink: StickerSink?): Character {
         longTerm = mapLongTermList(memory?.longTerm),
         lorebook = (dto.lorebook ?: emptyList()).map { mapLorebook(it) }.take(200),
         stickers = mapStickers(dto.stickers, stickerSink),
-        instant = (memory?.instant ?: emptyList())
-            .filter { it.isLoading != true }
-            .map { mapInstant(it, stickerSink) }
-            .takeLast(160),
+        instant = mapInstantMessages(memory?.instant, stickerSink).takeLast(160),
         dynamicStateMeta = mapDynamicStateMeta(dto.dynamicStateMeta),
         avatarRepairPending = dto.avatarRepairPending == true ||
             isAvatarDamaged(basic?.avatar) ||

@@ -42,6 +42,14 @@ object AppLimits {
         const val INSTANT_HARD_CAP = 120
 
         /**
+         * Window size above which the window is a legacy/anomalous backlog: it is
+         * compressed by the one-time migration (batched, run to completion, blocking
+         * overlay) instead of the normal whole-window fold, and no positional trim is
+         * applied to it, so a message no pass has read yet can never be dropped.
+         */
+        const val INSTANT_MIGRATION_THRESHOLD = INSTANT_HARD_CAP
+
+        /**
          * Short-term window — same high/low watermark shape as [INSTANT] (40 → 20).
          * The whole window is injected (it sits in the cached prefix) and the whole
          * window is carried into each analysis pass, so the low-water leftovers are
@@ -103,9 +111,18 @@ object AppLimits {
 
     object Lorebook {
         const val ENTRIES = 200
-        const val KEYWORDS_PER_ENTRY = 20
+        const val KEYWORDS_PER_ENTRY = 8
         const val NAME_CHARS = 60
-        const val CONTENT_CHARS = 2_000
+
+        /**
+         * One entry = one concept. Reference implementations (SillyTavern lorebooks)
+         * keep entries at roughly 50–200 characters; 400 is the generous ceiling for
+         * auto-generated entries, small enough that a normal hit set fits
+         * [INJECT_CHARS] instead of the entries starving each other. The write path
+         * truncates to this, and anything already over it is rewritten by the
+         * one-time lorebook rebuild.
+         */
+        const val CONTENT_CHARS = 400
         const val INJECT_ENTRIES = 6
         const val INJECT_CHARS = 1_400
         const val MAX_ALWAYS_ACTIVE = 6
@@ -152,5 +169,33 @@ object AppLimits {
          * already seen.
          */
         const val IMAGE_RETENTION_MESSAGES = Memory.INSTANT
+
+        /**
+         * Imported images are re-encoded to this size/quality: they are only needed to
+         * look back at the chat, and a backup can carry arbitrarily large payloads.
+         */
+        const val IMPORTED_IMAGE_DIMENSION = 512
+        const val IMPORTED_IMAGE_QUALITY = 70
+
+        /**
+         * One thumbnail size/quality for everything that does not need the original:
+         * the preview inlined for each archive image on export, and the archive images
+         * that fall outside [IMAGE_RETENTION_MESSAGES] (shrunk in place, not deleted).
+         * The full-resolution file only ever lives on the device for the newest window.
+         */
+        const val THUMBNAIL_DIMENSION = 384
+        const val THUMBNAIL_QUALITY = 60
+    }
+
+    object History {
+        /**
+         * Max chat-archive rows kept per conversation. The archive (`history`) is a
+         * plain bounded FIFO used only to look back at the chat; it never feeds the
+         * memory window, which is maintained separately on the character.
+         */
+        const val ARCHIVE_MESSAGES = 400
+
+        /** Messages rendered per page; older pages load when the list is scrolled to the top. */
+        const val PAGE = 50
     }
 }

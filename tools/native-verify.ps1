@@ -36,7 +36,7 @@ $vCode = if ($vCodeMatch.Success) { [int]$vCodeMatch.Groups[1].Value } else { -1
 Write-Host ('  versionName=' + $vName + ' versionCode=' + $vCode)
 if ($vName -notmatch '^\d+\.\d+\.\d+$') { Write-Host '  FAIL: versionName must be X.Y.Z' -ForegroundColor Red; $staticBad++ }
 if ($vCode -lt 1) { Write-Host '  FAIL: versionCode missing or not positive' -ForegroundColor Red; $staticBad++ }
-foreach ($doc in @('docs\AGENT_ARCHITECTURE.md', 'docs\NATIVE_MODULES.md')) {
+foreach ($doc in @('docs\AGENT_ARCHITECTURE.md', 'docs\NATIVE_MODULES.md', 'docs\REMOTE_TTS.md')) {
   if (-not (Test-Path -LiteralPath (Join-Path $root $doc))) { Write-Host ('  FAIL: missing ' + $doc) -ForegroundColor Red; $staticBad++ }
 }
 if ($staticBad -ne 0) { Write-Host 'VERIFY FAILED (static checks)' -ForegroundColor Red; exit 1 }
@@ -44,7 +44,9 @@ Write-Host '  static checks OK' -ForegroundColor Green
 
 $testTasks = @(
   ':engine:ondevice:test',
+  ':engine:audio:testDebugUnitTest',
   ':engine:cosyvoice:testDebugUnitTest',
+  ':engine:remote-tts:testDebugUnitTest',
   ':domain:agent:test',
   ':core:network:test',
   ':domain:memory:test',
@@ -84,7 +86,7 @@ $testExit = Invoke-Gradle -Tasks $testTasks -Label '[2/2] Unit tests'
 Write-Host ''
 Write-Host '== Summary ==' -ForegroundColor Cyan
 $total = 0; $bad = 0
-foreach ($m in @('engine\ondevice','engine\cosyvoice','domain\agent','core\network','domain\memory','core\data','core\model','feature\richtext')) {
+foreach ($m in @('engine\ondevice','engine\audio','engine\cosyvoice','engine\remote-tts','domain\agent','core\network','domain\memory','core\data','core\model','feature\richtext')) {
   $dir = Join-Path $android ($m + '\build\test-results')
   if (-not (Test-Path -LiteralPath $dir)) { continue }
   $modTotal = 0; $modFail = 0

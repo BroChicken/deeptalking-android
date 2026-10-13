@@ -259,7 +259,7 @@ class ChatOrchestrator(
             styleViolations = styleViolations,
         )
         // Append-only: the window grows with the turn and is only compacted by the fold
-        // pass (`trimInstant` at the high watermark). Clamping here would drop the oldest
+        // pass (which consumes exactly the batch it read). Clamping here would drop the oldest
         // message outside a fold — before it was ever folded (silent loss) and in the
         // middle of a stable period (a cache miss the request prefix cannot predict).
         val instantWindow = history.filter { !it.rejected } + assistantMessage

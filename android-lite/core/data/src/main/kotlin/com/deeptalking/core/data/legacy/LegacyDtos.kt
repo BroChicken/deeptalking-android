@@ -180,7 +180,6 @@ data class LegacyInstantMessage(
     @SerialName("content") val content: String? = null,
     @SerialName("sequence") val sequence: Int? = null,
     @SerialName("timestamp") val timestamp: String? = null,
-    @SerialName("extractedAt") val extractedAt: String? = null,
     @SerialName("images") val images: List<String>? = null,
     @SerialName("internalOnly") val internalOnly: Boolean? = null,
     @SerialName("isLoading") val isLoading: Boolean? = null,
@@ -336,6 +335,11 @@ data class LegacyCharacter(
     @SerialName("stickers") val stickers: List<LegacySticker>? = null,
     @SerialName("lorebook") val lorebook: List<LegacyLorebookEntry>? = null,
     @SerialName("memory") val memory: LegacyMemory? = null,
+    /**
+     * Bounded chat archive (store A). Absent in every pre-split backup, where the whole
+     * conversation lived in `memory.instant` (which is then used as the archive too).
+     */
+    @SerialName("history") val history: List<LegacyInstantMessage>? = null,
     @SerialName("groupInfo") val groupInfo: LegacyGroupInfo? = null,
     @SerialName("members") val members: List<LegacyGroupMember>? = null,
     @SerialName("fieldsMigrationVersion") val fieldsMigrationVersion: String? = null,

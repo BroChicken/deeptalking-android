@@ -107,6 +107,10 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
     val avatarRepairProgress by vm.avatarRepairProgress.collectAsState()
     val memoryCleanupPrompt by vm.memoryCleanupPrompt.collectAsState()
     val memoryCleanupProgress by vm.memoryCleanupProgress.collectAsState()
+    val memoryMigrationPrompt by vm.memoryMigrationPrompt.collectAsState()
+    val memoryMigration by vm.memoryMigration.collectAsState()
+    val lorebookRebuildPrompt by vm.lorebookRebuildPrompt.collectAsState()
+    val lorebookRebuild by vm.lorebookRebuild.collectAsState()
     val tts by vm.tts.collectAsState()
 
     val activeCharacter = characters.firstOrNull { it.id == activeId }
@@ -243,6 +247,43 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                         onDeleteTtsVoice = vm::deleteVoice,
                         onTestTtsSpeak = vm::speakText,
                         onStopTts = vm::stopSpeaking,
+                        ttsBackend = tts.backend,
+                        ttsReady = tts.ready,
+                        ttsRemoteUrl = tts.remoteUrl,
+                        ttsRemoteModel = tts.remoteModel,
+                        ttsRemoteVoice = tts.remoteVoice,
+                        ttsRemoteToken = tts.remoteToken,
+                        ttsRemoteStatus = tts.remoteStatus,
+                        ttsRemoteVoices = tts.remoteVoices,
+                        ttsAdvanced = com.deeptalking.feature.settings.TtsAdvanced.fromStored(
+                            chunkTokens = tts.remoteChunkTokens,
+                            temperature = tts.remoteTemperature,
+                            topK = tts.remoteTopK,
+                            topP = tts.remoteTopP,
+                            winSize = tts.remoteWinSize,
+                            tauR = tts.remoteTauR,
+                            minTokenTextRatio = tts.remoteMinTokenTextRatio,
+                            maxTokenTextRatio = tts.remoteMaxTokenTextRatio,
+                        ),
+                        onSelectTtsBackend = vm::setTtsBackend,
+                        onChangeTtsRemoteUrl = { vm.updateRemoteTts(url = it) },
+                        onChangeTtsRemoteModel = { vm.updateRemoteTts(model = it) },
+                        onChangeTtsRemoteVoice = { vm.updateRemoteTts(voice = it) },
+                        onChangeTtsAdvanced = { adv ->
+                            vm.updateRemoteTts(
+                                chunkTokens = adv.chunkTokens,
+                                temperature = adv.temperature,
+                                topK = adv.topK,
+                                topP = adv.topP,
+                                winSize = adv.winSize,
+                                tauR = adv.tauR,
+                                minTokenTextRatio = adv.minTokenTextRatio,
+                                maxTokenTextRatio = adv.maxTokenTextRatio,
+                            )
+                        },
+                        onSaveTtsRemoteToken = vm::saveTtsToken,
+                        onDiscoverTtsRemote = vm::discoverTtsServer,
+                        onUploadTtsVoices = vm::uploadVoicesToRemote,
                     )
                 }
             }
@@ -419,6 +460,126 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
             title = { Text("正在整理短期记忆…") },
             text = { Text("分批转成长期记忆，请稍候。") },
             confirmButton = {},
+        )
+    }
+
+    // One-time catch-up of an oversized (legacy) window: blocking on purpose — the whole
+    // backlog is folded oldest-first and no message may be dropped in between.
+    memoryMigration?.let { migration ->
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text(if (migration.running) "正在整理旧记忆…" else "整理旧记忆未完成") },
+            text = {
+                Column {
+                    if (migration.running) {
+                        Text("历史过长，正在从最早的一批开始分批压成记忆，请勿退出。")
+                        Spacer(Modifier.height(6.dp))
+                        val left = if (migration.remaining > 0) "，剩余 ${migration.remaining} 条" else ""
+                        Text("已完成 ${migration.batches} 批$left", fontSize = 13.sp)
+                    } else {
+                        Text(migration.error.ifBlank { "整理未能完成。" })
+                        Spacer(Modifier.height(6.dp))
+                        Text("已经整理的部分已保存，继续或重试都不会重复。", fontSize = 13.sp)
+                    }
+                }
+            },
+            confirmButton = {
+                if (!migration.running) {
+                    Row {
+                        TextButton(onClick = { vm.retryMemoryMigration() }) { Text("重试") }
+                        TextButton(onClick = { vm.dismissMemoryMigration() }) { Text("稍后") }
+                    }
+                }
+            },
+        )
+    }
+
+    // Confirmation for the oversized-window catch-up: it runs before the app is usable, so
+    // ask first. "稍后" skips only this run — the next launch asks again.
+    memoryMigrationPrompt?.let { target ->
+        var skipForever by remember { mutableStateOf(false) }
+        AlertDialog(
+            onDismissRequest = { vm.dismissMemoryMigrationPrompt() },
+            title = { Text("整理旧记忆") },
+            text = {
+                Column {
+                    Text("有 ${target.characters} 个角色的历史窗口过大（共 ${target.messages} 条，正常只需要 20~60 条）。")
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "需要从最早的一批开始分批压成记忆，期间不能使用，可能要几分钟。" +
+                            "聊天记录一条都不会删，只是把早期消息压成摘要。",
+                        fontSize = 13.sp,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Row {
+                        Checkbox(checked = skipForever, onCheckedChange = { skipForever = it })
+                        Text("以后不再询问", fontSize = 13.sp)
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        if (skipForever) vm.skipMemoryWindowMigrationForever() else vm.confirmMemoryMigration()
+                    },
+                ) { Text("开始整理") }
+            },
+            dismissButton = {
+                TextButton(onClick = { vm.dismissMemoryMigrationPrompt() }) { Text("稍后") }
+            },
+        )
+    }
+
+    // Confirmation for the one-time world-book rewrite (oversized entries an older version
+    // grew by appending instead of replacing). Shown only when no other prompt is up — the
+    // view model already serialises these, this is the belt-and-braces check.
+    lorebookRebuildPrompt?.let { count ->
+        if (memoryCleanupPrompt != null || memoryCleanupProgress ||
+            memoryMigration != null || memoryMigrationPrompt != null
+        ) {
+            return@let
+        }
+        AlertDialog(
+            onDismissRequest = { vm.dismissLorebookRebuildPrompt() },
+            title = { Text("整理世界书") },
+            text = {
+                Column {
+                    Text("有 $count 条世界书条目内容过多，把好几件不同的事混在了一起，会一直占着每轮注入的额度。")
+                    Spacer(Modifier.height(6.dp))
+                    Text("需要交给模型重新整理，按主题拆成一条只讲一件事的条目；用户手写的条目不会被改动。", fontSize = 13.sp)
+                }
+            },
+            confirmButton = { TextButton(onClick = { vm.confirmLorebookRebuild() }) { Text("开始整理") } },
+            dismissButton = { TextButton(onClick = { vm.dismissLorebookRebuildPrompt() }) { Text("稍后") } },
+        )
+    }
+
+    lorebookRebuild?.let { rebuild ->
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text(if (rebuild.running) "正在整理世界书…" else "整理世界书未完成") },
+            text = {
+                Column {
+                    if (rebuild.running) {
+                        Text("正在把过长的条目按主题重写，请勿退出。")
+                        Spacer(Modifier.height(6.dp))
+                        val left = if (rebuild.remaining > 0) "，剩余 ${rebuild.remaining} 条" else ""
+                        Text("已完成 ${rebuild.done} 条$left", fontSize = 13.sp)
+                    } else {
+                        Text(rebuild.error.ifBlank { "整理未能完成。" })
+                        Spacer(Modifier.height(6.dp))
+                        Text("已经整理的部分已保存，继续或重试都不会重复。", fontSize = 13.sp)
+                    }
+                }
+            },
+            confirmButton = {
+                if (!rebuild.running) {
+                    Row {
+                        TextButton(onClick = { vm.retryLorebookRebuild() }) { Text("重试") }
+                        TextButton(onClick = { vm.dismissLorebookRebuild() }) { Text("稍后") }
+                    }
+                }
+            },
         )
     }
 

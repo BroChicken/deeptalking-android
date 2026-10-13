@@ -3,8 +3,12 @@ package com.deeptalking.engine.cosyvoice
 import android.content.Context
 import android.net.Uri
 import com.deeptalking.core.model.TtsPhase
+import com.deeptalking.engine.audio.PcmFormat
+import com.deeptalking.engine.audio.PcmPlayer
 import com.deeptalking.engine.ondevice.AudioChunk
 import com.deeptalking.engine.ondevice.TtsBackend
+import com.deeptalking.engine.ondevice.TtsSpeaker
+import com.deeptalking.engine.ondevice.TtsTurn
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -17,12 +21,39 @@ import java.security.MessageDigest
  * App-facing facade over the on-device CosyVoice3 runtime: model/voice download,
  * reference-voice import, and read-aloud playback. One instance is owned by the
  * application graph.
+ *
+ * Implements [TtsSpeaker] so the app can swap it for the remote HTTP engine
+ * (`:engine:remote-tts`) purely via configuration.
  */
-class CosyVoiceController(private val context: Context) {
+class CosyVoiceController(private val context: Context) : TtsSpeaker {
+
+    override val id: String = "cosyvoice3"
 
     private val engine = CosyVoiceEngine()
     private val models = CosyVoiceModelManager(context)
     private val player = PcmPlayer()
+
+    /**
+     * Speech-rate multiplier for synthesis. Mirrors `AppConfig.ttsSpeed`; the app
+     * writes it before every read-aloud (the controller has no config access).
+     */
+    @Volatile
+    var speed: Float = 1.0f
+
+    /**
+     * Sampling/chunking knobs shared with the PC server. Also written before every
+     * read-aloud (like [speed]); the last value is replayed when the model loads.
+     */
+    @Volatile
+    private var generation: GenerationSettings? = null
+
+    /** Applies the shared knobs to the on-device engine (no-op while unchanged). */
+    fun applyGeneration(settings: GenerationSettings) {
+        val valid = settings.coerceValid()
+        if (generation == valid) return
+        generation = valid
+        engine.applyGeneration(valid)
+    }
 
     val modelManager: CosyVoiceModelManager get() = models
 
@@ -61,13 +92,7 @@ class CosyVoiceController(private val context: Context) {
         }.flowOn(Dispatchers.Default)
     }
 
-    private fun toShort(samples: FloatArray): ShortArray {
-        val out = ShortArray(samples.size)
-        for (i in samples.indices) {
-            out[i] = (samples[i] * 32767f).toInt().coerceIn(-32768, 32767).toShort()
-        }
-        return out
-    }
+    private fun toShort(samples: FloatArray): ShortArray = PcmFormat.floatsToPcm16(samples)
 
     suspend fun prepare() = withContext(Dispatchers.IO) {
         if (!models.isReady()) error("语音模型尚未下载")
@@ -117,15 +142,28 @@ class CosyVoiceController(private val context: Context) {
             File(voicesDir, "builtin_1.gguf").delete()
             File(voicesDir, "builtin_2.gguf").delete()
         }
-        val existing = store.list().map { it.file }.toSet()
+        val indexed = store.list()
         for (default in DEFAULTS) {
             val out = File(voicesDir, default.fileName)
-            if (out.exists() && existing.contains(default.fileName) && engine.canLoadPromptSpeech(out.absolutePath)) continue
-            // Missing, unindexed or corrupt -> rebuild it.
+            val bytes = runCatching {
+                context.assets.open(default.asset).use { it.readBytes() }
+            }.getOrNull() ?: continue
+            // The asset content + prompt text identify the voice. The prompt text used to
+            // be wrong for both bundled clips (it did not match the audio, which made the
+            // model degenerate into repetition loops), so any install whose gguf predates
+            // this change - or whose asset changes later - is rebuilt here. The file name
+            // is untouched, so the name the PC registers stays identical on both ends.
+            val source = default.sourceTag(bytes)
+            val recorded = indexed.firstOrNull { it.file == default.fileName }
+            if (out.exists() && recorded?.builtin == true && recorded.source == source &&
+                engine.canLoadPromptSpeech(out.absolutePath)
+            ) {
+                continue
+            }
             if (out.exists()) out.delete()
             runCatching {
                 val tmp = File(context.cacheDir, "deeptalking-" + default.asset.replace('/', '_'))
-                context.assets.open(default.asset).use { input -> tmp.outputStream().use { input.copyTo(it) } }
+                tmp.writeBytes(bytes)
                 val clip = try {
                     loader.load(tmp)
                 } finally {
@@ -138,7 +176,7 @@ class CosyVoiceController(private val context: Context) {
                     tokenizerPath = models.tokenizerFile.absolutePath,
                     campplusPath = models.campplusFile.absolutePath,
                 )
-                store.add(out, default.name, builtin = true)
+                store.add(out, default.name, builtin = true, source = source)
             }
         }
         true
@@ -152,6 +190,12 @@ class CosyVoiceController(private val context: Context) {
         voiceFile = resolved
         return resolved
     }
+
+    /**
+     * The prompt-speech file behind a stored voice, without changing the active
+     * selection (used to push voices to the PC). Null when the file is gone.
+     */
+    fun voiceFileFor(file: String): File? = store.fileFor(file).takeIf { it.exists() }
 
     fun renameVoice(file: String, name: String): Boolean {
         val trimmed = name.trim()
@@ -175,9 +219,15 @@ class CosyVoiceController(private val context: Context) {
         withContext(Dispatchers.Default) {
             if (!engine.isModelLoaded) engine.loadModel(models.modelFile.absolutePath)
             val path = voicePath ?: voiceFile?.absolutePath ?: error("尚未选择音色，请先导入参考音频")
-            val pcm = engine.synthesize(text, path, style, 1.0f)
+            val pcm = engine.synthesize(text, path, style, speed.coerceIn(MIN_SPEED, MAX_SPEED))
             pcm to engine.sampleRate
         }
+
+    /** [TtsSpeaker]: one [AudioChunk]-style turn per element, played back in order. */
+    override suspend fun speak(turns: List<TtsTurn>, onPhase: (TtsPhase) -> Unit) {
+        if (turns.isEmpty()) return
+        speakSegments(turns.map { it.text to it.style }, onPhase)
+    }
 
     /**
      * Synthesizes and plays [text] on the speaker; blocks until playback ends.
@@ -228,24 +278,46 @@ class CosyVoiceController(private val context: Context) {
      * Preempts any running synthesis and stops playback. [CosyVoiceEngine.cancel]
      * blocks until the native worker exits, so this must not run on the main thread.
      */
-    fun cancel() {
+    override fun cancel() {
         runCatching { engine.cancel() }
         player.stop()
     }
 
-    fun stop() = player.stop()
+    override fun stop() = player.stop()
 
     fun release() {
         player.release()
         engine.release()
     }
 
-    private data class DefaultVoice(val asset: String, val fileName: String, val name: String, val prompt: String)
+    private data class DefaultVoice(val asset: String, val fileName: String, val name: String, val prompt: String) {
+        /** Identity of the built-in voice: bundled asset content plus its prompt text. */
+        fun sourceTag(assetBytes: ByteArray): String {
+            val digest = MessageDigest.getInstance("MD5")
+            digest.update(assetBytes)
+            digest.update(prompt.toByteArray())
+            return digest.digest().joinToString("") { "%02x".format(it) }.take(12)
+        }
+    }
 
     private companion object {
+        /** Speech-rate bounds accepted by the native engine (`AppConfig.ttsSpeed`). */
+        const val MIN_SPEED = 0.5f
+        const val MAX_SPEED = 2.0f
+
+        /**
+         * Bundled voices. The prompt text MUST be the transcript of the clip the frontend
+         * actually receives, otherwise the zero-shot model has nothing to align the
+         * reference audio with and degenerates into repetition loops. Each clip below is
+         * ~3 s (the length the picker in [VoiceSegment] keeps) and the text is the
+         * transcript of that trimmed clip.
+         *
+         * The file names are the voice names the PC's `cosyvoice-server` registers, so the
+         * remote engine speaks with exactly these voices (see docs/REMOTE_TTS.md section 8).
+         */
         val DEFAULTS = listOf(
-            DefaultVoice("voices/sample_1.wav", "builtin_1_v2.gguf", "内置音色 1", "今天天气真不错，我们一起去公园散步吧。"),
-            DefaultVoice("voices/sample_2.wav", "builtin_2_v2.gguf", "内置音色 2", "大家好，很高兴在这里和你聊天。"),
+            DefaultVoice("voices/sample_1.wav", "builtin_1_v2.gguf", "内置音色 1", "能够做的比我还好哟"),
+            DefaultVoice("voices/sample_2.wav", "builtin_2_v2.gguf", "内置音色 2", "在那之后完全收购那家公司"),
         )
     }
 }

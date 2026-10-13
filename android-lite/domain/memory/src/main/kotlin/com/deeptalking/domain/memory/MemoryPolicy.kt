@@ -127,29 +127,6 @@ fun pruneLongTerm(
 }
 
 /**
- * Batch trim of the legacy instant window (legacy `trimCharacterMemory` instant
- * branch). At the high watermark it drops already-extracted messages FIFO down to
- * the low watermark; un-extracted messages are never dropped.
- */
-fun trimInstant(
-    items: List<ChatMessage>,
-    limit: Int = AppLimits.Memory.INSTANT,
-    floor: Int = AppLimits.Memory.INSTANT_TRIM_FLOOR,
-): List<ChatMessage> {
-    if (items.size < limit) return items
-    var removeCount = (items.size - floor).coerceAtLeast(0)
-    var removed = 0
-    return items.filter { message ->
-        if (removed < removeCount && message.extractedAt != null) {
-            removed++
-            false
-        } else {
-            true
-        }
-    }
-}
-
-/**
  * Trims short-term memory (legacy `trimShortTermList`): keep the newest [floor]
  * entries plus any older entry that either consumer has not yet acknowledged for
  * its current `revision`.
@@ -584,11 +561,15 @@ fun addShortTermMemory(
 ): ShortTermAddResult {
     var text = draft.content.trim()
     if (text.isEmpty()) return ShortTermAddResult(list, false)
+    // Source ids are a best-effort anchor, not a gate. The fold summarizes the whole
+    // window, so an entry may describe a beat no single user line states; unknown ids
+    // are dropped rather than rejecting the entry (that gate used to discard an entire
+    // fold over one bad citation).
     val sourceIds = draft.sourceMessageIds.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
         .take(AppLimits.Memory.SUMMARY_SOURCES)
-    if (sourceIds.isEmpty() || sourceIds.any { !sources.containsKey(it) }) return ShortTermAddResult(list, false)
-    val sourceRoles = sourceIds.map { sources.getValue(it).role }
-    val userEvidence = sourceIds.mapNotNull { id ->
+    val knownIds = sourceIds.filter { sources.containsKey(it) }
+    val sourceRoles = knownIds.map { sources.getValue(it).role }
+    val userEvidence = knownIds.mapNotNull { id ->
         val source = sources.getValue(id)
         if (source.role == "user") SourceEvidence(sourceMessageId = id, text = source.text.trimTo(300)) else null
     }
@@ -612,7 +593,7 @@ fun addShortTermMemory(
         } ?: -1
         if (existingIndex >= 0) {
             val existing = list[existingIndex]
-            val mergedIds = (existing.sourceMessageIds + sourceIds).distinct()
+            val mergedIds = (existing.sourceMessageIds + knownIds).distinct()
                 .takeLast(AppLimits.Memory.SUMMARY_SOURCES)
             val mergedRoles = mergedIds.map { sources[it]?.role.orEmpty() }
             val mergedEvidence = (existing.userEvidence + userEvidence).distinct()
@@ -631,7 +612,7 @@ fun addShortTermMemory(
     val item = ShortTermMemory(
         id = defaultMemoryId("short", nowMillis),
         content = text,
-        sourceMessageIds = sourceIds,
+        sourceMessageIds = knownIds,
         eventTime = eventTime,
         createdAt = timestamp ?: nowIso,
         analyzedAt = null,

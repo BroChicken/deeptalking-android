@@ -13,6 +13,12 @@ data class VoiceInfo(
     val name: String,
     val builtin: Boolean = false,
     val createdAt: Long = 0L,
+    /**
+     * Identity of a built-in voice: the bundled asset's content plus its prompt text.
+     * When either changes, the stored gguf is stale and gets rebuilt (the file name -
+     * which is what the PC registers - stays the same). Empty for user voices.
+     */
+    val source: String = "",
 )
 
 /**
@@ -35,8 +41,8 @@ class VoiceStore(private val dir: File) {
             .sortedWith(compareByDescending<VoiceInfo> { it.builtin }.thenBy { it.name })
     }
 
-    fun add(file: File, name: String, builtin: Boolean): VoiceInfo {
-        val info = VoiceInfo(file.name, name, builtin, System.currentTimeMillis())
+    fun add(file: File, name: String, builtin: Boolean, source: String = ""): VoiceInfo {
+        val info = VoiceInfo(file.name, name, builtin, System.currentTimeMillis(), source)
         write(read().filterNot { it.file == file.name } + info)
         return info
     }

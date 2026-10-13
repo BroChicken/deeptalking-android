@@ -1,5 +1,6 @@
 package com.deeptalking.feature.characters
 
+import com.deeptalking.core.common.AppLimits
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.DynamicState
 import com.deeptalking.core.model.DynamicStateMeta
@@ -81,6 +82,41 @@ class CharacterParityTest {
         assertEquals("疲惫", draft.dynamicState.currentMood)
         assertEquals(1, draft.lorebook.size)
         assertEquals("港城", draft.lorebook[0].name)
+    }
+
+    @Test
+    fun generatedLorebookDropsContentOverLimitAndKeepsTheRest() {
+        val limit = AppLimits.Lorebook.CONTENT_CHARS
+        val overLong = "长".repeat(limit + 1)
+        val exact = "字".repeat(limit)
+        val raw = """
+            {"entityType":"character","name":"林晚",
+             "lorebook":[
+               {"name":"超长条目","keywords":["超长"],"content":"$overLong"},
+               {"name":"恰好条目","keywords":["恰好"],"content":"$exact"},
+               {"name":"正常条目","keywords":["正常"],"content":"简短设定"}
+             ]}
+        """.trimIndent()
+
+        val draft = CharacterParity.parseGeneratedDraft(raw)!!
+        // 超过 400 字的条目整条丢弃（不截断），恰好 400 字及以下的条目保留。
+        assertEquals(listOf("恰好条目", "正常条目"), draft.lorebook.map { it.name })
+        assertEquals(exact, draft.lorebook[0].content)
+        assertEquals("简短设定", draft.lorebook[1].content)
+        assertTrue(draft.lorebook.all { it.content.length <= limit })
+    }
+
+    @Test
+    fun noKeywordDraftEntryStillAutoActivatesAsLegacy() {
+        // keywordsToAlwaysActive 的老逻辑：关键词清空时自动置为常驻（保留，不改）；
+        // parseGeneratedLorebook 对无关键词的模型条目同样会自动常驻（上限内），此处仅断言现状。
+        val draft = CharacterParity.parseGeneratedDraft(
+            """{"entityType":"character","name":"林晚",
+               "lorebook":[{"name":"常驻设定","keywords":[],"content":"世界是魔法世界","alwaysActive":false}]}""",
+        )!!
+        assertEquals(1, draft.lorebook.size)
+        assertTrue(draft.lorebook[0].alwaysActive)
+        assertTrue(CharacterParity.keywordsToAlwaysActive(current = false, keywords = emptyList()))
     }
 
     @Test
@@ -194,27 +230,54 @@ class CharacterParityTest {
     }
 
     @Test
-    fun dedupeGeneratedLorebookMergesSameNameModelEntriesAndKeepsUserEntries() {
+    fun dedupeGeneratedLorebookPrefersLaterSameNameModelEntriesAndKeepsUserEntries() {
         val first = LorebookEntry(
             name = "赤月王国",
             content = "古老王国",
             keywords = listOf("赤月"),
+            alwaysActive = true,
             origin = LorebookOrigin.Model,
         )
         val duplicate = LorebookEntry(
             name = "赤月王国 ",
             content = "银月商会旧址",
             keywords = listOf("王都"),
+            alwaysActive = false,
             origin = LorebookOrigin.Model,
         )
         val user = LorebookEntry(name = "赤月王国", content = "用户手写", origin = LorebookOrigin.User)
         val deduped = CharacterParity.dedupeGeneratedLorebook(listOf(first, duplicate, user))
         assertEquals(2, deduped.size)
         val merged = deduped.first { it.origin == LorebookOrigin.Model }
-        assertTrue(merged.content.contains("古老王国"))
-        assertTrue(merged.content.contains("银月商会旧址"))
-        assertEquals(listOf("赤月", "王都"), merged.keywords)
+        // 同名 AI 条目取后者为准：内容不再拼接，替换为后出现条目的完整内容。
+        assertEquals("银月商会旧址", merged.content)
+        // alwaysActive 也取后者（false），不再做 OR。
+        assertFalse(merged.alwaysActive)
+        assertEquals(listOf("王都", "赤月"), merged.keywords)
         assertTrue(deduped.any { it.origin == LorebookOrigin.User })
+    }
+
+    @Test
+    fun dedupeGeneratedLorebookLaterBlankContentFallsBackToEarlier() {
+        val first = LorebookEntry(
+            name = "港城",
+            content = "港口城市",
+            keywords = listOf("港城"),
+            origin = LorebookOrigin.Model,
+        )
+        val later = LorebookEntry(
+            name = "港城",
+            content = "",
+            keywords = listOf("码头"),
+            alwaysActive = true,
+            origin = LorebookOrigin.Model,
+        )
+        val deduped = CharacterParity.dedupeGeneratedLorebook(listOf(first, later))
+        assertEquals(1, deduped.size)
+        // 后者 content 为空时回退到前者，避免整条内容丢失。
+        assertEquals("港口城市", deduped[0].content)
+        assertTrue(deduped[0].alwaysActive)
+        assertEquals(listOf("码头", "港城"), deduped[0].keywords)
     }
 
     @Test
@@ -235,9 +298,15 @@ class CharacterParityTest {
     @Test
     fun splitKeywordsHonoursCaps() {
         assertEquals(listOf("a", "b", "c", "d", "e"), CharacterParity.splitLorebookKeywords("a,b，c、d\ne"))
-        assertEquals(20, CharacterParity.splitLorebookKeywords((1..25).joinToString(",")).size)
+        assertEquals(
+            com.deeptalking.core.common.AppLimits.Lorebook.KEYWORDS_PER_ENTRY,
+            CharacterParity.splitLorebookKeywords((1..25).joinToString(",")).size,
+        )
         assertEquals(60, CharacterParity.capLorebookName("x".repeat(100)).length)
-        assertEquals(2000, CharacterParity.capLorebookContent("x".repeat(3000)).length)
+        assertEquals(
+            com.deeptalking.core.common.AppLimits.Lorebook.CONTENT_CHARS,
+            CharacterParity.capLorebookContent("x".repeat(3000)).length,
+        )
     }
 
     @Test

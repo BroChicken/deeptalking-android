@@ -66,6 +66,26 @@ class BackgroundTasksTest {
     }
 
     @Test
+    fun overLongLorebookEntryRejectsWholeBatchAndMarksNothing() = runBlocking {
+        // 400+ characters: the cap is a writing rule, so the batch is rejected instead of
+        // silently cutting the model's text.
+        val (background, _) = tasks(
+            listOf(
+                """{"entries":[{"name":"银月商会","keywords":["银月"],""" +
+                    """"content":"${"多雾的旧设定".repeat(70)}","sourceShortTermIds":["s1"]}]}""",
+            ),
+        )
+        val character = Character(
+            id = "c1",
+            shortTerm = listOf(ShortTermMemory(id = "s1", content = "银月商会在西街", analyzedAt = "done")),
+        )
+        val (status, updated) = background.consolidateLorebook(character)
+        assertEquals(BackgroundTasks.TaskStatus.Failure, status)
+        assertTrue(updated.lorebook.isEmpty())
+        assertTrue(updated.shortTerm[0].lorebookScannedAt == null)
+    }
+
+    @Test
     fun malformedLorebookOutputTouchesNothing() = runBlocking {
         val (background, _) = tasks(listOf("{}"))
         val character = Character(
@@ -269,15 +289,16 @@ class BackgroundTasksTest {
     }
 
     @Test
-    fun analyzeSkipsEntryWithUnresolvableSourceButConsumesTheBatch() = runBlocking {
-        // A malformed entry must not fail the whole batch — that used to poison the
-        // queue permanently (the same oldest batch is retried forever). It is
-        // dropped and the batch is still acknowledged.
+    fun analyzeReanchorsAHallucinatedSourceIdOnTheCapturedUserEvidence() = runBlocking {
+        // The model invented a message id. Ids are no longer a gate: the evidence is
+        // matched against the user lines the cited short-term entries carry, and the
+        // item is re-anchored on that exact line before the validated write.
         val response = """{"status":"ok","analyzedShortTermIds":["s1"],"longTerm":[{"category":"userProfile","subject":"user","key":"饮品","value":"用户喜欢喝美式咖啡。","sourceShortTermIds":["s1"],"sourceMessageIds":["ghost"],"evidence":"用户喜欢喝美式咖啡。"}]}"""
         val (background, _) = tasks(listOf(response))
         val character = analyzableCharacter()
         val updated = background.analyzeShortToLongTerm(character)
-        assertTrue(updated.longTerm.isEmpty())
+        assertEquals(1, updated.longTerm.size)
+        assertEquals(listOf("u1"), updated.longTerm.single().sourceMessageIds)
         assertTrue(updated.shortTerm.first { it.id == "s1" }.analyzedAt != null)
     }
 
@@ -334,13 +355,120 @@ class BackgroundTasksTest {
     }
 
     @Test
-    fun initialMemoryMigrationIsNoOpForSmallWindow() = runBlocking {
+    fun initialMemoryMigrationIsNoOpForAnOrdinaryWindow() = runBlocking {
         val (background, _) = tasks(emptyList())
         val character = Character(
             id = "c1",
             instant = listOf(ChatMessage(id = "u1", role = Role.User, content = "你好")),
         )
-        assertEquals(character, background.runInitialMemoryMigration(character))
+        val (status, migrated) = background.runInitialMemoryMigration(character)
+        assertEquals(BackgroundTasks.TaskStatus.Success, status)
+        assertEquals(character, migrated)
+    }
+
+    @Test
+    fun oversizedWindowIsCaughtUpInBatchesOldestFirst() = runBlocking {
+        // Three distinct batches (distinct event times so the entries do not merge).
+        val (background, llm) = tasks(
+            listOf(
+                """[{"content":"2026-08-01 下午在旧书店找书。","eventTime":"2026-08-01T15:00:00Z","participants":["用户"],"location":"旧书店"}]""",
+                """[{"content":"2026-08-02 下午在河边散步。","eventTime":"2026-08-02T15:00:00Z","participants":["用户"],"location":"河边"}]""",
+                """[{"content":"2026-08-03 下午在咖啡馆等人。","eventTime":"2026-08-03T15:00:00Z","participants":["用户"],"location":"咖啡馆"}]""",
+            ),
+        )
+        val backlog = AppLimits.Memory.INSTANT_MIGRATION_THRESHOLD + 80
+        val character = Character(
+            id = "c1",
+            instant = (0 until backlog).map { index ->
+                ChatMessage(
+                    id = "m$index",
+                    role = Role.User,
+                    content = "消息$index",
+                    timestamp = "2026-08-01T15:00:00Z",
+                )
+            },
+        )
+        assertTrue(background.hasOversizedWindow(character))
+
+        val (status, updated) = background.migrateOversizedWindow(character)
+
+        assertEquals(BackgroundTasks.TaskStatus.Success, status)
+        // Back inside the normal window range, folded oldest-first.
+        assertTrue(updated.instant.size <= AppLimits.Memory.INSTANT)
+        assertTrue(updated.instant.none { it.id == "m0" })
+        // One pass per batch, each producing an entry — nothing was dropped un-folded.
+        assertEquals(3, llm.requests.size)
+        assertEquals(3, updated.shortTerm.size)
+    }
+
+    @Test
+    fun oversizedLorebookEntryIsRewrittenIntoConciseEntries() = runBlocking {
+        val blob = "银月商会在西街，经营药材，" + "很长的旧内容".repeat(80)
+        val (background, llm) = tasks(
+            listOf(
+                """{"entries":[""" +
+                    """{"name":"银月商会","keywords":["银月","商会"],"content":"银月商会在西街，经营药材。","alwaysActive":false},""" +
+                    """{"name":"商会位置","keywords":["西街"],"content":"商会位于西街。","alwaysActive":false}]}""",
+            ),
+        )
+        val user = com.deeptalking.core.model.LorebookEntry(
+            id = "u1",
+            name = "用户条目",
+            content = blob,
+            origin = com.deeptalking.core.model.LorebookOrigin.User,
+        )
+        val character = Character(
+            id = "c1",
+            lorebook = listOf(
+                com.deeptalking.core.model.LorebookEntry(
+                    id = "l1",
+                    name = "银月商会",
+                    content = blob,
+                    keywords = listOf("银月"),
+                    origin = com.deeptalking.core.model.LorebookOrigin.Model,
+                ),
+                user,
+            ),
+        )
+        assertEquals(1, background.oversizedLorebookCount(character))
+
+        val (status, updated) = background.rebuildOversizedLorebook(character)
+
+        assertEquals(BackgroundTasks.TaskStatus.Success, status)
+        assertEquals(1, llm.requests.size)
+        // The original id stays on the first rewritten entry (injection/mention history).
+        assertEquals(3, updated.lorebook.size)
+        assertEquals("l1", updated.lorebook.first().id)
+        // User-written entries are never touched, so only the AI ones must be within the cap.
+        assertTrue(
+            updated.lorebook
+                .filter { it.origin == com.deeptalking.core.model.LorebookOrigin.Model }
+                .all { it.content.length <= AppLimits.Lorebook.CONTENT_CHARS },
+        )
+        assertEquals(blob, updated.lorebook.last().content)
+        assertEquals(user, updated.lorebook.last())
+    }
+
+    @Test
+    fun overLongLorebookRewriteKeepsTheOriginalEntry() = runBlocking {
+        val blob = "银月商会在西街，经营药材，" + "很长的旧内容".repeat(80)
+        val (background, _) = tasks(
+            // 480 characters: over the cap, so the rewrite is dropped rather than cut.
+            listOf(
+                """{"entries":[{"name":"银月商会","keywords":["银月"],""" +
+                    """"content":"${"很长的新内容".repeat(80)}","alwaysActive":false}]}""",
+            ),
+        )
+        val entry = com.deeptalking.core.model.LorebookEntry(
+            id = "l1",
+            name = "银月商会",
+            content = blob,
+            keywords = listOf("银月"),
+            origin = com.deeptalking.core.model.LorebookOrigin.Model,
+        )
+        val (status, updated) = background.rebuildOversizedLorebook(Character(id = "c1", lorebook = listOf(entry)))
+        assertEquals(BackgroundTasks.TaskStatus.Failure, status)
+        assertEquals(listOf(entry), updated.lorebook)
     }
 
     @Test
@@ -511,8 +639,8 @@ class BackgroundTasksTest {
                     """"participants":["用户"],"location":"家","sourceMessageIds":["m2"]}]""",
             ),
         )
-        // The window is full (high watermark): the head was folded in an earlier pass and
-        // rides along as context, the tail is what this pass must summarise.
+        // The window is full (high watermark): the whole window is the fold unit, and the
+        // fold drops it back to the low watermark.
         val instant = buildList {
             repeat(AppLimits.Memory.INSTANT - 2) { i ->
                 add(
@@ -521,7 +649,6 @@ class BackgroundTasksTest {
                         role = Role.User,
                         content = "旧消息$i",
                         timestamp = "2026-08-01T10:00:00Z",
-                        extractedAt = "done",
                     ),
                 )
             }
@@ -532,14 +659,13 @@ class BackgroundTasksTest {
         val (status, updated) = background.extractMemoryStatus(character, instant)
 
         assertEquals(BackgroundTasks.TaskStatus.Success, status)
-        // The request carried the whole window, and only the pending tail is actionable.
+        // The request carried the whole window (one whole-window pass, no id citations).
         val prompt = llm.requests.single().input.last().content
-        assertTrue(prompt.contains("\"extracted\":true"))
-        assertTrue(prompt.contains("\"extracted\":false"))
+        assertTrue(prompt.contains("\"m2\""))
+        assertTrue(prompt.contains("\"old0\""))
         assertEquals(1, updated.shortTerm.size)
-        // Only the covered message is stamped; an uncovered one stays pending for retry.
-        assertTrue(updated.instant.first { it.id == "m2" }.extractedAt != null)
-        assertEquals(null, updated.instant.first { it.id == "m3" }.extractedAt)
+        // Evidence is collected client-side from the user line in the same day+slot.
+        assertTrue(updated.shortTerm.single().sourceMessageIds.contains("m2"))
         // The fold compacted the window down to the low watermark.
         assertEquals(AppLimits.Memory.INSTANT_TRIM_FLOOR, updated.instant.size)
     }

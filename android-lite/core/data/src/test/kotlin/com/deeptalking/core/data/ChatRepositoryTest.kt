@@ -1,5 +1,6 @@
 package com.deeptalking.core.data
 
+import com.deeptalking.core.common.AppLimits
 import com.deeptalking.core.database.MessageDao
 import com.deeptalking.core.database.MessageEntity
 import com.deeptalking.core.model.ChatMessage
@@ -9,6 +10,7 @@ import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 private class FakeMessageDao : MessageDao {
@@ -32,6 +34,13 @@ private class FakeMessageDao : MessageDao {
         rows.entries.removeAll { it.value.characterId == characterId }
     }
 
+    override suspend fun deleteOldestBeyond(characterId: String, keep: Int) {
+        rows.values.filter { it.characterId == characterId }
+            .sortedBy { it.timestamp }
+            .dropLast(keep)
+            .forEach { rows.remove(it.id) }
+    }
+
     override suspend fun deleteAll() {
         rows.clear()
     }
@@ -40,28 +49,27 @@ private class FakeMessageDao : MessageDao {
 class ChatRepositoryTest {
 
     @Test
-    fun markExtractedPersistsBackToRoom() = runBlocking {
+    fun appendCapsTheArchiveAndKeepsSequencesMonotonic() = runBlocking {
         val dao = FakeMessageDao()
         val repository = ChatRepository(dao)
-        val message = ChatMessage(id = "m1", role = Role.User, content = "你好", timestamp = "2026-08-01T12:00:00Z")
-        repository.append("c1", message)
-        assertNull(repository.getMessages("c1").single().extractedAt)
-
-        repository.markExtracted("c1", listOf(message.copy(extractedAt = "2026-08-01T12:05:00Z")))
-
-        assertEquals("2026-08-01T12:05:00Z", repository.getMessages("c1").single().extractedAt)
-    }
-
-    @Test
-    fun markExtractedIgnoresMessagesNotYetPersisted() = runBlocking {
-        val dao = FakeMessageDao()
-        val repository = ChatRepository(dao)
-        repository.append("c1", ChatMessage(id = "m1", role = Role.User, content = "你好"))
-        repository.markExtracted(
-            "c1",
-            listOf(ChatMessage(id = "synth", role = Role.Assistant, content = "回复", extractedAt = "done")),
-        )
-        assertEquals(1, repository.getMessages("c1").size)
-        assertNull(repository.getMessages("c1").single().extractedAt)
+        val cap = AppLimits.History.ARCHIVE_MESSAGES
+        repeat(cap + 5) { index ->
+            val stamp = "2026-08-01T00:" + (index / 60).toString().padStart(2, '0') + ":" +
+                (index % 60).toString().padStart(2, '0') + "Z"
+            repository.append(
+                "c1",
+                ChatMessage(id = "m$index", role = Role.User, content = "消息$index", timestamp = stamp),
+            )
+        }
+        val stored = repository.getMessages("c1")
+        // The archive is a bounded FIFO: only the newest `cap` rows survive.
+        assertEquals(cap, stored.size)
+        assertTrue(stored.none { it.id == "m0" })
+        assertTrue(stored.any { it.id == "m${cap + 4}" })
+        // Sequence numbers stay monotonic and unique even though old rows were deleted
+        // (a row-count-derived sequence would reuse them).
+        val sequences = stored.map { it.sequence }
+        assertEquals(sequences.size, sequences.distinct().size)
+        assertEquals(sequences.sorted(), sequences)
     }
 }

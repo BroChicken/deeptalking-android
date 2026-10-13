@@ -17,12 +17,17 @@ import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.RequestMetric
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.StaticProfile
+import com.deeptalking.core.model.TTS_BACKEND_REMOTE
 import com.deeptalking.core.model.TtsPhase
 import com.deeptalking.core.model.SpeechSegment
 import com.deeptalking.core.model.extractSpeechSegments
 import com.deeptalking.core.model.extractSpeechText
 import com.deeptalking.domain.agent.OrchestratorResult
 import com.deeptalking.domain.agent.prompts.buildShortTermBlock
+import com.deeptalking.engine.ondevice.TtsSpeaker
+import com.deeptalking.engine.ondevice.TtsTurn
+import com.deeptalking.engine.remote.RemoteTtsProbe
+import com.deeptalking.engine.remote.RemoteVoiceUpload
 import com.deeptalking.feature.characters.CharacterParity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -140,6 +145,49 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     private val memoryCleanupProgressState = MutableStateFlow(false)
     val memoryCleanupProgress: StateFlow<Boolean> = memoryCleanupProgressState
 
+    /** True once the cleanup dialog was shown in this run (one prompt at a time). */
+    private var memoryCleanupPromptedThisRun = false
+
+    /** Non-null when the oversized-window catch-up should be confirmed first. */
+    private val memoryMigrationPromptState = MutableStateFlow<NativeCore.OversizedWindowTarget?>(null)
+    val memoryMigrationPrompt: StateFlow<NativeCore.OversizedWindowTarget?> = memoryMigrationPromptState
+
+    /** True once the window prompt was answered/dismissed in this app run ("稍后"). */
+    private var memoryMigrationAskedThisRun = false
+
+    /** Non-null while the one-time oversized-window catch-up runs (blocking overlay). */
+    private val memoryMigrationState = MutableStateFlow<MemoryMigrationUi?>(null)
+    val memoryMigration: StateFlow<MemoryMigrationUi?> = memoryMigrationState
+
+    /**
+     * Progress of the oversized-window catch-up. [error] non-blank means it stopped
+     * early (already-folded batches are saved, so a retry resumes).
+     */
+    data class MemoryMigrationUi(
+        val batches: Int = 0,
+        val remaining: Int = 0,
+        val running: Boolean = true,
+        val error: String = "",
+    )
+
+    /** Non-null when the one-time lorebook rebuild should be confirmed first. */
+    private val lorebookRebuildPromptState = MutableStateFlow<Int?>(null)
+    val lorebookRebuildPrompt: StateFlow<Int?> = lorebookRebuildPromptState
+
+    private var lorebookRebuildAskedThisRun = false
+
+    /** Non-null while the one-time lorebook rebuild runs (progress dialog). */
+    private val lorebookRebuildState = MutableStateFlow<LorebookRebuildUi?>(null)
+    val lorebookRebuild: StateFlow<LorebookRebuildUi?> = lorebookRebuildState
+
+    /** Progress of the lorebook rebuild ([error] non-blank = stopped, progress kept). */
+    data class LorebookRebuildUi(
+        val done: Int = 0,
+        val remaining: Int = 0,
+        val running: Boolean = true,
+        val error: String = "",
+    )
+
     /**
      * Asks once, when short-term memory is over its cap (the analysis task could not
      * drain it) or when images sit outside the retention window. Silent while a
@@ -147,20 +195,176 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
      * the job on its own and only asks again if it piles up later.
      */
     private suspend fun checkMemoryCleanupPrompt() {
+        if (memoryCleanupPromptedThisRun) return
         if (core.data.settings.getBoolean(MEMORY_CLEANUP_SKIP_KEY)) return
         if (core.data.settings.getBoolean(MEMORY_CLEANUP_PENDING_KEY)) return
         val target = runCatching { core.memoryCleanupTarget() }.getOrNull() ?: return
         if (!target.overLimit && target.images <= 0) return
+        memoryCleanupPromptedThisRun = true
         memoryCleanupState.value = target
     }
 
     fun dismissMemoryCleanup() {
         memoryCleanupState.value = null
+        askLorebookRebuildOnce()
     }
 
     fun skipMemoryCleanupForever() {
         memoryCleanupState.value = null
         viewModelScope.launch { core.data.settings.putBoolean(MEMORY_CLEANUP_SKIP_KEY, true) }
+        askLorebookRebuildOnce()
+    }
+
+    /**
+     * App-open check: a window far above the normal size is a legacy backlog — ask first.
+     *
+     * Confirming folds the whole backlog into memory, oldest batch first, before the app
+     * is usable (nothing is dropped; see `migrateOversizedWindow`). "稍后" means don't ask
+     * again in this run — the next launch asks again. "以后不再询问" persists a key and
+     * leaves the backlog to the per-turn catch-up path (which still runs, just silently).
+     */
+    private suspend fun checkOversizedWindowMigration() {
+        if (memoryMigrationAskedThisRun) return
+        memoryMigrationAskedThisRun = true
+        if (core.data.settings.getBoolean(MEMORY_WINDOW_MIGRATION_SKIP_KEY)) return
+        if (memoryMigrationState.value != null) return
+        val target = runCatching { core.oversizedWindowTarget() }.getOrNull() ?: return
+        if (target.characters <= 0) return
+        memoryMigrationPromptState.value = target
+    }
+
+    fun confirmMemoryMigration() {
+        memoryMigrationPromptState.value = null
+        startMemoryMigration()
+    }
+
+    /** "稍后": don't ask again in this run; the next launch asks again. */
+    fun dismissMemoryMigrationPrompt() {
+        memoryMigrationPromptState.value = null
+        continueStartupPromptsLater()
+    }
+
+    fun skipMemoryWindowMigrationForever() {
+        memoryMigrationPromptState.value = null
+        viewModelScope.launch { core.data.settings.putBoolean(MEMORY_WINDOW_MIGRATION_SKIP_KEY, true) }
+        continueStartupPromptsLater()
+    }
+
+    private fun startMemoryMigration() {
+        memoryMigrationState.value = MemoryMigrationUi()
+        viewModelScope.launch {
+            val cfg = runCatching { core.currentConfig() }.getOrNull()
+            if (cfg == null) {
+                memoryMigrationState.value = MemoryMigrationUi(running = false, error = "读取配置失败")
+                return@launch
+            }
+            val result = runCatching {
+                core.migrateOversizedWindows(cfg) { done, remaining ->
+                    memoryMigrationState.value = MemoryMigrationUi(batches = done, remaining = remaining)
+                }
+            }.getOrElse { NativeCore.MigrationResult(0, it.message ?: "整理失败") }
+            if (result.error.isBlank()) {
+                memoryMigrationState.value = null
+                continueStartupPromptsLater()
+            } else {
+                memoryMigrationState.value = MemoryMigrationUi(
+                    batches = result.batches,
+                    running = false,
+                    error = result.error,
+                )
+            }
+        }
+    }
+
+    /** Retries a catch-up that stopped early; saved progress is resumed, not repeated. */
+    fun retryMemoryMigration() {
+        memoryMigrationState.value = null
+        startMemoryMigration()
+    }
+
+    fun dismissMemoryMigration() {
+        memoryMigrationState.value = null
+        continueStartupPromptsLater()
+    }
+
+    /**
+     * Walks the one-time startup prompts one at a time: the cleanup dialog (when it has
+     * something to do), then the world-book rebuild. Called at launch and again whenever
+     * one of those prompts is resolved, so skipping one hands over to the next instead of
+     * two dialogs stacking on top of each other.
+     */
+    private suspend fun continueStartupPrompts() {
+        if (memoryCleanupState.value == null && !memoryCleanupProgressState.value) {
+            runCatching { checkMemoryCleanupPrompt() }.onFailure { DeepTalkingApp.recordError(it) }
+        }
+        askLorebookRebuildOnce()
+    }
+
+    private fun continueStartupPromptsLater() {
+        viewModelScope.launch { continueStartupPrompts() }
+    }
+
+    /**
+     * App-open check: oversized AI lorebook entries (an older version grew them into
+     * hundreds of characters) are rewritten once into one-concept entries, so the world
+     * book stops eating the injection budget. Asked again next launch when dismissed.
+     */
+    private fun askLorebookRebuildOnce() {
+        if (lorebookRebuildAskedThisRun) return
+        // One dialog at a time: hand over only once every earlier prompt is gone. The flag
+        // is set *after* these gates so a deferred ask still happens later (the paths that
+        // can defer it all funnel back through `continueStartupPrompts`).
+        if (memoryCleanupState.value != null || memoryCleanupProgressState.value) return
+        if (memoryMigrationPromptState.value != null || memoryMigrationState.value != null) return
+        if (fieldMigrationState.value != null || lorebookMigrationState.value != null) return
+        if (avatarRepairPromptState.value != null || avatarRepairProgressState.value != null) return
+        lorebookRebuildAskedThisRun = true
+        viewModelScope.launch {
+            if (lorebookRebuildState.value != null) return@launch
+            val count = runCatching { core.oversizedLorebookCount() }.getOrNull() ?: return@launch
+            if (count <= 0) return@launch
+            val cfg = runCatching { core.currentConfig() }.getOrNull() ?: return@launch
+            // Without a key the rewrite cannot run, so don't ask (the entries stay as they
+            // are and simply eat the injection budget until a key is configured).
+            if (!core.hasApiKey(cfg.apiPlatform)) return@launch
+            lorebookRebuildPromptState.value = count
+        }
+    }
+
+    fun confirmLorebookRebuild() {
+        lorebookRebuildPromptState.value = null
+        lorebookRebuildState.value = LorebookRebuildUi()
+        viewModelScope.launch {
+            val cfg = runCatching { core.currentConfig() }.getOrNull()
+            if (cfg == null) {
+                lorebookRebuildState.value = LorebookRebuildUi(running = false, error = "读取配置失败")
+                return@launch
+            }
+            val result = runCatching {
+                core.rebuildOversizedLorebooks(cfg) { done, remaining ->
+                    lorebookRebuildState.value = LorebookRebuildUi(done = done, remaining = remaining)
+                }
+            }.getOrElse { NativeCore.MigrationResult(0, it.message ?: "整理失败") }
+            lorebookRebuildState.value = if (result.error.isBlank()) {
+                null
+            } else {
+                LorebookRebuildUi(done = result.batches, running = false, error = result.error)
+            }
+        }
+    }
+
+    /** "稍后": don't ask again in this run; the next launch asks again. */
+    fun dismissLorebookRebuildPrompt() {
+        lorebookRebuildPromptState.value = null
+    }
+
+    fun retryLorebookRebuild() {
+        lorebookRebuildState.value = null
+        confirmLorebookRebuild()
+    }
+
+    fun dismissLorebookRebuild() {
+        lorebookRebuildState.value = null
     }
 
     /**
@@ -283,6 +487,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     /** Dismiss without marking, so it is asked again on the next launch (legacy "跳过"). */
     fun dismissFieldMigration() {
         fieldMigrationState.value = null
+        askLorebookRebuildOnce()
     }
 
     fun runLorebookMigration(trimSource: Boolean) {
@@ -317,6 +522,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
 
     fun dismissLorebookMigration() {
         lorebookMigrationState.value = null
+        askLorebookRebuildOnce()
     }
 
     // ---------------------------------------------------------------- selection
@@ -760,6 +966,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
 
     fun dismissAvatarRepair() {
         avatarRepairPromptState.value = null
+        askLorebookRebuildOnce()
     }
 
     fun confirmAvatarRepair() {
@@ -933,7 +1140,6 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                     onCharacterUpdated = { updated ->
                         core.appScope.launch {
                             core.data.characters.upsert(updated)
-                            core.data.chat.markExtracted(updated.id, updated.instant)
                         }
                     },
                     onStatus = { statusState.value = it },
@@ -1040,10 +1246,21 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         if (instant.isEmpty()) {
             return if (room.size > AppLimits.Memory.INSTANT) room.takeLast(AppLimits.Memory.INSTANT) else room
         }
-        val roomIds = room.map { it.id }.toSet()
-        val kept = instant.filter { it.id in roomIds }
-        val keptIds = kept.map { it.id }.toSet()
-        return kept + room.filter { it.id !in keptIds }
+        val roomIndex = room.withIndex().associate { it.value.id to it.index }
+        // The persisted window is authoritative: keep its content and append only the
+        // chat rows it has not seen yet. Re-deriving the window from the archive (the
+        // old behaviour) silently undid every fold, because the archive never drops a
+        // row that the fold trimmed away, so the window could only ever grow.
+        val kept = instant.filter { it.id in roomIndex }
+        if (kept.isEmpty()) {
+            return if (room.size > AppLimits.Memory.INSTANT) room.takeLast(AppLimits.Memory.INSTANT) else room
+        }
+        val lastSeen = kept.maxOf { roomIndex.getValue(it.id) }
+        val seen = kept.mapTo(HashSet()) { it.id }
+        val appended = room.drop(lastSeen + 1).filter { it.id !in seen }
+        // Safety clamp: an imported/legacy window can be far larger than the watermark
+        // (the archive never drops rows). Only the recent slice is the working window.
+        return (kept + appended).takeLast(AppLimits.Memory.INSTANT)
     }
 
     /**
@@ -1424,7 +1641,12 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 core.runStartupMaintenance(cfg)
             }.onFailure { DeepTalkingApp.recordError(it) }
             runCatching { checkMigrationPrompts() }.onFailure { DeepTalkingApp.recordError(it) }
-            runCatching { checkMemoryCleanupPrompt() }.onFailure { DeepTalkingApp.recordError(it) }
+            // Oversized (legacy) window catch-up asks first and blocks while it runs, so the
+            // cleanup prompt and the world-book rebuild wait for it.
+            runCatching { checkOversizedWindowMigration() }.onFailure { DeepTalkingApp.recordError(it) }
+            if (memoryMigrationPromptState.value == null && memoryMigrationState.value == null) {
+                continueStartupPrompts()
+            }
             runCatching { runMemoryCleanupChunk(AppLimits.Memory.CLEANUP_BATCHES_PER_RUN) }
                 .onFailure { DeepTalkingApp.recordError(it) }
             autoRepairAvatars()
@@ -1483,6 +1705,9 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         /** Set when the user chose "以后不再询问" on the one-time memory cleanup. */
         const val MEMORY_CLEANUP_SKIP_KEY = "deeptalking_memory_cleanup_skip_v1"
 
+        /** Set when the user chose "以后不再询问" on the oversized-window catch-up. */
+        const val MEMORY_WINDOW_MIGRATION_SKIP_KEY = "deeptalking_memory_window_migration_skip_v1"
+
         /**
          * Set while a confirmed cleanup is still consuming the short-term backlog: the
          * app then keeps working on its own and never asks twice for one backlog.
@@ -1507,10 +1732,14 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
 
     private val ttsState = MutableStateFlow(TtsState())
 
-    /** On-device read-aloud state (CosyVoice3). */
+    /** Read-aloud state (on-device CosyVoice3 or the remote HTTP server). */
     val tts: StateFlow<TtsState> = ttsState
 
     private var ttsJob: Job? = null
+
+    /** Engine used by the running read-aloud, so a stop reaches the right one. */
+    @Volatile
+    private var activeSpeaker: TtsSpeaker? = null
 
     private fun refreshTtsState(cfg: AppConfig) {
         val voices = runCatching { core.cosyVoice.listVoices() }.getOrDefault(emptyList())
@@ -1525,7 +1754,170 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             voices = voices,
             activeVoice = activeFile,
             speed = cfg.ttsSpeed,
+            backend = cfg.ttsBackend,
+            remoteUrl = cfg.ttsRemoteUrl,
+            remoteModel = cfg.ttsRemoteModel,
+            remoteVoice = cfg.ttsRemoteVoice,
+            remoteSampleRate = cfg.ttsRemoteSampleRate,
+            remoteToken = core.secrets.getTtsToken().orEmpty(),
+            remoteReady = cfg.ttsRemoteUrl.isNotBlank(),
+            remoteChunkTokens = cfg.ttsRemoteChunkTokens,
+            remoteTemperature = cfg.ttsRemoteTemperature,
+            remoteTopK = cfg.ttsRemoteTopK,
+            remoteTopP = cfg.ttsRemoteTopP,
+            remoteWinSize = cfg.ttsWinSize,
+            remoteTauR = cfg.ttsTauR,
+            remoteMinTokenTextRatio = cfg.ttsMinTokenTextRatio,
+            remoteMaxTokenTextRatio = cfg.ttsMaxTokenTextRatio,
         )
+    }
+
+    fun setTtsBackend(backend: String) {
+        viewModelScope.launch {
+            val cfg = core.currentConfig()
+            core.data.config.update(cfg.copy(ttsBackend = backend))
+            refreshTtsState(core.currentConfig())
+            // Switching to the remote engine should be a one-tap affair: with USB
+            // tethering there is no address to type, so look for the PC right away
+            // when none is configured yet (the user can still override it by hand).
+            if (backend == TTS_BACKEND_REMOTE && cfg.ttsRemoteUrl.isBlank()) {
+                discoverTtsServer()
+            }
+        }
+    }
+
+    /** Persists the non-secret remote fields edited in one pass from the settings form. */
+    fun updateRemoteTts(
+        url: String? = null,
+        model: String? = null,
+        voice: String? = null,
+        chunkTokens: Int? = null,
+        temperature: Double? = null,
+        topK: Int? = null,
+        topP: Double? = null,
+        winSize: Int? = null,
+        tauR: Double? = null,
+        minTokenTextRatio: Double? = null,
+        maxTokenTextRatio: Double? = null,
+    ) {
+        viewModelScope.launch {
+            val cfg = core.currentConfig()
+            core.data.config.update(
+                cfg.copy(
+                    ttsRemoteUrl = url?.trim()?.trimEnd('/') ?: cfg.ttsRemoteUrl,
+                    ttsRemoteModel = model ?: cfg.ttsRemoteModel,
+                    ttsRemoteVoice = voice ?: cfg.ttsRemoteVoice,
+                    ttsRemoteChunkTokens = chunkTokens ?: cfg.ttsRemoteChunkTokens,
+                    ttsRemoteTemperature = temperature ?: cfg.ttsRemoteTemperature,
+                    ttsRemoteTopK = topK ?: cfg.ttsRemoteTopK,
+                    ttsRemoteTopP = topP ?: cfg.ttsRemoteTopP,
+                    ttsWinSize = winSize ?: cfg.ttsWinSize,
+                    ttsTauR = tauR ?: cfg.ttsTauR,
+                    ttsMinTokenTextRatio = minTokenTextRatio ?: cfg.ttsMinTokenTextRatio,
+                    ttsMaxTokenTextRatio = maxTokenTextRatio ?: cfg.ttsMaxTokenTextRatio,
+                ),
+            )
+            refreshTtsState(core.currentConfig())
+        }
+    }
+
+    /** Saves (or clears) the remote server's bearer token. Never written to `AppConfig`. */
+    fun saveTtsToken(token: String?) {
+        viewModelScope.launch {
+            core.secrets.setTtsToken(token?.trim()?.takeIf { it.isNotEmpty() })
+            refreshTtsState(core.currentConfig())
+        }
+    }
+
+    /** "测试连接": probes the configured server and stores the discovered sample rate. */
+    fun testTtsConnection() {
+        if (ttsState.value.busy) return
+        ttsState.value = ttsState.value.copy(busy = true, remoteStatus = "正在测试…")
+        viewModelScope.launch {
+            val cfg = core.currentConfig()
+            val probe = runCatching { core.testTtsConnection(cfg) }
+                .getOrElse { RemoteTtsProbe(ok = false, message = "测试失败：${it.message}") }
+            if (probe.sampleRate > 0) {
+                core.data.config.update(core.currentConfig().copy(ttsRemoteSampleRate = probe.sampleRate))
+            }
+            ttsState.value = ttsState.value.copy(
+                busy = false,
+                remoteStatus = probe.message,
+                remoteVoices = if (probe.speakers.isEmpty()) ttsState.value.remoteVoices else probe.speakers,
+            )
+            refreshTtsState(core.currentConfig())
+        }
+    }
+
+    /**
+     * "上传音色到电脑": pushes every on-device voice (built-ins and user imports) to
+     * the PC, which stores and registers each one under the same name. The PC then
+     * reads with the exact voice the phone has, because it is the same prompt-speech
+     * file the phone cloned locally (see docs/REMOTE_TTS.md §8).
+     */
+    fun uploadVoicesToRemote() {
+        if (ttsState.value.busy) return
+        val voices = runCatching { core.cosyVoice.listVoices() }.getOrDefault(emptyList())
+        if (voices.isEmpty()) {
+            ttsState.value = ttsState.value.copy(remoteStatus = "本机还没有音色可上传")
+            return
+        }
+        ttsState.value = ttsState.value.copy(busy = true, remoteStatus = "正在上传 ${voices.size} 个音色…")
+        viewModelScope.launch {
+            val config = core.remoteTtsConfig(core.currentConfig())
+            var uploaded = 0
+            val failures = mutableListOf<String>()
+            for (voice in voices) {
+                val file = core.cosyVoice.voiceFileFor(voice.file)
+                val bytes = file?.let { runCatching { it.readBytes() }.getOrNull() }
+                if (bytes == null) {
+                    failures += "${voice.name}（文件缺失）"
+                    continue
+                }
+                val result = runCatching {
+                    core.uploadTtsVoice(config, voice.file.removeSuffix(".gguf"), bytes)
+                }.getOrElse { RemoteVoiceUpload(voice.file, ok = false, message = it.message ?: "上传失败") }
+                if (result.ok) uploaded++ else failures += "${voice.name}：${result.message}"
+            }
+            // Re-probe so the picker stops marking the uploaded voices as "服务端未注册".
+            val probe = runCatching { core.testTtsConnection(core.currentConfig()) }.getOrNull()
+            ttsState.value = ttsState.value.copy(
+                busy = false,
+                remoteStatus = buildString {
+                    append("已上传 $uploaded/${voices.size} 个音色到电脑")
+                    if (failures.isNotEmpty()) append("；未成功：").append(failures.joinToString("、"))
+                },
+                remoteVoices = probe?.speakers?.takeIf { it.isNotEmpty() } ?: ttsState.value.remoteVoices,
+            )
+            refreshTtsState(core.currentConfig())
+        }
+    }
+
+    /** "自动发现": sweeps the phone's own subnets for the server and stores the address. */
+    fun discoverTtsServer() {        if (ttsState.value.busy) return
+        ttsState.value = ttsState.value.copy(busy = true, remoteStatus = "正在扫描本机网段…")
+        viewModelScope.launch {
+            val cfg = core.currentConfig()
+            val found = runCatching { core.findTtsServer(cfg) }.getOrNull()
+            if (found != null) {
+                core.data.config.update(core.currentConfig().copy(ttsRemoteUrl = found))
+                val probe = runCatching { core.testTtsConnection(core.currentConfig()) }.getOrNull()
+                if (probe != null && probe.sampleRate > 0) {
+                    core.data.config.update(core.currentConfig().copy(ttsRemoteSampleRate = probe.sampleRate))
+                }
+                ttsState.value = ttsState.value.copy(
+                    busy = false,
+                    remoteStatus = "已找到服务器：$found（${probe?.message ?: "已连接"}）",
+                    remoteVoices = probe?.speakers ?: ttsState.value.remoteVoices,
+                )
+            } else {
+                ttsState.value = ttsState.value.copy(
+                    busy = false,
+                    remoteStatus = "没有找到服务器。请确认电脑已启动 cosyvoice-server，且手机已开启 USB 网络共享",
+                )
+            }
+            refreshTtsState(core.currentConfig())
+        }
     }
 
     fun setTtsEnabled(enabled: Boolean) {
@@ -1686,11 +2078,15 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             // used to silence every read-aloud after the first one.
             if (previous?.isActive == true) {
                 previous.cancel()
-                withContext(Dispatchers.IO) { runCatching { core.cosyVoice.cancel() } }
+                withContext(Dispatchers.IO) { runCatching { activeSpeaker?.cancel() } }
             }
             val cfg = core.currentConfig()
             if (!cfg.ttsEnabled) {
                 eventsState.tryEmit(UiEvent("请先在设置-语音朗读中开启"))
+                return@launch
+            }
+            if (cfg.ttsBackend == TTS_BACKEND_REMOTE && cfg.ttsRemoteUrl.isBlank()) {
+                eventsState.tryEmit(UiEvent("请先在设置-语音朗读中配置远程服务器地址"))
                 return@launch
             }
             if (generation != ttsGeneration) return@launch
@@ -1702,10 +2098,12 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 status = "正在合成…",
             )
             startTtsTimer()
-            val turns = segments.map { it.text to toneFor(it, character) }
+            val speaker = core.ttsSpeaker(cfg)
+            activeSpeaker = speaker
+            val turns = segments.map { TtsTurn(it.text, toneFor(it, character)) }
             if (generation != ttsGeneration) return@launch
             val ok = runCatching {
-                core.cosyVoice.speakSegments(turns) { phase ->
+                speaker.speak(turns) { phase ->
                     viewModelScope.launch {
                         if (generation == ttsGeneration) ttsState.value = ttsState.value.copy(phase = phase)
                     }
@@ -1741,13 +2139,13 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         ttsTimerJob = null
     }
 
-    /** Stops any running read-aloud (playback + native synthesis). */
+    /** Stops any running read-aloud (playback + synthesis on the active engine). */
     fun stopSpeaking() {
         ++ttsGeneration
         ttsJob?.cancel()
         ttsJob = null
         stopTtsTimer()
-        viewModelScope.launch { withContext(Dispatchers.IO) { runCatching { core.cosyVoice.cancel() } } }
+        viewModelScope.launch { withContext(Dispatchers.IO) { runCatching { activeSpeaker?.cancel() } } }
         ttsState.value = ttsState.value.copy(
             speaking = false, activeMessageId = null, phase = TtsPhase.Idle, elapsedMs = 0L, status = "",
         )
@@ -1792,9 +2190,13 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         viewModelScope.launch {
             runCatching { checkMigrationPrompts() }.onFailure { DeepTalkingApp.recordError(it) }
         }
-        // One-time memory cleanup prompt (short-term backlog + stale images).
+        // One-time startup prompts, in order: oversized window (blocks while it runs) →
+        // short-term/image cleanup → world-book rebuild. Each waits for the previous one.
         viewModelScope.launch {
-            runCatching { checkMemoryCleanupPrompt() }.onFailure { DeepTalkingApp.recordError(it) }
+            runCatching { checkOversizedWindowMigration() }.onFailure { DeepTalkingApp.recordError(it) }
+            if (memoryMigrationPromptState.value == null && memoryMigrationState.value == null) {
+                continueStartupPrompts()
+            }
         }
         // Legacy silent avatar auto-repair for damaged placeholders.
         autoRepairAvatars()

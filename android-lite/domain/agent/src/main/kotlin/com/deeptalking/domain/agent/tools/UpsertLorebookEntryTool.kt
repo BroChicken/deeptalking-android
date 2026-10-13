@@ -6,7 +6,6 @@ import com.deeptalking.core.model.LorebookOrigin
 import com.deeptalking.domain.agent.AgentContext
 import com.deeptalking.domain.agent.AgentTool
 import com.deeptalking.domain.agent.AgentToolResult
-import com.deeptalking.domain.agent.prompts.trimText
 import com.deeptalking.domain.memory.parseRelativeText
 import com.deeptalking.domain.memory.parseZoned
 import com.deeptalking.domain.memory.resolveLorebookSources
@@ -28,15 +27,15 @@ class UpsertLorebookEntryTool : AgentTool {
 
     override val definition = ToolDefinition(
         name = "upsert_lorebook_entry",
-        description = "写入/更新世界书条目——世界层设定的唯一去处（时代与世界观、地点、组织、专有名词、历史、规则、背景事实）。**同一件事物只能有一条**：先对照现有条目，凡名称相近、关键词相同或内容重叠的都算同一条，必须用它的 entryId/name 更新合并，绝不新建近似条目；当你用 entryId/name 明确指定要更新的条目时，content 会**替换**该条目原有内容，因此更新时要写全该条目应有的完整内容（不要只写增量，否则会丢掉原有信息）；未指定 id/name 而由系统按相似度命中时，只会把新句子并入已有内容。只在近期对话里已经出现/确立、且**会反复复用**的这类设定，或用户补充修正了这类设定时才使用；一次性的小事、可从上下文直接看出的细节不要写。**用户手写条目（origin=user）受保护，不得覆盖或改写**；若现有用户条目已覆盖同一设定，不要重复写入。keywords 写剧情里可能出现的称呼（命中才注入）；只有确实需要每轮生效的世界前提/规则才把 alwaysActive 设为 true（常驻条目数量有限，不要滥用）。必须给出 sourceMessageIds 与 evidence 证明该设定已在对话中出现（本轮新编、尚未落库的内容不要写，等它出现在消息里再由整理任务沉淀）；拿不出依据就不要写。",
-        parametersJson = """{"type":"object","properties":{"name":{"type":"string","description":"条目名（如「赤月王国」「银月商会」）；未给 entryId 时按名字匹配已有条目"},"content":{"type":"string","description":"命中后注入的设定内容，只写该条目本身的信息，不写理由或解释"},"keywords":{"type":"array","items":{"type":"string"},"description":"触发关键词（剧情里可能出现的称呼）；常驻条目可留空"},"alwaysActive":{"type":"boolean","description":"true=常驻（每轮都注入，用于世界前提/规则）；默认 false=只在关键词命中时注入"},"entryId":{"type":"string","description":"可选，明确要更新的条目ID（比按名字匹配更精确）"},"memberName":{"type":"string","description":"可选，群组对话中写入某位成员的私人世界书（不传则写入共享世界书）"},"sourceMessageIds":{"type":"array","items":{"type":"string"},"description":"该设定所在的消息ID（必须是上下文里真实的已存在消息ID）"},"evidence":{"type":"string","description":"逐字摘录或紧扣原文的短句，体现该设定"}},"required":["name","content","sourceMessageIds","evidence"],"additionalProperties":false}""",
+        description = "写入/更新世界书条目——世界层设定的唯一去处（时代与世界观、地点、组织、专有名词、历史、规则、背景事实）。**同一件事物只能有一条**：先对照现有条目，凡名称相近、关键词相同或内容重叠的都算同一条，必须用它的 entryId/name 更新合并，绝不新建近似条目；当你用 entryId/name 明确指定要更新的条目时，content 会**替换**该条目原有内容，因此更新时要写全该条目应有的完整内容（不要只写增量，否则会丢信息）；**内容要精炼，一条只讲一件事，不超过 400 字（超了会被拒绝，要求你精简后重写）**；未指定 id/name 而由系统按相似度命中时，同样会用你这次写的完整内容**替换**该条目。只在近期对话里已经出现/确立、且**会反复复用**的这类设定，或用户补充修正了这类设定时才使用；一次性的小事、可从上下文直接看出的细节不要写。**用户手写条目（origin=user）受保护，不得覆盖或改写**；若现有用户条目已覆盖同一设定，不要重复写入。keywords 写剧情里可能出现的称呼（命中才注入；没给关键词时系统会用条目名当触发词）；只有确实需要每轮生效的世界前提/规则才把 alwaysActive 设为 true（常驻条目数量有限，不要滥用）。必须给出 sourceMessageIds 与 evidence 证明该设定已在对话中出现（本轮新编、尚未落库的内容不要写，等它出现在消息里再由整理任务沉淀）；拿不出依据就不要写。",
+        parametersJson = """{"type":"object","properties":{"name":{"type":"string","description":"条目名（如「赤月王国」「银月商会」）；未给 entryId 时按名字匹配已有条目"},"content":{"type":"string","description":"命中后注入的设定内容，用你这次写的完整内容替换原内容（不要只写增量，否则会丢信息）；内容要精炼，一条只讲一件事，不超过 400 字（超了会被拒绝，请精简后重写）"},"keywords":{"type":"array","items":{"type":"string"},"description":"触发关键词（剧情里可能出现的称呼）；常驻条目可留空，留空时系统会用条目名当触发词"},"alwaysActive":{"type":"boolean","description":"true=常驻（每轮都注入，用于世界前提/规则）；默认 false=只在关键词命中时注入"},"entryId":{"type":"string","description":"可选，明确要更新的条目ID（比按名字匹配更精确）"},"memberName":{"type":"string","description":"可选，群组对话中写入某位成员的私人世界书（不传则写入共享世界书）"},"sourceMessageIds":{"type":"array","items":{"type":"string"},"description":"该设定所在的消息ID（必须是上下文里真实的已存在消息ID）"},"evidence":{"type":"string","description":"逐字摘录或紧扣原文的短句，体现该设定"}},"required":["name","content","sourceMessageIds","evidence"],"additionalProperties":false}""",
     )
 
     override suspend fun execute(call: ToolCall, context: AgentContext): AgentToolResult {
         val args = ToolArgs.parse(call.arguments)
         val character = context.character
         val name = ToolArgs.string(args, "name").trim().take(AppLimits.Lorebook.NAME_CHARS)
-        val rawContent = ToolArgs.string(args, "content").trim().take(AppLimits.Lorebook.CONTENT_CHARS)
+        val rawContent = ToolArgs.string(args, "content").trim()
         if (name.isEmpty() || rawContent.isEmpty()) {
             return AgentToolResult(errorJson("name 与 content 不能为空"))
         }
@@ -57,9 +56,16 @@ class UpsertLorebookEntryTool : AgentTool {
         val timeRef = ToolArgs.timeRef(args, "timeRef")
         val content = if (timeRef != null) {
             val base = resolveTimeRef(timeRef, ZonedDateTime.now())?.iso?.let { parseZoned(it) } ?: ZonedDateTime.now()
-            trimText(parseRelativeText(rawContent, base), AppLimits.Lorebook.CONTENT_CHARS)
+            parseRelativeText(rawContent, base)
         } else {
             rawContent
+        }
+        // The cap is a writing rule, not a knife: ask for a shorter entry instead of
+        // storing a cut one. The model sees this error and can rewrite it in the same turn.
+        if (content.length > AppLimits.Lorebook.CONTENT_CHARS) {
+            return AgentToolResult(
+                errorJson("content 超过 ${AppLimits.Lorebook.CONTENT_CHARS} 字，请精简成一条只讲一件事的条目后重写"),
+            )
         }
         val keywords = ToolArgs.strings(args, "keywords")
             .map { it.trim() }
@@ -92,7 +98,6 @@ class UpsertLorebookEntryTool : AgentTool {
 
 private const val NAME_SIMILARITY = 0.5
 private const val CONTENT_SIMILARITY = 0.45
-private const val MERGE_SENTENCE_SIMILARITY = 0.6
 
 private data class UpsertResult(
     val ok: Boolean,
@@ -120,7 +125,7 @@ private fun upsert(
             name = exact.name.ifEmpty { name },
             content = content,
             keywords = if (keywords.isNotEmpty()) keywords else exact.keywords,
-            alwaysActive = exact.alwaysActive || alwaysActive,
+            alwaysActive = alwaysActive,
             misses = 0,
             updatedAt = Instant.now().toString(),
         )
@@ -134,21 +139,18 @@ private fun upsert(
             return UpsertResult(true, list = list, entry = similar, created = false, mergedIntoUser = true)
         }
         val merged = similar.copy(
-            content = mergeContent(similar.content, content),
-            keywords = (similar.keywords + keywords).distinct().take(AppLimits.Lorebook.KEYWORDS_PER_ENTRY),
-            alwaysActive = similar.alwaysActive || alwaysActive,
+            content = content,
+            keywords = if (keywords.isNotEmpty()) keywords else similar.keywords,
+            alwaysActive = alwaysActive,
             misses = 0,
             updatedAt = Instant.now().toString(),
         )
         return UpsertResult(true, list = replace(list, similar.id, merged), entry = merged, created = false)
     }
 
-    if (keywords.isEmpty() && !alwaysActive) {
-        return UpsertResult(
-            false,
-            "世界书条目需要 keywords（命中才注入）或显式 alwaysActive:true（常驻）；请补关键词，或确实属于世界前提时设为常驻",
-        )
-    }
+    // No keywords and not always-on would never be injected at all; use the entry name
+    // as the trigger instead of rejecting the entry outright.
+    val triggerKeywords = keywords.ifEmpty { listOf(name) }
     if (alwaysActive) {
         val activeCount = list.count { it.origin == LorebookOrigin.Model && it.alwaysActive }
         if (activeCount >= AppLimits.Lorebook.MAX_ALWAYS_ACTIVE) {
@@ -167,7 +169,7 @@ private fun upsert(
         id = "lore_" + System.currentTimeMillis() + "_" + UUID.randomUUID().toString().take(8),
         name = name,
         content = content,
-        keywords = keywords,
+        keywords = triggerKeywords,
         alwaysActive = alwaysActive,
         origin = LorebookOrigin.Model,
         createdAt = now,
@@ -240,36 +242,6 @@ private fun bigramRatio(left: Set<String>, right: Set<String>): Double {
     val inter = left.count { it in right }
     val union = left.size + right.size - inter
     return if (union == 0) 0.0 else inter.toDouble() / union
-}
-
-private fun splitSentences(text: String): List<String> {
-    val delimiters = "。！？!?；;\n"
-    val out = mutableListOf<String>()
-    val buffer = StringBuilder()
-    for (ch in text) {
-        buffer.append(ch)
-        if (ch in delimiters) {
-            val trimmed = buffer.toString().trim()
-            if (trimmed.isNotEmpty()) out += trimmed
-            buffer.clear()
-        }
-    }
-    if (buffer.toString().trim().isNotEmpty()) out += buffer.toString().trim()
-    return out
-}
-
-private fun mergeContent(existing: String, incoming: String): String {
-    val base = existing.trim()
-    val known = splitSentences(base)
-    val added = mutableListOf<String>()
-    splitSentences(incoming).forEach { sentence ->
-        if (sentence.length < 2 || base.contains(sentence)) return@forEach
-        val duplicate = (known + added).any {
-            bigramRatio(lorebookBigrams(it), lorebookBigrams(sentence)) >= MERGE_SENTENCE_SIMILARITY
-        }
-        if (!duplicate) added += sentence
-    }
-    return trimText(base + added.joinToString(""), AppLimits.Lorebook.CONTENT_CHARS)
 }
 
 private fun entryJson(entry: LorebookEntry, created: Boolean, mergedIntoUser: Boolean): String {

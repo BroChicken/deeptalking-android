@@ -52,6 +52,22 @@ class VoiceStoreTest {
     }
 
     @Test
+    fun builtinSourceTagRoundTripsSoStaleGgufsAreRebuilt() {
+        val store = VoiceStore(temp.root)
+        val file = voiceFile("builtin_1_v2.gguf")
+        store.add(file, "内置音色 1", builtin = true, source = "abc123")
+
+        // Reopened store (fresh process) must see the recorded identity.
+        val reopened = VoiceStore(temp.root).list().single()
+        assertEquals("abc123", reopened.source)
+        assertTrue(reopened.builtin)
+
+        // A voice from an older build has no source -> it must not look up to date.
+        VoiceStore(temp.root).add(file, "内置音色 1", builtin = true)
+        assertEquals("", VoiceStore(temp.root).list().single().source)
+    }
+
+    @Test
     fun untrackedFilesShowUpWithFallbackName() {
         val store = VoiceStore(temp.root)
         voiceFile("voice-loose.gguf")

@@ -3,6 +3,7 @@ package com.deeptalking.core.data.legacy
 import android.content.Context
 import android.net.Uri
 import android.util.Base64
+import com.deeptalking.core.common.AppLimits
 import java.io.File
 
 /**
@@ -53,5 +54,45 @@ object MediaRef {
     }
 
     /** [MediaSource] implementation bound to an application context. */
-    fun source(context: Context): MediaSource = MediaSource { ref -> toDataUri(context, ref) }
+    fun source(context: Context): MediaSource = object : MediaSource {
+        override fun toDataUri(ref: String): String? = toDataUri(context, ref)
+        override fun toThumbnailDataUri(ref: String): String? = toThumbnailDataUri(context, ref)
+    }
+
+    /**
+     * Downscaled JPEG preview for backup export ([AppLimits.Media.EXPORT_PREVIEW_*]).
+     * Falls back to the full payload when the bytes cannot be decoded, so an image is
+     * never silently dropped from a backup.
+     */
+    fun toThumbnailDataUri(
+        context: Context,
+        ref: String,
+        maxDimension: Int = AppLimits.Media.THUMBNAIL_DIMENSION,
+        quality: Int = AppLimits.Media.THUMBNAIL_QUALITY,
+    ): String? {
+        if (ref.startsWith("data:", ignoreCase = true)) return ref
+        val file = fileFor(context, ref) ?: return toDataUri(context, ref)
+        if (!file.exists()) return null
+        val encoded = runCatching {
+            val bitmap = android.graphics.BitmapFactory.decodeFile(file.absolutePath) ?: return@runCatching null
+            val longest = maxOf(bitmap.width, bitmap.height)
+            val scaled = if (longest > maxDimension) {
+                val ratio = maxDimension.toFloat() / longest
+                android.graphics.Bitmap.createScaledBitmap(
+                    bitmap,
+                    (bitmap.width * ratio).toInt().coerceAtLeast(1),
+                    (bitmap.height * ratio).toInt().coerceAtLeast(1),
+                    true,
+                )
+            } else {
+                bitmap
+            }
+            val stream = java.io.ByteArrayOutputStream()
+            scaled.compress(android.graphics.Bitmap.CompressFormat.JPEG, quality, stream)
+            if (scaled !== bitmap) scaled.recycle()
+            bitmap.recycle()
+            stream.toByteArray()
+        }.getOrNull() ?: return toDataUri(context, ref)
+        return "data:image/jpeg;base64," + Base64.encodeToString(encoded, Base64.NO_WRAP)
+    }
 }

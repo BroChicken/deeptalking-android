@@ -1,5 +1,6 @@
 package com.deeptalking.core.data
 
+import com.deeptalking.core.common.AppLimits
 import com.deeptalking.core.database.MessageDao
 import com.deeptalking.core.database.MessageEntity
 import com.deeptalking.core.model.ChatMessage
@@ -20,10 +21,19 @@ class ChatRepository(private val dao: MessageDao) {
 
     suspend fun append(characterId: String, message: ChatMessage) {
         // Legacy `ensureMessageSequences`: every persisted message gets a monotonic
-        // per-conversation sequence (1-based).
-        val sequence = if (message.sequence > 0) message.sequence else dao.getForCharacter(characterId).size + 1
+        // per-conversation sequence (1-based), derived from the stored high-water mark
+        // rather than the row count. The archive cap deletes old rows, and a row-count
+        // sequence would then reuse numbers, collapsing distinct messages onto one id.
+        val sequence = if (message.sequence > 0) message.sequence else nextSequence(characterId)
         dao.upsert(toEntity(characterId, message.copy(sequence = sequence)))
+        // Archive cap: the chat is a bounded FIFO kept only for looking back. The
+        // memory window lives on the character and is never derived from this table.
+        dao.deleteOldestBeyond(characterId, AppLimits.History.ARCHIVE_MESSAGES)
     }
+
+    /** Next monotonic sequence for a conversation, from the decoded high-water mark. */
+    private suspend fun nextSequence(characterId: String): Int =
+        dao.getForCharacter(characterId).mapNotNull(::decode).maxOfOrNull { it.sequence }?.plus(1) ?: 1
 
     suspend fun replace(characterId: String, messages: List<ChatMessage>) {
         dao.replaceForCharacter(characterId, messages.map { toEntity(characterId, it) })
@@ -32,25 +42,6 @@ class ChatRepository(private val dao: MessageDao) {
     suspend fun clear(characterId: String) = dao.deleteForCharacter(characterId)
 
     suspend fun clearAll() = dao.deleteAll()
-
-    /**
-     * Copies the memory-task `extractedAt` marks from the live [instant] window back
-     * onto the persisted chat rows. The live window is rebuilt from Room every turn
-     * (`windowInstant`), so without this write-back the marks would be lost and
-     * extraction would re-process the same messages forever. Only rows that already
-     * exist are touched; synthesized in-window messages are ignored.
-     */
-    suspend fun markExtracted(characterId: String, instant: List<ChatMessage>) {
-        val marked = instant.filter { it.extractedAt != null }.associateBy { it.id }
-        if (marked.isEmpty()) return
-        val updates = dao.getForCharacter(characterId).mapNotNull { row ->
-            val message = decode(row) ?: return@mapNotNull null
-            val source = marked[message.id] ?: return@mapNotNull null
-            if (message.extractedAt == source.extractedAt) return@mapNotNull null
-            row.copy(payload = AppJson.encodeToString(message.copy(extractedAt = source.extractedAt)))
-        }
-        if (updates.isNotEmpty()) dao.upsertAll(updates)
-    }
 
     private fun toEntity(characterId: String, message: ChatMessage): MessageEntity {
         val timestamp = message.timestamp ?: Instant.now().toString()

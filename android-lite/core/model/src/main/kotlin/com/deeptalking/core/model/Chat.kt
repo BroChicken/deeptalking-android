@@ -29,8 +29,6 @@ data class ChatMessage(
     val internalOnly: Boolean = false,
     /** True while a streamed assistant turn is still being generated. */
     val isLoading: Boolean = false,
-    /** When this message was folded into short-term memory (legacy `extractedAt`). */
-    val extractedAt: String? = null,
     /** Style violations detected on this assistant turn (persisted for the review pass). */
     val styleViolations: List<String> = emptyList(),
     /** Quick-reply issues detected on this assistant turn. */

@@ -37,6 +37,19 @@ class SecretStore(context: Context) {
 
     private fun platformKey(platform: String): String = KEY_API_KEY + "_" + platform
 
+    /**
+     * Bearer token for the remote read-aloud server (`cosyvoice-server --api-key`).
+     * Kept here rather than in `AppConfig` so it never reaches the database, logs
+     * or backup exports (see AGENTS.md: secrets only live in [SecretStore]).
+     */
+    fun getTtsToken(): String? = prefs.getString(KEY_TTS_TOKEN, null)
+
+    fun setTtsToken(value: String?) {
+        prefs.edit().apply {
+            if (value == null) remove(KEY_TTS_TOKEN) else putString(KEY_TTS_TOKEN, value)
+        }.apply()
+    }
+
     fun clear() {
         prefs.edit().clear().apply()
     }
@@ -59,5 +72,6 @@ class SecretStore(context: Context) {
     private companion object {
         const val FILE_NAME = "deeptalking_secrets"
         const val KEY_API_KEY = "api_key"
+        const val KEY_TTS_TOKEN = "tts_token"
     }
 }

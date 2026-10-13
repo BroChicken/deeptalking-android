@@ -265,6 +265,29 @@ class MemoryToolsTest {
     }
 
     @Test
+    fun `upsert_lorebook_entry rejects over-long content and falls back to the name as keyword`() = runBlocking {
+        val character = Character(
+            id = "c1",
+            shortTerm = listOf(ShortTermMemory(id = "s1", content = "潮汐镇终年多雾，是海边小城")),
+        )
+        // 450 characters: the tool asks the model to shorten instead of storing a cut entry.
+        val longArgs = """
+            {"name":"潮汐镇","content":"${"多雾。".repeat(150)}",
+             "sourceMessageIds":["s1"],"evidence":"潮汐镇终年多雾"}
+        """.trimIndent()
+        val rejected = UpsertLorebookEntryTool().execute(call("upsert_lorebook_entry", longArgs), context(character))
+        assertTrue(rejected.contentJson.contains("\"ok\":false"))
+
+        val noKeywords = """
+            {"name":"潮汐镇","content":"潮汐镇终年多雾。",
+             "sourceMessageIds":["s1"],"evidence":"潮汐镇终年多雾"}
+        """.trimIndent()
+        val created = UpsertLorebookEntryTool().execute(call("upsert_lorebook_entry", noKeywords), context(character))
+        assertTrue(created.contentJson.contains("\"ok\":true"))
+        assertEquals(listOf("潮汐镇"), created.updatedCharacter!!.lorebook.first().keywords)
+    }
+
+    @Test
     fun `send_sticker schema exposes the character tag enum through the registry`() {
         val character = Character(
             id = "c1",

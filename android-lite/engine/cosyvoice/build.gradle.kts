@@ -61,6 +61,7 @@ tasks.named("preBuild") {
 
 dependencies {
     implementation(project(":engine:ondevice"))
+    implementation(project(":engine:audio"))
     implementation(project(":core:common"))
     implementation(project(":core:model"))
     implementation(libs.kotlinx.coroutines.core)

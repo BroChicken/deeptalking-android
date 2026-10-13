@@ -36,6 +36,52 @@ data class AppConfig(
     val ttsStyle: String = "",
     /** CosyVoice3 speech speed multiplier (0.5–2.0). */
     val ttsSpeed: Float = 1.0f,
+    /** Read-aloud engine: `ondevice` (CosyVoice3 inside the APK) or `remote` (HTTP server). */
+    val ttsBackend: String = TTS_BACKEND_ONDEVICE,
+    /**
+     * Base URL of the remote read-aloud server, e.g. `http://10.84.116.224:8080`
+     * (the PC's address on the phone's USB-tethering subnet).
+     */
+    val ttsRemoteUrl: String = "",
+    /** `--served-model-name` of the remote server (sent as the request `model`). */
+    val ttsRemoteModel: String = "cosyvoice-3",
+    /**
+     * Voice name on the remote server. **Empty = follow the on-device selection**
+     * (`ttsVoiceFile`), so the same voice is used by both engines as long as the
+     * server exposes a voice under that name (see `docs/REMOTE_TTS.md` §8).
+     */
+    val ttsRemoteVoice: String = "",
+    /** Sample rate from the server's `GET /status`; 0 = not probed yet (24000 assumed). */
+    val ttsRemoteSampleRate: Int = 0,
+
+    /* ---- shared synthesis knobs (quality vs speed), used by BOTH engines ---- */
+
+    /**
+     * Speech tokens per token->wav chunk. On the server (non-streaming) it trades
+     * peak memory for throughput; on the phone it is the same internal chunking.
+     * Model default 28.
+     */
+    val ttsRemoteChunkTokens: Int = 28,
+    /** Sampling temperature (> 0); lower is steadier, higher more expressive. Default 1.0. */
+    val ttsRemoteTemperature: Double = 1.0,
+    /** Top-k sampling (>= 0). Model default 25. */
+    val ttsRemoteTopK: Int = 25,
+    /** Top-p sampling in [0, 1]. Model default 0.8. */
+    val ttsRemoteTopP: Double = 0.8,
+    /** Repetition-window size for the built-in sampler (> 0). Model default 10. */
+    val ttsWinSize: Int = 10,
+    /**
+     * Repetition-control coefficient (>= 0): a token is rejected while it repeats
+     * more than `win_size * tau_r` times in the window. Model default 0.1.
+     */
+    val ttsTauR: Double = 0.1,
+    /** Minimum generated-token/text-length ratio (>= 0). Model default 2.0. */
+    val ttsMinTokenTextRatio: Double = 2.0,
+    /**
+     * Maximum generated-token/text-length ratio (>= min): too small truncates the
+     * utterance, too large lets it drag. Model default 20.0.
+     */
+    val ttsMaxTokenTextRatio: Double = 20.0,
     /**
      * Resolve hostnames over DNS-over-HTTPS to bypass carrier DNS hijacking
      * (falls back to the system resolver). Provider id: `alidns` / `tencent`.
@@ -114,3 +160,9 @@ val BuiltinPlatforms: List<PlatformPreset> = listOf(
         emptyList(),
     ),
 )
+
+/** `AppConfig.ttsBackend`: read-aloud runs inside the APK (CosyVoice3). */
+const val TTS_BACKEND_ONDEVICE = "ondevice"
+
+/** `AppConfig.ttsBackend`: read-aloud is delegated to a remote OpenAI-Speech server. */
+const val TTS_BACKEND_REMOTE = "remote"

@@ -1,6 +1,9 @@
 package com.deeptalking.lite
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import java.io.ByteArrayOutputStream
 import com.deeptalking.core.data.CoreDataContainer
 import com.deeptalking.core.data.legacy.BackupService
 import com.deeptalking.core.data.legacy.FileStickerSink
@@ -15,6 +18,7 @@ import com.deeptalking.core.model.MessageAttachment
 import com.deeptalking.core.model.RequestMetric
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.StaticProfile
+import com.deeptalking.core.model.TTS_BACKEND_REMOTE
 import com.deeptalking.core.network.HttpWebContentProvider
 import com.deeptalking.core.network.DohDns
 import com.deeptalking.core.network.ResponsesLlmBackend
@@ -25,7 +29,15 @@ import com.deeptalking.engine.ondevice.InferenceRegistry
 import com.deeptalking.engine.ondevice.LlmRequest
 import com.deeptalking.engine.ondevice.LlmResult
 import com.deeptalking.engine.ondevice.TokenUsage
+import com.deeptalking.engine.ondevice.TtsSpeaker
 import com.deeptalking.engine.cosyvoice.CosyVoiceController
+import com.deeptalking.engine.cosyvoice.GenerationSettings
+import com.deeptalking.engine.remote.RemoteTtsClient
+import com.deeptalking.engine.remote.RemoteTtsConfig
+import com.deeptalking.engine.remote.RemoteTtsProbe
+import com.deeptalking.engine.remote.RemoteVoiceUpload
+import com.deeptalking.engine.remote.RemoteTtsSpeaker
+import com.deeptalking.engine.remote.TtsServerFinder
 import com.deeptalking.domain.agent.ChatOrchestrator
 import com.deeptalking.domain.agent.ToolRegistry
 import com.deeptalking.domain.agent.background.BackgroundTaskQueue
@@ -33,6 +45,7 @@ import com.deeptalking.domain.agent.background.BackgroundTasks
 import com.deeptalking.domain.agent.defaultTools
 import com.deeptalking.domain.memory.MemoryServiceImpl
 import com.deeptalking.domain.memory.MEMORY_REPAIR_VERSION
+import com.deeptalking.domain.memory.needsLorebookRewrite
 import com.deeptalking.domain.memory.RelativeTimeMigration
 import com.deeptalking.domain.memory.repairMemories
 import kotlinx.serialization.json.Json
@@ -101,11 +114,100 @@ class NativeCore(context: Context) {
     /** On-device CosyVoice3 read-aloud engine (model downloaded on demand). */
     val cosyVoice: CosyVoiceController = CosyVoiceController(appContext)
 
-    /** LLM is remote; the read-aloud TTS backend is on-device. embedding/asr stay null. */
+    /** HTTP client for the remote read-aloud server (also used by the settings probe). */
+    private val remoteTtsClient: RemoteTtsClient = RemoteTtsClient(userAgent = userAgent, dns = dohDns)
+
+    /** Remote read-aloud engine; inactive unless `AppConfig.ttsBackend` selects it. */
+    val remoteTts: RemoteTtsSpeaker = RemoteTtsSpeaker(remoteTtsClient)
+
+    /** Sweeps the phone's own subnets for the server when the address is unknown. */
+    private val ttsFinder: TtsServerFinder = TtsServerFinder(remoteTtsClient)
+
+    /** LLM is remote; read-aloud is on-device or remote per configuration. embedding/asr stay null. */
     val inference: InferenceRegistry = InferenceRegistry(
         llm = ResponsesLlmBackend(apiKeyProvider = { secrets.getApiKey() }, userAgent = userAgent, dns = dohDns),
         tts = cosyVoice.backend,
     )
+
+    /**
+     * Remote read-aloud settings for [config]; the bearer token comes from [SecretStore].
+     *
+     * The voice resolves to `ttsRemoteVoice` when set, otherwise to the **on-device
+     * selection** (`ttsVoiceFile`'s file name without extension). That keeps one
+     * voice list for both engines: whatever the user picked for local read-aloud is
+     * requested by name from the server, which is why the server registers its
+     * prompt-speech files under the app's own voice names.
+     */
+    fun remoteTtsConfig(config: AppConfig): RemoteTtsConfig = RemoteTtsConfig(
+        baseUrl = config.ttsRemoteUrl,
+        token = secrets.getTtsToken(),
+        model = config.ttsRemoteModel,
+        voice = config.ttsRemoteVoice.trim()
+            .ifBlank { localVoiceName(config).orEmpty() }
+            .ifBlank { RemoteTtsConfig.DEFAULT_VOICE },
+        speed = config.ttsSpeed,
+        sampleRate = config.ttsRemoteSampleRate,
+        chunkTokens = config.ttsRemoteChunkTokens,
+        temperature = config.ttsRemoteTemperature,
+        topK = config.ttsRemoteTopK,
+        topP = config.ttsRemoteTopP,
+        winSize = config.ttsWinSize,
+        tauR = config.ttsTauR,
+        minTokenTextRatio = config.ttsMinTokenTextRatio,
+        maxTokenTextRatio = config.ttsMaxTokenTextRatio,
+    )
+
+    /** The active on-device voice as a bare name (`builtin_1_v2`), or null when unset. */
+    private fun localVoiceName(config: AppConfig): String? =
+        config.ttsVoiceFile.trim()
+            .takeIf { it.isNotEmpty() }
+            ?.substringAfterLast('/')
+            ?.substringAfterLast('\\')
+            ?.removeSuffix(".gguf")
+            ?.takeIf { it.isNotEmpty() }
+
+    /**
+     * The active read-aloud engine for [config]. Both engines sit behind the same
+     * [TtsSpeaker] seam, so callers never branch on the backend; this is the single
+     * place `AppConfig.ttsBackend` is interpreted.
+     */
+    fun ttsSpeaker(config: AppConfig): TtsSpeaker {
+        cosyVoice.speed = config.ttsSpeed
+        cosyVoice.applyGeneration(generationSettings(config))
+        remoteTts.configure(remoteTtsConfig(config))
+        return if (config.ttsBackend == TTS_BACKEND_REMOTE) remoteTts else cosyVoice
+    }
+
+    /**
+     * The shared sampling/chunking knobs. The same values go to the PC in the request
+     * body (`remoteTtsConfig`) and to the on-device engine (`cosyVoice.applyGeneration`),
+     * so the settings screen tunes both engines at once (see `docs/REMOTE_TTS.md` §9).
+     */
+    fun generationSettings(config: AppConfig): GenerationSettings = GenerationSettings.fromStored(
+        temperature = config.ttsRemoteTemperature,
+        topK = config.ttsRemoteTopK,
+        topP = config.ttsRemoteTopP,
+        winSize = config.ttsWinSize,
+        tauR = config.ttsTauR,
+        minTokenTextRatio = config.ttsMinTokenTextRatio,
+        maxTokenTextRatio = config.ttsMaxTokenTextRatio,
+        chunkTokens = config.ttsRemoteChunkTokens,
+    )
+
+    /** Settings "test connection": never throws, reports mode/sample rate/voices. */
+    suspend fun testTtsConnection(config: AppConfig): RemoteTtsProbe =
+        withContext(Dispatchers.IO) { remoteTtsClient.probe(remoteTtsConfig(config)) }
+
+    /** Settings "find server": sweeps the phone's own subnets; null when nothing answers. */
+    suspend fun findTtsServer(config: AppConfig): String? =
+        withContext(Dispatchers.IO) { ttsFinder.find(config.ttsRemoteUrl, secrets.getTtsToken()) }
+
+    /**
+     * Uploads one on-device voice (its prompt-speech gguf) so the server registers it
+     * under the same name; the PC then speaks with the phone's own voices.
+     */
+    suspend fun uploadTtsVoice(config: RemoteTtsConfig, name: String, bytes: ByteArray): RemoteVoiceUpload =
+        withContext(Dispatchers.IO) { remoteTtsClient.uploadVoice(config, name, bytes) }
 
     val stickerSink: FileStickerSink = FileStickerSink(appContext)
     val backup: BackupService = BackupService(
@@ -286,43 +388,169 @@ class NativeCore(context: Context) {
         MemoryCleanupTarget(characters, total, pending, images, overLimit)
     }
 
+    /**
+     * Images outside the retention window whose file is still full-size, i.e. still to
+     * be shrunk to a thumbnail. Uses a bounds-only decode (header, not pixels).
+     */
     private fun staleImageCount(messages: List<ChatMessage>): Int {
         val cutoff = messages.size - AppLimits.Media.IMAGE_RETENTION_MESSAGES
         if (cutoff <= 0) return 0
         return messages.take(cutoff).sumOf { message ->
-            message.attachments.count { it.kind == MessageAttachment.Kind.Image }
+            message.attachments.count {
+                it.kind == MessageAttachment.Kind.Image && isFullSizeImage(it.uri)
+            }
         }
     }
 
+    private fun isFullSizeImage(ref: String): Boolean {
+        if (!ref.startsWith("images/")) return false
+        val file = File(appContext.filesDir, ref)
+        if (!file.exists()) return false
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(file.absolutePath, bounds)
+        return maxOf(bounds.outWidth, bounds.outHeight) > AppLimits.Media.THUMBNAIL_DIMENSION
+    }
+
     /**
-     * Drops image attachments (and their files) from messages older than the
-     * retention window. Message text is untouched, so history stays readable.
-     * Returns the number of attachments removed.
+     * Shrinks message images that fell outside the retention window **in place** instead
+     * of deleting them: the archive keeps its pictures, just at
+     * [AppLimits.Media.THUMBNAIL_DIMENSION] px, so looking back never shows a broken or
+     * empty image. The attachment reference is untouched, so no row is rewritten.
+     * Returns how many files were shrunk.
      */
     suspend fun pruneOldMessageImages(): Int = withContext(Dispatchers.IO) {
-        var removed = 0
+        var shrunk = 0
         val referenced = mutableSetOf<String>()
         data.characters.all().forEach { character ->
             val messages = data.chat.getMessages(character.id)
-            if (messages.isEmpty()) return@forEach
             val cutoff = (messages.size - AppLimits.Media.IMAGE_RETENTION_MESSAGES).coerceAtLeast(0)
-            val updated = messages.mapIndexed { index, message ->
-                val stale = message.attachments.filter { it.kind == MessageAttachment.Kind.Image }
-                if (index < cutoff && stale.isNotEmpty()) {
-                    removed += stale.size
-                    message.copy(attachments = message.attachments - stale.toSet())
-                } else {
-                    message
+            messages.forEachIndexed { index, message ->
+                message.attachments.forEach { attachment ->
+                    referenced += attachment.uri
+                    if (index < cutoff &&
+                        attachment.kind == MessageAttachment.Kind.Image &&
+                        shrinkToThumbnail(attachment.uri)
+                    ) {
+                        shrunk++
+                    }
                 }
             }
-            if (updated != messages) data.chat.replace(character.id, updated)
-            updated.forEach { message -> message.attachments.forEach { referenced += it.uri } }
         }
-        val directory = File(appContext.filesDir, "images")
-        directory.listFiles()?.forEach { file ->
+        File(appContext.filesDir, "images").listFiles()?.forEach { file ->
             if ("images/${file.name}" !in referenced) runCatching { file.delete() }
         }
-        removed
+        shrunk
+    }
+
+    /** Overwrites an `images/<sha>.jpg` file with a thumbnail; false when already small. */
+    private fun shrinkToThumbnail(ref: String): Boolean {
+        if (!ref.startsWith("images/")) return false
+        val file = File(appContext.filesDir, ref)
+        if (!file.exists()) return false
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(file.absolutePath, bounds)
+        val longest = maxOf(bounds.outWidth, bounds.outHeight)
+        if (longest <= AppLimits.Media.THUMBNAIL_DIMENSION) return false
+        return runCatching {
+            val bitmap = BitmapFactory.decodeFile(file.absolutePath) ?: return@runCatching false
+            val ratio = AppLimits.Media.THUMBNAIL_DIMENSION.toFloat() / longest
+            val scaled = Bitmap.createScaledBitmap(
+                bitmap,
+                (bitmap.width * ratio).toInt().coerceAtLeast(1),
+                (bitmap.height * ratio).toInt().coerceAtLeast(1),
+                true,
+            )
+            val out = ByteArrayOutputStream()
+            scaled.compress(Bitmap.CompressFormat.JPEG, AppLimits.Media.THUMBNAIL_QUALITY, out)
+            if (scaled !== bitmap) scaled.recycle()
+            bitmap.recycle()
+            file.writeBytes(out.toByteArray())
+            true
+        }.getOrDefault(false)
+    }
+
+    /** Characters whose window is an oversized backlog, and how many messages that is. */
+    data class OversizedWindowTarget(val characters: Int, val messages: Int)
+
+    suspend fun oversizedWindowTarget(): OversizedWindowTarget = withContext(Dispatchers.IO) {
+        val sizes = data.characters.all()
+            .map { character -> character.instant.count { message -> !message.isLoading } }
+            .filter { it > AppLimits.Memory.INSTANT_MIGRATION_THRESHOLD }
+        OversizedWindowTarget(sizes.size, sizes.sum())
+    }
+
+    /** AI lorebook entries over the per-entry cap that still need the one-time rewrite. */
+    suspend fun oversizedLorebookCount(): Int = withContext(Dispatchers.IO) {
+        data.characters.all().sumOf { character ->
+            character.lorebook.count { needsLorebookRewrite(it) } +
+                character.members.sumOf { member -> member.lorebook.count { needsLorebookRewrite(it) } }
+        }
+    }
+
+    /** Result of one catch-up run: batches folded, and a reason when it stopped early. */
+    data class MigrationResult(val batches: Int, val error: String = "")
+
+    /**
+     * One-time catch-up of every oversized window: batches, oldest first, run to
+     * completion (the UI blocks on it, as requested). Stops early only when a batch
+     * fails — everything already folded is persisted first, so a retry resumes instead
+     * of repeating the work.
+     */
+    suspend fun migrateOversizedWindows(
+        config: AppConfig,
+        onProgress: (done: Int, remaining: Int) -> Unit = { _, _ -> },
+    ): MigrationResult = withContext(Dispatchers.IO) {
+        if (apiKeyFor(config.apiPlatform).isNullOrBlank()) {
+            return@withContext MigrationResult(0, "没有可用的 API Key，无法整理旧记忆")
+        }
+        val tasks = backgroundTasks(config)
+        var batches = 0
+        for (character in data.characters.all()) {
+            if (!tasks.hasOversizedWindow(character)) continue
+            val (status, updated) = tasks.migrateOversizedWindow(character) { done, remaining ->
+                batches = maxOf(batches, done)
+                onProgress(done, remaining)
+            }
+            if (updated != character) persistMemory(character, updated)
+            if (status == BackgroundTasks.TaskStatus.Failure) {
+                return@withContext MigrationResult(batches, "整理中途失败（网络或接口异常），已整理的部分已保存")
+            }
+        }
+        MigrationResult(batches)
+    }
+
+    /**
+     * One-time rewrite of the oversized lorebook entries an older version produced: each
+     * is handed to the model in full and rewritten into 1..3 concise entries (one concept
+     * each) **in place**, replacing the original. Runs to completion (the caller shows
+     * progress); a failure keeps everything already rewritten, so a retry resumes.
+     */
+    suspend fun rebuildOversizedLorebooks(
+        config: AppConfig,
+        onProgress: (done: Int, remaining: Int) -> Unit = { _, _ -> },
+    ): MigrationResult = withContext(Dispatchers.IO) {
+        if (apiKeyFor(config.apiPlatform).isNullOrBlank()) {
+            return@withContext MigrationResult(0, "没有可用的 API Key，无法整理世界书")
+        }
+        val tasks = backgroundTasks(config)
+        var processed = 0
+        for (character in data.characters.all()) {
+            if (tasks.oversizedLorebookCount(character) <= 0) continue
+            var doneHere = 0
+            val (status, updated) = tasks.rebuildOversizedLorebook(character) { done, remaining ->
+                doneHere = done
+                onProgress(processed + done, remaining)
+            }
+            if (updated != character) persistMemory(character, updated)
+            if (status == BackgroundTasks.TaskStatus.Failure) {
+                return@withContext MigrationResult(
+                    processed + doneHere,
+                    "整理世界书中途失败（网络或接口异常），已整理的部分已保存",
+                )
+            }
+            processed += doneHere
+        }
+        MigrationResult(processed)
     }
 
     /**
@@ -361,18 +589,24 @@ class NativeCore(context: Context) {
         MemoryDrainResult(passes, lastError)
     }
 
-    /** Persists the memory fields a background pass owns, without clobbering a concurrent write. */
+    /**
+     * Persists only the fields a background pass actually changed, re-reading the row
+     * first. A pass can take seconds (folds, model rewrites); writing its whole starting
+     * snapshot back would silently roll back whatever a concurrent writer added in the
+     * meantime. `instant` is included because folds consume window messages.
+     */
     private suspend fun persistMemory(original: Character, updated: Character) {
         val fresh = data.characters.get(original.id) ?: original
         data.characters.upsert(
             fresh.copy(
-                shortTerm = updated.shortTerm,
-                longTerm = updated.longTerm,
-                members = updated.members,
-                scenes = updated.scenes,
-                sceneState = updated.sceneState,
-                lorebook = updated.lorebook,
-                counters = updated.counters,
+                instant = if (updated.instant != original.instant) updated.instant else fresh.instant,
+                shortTerm = if (updated.shortTerm != original.shortTerm) updated.shortTerm else fresh.shortTerm,
+                longTerm = if (updated.longTerm != original.longTerm) updated.longTerm else fresh.longTerm,
+                members = if (updated.members != original.members) updated.members else fresh.members,
+                scenes = if (updated.scenes != original.scenes) updated.scenes else fresh.scenes,
+                sceneState = if (updated.sceneState != original.sceneState) updated.sceneState else fresh.sceneState,
+                lorebook = if (updated.lorebook != original.lorebook) updated.lorebook else fresh.lorebook,
+                counters = if (updated.counters != original.counters) updated.counters else fresh.counters,
             ),
         )
     }

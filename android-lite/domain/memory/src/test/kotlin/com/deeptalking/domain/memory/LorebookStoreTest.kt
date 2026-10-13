@@ -1,5 +1,6 @@
 package com.deeptalking.domain.memory
 
+import com.deeptalking.core.common.AppLimits
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.LorebookEntry
@@ -24,9 +25,19 @@ class LorebookStoreTest {
     }
 
     @Test
-    fun rejectsNewEntryWithoutKeywordOrAlwaysActive() {
+    fun keywordlessEntryFallsBackToItsNameAsTrigger() {
         val result = upsertLorebookEntry(emptyList(), LorebookProposal("无关键词", "内容"))
+        assertTrue(result.ok)
+        assertEquals(listOf("无关键词"), result.entry?.keywords)
+        assertFalse(result.entry?.alwaysActive ?: true)
+    }
+
+    @Test
+    fun overLimitContentIsRejectedInsteadOfTruncated() {
+        val tooLong = "很长的设定".repeat(200)
+        val result = upsertLorebookEntry(emptyList(), LorebookProposal("超长条目", tooLong, listOf("超长")))
         assertFalse(result.ok)
+        assertTrue(result.list.isEmpty())
     }
 
     @Test
@@ -50,14 +61,99 @@ class LorebookStoreTest {
     }
 
     @Test
-    fun nearNameMergesIntoExistingModelEntry() {
-        val first = upsertLorebookEntry(emptyList(), LorebookProposal("银月商会", "西街的商会。", listOf("银月")))
-        val merged = upsertLorebookEntry(first.list, LorebookProposal("银月商行", "经营药材。", listOf("银月")))
-        assertTrue(merged.ok)
-        assertFalse(merged.created)
-        assertEquals(1, merged.list.size)
-        assertTrue(merged.list[0].content.contains("西街"))
-        assertTrue(merged.list[0].content.contains("药材"))
+    fun nearNameReplacesExistingModelEntryInsteadOfAppending() {
+        val first = upsertLorebookEntry(emptyList(), LorebookProposal("银月商会", "西街的商会，经营茶叶。", listOf("银月")))
+        val replaced = upsertLorebookEntry(first.list, LorebookProposal("银月商行", "经营药材。", listOf("银月")))
+        assertTrue(replaced.ok)
+        assertFalse(replaced.created)
+        assertEquals(1, replaced.list.size)
+        assertEquals("经营药材。", replaced.list[0].content)
+        assertFalse(replaced.list[0].content.contains("西街"))
+    }
+
+    @Test
+    fun sameNameUpdateRewritesContentShorterAndCanClearAlwaysActive() {
+        val first = upsertLorebookEntry(
+            emptyList(),
+            LorebookProposal("赤月王国", "西侧王国，城墙高耸，常年积雪，商队往来不绝。", listOf("赤月"), alwaysActive = true),
+        )
+        assertTrue(first.list[0].alwaysActive)
+        val longContent = first.list[0].content
+
+        val second = upsertLorebookEntry(first.list, LorebookProposal("赤月王国", "西侧王国。", listOf("赤月"), alwaysActive = false))
+
+        assertTrue(second.ok)
+        assertEquals(1, second.list.size)
+        assertEquals("西侧王国。", second.list[0].content)
+        assertTrue(second.list[0].content.length < longContent.length)
+        assertFalse(second.list[0].alwaysActive)
+    }
+
+    @Test
+    fun replaceLorebookEntryTakesIncomingBodyButKeepsIdentityAndBookkeeping() {
+        val existing = LorebookEntry(
+            id = "e1",
+            name = "王都",
+            content = "很长的旧内容。",
+            keywords = listOf("王都", "旧词"),
+            alwaysActive = true,
+            origin = LorebookOrigin.Model,
+            memberName = "甲",
+            createdAt = "2026-01-01T00:00:00Z",
+            updatedAt = "2026-01-01T00:00:00Z",
+            mentions = 3,
+            order = 7,
+        )
+        val incoming = LorebookEntry(
+            content = "新内容。",
+            keywords = listOf("新词", "新词"),
+            alwaysActive = false,
+            updatedAt = "2026-02-01T00:00:00Z",
+        )
+
+        val replaced = replaceLorebookEntry(existing, incoming)
+
+        assertEquals("新内容。", replaced.content)
+        assertEquals(listOf("新词"), replaced.keywords)
+        assertFalse(replaced.alwaysActive)
+        assertTrue(replaced.enabled)
+        assertEquals(0, replaced.misses)
+        // Identity/bookkeeping stays with the existing entry.
+        assertEquals("e1", replaced.id)
+        assertEquals("王都", replaced.name)
+        assertEquals("2026-01-01T00:00:00Z", replaced.createdAt)
+        assertEquals(3, replaced.mentions)
+        assertEquals(7, replaced.order)
+        assertEquals("甲", replaced.memberName)
+        assertEquals("2026-02-01T00:00:00Z", replaced.updatedAt)
+    }
+
+    @Test
+    fun replaceLorebookEntryKeepsOldKeywordsOnlyWhenIncomingHasNone() {
+        val existing = LorebookEntry(id = "e", name = "城", content = "x", keywords = listOf("旧一", "旧二"))
+
+        val replaced = replaceLorebookEntry(existing, LorebookEntry(name = "城", content = "y"))
+
+        assertEquals(listOf("旧一", "旧二"), replaced.keywords)
+    }
+
+    @Test
+    fun userEntryWithNearNameIsProtectedOnSimilarPath() {
+        val user = LorebookEntry(
+            id = "u",
+            name = "银月商会",
+            content = "用户手写。",
+            keywords = listOf("银月"),
+            origin = LorebookOrigin.User,
+        )
+
+        val result = upsertLorebookEntry(listOf(user), LorebookProposal("银月商行", "AI 版本。", listOf("银月")))
+
+        assertTrue(result.ok)
+        assertTrue(result.mergedIntoUser)
+        assertEquals(1, result.list.size)
+        assertSame(user, result.list[0])
+        assertEquals("用户手写。", result.list[0].content)
     }
 
     @Test
@@ -151,16 +247,50 @@ class LorebookStoreTest {
     }
 
     @Test
-    fun dedupeMergesModelNearDuplicatesAndKeepsUserEntry() {
+    fun dedupeKeepsLatestModelEntryAndKeepsUserEntryUntouched() {
         val list = listOf(
-            LorebookEntry(id = "a", name = "王都", content = "北方的都城。", origin = LorebookOrigin.Model, keywords = listOf("王都")),
-            LorebookEntry(id = "b", name = "王都", content = "都城有钟楼。", origin = LorebookOrigin.Model, keywords = listOf("王都")),
+            LorebookEntry(id = "a", name = "王都", content = "北方的都城。", origin = LorebookOrigin.Model, keywords = listOf("王都", "旧词")),
+            LorebookEntry(id = "b", name = "王都", content = "都城有钟楼。", origin = LorebookOrigin.Model, keywords = listOf("王都", "新词")),
             LorebookEntry(id = "c", name = "王都", content = "用户版本。", origin = LorebookOrigin.User),
         )
         val deduped = dedupeLorebook(list)
         assertEquals(2, deduped.size)
         assertEquals(1, deduped.count { it.origin == LorebookOrigin.User })
-        val merged = deduped.first { it.origin == LorebookOrigin.Model }
-        assertTrue(merged.content.contains("钟楼"))
+        val only = deduped.first { it.origin == LorebookOrigin.Model }
+        // The later entry wins whole; the earlier content is gone (no appending).
+        assertEquals("b", only.id)
+        assertEquals("都城有钟楼。", only.content)
+        assertFalse(only.content.contains("北方"))
+        // Keywords are unioned so nothing becomes unhittable, then capped.
+        assertTrue(only.keywords.contains("新词"))
+        assertTrue(only.keywords.contains("旧词"))
+        assertTrue(only.keywords.size <= AppLimits.Lorebook.KEYWORDS_PER_ENTRY)
+    }
+
+    @Test
+    fun needsLorebookRewriteOnlyForOverCapModelEntries() {
+        val overCap = LorebookEntry(
+            id = "ai",
+            name = "长",
+            content = "x".repeat(AppLimits.Lorebook.CONTENT_CHARS + 1),
+            origin = LorebookOrigin.Model,
+        )
+        assertTrue(needsLorebookRewrite(overCap))
+
+        val atCap = LorebookEntry(
+            id = "ok",
+            name = "刚好",
+            content = "x".repeat(AppLimits.Lorebook.CONTENT_CHARS),
+            origin = LorebookOrigin.Model,
+        )
+        assertFalse(needsLorebookRewrite(atCap))
+
+        val userOverCap = LorebookEntry(
+            id = "u",
+            name = "用户",
+            content = "x".repeat(AppLimits.Lorebook.CONTENT_CHARS + 1),
+            origin = LorebookOrigin.User,
+        )
+        assertFalse(needsLorebookRewrite(userOverCap))
     }
 }
