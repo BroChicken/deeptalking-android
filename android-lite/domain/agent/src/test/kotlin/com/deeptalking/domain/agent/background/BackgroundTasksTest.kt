@@ -77,16 +77,18 @@ class BackgroundTasksTest {
     }
 
     @Test
-    fun overLongLorebookEntryIsSkippedInsteadOfFailingTheBatch() = runBlocking {
-        // 400+ characters: the cap is a writing rule, so the entry is dropped (never cut)
-        // and the rest of the batch still lands — rejecting everything here is what used to
-        // stop the world book from being updated at all.
+    fun overLongLorebookEntryIsSentBackForAShorterRewrite() = runBlocking {
+        // 400+ characters: the cap is a writing rule, so the entry is **sent back once** to be
+        // rewritten shorter (never truncated, never silently dropped) and the rest of the
+        // batch lands in the meantime. The shortened version is what gets written.
         val failures = mutableListOf<Pair<String, String>>()
+        val long = "多雾的旧设定".repeat(70)
         val llm = ScriptedLlm(
             mutableListOf(
                 """{"entries":[""" +
-                    """{"name":"银月商会","keywords":["银月"],"content":"${"多雾的旧设定".repeat(70)}","sourceShortTermIds":["s1"]},""" +
+                    """{"name":"银月商会","keywords":["银月"],"content":"$long","sourceShortTermIds":["s1"]},""" +
                     """{"name":"西街","keywords":["西街"],"content":"西街有一家药材铺","sourceShortTermIds":["s1"]}]}""",
+                """{"entries":[{"name":"银月商会","keywords":["银月"],"content":"银月商会在西街，经营药材。","sourceShortTermIds":["s1"]}]}""",
             ),
         )
         val background = BackgroundTasks(llm, MemoryServiceImpl(), onAuxiliaryFailure = { task, reason -> failures += task to reason })
@@ -96,10 +98,34 @@ class BackgroundTasksTest {
         )
         val (status, updated) = background.consolidateLorebook(character, character.shortTerm)
         assertEquals(BackgroundTasks.TaskStatus.Success, status)
-        assertEquals(listOf("西街"), updated.lorebook.map { it.name })
+        assertEquals(listOf("西街", "银月商会"), updated.lorebook.map { it.name }.sorted())
+        assertEquals(2, llm.requests.size)
+        assertTrue(llm.requests[1].input.last().content.contains("被退回的条目"))
+        assertTrue(failures.isEmpty())
+    }
+
+    @Test
+    fun overLongLorebookEntryThatStaysOverLongIsReportedAndDropped() = runBlocking {
+        val failures = mutableListOf<Pair<String, String>>()
+        val long = "多雾的旧设定".repeat(70)
+        val llm = ScriptedLlm(
+            mutableListOf(
+                """{"entries":[{"name":"银月商会","keywords":["银月"],"content":"$long","sourceShortTermIds":["s1"]}]}""",
+                """{"entries":[{"name":"银月商会","keywords":["银月"],"content":"$long","sourceShortTermIds":["s1"]}]}""",
+            ),
+        )
+        val background = BackgroundTasks(llm, MemoryServiceImpl(), onAuxiliaryFailure = { task, reason -> failures += task to reason })
+        val character = Character(
+            id = "c1",
+            shortTerm = listOf(ShortTermMemory(id = "s1", content = "银月商会在西街", sourceMessageIds = listOf("m1"))),
+        )
+        val (status, updated) = background.consolidateLorebook(character, character.shortTerm)
+        assertEquals(BackgroundTasks.TaskStatus.Success, status)
+        assertTrue(updated.lorebook.isEmpty())
+        assertEquals(2, llm.requests.size)
         assertEquals(1, failures.size)
         assertEquals("lorebook", failures[0].first)
-        assertTrue(failures[0].second.contains("skipped"))
+        assertTrue(failures[0].second.contains("dropped"))
     }
 
     @Test

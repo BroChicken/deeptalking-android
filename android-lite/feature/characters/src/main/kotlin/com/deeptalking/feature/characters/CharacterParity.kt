@@ -40,9 +40,13 @@ object CharacterParity {
             "要体现口头禅、句尾助词、标点习惯与对用户的称呼，三条之间差异明显（能看出是同一个人、但场景不同）；" +
             "**禁止换行，三条之间只能用 \" / \" 分隔**，整个字段不超过 200 字。"
 
-    /** 世界书条目内容规则：单条内容上限 [AppLimits.Lorebook.CONTENT_CHARS]，超限条目会被丢弃。 */
+    /**
+     * 世界书条目内容规则：**目标 300 字**、硬上限 [AppLimits.Lorebook.CONTENT_CHARS]，
+     * 超限条目会被整条丢弃（绝不截断）。
+     */
     private val LOREBOOK_CONTENT_RULE =
-        "lorebook 每条 content 精炼、一条只讲一件事，**不超过 ${AppLimits.Lorebook.CONTENT_CHARS} 字**；超长会被丢弃。"
+        "lorebook 每条 content 精炼、一条只讲一件事，**目标 300 字以内**（硬上限 " +
+            "${AppLimits.Lorebook.CONTENT_CHARS} 字，超过会被丢掉）。"
 
     private val DYNAMIC_FIELD_KEYS = setOf(
         "currentSituation", "currentLocation", "currentMood", "currentOccupation",

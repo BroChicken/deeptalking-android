@@ -581,10 +581,20 @@ class BackgroundTasks(
     suspend fun drainMemoryBacklog(character: Character): DrainOutcome {
         val outcome = analyzeShortToLongTermStatus(character)
         if (outcome.status == TaskStatus.Stale) return DrainOutcome(character, progressed = false)
+        // A successful pass also clears the analysis failure bookkeeping. Only the per-turn
+        // path used to do that, so after a cleanup-only recovery a save kept carrying an
+        // `analysisFailures` count and a `analysisRetryAt` from a failure long resolved.
+        val base = if (outcome.status == TaskStatus.Success) {
+            outcome.character.withCounters(
+                resetMemoryRetry(countersOf(outcome.character), MemoryTaskKind.Analysis),
+            )
+        } else {
+            outcome.character
+        }
         // The world book / scene steps run even after a failed analysis: each has its own
         // retry gate, and the old "analysis failed → skip everything" short-circuit is how
         // a stuck analysis silently stopped the world book from ever being updated.
-        val maintained = runMemoryMaintenance(outcome.character, outcome.consumed)
+        val maintained = runMemoryMaintenance(base, outcome.consumed)
         return DrainOutcome(
             character = maintained,
             progressed = outcome.status == TaskStatus.Success && outcome.consumed.isNotEmpty(),
@@ -896,12 +906,13 @@ class BackgroundTasks(
         val entries = root["entries"] as? JsonArray ?: return TaskStatus.Failure to character
 
         val allowed = fresh.map { it.id }.toSet()
-        // Per-entry validation: one entry the model wrote too long (or cited nothing /
-        // invented a source) is skipped, and the rest of the batch still lands. Rejecting
-        // the whole batch is what made the world book silently stop updating — the cap is
-        // a writing rule, never a knife, so nothing here is ever cut.
+        // Per-entry validation: the model is asked for <=300 characters per entry, 400 is the
+        // hard line. An entry over the line is **sent back once** for a shorter rewrite — it is
+        // never truncated and never silently dropped. An entry citing nothing / inventing a
+        // source cannot be anchored and is reported instead (`invalid`).
         val items = mutableListOf<JsonObject>()
-        var skipped = 0
+        val overLong = mutableListOf<JsonObject>()
+        var invalid = 0
         for (entry in entries.take(AppLimits.Lorebook.AUTO_ENTRIES_PER_PASS)) {
             val obj = entry as? JsonObject
             val name = obj?.string("name").orEmpty()
@@ -910,15 +921,54 @@ class BackgroundTasks(
                 stringList(candidate["sourceShortTermIds"]).map { it.trim() }.filter { it.isNotEmpty() }
             }.orEmpty()
             if (obj == null || name.isBlank() || content.isBlank() || ids.isEmpty() ||
-                ids.any { it !in allowed } || content.trim().length > AppLimits.Lorebook.CONTENT_CHARS
+                ids.any { it !in allowed }
             ) {
-                skipped++
+                invalid++
+                continue
+            }
+            if (content.trim().length > AppLimits.Lorebook.CONTENT_CHARS) {
+                overLong += obj
                 continue
             }
             items += obj
         }
-        if (skipped > 0) {
-            onAuxiliaryFailure("lorebook", "skipped $skipped invalid/over-long entries")
+
+        // One re-ask round for the over-long entries (legacy "打回重写"): the model gets the
+        // same names/keywords/sources plus its own text back, and is told to compress it. A
+        // rewrite that still exceeds the cap is given up on — and reported, never cut.
+        var dropped = 0
+        if (overLong.isNotEmpty()) {
+            val overLongNames = overLong.map { it.string("name") }.toSet()
+            val fixPrompt = LOREBOOK_FIX_PROMPT + overLong.joinToString("\n") { obj ->
+                "- name: " + obj.string("name") +
+                    "｜keywords: " + stringList(obj["keywords"]).joinToString("、") +
+                    "｜sourceShortTermIds: " + stringList(obj["sourceShortTermIds"]).joinToString("、") +
+                    "｜content: " + obj.string("content")
+            }
+            onStatus("正在压缩世界书条目…")
+            val fixReply = completeDetailed(LOREBOOK_SYSTEM, fixPrompt, sessionId = sessionIdFor(character), taskType = "lorebook")
+            if (!isGuardCurrent(guard)) return TaskStatus.Stale to character
+            val fixEntries = (ResponseParser.parseJsonLenient(fixReply.text) as? JsonObject)?.get("entries") as? JsonArray
+            val fixed = mutableSetOf<String>()
+            for (element in fixEntries ?: JsonArray(emptyList())) {
+                val obj = element as? JsonObject ?: continue
+                val name = obj.string("name")
+                val content = obj.string("content")
+                val ids = stringList(obj["sourceShortTermIds"]).map { it.trim() }.filter { it.isNotEmpty() }
+                if (name !in overLongNames || name in fixed) continue
+                if (content.isBlank() || ids.isEmpty() || ids.any { it !in allowed }) continue
+                if (content.trim().length > AppLimits.Lorebook.CONTENT_CHARS) continue
+                items += obj
+                fixed += name
+            }
+            dropped = overLong.size - fixed.size
+        }
+
+        if (dropped > 0 || invalid > 0) {
+            onAuxiliaryFailure(
+                "lorebook",
+                "dropped $dropped still-over-${AppLimits.Lorebook.CONTENT_CHARS}-char (rewrite failed) / $invalid invalid entries",
+            )
         }
 
         // Eviction only runs after the batch parsed cleanly (legacy order).
@@ -1871,10 +1921,20 @@ class BackgroundTasks(
         const val LOREBOOK_PROMPT_HEAD =
             "下面是一段角色扮演对话里已经发生的事件摘要，以及现有的世界书条目清单。\n" +
                 "请找出其中**已经出现、值得日后复用**的世界层设定（时代/世界观、地点、组织、专有名词、历史、规则、背景事实），整理成世界书条目。\n" +
-                "要求：①只写已经出现或已被明确说出的内容，禁止推测、扩写或发明新设定；②**同一件事物只能有一条**：对照现有条目的名称、关键词与内容，凡与已有条目讲的是同一件事（名称相近、关键词相同、内容重叠），必须复用它的名字、用你这次总结的内容**整条替换**它，绝不新建近似条目；同理，本批不同摘要里指向同一件事的也只输出一条；③只沉淀会反复复用的世界层设定，一次性的小事、可从上下文直接看出的细节不要单独立条；④每条 content 只写该条目本身的信息，不写理由、解释或出处，**一条只讲一件事**；**每条 content 硬性不超过 400 字**，超了整批会被丢弃重来，宁可少写也要在 400 字内写完；⑤更新一条已有条目时，把它下面给出的**完整原有内容**与你掌握的新事实**重新总结成一条**：仍然有效的信息必须原样保留，重复的、过时的、与本条主题无关的内容删掉，允许比原来短——**只写增量会丢掉原有信息**；⑥清单里标注「内容（略）」的条目本轮不要更新（你看不到它的完整内容）；⑦keywords 写剧情里可能出现的称呼，不超过 8 个；若这条是世界前提/规则这类需要每轮生效的设定，把 alwaysActive 设为 true，否则一律 false；⑧最多 3 条；没有值得沉淀的就返回空数组。\n" +
+                "要求：①只写已经出现或已被明确说出的内容，禁止推测、扩写或发明新设定；②**同一件事物只能有一条**：对照现有条目的名称、关键词与内容，凡与已有条目讲的是同一件事（名称相近、关键词相同、内容重叠），必须复用它的名字、用你这次总结的内容**整条替换**它，绝不新建近似条目；同理，本批不同摘要里指向同一件事的也只输出一条；③只沉淀会反复复用的世界层设定，一次性的小事、可从上下文直接看出的细节不要单独立条；④每条 content 只写该条目本身的信息，不写理由、解释或出处，**一条只讲一件事**；**长度目标 300 字以内**、**硬上限 400 字**（超过 400 字的条目会被退回重写，宁短勿长）；⑤更新一条已有条目时，把它下面给出的**完整原有内容**与你掌握的新事实**重新总结成一条**：仍然有效的信息必须原样保留，重复的、过时的、与本条主题无关的内容删掉，允许比原来短——**只写增量会丢掉原有信息**；⑥清单里标注「内容（略）」的条目本轮不要更新（你看不到它的完整内容）；⑦keywords 写剧情里可能出现的称呼，不超过 8 个；若这条是世界前提/规则这类需要每轮生效的设定，把 alwaysActive 设为 true，否则一律 false；⑧最多 3 条；没有值得沉淀的就返回空数组。\n" +
                 "只返回 JSON：{\"entries\":[{\"name\":\"条目名\",\"keywords\":[\"触发词\"],\"content\":\"设定内容\",\"alwaysActive\":false,\"sourceShortTermIds\":[\"上面的摘要ID\"]}]}。sourceShortTermIds 必须是上面出现过的摘要ID，至少要有一个；没有可引用ID的条目不要返回。\n\n" +
                 "现有条目清单：\n"
         const val LOREBOOK_PROMPT_TAIL = "\n\n事件摘要"
+
+        /**
+         * Re-ask round for entries that came back over the hard cap: the entry is sent back
+         * with its own text and told to be shorter, instead of being dropped (or cut).
+         */
+        const val LOREBOOK_FIX_PROMPT =
+            "下面这些世界书条目**超过了 400 字的硬上限**被退回，请把每一条**重新写一遍**：\n" +
+                "要求：①压缩到 **300 字以内**，仍然有效的关键信息（专有名词、人名、地点、日期、已确定的事实）必须保留，只删重复、修饰和可从上下文推出的细节；②**一条只讲一件事**，名称保持不变；③sourceShortTermIds 原样照抄，不要新增或改动；④不得编造原文没有的内容。\n" +
+                "只返回 JSON：{\"entries\":[{\"name\":\"条目名\",\"keywords\":[\"触发词\"],\"content\":\"压缩后的设定内容\",\"alwaysActive\":false,\"sourceShortTermIds\":[\"摘要ID\"]}]}\n\n" +
+                "被退回的条目：\n"
 
         /** Existing entries whose full content is shown to the consolidation prompt. */
         const val LOREBOOK_EXISTING_FULL_ENTRIES = 12
@@ -1887,7 +1947,7 @@ class BackgroundTasks(
         const val LOREBOOK_REBUILD_SYSTEM = "你是世界书整理助手。只返回 JSON，不要任何额外文字。"
         const val LOREBOOK_REBUILD_PROMPT =
             "下面是一条已经积累得过长、把好几件不同的事混在一起的世界书条目。请把它**重新整理**成 1~3 条各自只讲一件事的条目。\n" +
-                "要求：①只使用原文里已有的信息，**禁止新增、推测或扩写任何设定**；②按主题拆分：读起来是不同话题的内容必须拆成不同条目，同一话题的合并成一条；③删掉重复的说法、已经过时或彼此矛盾的旧信息和与条目主题无关的内容；④每条的 content 都要写成完整、精炼的句子，**硬性不超过 400 字**（超了这次重写会被丢弃、原条目原样保留），只写该条目本身的信息，不写理由或出处；⑤沿用原文的专有名词写法，条目名简洁（不超过 20 字）；⑥keywords 写剧情里可能出现的称呼，不超过 8 个，不要写泛词；⑦只有确实是世界前提/规则这类需要每轮生效的才把 alwaysActive 设为 true，其余一律 false；⑧原文里**仍然有效的信息要尽量保留**，不要因为压缩而丢事实。\n" +
+                "要求：①只使用原文里已有的信息，**禁止新增、推测或扩写任何设定**；②按主题拆分：读起来是不同话题的内容必须拆成不同条目，同一话题的合并成一条；③删掉重复的说法、已经过时或彼此矛盾的旧信息和与条目主题无关的内容；④每条的 content 都要写成完整、精炼的句子，**目标 300 字以内、硬性不超过 400 字**（超了这次重写会被丢弃、原条目原样保留），只写该条目本身的信息，不写理由或出处；⑤沿用原文的专有名词写法，条目名简洁（不超过 20 字）；⑥keywords 写剧情里可能出现的称呼，不超过 8 个，不要写泛词；⑦只有确实是世界前提/规则这类需要每轮生效的才把 alwaysActive 设为 true，其余一律 false；⑧原文里**仍然有效的信息要尽量保留**，不要因为压缩而丢事实。\n" +
                 "只返回 JSON：{\"entries\":[{\"name\":\"条目名\",\"keywords\":[\"触发词\"],\"content\":\"设定内容\",\"alwaysActive\":false}]}"
 
         const val FILL_SYSTEM = "你是角色卡补全助手。只返回JSON。"
