@@ -27,8 +27,8 @@ android {
         applicationId = "com.deeptalking.lite"
         minSdk = 26
         targetSdk = 35
-        versionCode = 64
-        versionName = "1.6.0"
+        versionCode = 68
+        versionName = "1.6.4"
     }
 
     compileOptions {
@@ -83,6 +83,7 @@ dependencies {
     implementation(project(":core:designsystem"))
     implementation(project(":engine:ondevice"))
     implementation(project(":engine:cosyvoice"))
+    implementation(project(":engine:remote-tts"))
     implementation(project(":domain:agent"))
     implementation(project(":domain:memory"))
     implementation(project(":feature:chat"))
