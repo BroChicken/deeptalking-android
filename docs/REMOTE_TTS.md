@@ -351,6 +351,8 @@ App 侧的内置音色带一个**来源标记**（`VoiceInfo.source` = 资源内
 | `n_workers` / `n_threads` / 后端 | 1 / 性能核数 / CPU | 2 / 硬件并发÷2 / CUDA0 | 硬件与并发，非算法差异 |
 | **`diffusion_steps`（flow 步数）** | **5** | **10** | **唯一有意保留的差异**（编译期常量：手机 `.so` 改 `src/cosyvoice-modules.h` 后重编，PC 同上） |
 
+**注意（实测）**：DiT KV 缓存**只在流式下参与计算**——非流式（当前两端都是）`dit_sched_config` 把每步 `cache_kv` 置 false，缓存只分配、不读写，所以上表的 `dit_kv_cache_length` / DiT 槽数/类型对**速度和音质没有影响**；在 CPU 后端它甚至不落页（实测 App 加载后 `Heap Alloc` 2.31 GiB、`Private Dirty` 仅 765 MB），只有 CUDA 后端会实占 VRAM（2 槽 × 8192 ≈ 1.12 GB）。保留这些值是为了万一改走流式时两端仍然一致。
+
 ### 9.2 高级选项（App 设置页，两端同时生效）
 
 同一个值既通过 `cosyvoice_set_generation_config`/`set_chunk_tokens` 写给端侧引擎，
