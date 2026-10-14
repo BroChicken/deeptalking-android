@@ -1,7 +1,9 @@
 # Read/bump the app version in android-lite/app/build.gradle.kts.
 #
 # The app version name is X.Y.Z and versionCode is a monotonic integer.
-# Per AGENTS.md, every APK update increments Z and versionCode by 1; X and Y
+# Per AGENTS.md, changes are committed locally without a version bump by
+# default: only run -BumpPatch when releasing (the user asked to push), where
+# Z+1 and versionCode+1 go together with the push that triggers CI. X and Y
 # are only changed when the user asks.
 #
 # Usage:

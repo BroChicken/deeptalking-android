@@ -26,9 +26,17 @@ powershell -File ..\tools\native-build.ps1 -Release      # 签名 release（需 
 
 等价于在本目录运行 `gradle :app:assembleDebug` 加各模块单测（完整任务清单见 `tools/native-verify.ps1`）。debug 产物：`app/build/outputs/apk/debug/app-debug.apk`。
 
-## 版本
+## 版本与发布
 
-`app/build.gradle.kts` 的 `versionName`（`X.Y.Z`）与 `versionCode` 是版本号的唯一来源；每次出包补丁位 +1、`versionCode` +1，用 `powershell -File ..\tools\native-version.ps1 -BumpPatch` 修改。
+`app/build.gradle.kts` 的 `versionName`（`X.Y.Z`）与 `versionCode` 是版本号的唯一来源。**默认开发流程只做本地提交：不出包、不推送、不升版本**；只有明确要发版时才执行：
+
+```powershell
+powershell -File ..\tools\native-version.ps1 -BumpPatch   # 补丁位 +1、versionCode +1
+powershell -File ..\tools\native-verify.ps1               # 自检全绿
+git commit && git push                                    # 推送触发 CI 出包并发 Release
+```
+
+版本号没变就不要推送：CI 以 `versionName` 当标签，同名 Release 已存在时会覆盖其 APK。
 
 ## CI 与覆盖升级
 

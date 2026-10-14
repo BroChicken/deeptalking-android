@@ -20,10 +20,16 @@
 - **文档：`docs/` 必须同步更新**（凡触及 agent 循环、工具清单、提示词、记忆系统、字段、常量、模块结构、构建/测试流程的改动）。
   文档只描述"当前最新状态"，**禁止写变更记录/版本历史**（历史看 git）。
 
-## 3. 版本号规则
+## 3. 版本号与推送规则
 - `android-lite/app/build.gradle.kts` 中 `versionName` 为 `X.Y.Z`，`versionCode` 单调递增。
-- 每次 APK 更新：**Z 必须 +1**；前两位 X.Y 由用户决定，**若我认为需要升 X 或 Y，必须先询问用户**。
-- `versionCode` 必须同步 +1。应用内版本号由 BuildConfig/`versionName` 提供，不要另设手写常量。
+- **默认：改完只做本地提交** —— 不升版本、不推送、不出包。改完跑 `tools/native-verify.ps1`，本地 `git commit` 即止，停下等用户指示。
+- **只有用户明确说"推版本"（或"推送 / 出包"）时**才升版本并推送，一次做完：
+  1. `powershell -File tools/native-version.ps1 -BumpPatch`（Z+1、`versionCode`+1）；
+  2. `powershell -File tools/native-verify.ps1` 全绿；
+  3. 提交版本改动并 `git push` —— 推送即触发 CI 构建签名 release APK 并发布 GitHub Release。
+- **版本号没变就不要推送**：CI 用 `versionName` 当标签，同名 Release 已存在时会 `gh release upload --clobber` 覆盖已发布的 APK。
+- 升 X 或 Y 由用户决定，**若我认为需要升 X 或 Y，必须先询问用户**。
+- 应用内版本号由 BuildConfig/`versionName` 提供，不要另设手写常量。
 
 ## 4. 覆盖升级
 - `applicationId`、签名 keystore（`android-lite/keystore/deeptalking-release.jks`，CI secret `ANDROID_KEYSTORE_BASE64`）必须稳定，否则无法覆盖安装。
