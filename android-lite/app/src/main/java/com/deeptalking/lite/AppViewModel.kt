@@ -73,6 +73,13 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     private val activeIdState = MutableStateFlow<String?>(null)
     val activeId: StateFlow<String?> = activeIdState
 
+    /**
+     * Serializes read-modify-write patches on a character row. Without it two quick edits
+     * (toggling two world-book options, typing fast) both read the row before either write
+     * lands, and the later write silently drops the earlier change.
+     */
+    private val characterWriteMutex = Mutex()
+
     private val storedMessages: StateFlow<List<ChatMessage>> =
         activeIdState.flatMapLatest { id ->
             if (id == null) flowOf(emptyList()) else core.data.chat.observeMessages(id)
@@ -614,6 +621,44 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         viewModelScope.launch { core.data.characters.upsert(character.copy(updatedAt = Instant.now().toString())) }
     }
 
+    /**
+     * Applies [transform] to the **live** persisted row (not to a caller-held snapshot) and
+     * writes it back. A card editor holds a copy taken when it opened; writing that copy
+     * back would revert whatever a background task wrote in the meantime (analyzed memories,
+     * dynamic state), so every partial edit from the UI goes through here instead.
+     */
+    private fun patchCharacter(characterId: String, transform: (Character) -> Character) {
+        viewModelScope.launch {
+            characterWriteMutex.withLock {
+                val live = core.data.characters.get(characterId) ?: return@withLock
+                core.data.characters.upsert(transform(live).copy(updatedAt = Instant.now().toString()))
+            }
+        }
+    }
+
+    /**
+     * Saves the character-card editor. Only the fields the editor owns are copied onto the
+     * live row: the draft's memory windows, stickers, scene state and world book may be
+     * older than the store (background tasks and the per-entry world-book patches write
+     * them), and a whole-row write silently rolled those back — including the user's own
+     * world-book edits made in the same dialog.
+     */
+    fun saveCharacterEdit(draft: Character) {
+        patchCharacter(draft.id) { live ->
+            live.copy(
+                name = draft.name,
+                emoji = draft.emoji,
+                description = draft.description,
+                interactionRules = draft.interactionRules,
+                staticProfile = draft.staticProfile,
+                dynamicState = draft.dynamicState,
+                dynamicStateMeta = draft.dynamicStateMeta,
+                groupSharedDynamic = draft.groupSharedDynamic,
+                members = draft.members,
+            )
+        }
+    }
+
     fun deleteCharacter(id: String) {
         viewModelScope.launch {
             core.data.characters.delete(id)
@@ -634,8 +679,13 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     /** Replaces a group member (by index) on [character]. */
     fun updateMember(character: Character, index: Int, member: GroupMember) {
         if (index !in character.members.indices) return
-        val members = character.members.toMutableList().also { it[index] = member }
-        updateCharacter(character.copy(members = members))
+        patchCharacter(character.id) { live ->
+            if (index !in live.members.indices) {
+                live
+            } else {
+                live.copy(members = live.members.toMutableList().also { it[index] = member })
+            }
+        }
     }
 
     /**
@@ -772,28 +822,30 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         }
     }
 
-    fun addLorebookEntry(character: Character) {
-        if (character.lorebook.size >= com.deeptalking.core.common.AppLimits.Lorebook.ENTRIES) {
-            eventsState.tryEmit(UiEvent("世界书条目已达上限（200 条）"))
-            return
+    /**
+     * World-book edits from the editor. Each one patches the live row: the entry the UI
+     * shows is the entry that is stored (same id), consecutive edits cannot overwrite each
+     * other, and a background consolidation that touched another entry survives.
+     */
+    fun addLorebookEntry(characterId: String, entry: LorebookEntry) {
+        patchCharacter(characterId) { live ->
+            if (live.lorebook.size >= AppLimits.Lorebook.ENTRIES) {
+                eventsState.tryEmit(UiEvent("世界书条目已达上限（${AppLimits.Lorebook.ENTRIES} 条）"))
+                live
+            } else {
+                live.copy(lorebook = live.lorebook + entry)
+            }
         }
-        // A new entry is AI-maintained by default (the owner chip in the editor switches it
-        // to 人工维护); it is always active, matching the legacy `addLorebookEntry`.
-        val entry = com.deeptalking.feature.characters.CharacterParity.newLorebookEntry()
-            .copy(createdAt = Instant.now().toString())
-        updateCharacter(character.copy(lorebook = character.lorebook + entry))
     }
 
-    fun removeLorebookEntry(character: Character, entryId: String) {
-        updateCharacter(character.copy(lorebook = character.lorebook.filterNot { it.id == entryId }))
+    fun removeLorebookEntry(characterId: String, entryId: String) {
+        patchCharacter(characterId) { live -> live.copy(lorebook = live.lorebook.filterNot { it.id == entryId }) }
     }
 
-    fun updateLorebookEntry(character: Character, entry: LorebookEntry) {
-        updateCharacter(
-            character.copy(
-                lorebook = character.lorebook.map { if (it.id == entry.id) entry else it },
-            ),
-        )
+    fun updateLorebookEntry(characterId: String, entry: LorebookEntry) {
+        patchCharacter(characterId) { live ->
+            live.copy(lorebook = live.lorebook.map { if (it.id == entry.id) entry else it })
+        }
     }
 
     // ----------------------------------------------------------------- stickers

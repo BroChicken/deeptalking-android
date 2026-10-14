@@ -31,12 +31,14 @@ import com.deeptalking.domain.agent.prompts.trimText
 import com.deeptalking.domain.agent.prompts.withDynamicField
 import com.deeptalking.domain.agent.prompts.withStaticField
 import com.deeptalking.domain.agent.sessionIdFor
+import com.deeptalking.domain.memory.LorebookLimits
 import com.deeptalking.domain.memory.LorebookProposal
 import com.deeptalking.domain.memory.MemoryService
 import com.deeptalking.domain.memory.ShortTermDraft
 import com.deeptalking.domain.memory.addShortTermMemory
 import com.deeptalking.domain.memory.applyMemoryDecay
 import com.deeptalking.domain.memory.dedupeLorebook
+import com.deeptalking.domain.memory.dedupeShortTerm
 import com.deeptalking.domain.memory.ensureMessageSequences
 import com.deeptalking.domain.memory.evictStaleLorebookEntries
 import com.deeptalking.domain.memory.evidenceMatchesSource
@@ -316,6 +318,12 @@ class BackgroundTasks(
      * to diagnose from a save.
      */
     private val onAuxiliaryFailure: suspend (String, String) -> Unit = { _, _ -> },
+    /**
+     * A non-failure remark about an auxiliary call (e.g. world-book entries retired by the
+     * miss counter). Recorded in the app's request log with a `note` status, so a silent
+     * drop stops being silent without being reported as a failure.
+     */
+    private val onAuxiliaryNote: suspend (String, String) -> Unit = { _, _ -> },
 ) {
 
     private val json = Json {
@@ -552,7 +560,7 @@ class BackgroundTasks(
             emptySet()
         }
         working = working.copy(instant = working.instant.filterNot { it.id in consumed && it.id !in keep })
-        return TaskStatus.Success to trimMemory(working)
+        return TaskStatus.Success to settleShortTerm(working)
     }
 
     /**
@@ -733,7 +741,7 @@ class BackgroundTasks(
         working = working.copy(shortTerm = (live ?: character).shortTerm.filterNot { it.id in drop })
         val consumed = character.shortTerm.filter { it.id in drop }
         // Success clears the diagnostic, so a stale reason never lingers in the save.
-        return AnalysisOutcome(TaskStatus.Success, trimMemory(working.withAnalysisError("")), consumed)
+        return AnalysisOutcome(TaskStatus.Success, settleShortTerm(working.withAnalysisError("")), consumed)
     }
 
     /**
@@ -767,6 +775,20 @@ class BackgroundTasks(
             .copy(shortTerm = character.shortTerm.drop(shortOverflow))
             .withAnalysisError("window-overflow: dropped $shortOverflow short-term (analysis failing)")
     }
+
+    /**
+     * Window hygiene at the only moments the injected short-term block is allowed to change:
+     * right after a pass folded or consumed part of it. That consumption already invalidates
+     * the cached request prefix, so merging near-duplicates here is free; between passes the
+     * block stays byte-stable, because a merge in the middle would rewrite a prefix the next
+     * request cannot predict (a cache miss every turn).
+     *
+     * The write path only merges into the newest few entries (append-only), so a beat the
+     * fold re-read as low-water context and re-described lands as a second summary of the
+     * same event. This pass collapses those.
+     */
+    private fun settleShortTerm(character: Character): Character =
+        trimMemory(character.copy(shortTerm = dedupeShortTerm(character.shortTerm)))
 
     /** Captures the revision/last-message snapshot for the stale guard (legacy `captureMemoryTask`). */
     private fun captureGuard(character: Character): MemoryTaskGuard = MemoryTaskGuard(
@@ -971,17 +993,34 @@ class BackgroundTasks(
             )
         }
 
-        // Eviction only runs after the batch parsed cleanly (legacy order).
+        // Eviction only runs after the batch parsed cleanly (legacy order). Retired entries
+        // are real content: they are reported (as a note, not a failure) so "这条设定怎么
+        // 没了" has an answer in the request log instead of being silent.
+        val rootEviction = evictStaleLorebookEntries(character.lorebook)
+        val memberEvictions = character.members.map { it to evictStaleLorebookEntries(it.lorebook) }
+        val retired = rootEviction.removed + memberEvictions.flatMap { it.second.removed }
+        if (retired.isNotEmpty()) {
+            onAuxiliaryNote(
+                "lorebook",
+                "淘汰了 ${retired.size} 条世界书条目（连续 ${LorebookLimits().evictionMisses} 次整理未被提及）：" +
+                    retired.joinToString("、") { it.name },
+            )
+        }
         var working = character.copy(
-            lorebook = evictStaleLorebookEntries(character.lorebook).kept,
-            members = character.members.map { it.copy(lorebook = evictStaleLorebookEntries(it.lorebook).kept) },
+            lorebook = rootEviction.kept,
+            members = character.members.map { member ->
+                val kept = memberEvictions.firstOrNull { it.first.id == member.id }?.second?.kept
+                member.copy(lorebook = kept ?: member.lorebook)
+            },
         )
         items.forEach { obj ->
             val proposal = LorebookProposal(
                 name = obj.string("name"),
                 content = obj.string("content"),
                 keywords = stringList(obj["keywords"]),
-                alwaysActive = obj.string("alwaysActive").equals("true", ignoreCase = true) || (obj["alwaysActive"] as? JsonPrimitive)?.contentOrNull == "true",
+                // null = the model omitted the field, which must not switch a stored
+                // 常驻 entry off (only an explicit false may).
+                alwaysActive = optionalBoolean(obj, "alwaysActive"),
             )
             val ids = stringList(obj["sourceShortTermIds"]).map { it.trim() }.filter { it.isNotEmpty() }
             working = upsertLorebookEntryForCharacter(working, proposal, ids).first
@@ -1068,8 +1107,9 @@ class BackgroundTasks(
             // Keep the original entry instead of storing a half-entry: the prompt demands
             // ≤ CONTENT_CHARS, and a retry re-asks against the same source text.
             if (content.length > AppLimits.Lorebook.CONTENT_CHARS) return TaskStatus.Failure to character
-            val wantsActive = obj.string("alwaysActive").equals("true", ignoreCase = true) ||
-                (obj["alwaysActive"] as? JsonPrimitive)?.contentOrNull == "true"
+            // The prompt echoes the entry's 常驻 state; an omitted field keeps the source
+            // entry's value instead of silently demoting it.
+            val wantsActive = optionalBoolean(obj, "alwaysActive") ?: entry.alwaysActive
             val alwaysActive = wantsActive && activeCount < AppLimits.Lorebook.MAX_ALWAYS_ACTIVE
             if (alwaysActive) activeCount++
             rewritten += LorebookEntry(
@@ -1887,6 +1927,14 @@ class BackgroundTasks(
 
     private fun JsonObject.string(key: String): String =
         (this[key] as? JsonPrimitive)?.contentOrNull.orEmpty()
+
+    /**
+     * A boolean the model wrote, or `null` when the field is absent (or JSON-null). Used for
+     * tri-state fields such as `alwaysActive`, where "not answered" must not be read as
+     * "false": switching a stored 常驻 entry off on an omitted field was a silent downgrade.
+     */
+    private fun optionalBoolean(obj: JsonObject, key: String): Boolean? =
+        (obj[key] as? JsonPrimitive)?.contentOrNull?.let { it.equals("true", ignoreCase = true) }
 
     private fun eventIdentity(eventTime: String?, zone: ZoneId = ZoneId.systemDefault()): String {
         val zoned = parseZoned(eventTime, zone) ?: return ""

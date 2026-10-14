@@ -28,13 +28,20 @@ data class LorebookUpsertResult(
     val mergedIntoUser: Boolean = false,
 )
 
-/** A proposed lorebook entry (model output) before validation/merge. */
+/**
+ * A proposed lorebook entry (model output) before validation/merge.
+ *
+ * [alwaysActive] is a tri-state on purpose: `true` / `false` are the model's explicit
+ * answer, `null` means the reply omitted the field entirely — and an omitted field must
+ * never switch an existing 常驻 entry off (the model does not echo every field), so it
+ * falls back to whatever the stored entry already has.
+ */
 @Serializable
 data class LorebookProposal(
     val name: String,
     val content: String,
     val keywords: List<String> = emptyList(),
-    val alwaysActive: Boolean = false,
+    val alwaysActive: Boolean? = null,
 )
 
 private val LOREBOOK_EVIDENCE_PAIR = Regex("[\\u4e00-\\u9fff\\w]{2}")
@@ -87,6 +94,25 @@ fun resolveLorebookSources(character: Character, sourceIds: List<String>, eviden
 }
 
 /**
+ * Resolves the `alwaysActive` an update should store. An explicit `false` wins; an entry
+ * that is already always-active is never demoted by an unrelated update; an omitted answer
+ * (`null`) keeps the current value; and promoting an entry to always-active respects
+ * [AppLimits.Lorebook.MAX_ALWAYS_ACTIVE] (a promotion over the ceiling stays keyword-driven
+ * rather than being rejected — the content is the valuable part).
+ */
+fun resolveLorebookAlwaysActive(
+    list: List<LorebookEntry>,
+    current: LorebookEntry,
+    answer: Boolean?,
+): Boolean {
+    if (answer == false) return false
+    if (current.alwaysActive) return true
+    if (answer != true) return false
+    return list.count { it.origin == LorebookOrigin.Model && it.alwaysActive } <
+        AppLimits.Lorebook.MAX_ALWAYS_ACTIVE
+}
+
+/**
  * Inserts or replaces [proposal] into [list]. A matching or near-duplicate AI
  * entry is rewritten whole (see [replaceLorebookEntry]); user-written entries are
  * protected; an entry with no keywords falls back to its own name as the trigger.
@@ -123,7 +149,8 @@ fun upsertLorebookEntry(
             name = exact.name.ifEmpty { name },
             content = content,
             keywords = if (keywords.isNotEmpty()) keywords else exact.keywords,
-            alwaysActive = proposal.alwaysActive,
+            // An omitted field keeps the stored value (`null` = the model did not answer).
+            alwaysActive = resolveLorebookAlwaysActive(list, exact, proposal.alwaysActive),
             misses = 0,
             updatedAt = nowIso,
         )
@@ -137,7 +164,13 @@ fun upsertLorebookEntry(
         }
         val replaced = replaceLorebookEntry(
             similar,
-            LorebookEntry(name = name, content = content, keywords = keywords, updatedAt = nowIso),
+            LorebookEntry(
+                name = name,
+                content = content,
+                keywords = keywords,
+                alwaysActive = resolveLorebookAlwaysActive(list, similar, proposal.alwaysActive),
+                updatedAt = nowIso,
+            ),
         )
         return LorebookUpsertResult(true, list = replaceEntry(list, similar.id, replaced), entry = replaced)
     }
@@ -145,11 +178,14 @@ fun upsertLorebookEntry(
     // An entry with no keywords that is not always-on would never be injected at all;
     // fall back to its own name as the trigger instead of rejecting the entry.
     val triggerKeywords = keywords.ifEmpty { listOf(name) }
-    if (proposal.alwaysActive &&
-        list.count { it.origin == LorebookOrigin.Model && it.alwaysActive } >= AppLimits.Lorebook.MAX_ALWAYS_ACTIVE
-    ) {
-        return LorebookUpsertResult(false, "常驻条目已达上限")
-    }
+    // Hitting the always-active ceiling must never throw the entry away: the content is
+    // the valuable part, so the entry is stored keyword-driven instead (legacy rejected
+    // the whole proposal, which silently dropped what the model wanted to record).
+    val alwaysActive = resolveLorebookAlwaysActive(
+        list,
+        LorebookEntry(name = name, content = content),
+        proposal.alwaysActive,
+    )
     if (list.size >= AppLimits.Lorebook.ENTRIES) {
         return LorebookUpsertResult(false, "世界书条目已达上限")
     }
@@ -158,7 +194,7 @@ fun upsertLorebookEntry(
         name = name,
         content = content,
         keywords = triggerKeywords,
-        alwaysActive = proposal.alwaysActive,
+        alwaysActive = alwaysActive,
         origin = LorebookOrigin.Model,
         createdAt = nowIso,
         updatedAt = nowIso,

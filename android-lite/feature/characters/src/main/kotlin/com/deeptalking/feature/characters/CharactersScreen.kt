@@ -465,9 +465,9 @@ object CharacterEditorHost {
         character: Character,
         onDismiss: () -> Unit,
         onUpdate: (Character) -> Unit,
-        onAddLorebook: (Character) -> Unit,
-        onRemoveLorebook: (Character, String) -> Unit,
-        onUpdateLorebook: (Character, LorebookEntry) -> Unit,
+        onAddLorebook: (String, LorebookEntry) -> Unit,
+        onRemoveLorebook: (String, String) -> Unit,
+        onUpdateLorebook: (String, LorebookEntry) -> Unit,
         onGenerateAvatar: (Character, (String?) -> Unit) -> Unit,
         onFillMember: (Character, Int, String) -> Unit,
         initialMemberIndex: Int? = null,
@@ -489,9 +489,9 @@ fun CharacterEditorDialog(
     character: Character,
     onDismiss: () -> Unit,
     onUpdate: (Character) -> Unit,
-    onAddLorebook: (Character) -> Unit,
-    onRemoveLorebook: (Character, String) -> Unit,
-    onUpdateLorebook: (Character, LorebookEntry) -> Unit,
+    onAddLorebook: (String, LorebookEntry) -> Unit,
+    onRemoveLorebook: (String, String) -> Unit,
+    onUpdateLorebook: (String, LorebookEntry) -> Unit,
     onGenerateAvatar: (Character, (String?) -> Unit) -> Unit,
     onFillMember: (Character, Int, String) -> Unit,
     initialMemberIndex: Int? = null,
@@ -542,10 +542,28 @@ fun CharacterEditorDialog(
                         1 -> StateTab(draft = draft, memberIndex = memberIndex, onDraft = { draft = it })
                         2 -> LorebookTab(
                             draft = draft,
-                            onDraft = { draft = it },
-                            onAddLorebook = onAddLorebook,
-                            onRemoveLorebook = onRemoveLorebook,
-                            onUpdateLorebook = onUpdateLorebook,
+                            // A world-book edit is applied to the draft **and** patched onto
+                            // the stored row: the dialog's draft is a snapshot from when it
+                            // opened, so without the local update the checkbox/text the user
+                            // just touched keeps rendering the old value — and the next edit
+                            // (computed from the same snapshot) would undo this one.
+                            onAddLorebook = {
+                                // The cap is enforced here too, so the draft never shows an
+                                // entry the store refused.
+                                if (draft.lorebook.size < AppLimits.Lorebook.ENTRIES) {
+                                    val entry = CharacterParity.newLorebookEntry()
+                                    draft = draft.copy(lorebook = CharacterParity.addLorebookEntry(draft.lorebook, entry))
+                                    onAddLorebook(draft.id, entry)
+                                }
+                            },
+                            onRemoveLorebook = { entryId ->
+                                draft = draft.copy(lorebook = CharacterParity.removeLorebookEntry(draft.lorebook, entryId))
+                                onRemoveLorebook(draft.id, entryId)
+                            },
+                            onUpdateLorebook = { entry ->
+                                draft = draft.copy(lorebook = CharacterParity.updateLorebookEntry(draft.lorebook, entry))
+                                onUpdateLorebook(draft.id, entry)
+                            },
                         )
                     }
                 }
@@ -708,10 +726,9 @@ private fun StateTab(draft: Character, memberIndex: Int?, onDraft: (Character) -
 @Composable
 private fun LorebookTab(
     draft: Character,
-    onDraft: (Character) -> Unit,
-    onAddLorebook: (Character) -> Unit,
-    onRemoveLorebook: (Character, String) -> Unit,
-    onUpdateLorebook: (Character, LorebookEntry) -> Unit,
+    onAddLorebook: () -> Unit,
+    onRemoveLorebook: (String) -> Unit,
+    onUpdateLorebook: (LorebookEntry) -> Unit,
 ) {
     val legacy = MaterialTheme.legacy
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -732,23 +749,23 @@ private fun LorebookTab(
                     LegacyField(
                         value = entry.name,
                         onValueChange = { name ->
-                            onUpdateLorebook(draft, entry.copy(name = CharacterParity.capLorebookName(name)))
+                            onUpdateLorebook(entry.copy(name = CharacterParity.capLorebookName(name)))
                         },
                         placeholder = "条目名（如：赤月王国）",
                         modifier = Modifier.weight(1f),
                     )
                     Spacer(Modifier.width(6.dp))
                     LorebookOwnerChip(entry.origin) { origin ->
-                        onUpdateLorebook(draft, entry.copy(origin = origin))
+                        onUpdateLorebook(entry.copy(origin = origin))
                     }
-                    TextButton(onClick = { onRemoveLorebook(draft, entry.id) }) { Text("删除", fontSize = 12.sp, color = legacy.textSecondary) }
+                    TextButton(onClick = { onRemoveLorebook(entry.id) }) { Text("删除", fontSize = 12.sp, color = legacy.textSecondary) }
                 }
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     LegacyCheck("启用", entry.enabled) { checked ->
-                        onUpdateLorebook(draft, entry.copy(enabled = checked))
+                        onUpdateLorebook(entry.copy(enabled = checked))
                     }
                     LegacyCheck("常驻", entry.alwaysActive) { checked ->
-                        onUpdateLorebook(draft, entry.copy(alwaysActive = checked))
+                        onUpdateLorebook(entry.copy(alwaysActive = checked))
                     }
                     Text(lorebookMention(entry), fontSize = 12.sp, color = legacy.textMuted)
                 }
@@ -762,7 +779,7 @@ private fun LorebookTab(
                         } else {
                             CharacterParity.keywordsToAlwaysActive(entry.alwaysActive, keywords)
                         }
-                        onUpdateLorebook(draft, entry.copy(keywords = keywords, alwaysActive = alwaysActive))
+                        onUpdateLorebook(entry.copy(keywords = keywords, alwaysActive = alwaysActive))
                     },
                     placeholder = "触发关键词（用、或逗号分隔；常驻条目可留空）",
                 )
@@ -771,7 +788,7 @@ private fun LorebookTab(
                     onValueChange = { content ->
                         // 不截断：超过单条上限的本次输入直接丢弃，文本框保持原值。
                         if (content.length <= AppLimits.Lorebook.CONTENT_CHARS) {
-                            onUpdateLorebook(draft, entry.copy(content = content))
+                            onUpdateLorebook(entry.copy(content = content))
                         }
                     },
                     placeholder = "命中后注入的设定内容",
@@ -784,7 +801,7 @@ private fun LorebookTab(
                 )
             }
         }
-        LegacyButton("+ 添加条目", primary = false, onClick = { onAddLorebook(draft) })
+        LegacyButton("+ 添加条目", primary = false, onClick = onAddLorebook)
     }
 }
 

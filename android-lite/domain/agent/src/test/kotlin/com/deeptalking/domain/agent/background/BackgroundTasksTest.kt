@@ -129,6 +129,63 @@ class BackgroundTasksTest {
     }
 
     @Test
+    fun retiredLorebookEntriesAreReportedAsANote() = runBlocking {
+        // An AI entry that misses the threshold is retired; that used to be completely
+        // silent, so "这条设定怎么没了" had no answer anywhere.
+        val notes = mutableListOf<Pair<String, String>>()
+        val llm = ScriptedLlm(mutableListOf("""{"entries":[]}"""))
+        val background = BackgroundTasks(
+            llm,
+            MemoryServiceImpl(),
+            onAuxiliaryNote = { task, note -> notes += task to note },
+        )
+        val stale = com.deeptalking.core.model.LorebookEntry(
+            id = "old",
+            name = "底线测试与约定",
+            content = "旧的约定",
+            origin = com.deeptalking.core.model.LorebookOrigin.Model,
+            misses = 2,
+        )
+        val character = Character(
+            id = "c1",
+            lorebook = listOf(stale),
+            shortTerm = listOf(ShortTermMemory(id = "s1", content = "本轮内容", sourceMessageIds = listOf("m1"))),
+        )
+        val (status, updated) = background.consolidateLorebook(character, character.shortTerm)
+        assertEquals(BackgroundTasks.TaskStatus.Success, status)
+        assertTrue(updated.lorebook.isEmpty())
+        assertEquals(1, notes.size)
+        assertEquals("lorebook", notes[0].first)
+        assertTrue(notes[0].second.contains("淘汰了 1 条"))
+        assertTrue(notes[0].second.contains("底线测试与约定"))
+    }
+
+    @Test
+    fun theFoldedWindowCollapsesTheSameBeatDescribedTwice() = runBlocking {
+        // The fold re-reads the low-water leftovers, so the model re-describes a recent
+        // event; the write path only merges into the newest few entries, which left both
+        // copies in the injected block. The pass settles the window at the fold boundary.
+        val response = """
+            [{"content":"2026-08-01中午，家中，用户在咖啡馆和小雨聊天，说起了旅行计划。","eventTime":"2026-08-01T04:00:00Z"},
+             {"content":"2026-08-01中午，家中，用户和小雨在咖啡馆聊天，谈到旅行计划。","eventTime":"2026-08-01T04:05:00Z"}]
+        """.trimIndent()
+        val (background, _) = tasks(listOf(response))
+        val messages = (1..AppLimits.Memory.INSTANT).map { index ->
+            ChatMessage(
+                id = "m$index",
+                role = if (index % 2 == 0) Role.Assistant else Role.User,
+                content = "对话内容$index",
+                timestamp = "2026-08-01T04:00:00Z",
+                sequence = index,
+            )
+        }
+        val character = Character(id = "c1", name = "小雨", instant = messages)
+        val (status, updated) = background.extractMemoryStatus(character, messages)
+        assertEquals(BackgroundTasks.TaskStatus.Success, status)
+        assertEquals(1, updated.shortTerm.size)
+    }
+
+    @Test
     fun malformedLorebookOutputTouchesNothing() = runBlocking {
         val (background, _) = tasks(listOf("{}"))
         val character = Character(

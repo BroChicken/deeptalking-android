@@ -287,6 +287,42 @@ class CharacterParityTest {
         assertTrue(entry.alwaysActive)
         assertEquals(LorebookOrigin.Model, entry.origin)
         assertTrue(entry.enabled)
+        assertTrue(entry.createdAt!!.isNotBlank())
+    }
+
+    @Test
+    fun lorebookListEditsAreLocalAndAdditive() {
+        // The editor mirrors every edit into its draft, so the ops must be pure and must
+        // not disturb the other entries (two quick edits used to undo each other).
+        val a = LorebookEntry(id = "a", name = "甲", content = "甲内容")
+        val b = LorebookEntry(id = "b", name = "乙", content = "乙内容")
+        val base = listOf(a, b)
+
+        val added = CharacterParity.addLorebookEntry(base, LorebookEntry(id = "c", name = "丙", content = "丙内容"))
+        assertEquals(listOf("a", "b", "c"), added.map { it.id })
+        assertEquals(base, listOf(a, b))
+
+        val removed = CharacterParity.removeLorebookEntry(base, "a")
+        assertEquals(listOf("b"), removed.map { it.id })
+
+        val updated = CharacterParity.updateLorebookEntry(base, b.copy(content = "乙改"))
+        assertEquals(listOf("a", "b"), updated.map { it.id })
+        assertEquals("甲内容", updated[0].content)
+        assertEquals("乙改", updated[1].content)
+        // 两次连续编辑互不覆盖：第二次基于第一次的结果。
+        val second = CharacterParity.updateLorebookEntry(updated, a.copy(content = "甲改"))
+        assertEquals("甲改", second[0].content)
+        assertEquals("乙改", second[1].content)
+    }
+
+    @Test
+    fun addingBeyondTheEntryCapIsRefused() {
+        val full = (1..com.deeptalking.core.common.AppLimits.Lorebook.ENTRIES).map {
+            LorebookEntry(id = "e$it", name = "n$it", content = "c")
+        }
+        val next = CharacterParity.addLorebookEntry(full, LorebookEntry(id = "extra", name = "x", content = "c"))
+        assertEquals(full.size, next.size)
+        assertFalse(next.any { it.id == "extra" })
     }
 
     @Test

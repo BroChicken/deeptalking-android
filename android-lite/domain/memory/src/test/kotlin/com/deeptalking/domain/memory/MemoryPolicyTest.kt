@@ -323,6 +323,46 @@ class MemoryPolicyTest {
     }
 
     @Test
+    fun dedupeShortTermMergesTheSameBeatRewordedInOneSlotButNotAcrossSlots() {
+        // Real window pair: the fold re-read the low-water leftovers and wrote the same beat
+        // a second time, longer. Jaccard is only 0.68 (below the global rule) but the short
+        // text is 98% contained in the long one, and both sit in one logical day + slot.
+        val short = ShortTermMemory(
+            id = "s1",
+            eventTime = "2026-10-13T17:29:09Z",
+            content = "2026-10-13夜里，家中卧室，用户说笔太细、自己手指也不够粗，瑟瑞斯把笔搁回床头，说用户的手稳，" +
+                "身上有比笔粗的东西，那格本就留给它，要用户自己拿主意。",
+        )
+        val full = short.copy(
+            id = "s2",
+            content = short.content.dropLast(1) +
+                "；用户追问是什么，瑟瑞斯说是用户那根大肉棒，要往她小穴里送的那一样。",
+        )
+        assertEquals(1, dedupeShortTerm(listOf(short, full)).size)
+        // The longer text and both source sets survive the merge.
+        val merged = dedupeShortTerm(
+            listOf(
+                short.copy(sourceMessageIds = listOf("m1"), sourceRoles = listOf("user")),
+                full.copy(sourceMessageIds = listOf("m2"), sourceRoles = listOf("user")),
+            ),
+        )
+        assertEquals(full.content.length, merged[0].content.length)
+        assertEquals(listOf("m1", "m2"), merged[0].sourceMessageIds)
+
+        // Same slot, but this is *the next beat* of the scene (containment 0.62): both stay.
+        val next = ShortTermMemory(
+            id = "s3",
+            eventTime = "2026-10-13T17:46:12Z",
+            content = "2026-10-13夜里，家中卧室，瑟瑞斯与用户继续性交，用户快速抽插并射精到子宫口，瑟瑞斯同时到达，" +
+                "两人约定一起去；瑟瑞斯念出数句台词，用户射后揉小肚子，指出生小宝宝那句。",
+        )
+        assertEquals(2, dedupeShortTerm(listOf(full, next)).size)
+
+        // Same wording, different slot → two different beats, both must survive.
+        assertEquals(2, dedupeShortTerm(listOf(short, full.copy(id = "s4", eventTime = "2026-10-13T03:29:09Z"))).size)
+    }
+
+    @Test
     fun repairMemoriesCollapsesShortAndLongDuplicates() {
         val character = Character(
             id = "c1",

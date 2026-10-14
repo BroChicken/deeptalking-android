@@ -444,9 +444,18 @@ const val MEMORY_REPAIR_VERSION = 3
 /**
  * Deterministic near-duplicate pass over short-term memory: items whose content is
  * a near-duplicate of an earlier item collapse into the first occurrence, unioning
- * their sources/evidence. Only *content* similarity merges — two distinct beats that
- * merely share a day/time slot are kept separate, so a repair pass can never drop a
- * unique fact (this is a deliberate deviation from the old identity-only merge).
+ * their sources/evidence. Two merge rules apply:
+ *
+ * 1. content similarity at [AppLimits.Memory.NEAR_DUP_SIMILARITY] (the global rule), or
+ * 2. *same logical day + time slot* where one text is (almost) wholly contained in the
+ *    other ([SAME_EVENT_CONTAINMENT] 0.75): the two sides are the same beat, written once
+ *    short and once in full, because the fold re-reads the low-water leftovers and the
+ *    model re-summarizes them. On a real window those pairs measured 0.86–1.00 containment,
+ *    while the *next* beat of the same scene measured 0.62 — so the rule does not swallow
+ *    two different beats.
+ *
+ * Different days/slots are never merged on wording alone, so the pass cannot drop a
+ * unique fact into an unrelated one.
  *
  * The pass is O(n²), so every item's signature (normalized text + bigram set) is
  * computed **once** and cached, and pairs whose bigram sets differ too much in size
@@ -457,11 +466,24 @@ const val MEMORY_REPAIR_VERSION = 3
 fun dedupeShortTerm(items: List<ShortTermMemory>): List<ShortTermMemory> {
     val result = mutableListOf<ShortTermMemory>()
     val signatures = mutableListOf<BigramSignature>()
+    val identities = mutableListOf<String>()
     for (item in items) {
         val signature = bigramSignature(item.content)
+        val identity = eventIdentity(item.eventTime)
         var dupIndex = -1
         for (index in result.indices) {
             if (couldBeNearDuplicate(signatures[index], signature)) {
+                dupIndex = index
+                break
+            }
+            // Same logical day + time slot with one description (almost) contained in the
+            // other = the same beat written twice, once short and once in full. The fold
+            // re-reads the low-water leftovers as context, so the model re-summarizes recent
+            // events, and the write path only merges into the newest few entries — those
+            // pairs otherwise stay in the window and get injected twice on every request.
+            if (identity.isNotEmpty() && identity == identities[index] &&
+                containedIn(signatures[index], signature) >= SAME_EVENT_CONTAINMENT
+            ) {
                 dupIndex = index
                 break
             }
@@ -469,6 +491,7 @@ fun dedupeShortTerm(items: List<ShortTermMemory>): List<ShortTermMemory> {
         if (dupIndex < 0) {
             result += item
             signatures += signature
+            identities += identity
             continue
         }
         val existing = result[dupIndex]
@@ -494,6 +517,7 @@ fun dedupeShortTerm(items: List<ShortTermMemory>): List<ShortTermMemory> {
         )
         result[dupIndex] = merged
         signatures[dupIndex] = bigramSignature(merged.content)
+        if (identity.isNotEmpty()) identities[dupIndex] = identity
     }
     return result
 }
@@ -518,10 +542,53 @@ private fun couldBeNearDuplicate(a: BigramSignature, b: BigramSignature): Boolea
     val smallest = minOf(a.length, b.length)
     val total = (a.length + b.length).toDouble()
     if (smallest * (1 + threshold) < threshold * total) return false
+    return bigramRatio(a, b) >= threshold
+}
+
+/**
+ * Bigram Jaccard index of two pre-computed signatures, or 0 when either is empty.
+ * Callers that already hold the signatures reuse them instead of re-tokenizing.
+ */
+private fun bigramRatio(a: BigramSignature, b: BigramSignature): Double {
+    if (a.length == 0 || b.length == 0) return 0.0
     val intersection = a.grams.count { it in b.grams }
     val union = a.length + b.length - intersection
-    return union > 0 && intersection.toDouble() / union >= threshold
+    return if (union == 0) 0.0 else intersection.toDouble() / union
 }
+
+/**
+ * Share of the **smaller** bigram set that the larger one also contains (0..1). This is the
+ * shape a fold re-read produces: the same beat summarized once briefly and once in full.
+ * The Jaccard index collapses there purely because the longer text contributes many bigrams
+ * of its own (measured on real windows: 0.37 Jaccard for a fully contained pair), so
+ * containment — not Jaccard — is what tells "the same beat, longer" from "the next beat".
+ */
+private fun containedIn(a: BigramSignature, b: BigramSignature): Double {
+    if (a.length == 0 || b.length == 0) return 0.0
+    val smaller = if (a.length <= b.length) a else b
+    // Trivially short texts are "contained" in almost anything ("占位2" in "占位21"), and a
+    // real summary of a beat is far longer than this floor (measured pairs: 50+ bigrams).
+    if (smaller.length < MIN_SAME_EVENT_GRAMS) return 0.0
+    val larger = if (a.length <= b.length) b else a
+    val intersection = smaller.grams.count { it in larger.grams }
+    return intersection.toDouble() / smaller.length
+}
+
+/**
+ * Containment at which two entries sharing one logical day + time slot are treated as the
+ * same beat (see [dedupeShortTerm]). Calibrated on a real window: genuine short/full pairs
+ * of one beat sat at 0.86–1.00, while the next beat of the same scene sat at 0.62 — so this
+ * never fires on two *different* beats, and it needs an identical event identity to apply
+ * at all (it cannot touch the global near-duplicate rule).
+ */
+private const val SAME_EVENT_CONTAINMENT = 0.75
+
+/**
+ * Bigrams the smaller text of a same-event pair must have before containment is trusted:
+ * short labels/dates are "contained" in their own extensions by construction, while a real
+ * summary of a beat is an order of magnitude longer (measured pairs held 50+ bigrams).
+ */
+private const val MIN_SAME_EVENT_GRAMS = 16
 
 /** Input to [addShortTermMemory] (legacy `sourceData`). */
 data class ShortTermDraft(

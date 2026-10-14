@@ -157,7 +157,7 @@ class LorebookStoreTest {
     }
 
     @Test
-    fun alwaysActiveCapIsEnforced() {
+    fun alwaysActiveCapDemotesTheEntryInsteadOfDroppingIt() {
         val names = listOf("甲", "乙", "丙", "丁", "戊", "己")
         val list = names.mapIndexed { index, name ->
             LorebookEntry(
@@ -168,8 +168,46 @@ class LorebookStoreTest {
                 alwaysActive = true,
             )
         }
-        val blocked = upsertLorebookEntry(list, LorebookProposal("庚", "庚", alwaysActive = true))
-        assertFalse(blocked.ok)
+        // The ceiling must not throw the content away: the entry is stored keyword-driven.
+        val demoted = upsertLorebookEntry(list, LorebookProposal("庚", "庚的内容", alwaysActive = true))
+        assertTrue(demoted.ok)
+        assertFalse(demoted.entry!!.alwaysActive)
+        assertEquals("庚的内容", demoted.list.last().content)
+        // …and its own name becomes the trigger, so it is still injectable.
+        assertEquals(listOf("庚"), demoted.list.last().keywords)
+    }
+
+    @Test
+    fun omittedAlwaysActiveKeepsTheStoredValueAndExplicitFalseClearsIt() {
+        val stored = listOf(
+            LorebookEntry(id = "lore1", name = "世界前提", content = "旧", origin = LorebookOrigin.Model, alwaysActive = true),
+        )
+        // The model did not echo the field → the entry must stay 常驻.
+        val omitted = upsertLorebookEntry(stored, LorebookProposal("世界前提", "新内容"))
+        assertTrue(omitted.ok)
+        assertTrue(omitted.entry!!.alwaysActive)
+        assertEquals("新内容", omitted.entry!!.content)
+        // An explicit false is an answer and may switch it off.
+        val cleared = upsertLorebookEntry(stored, LorebookProposal("世界前提", "新内容", alwaysActive = false))
+        assertFalse(cleared.entry!!.alwaysActive)
+    }
+
+    @Test
+    fun promotingAnEntryToAlwaysActiveRespectsTheCeilingWithoutLosingContent() {
+        val active = (1..AppLimits.Lorebook.MAX_ALWAYS_ACTIVE).map {
+            LorebookEntry(id = "a$it", name = "常驻$it", content = "c", origin = LorebookOrigin.Model, alwaysActive = true)
+        }
+        val plain = LorebookEntry(id = "p1", name = "普通条目", content = "旧内容", origin = LorebookOrigin.Model)
+        val promoted = upsertLorebookEntry(active + plain, LorebookProposal("普通条目", "新内容", alwaysActive = true))
+        assertTrue(promoted.ok)
+        assertFalse(promoted.entry!!.alwaysActive)
+        assertEquals("新内容", promoted.entry!!.content)
+
+        // With room it promotes normally, and an already-active entry is never demoted by an
+        // update that does not mention the field.
+        val room = active.drop(1) + plain
+        assertTrue(upsertLorebookEntry(room, LorebookProposal("普通条目", "新内容", alwaysActive = true)).entry!!.alwaysActive)
+        assertTrue(upsertLorebookEntry(active, LorebookProposal("常驻1", "改后内容")).entry!!.alwaysActive)
     }
 
     @Test

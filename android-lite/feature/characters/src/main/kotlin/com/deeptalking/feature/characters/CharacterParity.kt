@@ -15,6 +15,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
+import java.time.Instant
 import java.time.ZoneId
 import java.time.ZonedDateTime
 import java.util.UUID
@@ -322,12 +323,27 @@ object CharacterParity {
      * user switches it to 人工维护 if they want to keep the model's hands off it) and is
      * always active by default (legacy `addLorebookEntry`).
      */
-    fun newLorebookEntry(): LorebookEntry = LorebookEntry(
+    fun newLorebookEntry(nowIso: String = Instant.now().toString()): LorebookEntry = LorebookEntry(
         id = UUID.randomUUID().toString(),
         enabled = true,
         alwaysActive = true,
         origin = LorebookOrigin.Model,
+        createdAt = nowIso,
     )
+
+    /**
+     * World-book list edits. They are pure so the editor stays a thin wrapper: the dialog
+     * applies one to its local draft (so the change is visible immediately) *and* the same
+     * one is patched onto the stored row.
+     */
+    fun addLorebookEntry(list: List<LorebookEntry>, entry: LorebookEntry): List<LorebookEntry> =
+        if (list.size >= AppLimits.Lorebook.ENTRIES) list else list + entry
+
+    fun removeLorebookEntry(list: List<LorebookEntry>, entryId: String): List<LorebookEntry> =
+        list.filterNot { it.id == entryId }
+
+    fun updateLorebookEntry(list: List<LorebookEntry>, entry: LorebookEntry): List<LorebookEntry> =
+        list.map { if (it.id == entry.id) entry else it }
 
     fun splitLorebookKeywords(raw: String): List<String> =
         raw.split(',', '，', '、', '\n')

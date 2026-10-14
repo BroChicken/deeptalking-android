@@ -335,7 +335,7 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
         com.deeptalking.feature.characters.CharacterEditorHost(
             character = characters.firstOrNull { it.id == target.id } ?: target,
             onDismiss = { editingCharacter = null; editingMemberIndex = null },
-            onUpdate = vm::updateCharacter,
+            onUpdate = vm::saveCharacterEdit,
             onAddLorebook = vm::addLorebookEntry,
             onRemoveLorebook = vm::removeLorebookEntry,
             onUpdateLorebook = vm::updateLorebookEntry,

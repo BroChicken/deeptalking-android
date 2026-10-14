@@ -251,6 +251,9 @@ class NativeCore(context: Context) {
                 lastAuxFailure = AuxFailure(taskType, reason, Instant.now().toEpochMilli())
                 recordAuxMetric(config, taskType, System.currentTimeMillis(), null, "failed", reason)
             },
+            onAuxiliaryNote = { taskType, note ->
+                recordAuxMetric(config, taskType, System.currentTimeMillis(), null, "note", note)
+            },
         )
 
     /** Task type, reason and time of the most recent failed background call. */
@@ -1121,6 +1124,9 @@ class NativeCore(context: Context) {
             liveCharacter = { id -> data.characters.get(id) },
             onStatus = onStatus,
             onAuxiliaryUsage = onAuxiliaryUsage,
+            onAuxiliaryNote = { taskType, note ->
+                recordAuxMetric(config, taskType, System.currentTimeMillis(), null, "note", note)
+            },
         )
         return ChatOrchestrator(
             llm = llm,
