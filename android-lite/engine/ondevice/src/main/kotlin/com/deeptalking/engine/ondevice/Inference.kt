@@ -47,6 +47,13 @@ data class LlmRequest(
      * (legacy `buildUserMessageContent`). Null when the caller has no media access.
      */
     val imageResolver: ((String) -> String?)? = null,
+    /**
+     * Marks a background/auxiliary call (memory analysis, style critique, quick
+     * replies, profile fill, avatar/sticker generation, …). The transport applies
+     * the auxiliary timeout budget instead of the chat one — legacy `callAPI` used
+     * 90s for these while chat turns got 180s.
+     */
+    val auxiliary: Boolean = false,
 )
 
 data class ToolCall(

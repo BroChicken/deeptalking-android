@@ -30,6 +30,7 @@ import com.deeptalking.engine.ondevice.TtsTurn
 import com.deeptalking.engine.remote.RemoteTtsProbe
 import com.deeptalking.engine.remote.RemoteVoiceUpload
 import com.deeptalking.feature.characters.CharacterParity
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
@@ -1155,6 +1156,9 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             sendingState.value = true
             statusState.value = "思考中…"
             lastUserActivityAt.value = System.currentTimeMillis()
+            // Captured before the request body is assembled so the failure metric can
+            // still report a duration (its scope must outlive `cfg`/`requestStartedAt`).
+            val turnStartedAt = System.currentTimeMillis()
             try {
                 // Legacy blocks before mutating the conversation when no key is set.
                 val cfg = core.currentConfig()
@@ -1283,6 +1287,25 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             } catch (error: Exception) {
                 streamingState.value = null
                 statusState.value = ""
+                if (error !is CancellationException) {
+                    // Legacy `recordCacheUsage` also logged failed chat requests: without
+                    // this row the settings panel cannot explain "为什么这次没回".
+                    val failedCfg = core.currentConfig()
+                    runCatching {
+                        appendMetric { metrics ->
+                            metrics + RequestMetric(
+                                at = Instant.now().toString(),
+                                characterId = id,
+                                taskType = "chat",
+                                model = failedCfg.modelName,
+                                platform = failedCfg.apiPlatform,
+                                phase = (error.message ?: error.toString()).replace(Regex("\\s+"), " ").trim().take(160),
+                                status = "failed",
+                                durationMs = System.currentTimeMillis() - turnStartedAt,
+                            )
+                        }
+                    }
+                }
                 eventsState.tryEmit(UiEvent("回复失败：${error.message ?: error}。你的消息已保留，可稍后重试。"))
             } finally {
                 sendingState.value = false

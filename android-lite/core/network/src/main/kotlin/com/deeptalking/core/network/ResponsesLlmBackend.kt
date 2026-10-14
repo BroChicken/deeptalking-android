@@ -1,5 +1,6 @@
 package com.deeptalking.core.network
 
+import com.deeptalking.core.common.AppLimits
 import com.deeptalking.core.model.BuiltinPlatforms
 import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.MessageAttachment
@@ -60,6 +61,21 @@ private const val HARD_TIMEOUT_SECONDS = 180L
 private const val IDLE_TIMEOUT_SECONDS = 60L
 
 /**
+ * Total budget for background/auxiliary calls, mirroring the legacy 90s cap
+ * (`API_LIMITS.auxiliaryTimeoutMs` in `request.js`). Kept wired to
+ * [AppLimits.Api.AUXILIARY_TIMEOUT_MS] so the shared constant and the transport
+ * cannot drift apart.
+ */
+private const val AUXILIARY_TIMEOUT_SECONDS = AppLimits.Api.AUXILIARY_TIMEOUT_MS / 1_000
+
+/**
+ * Timeout budget a request gets: chat turns 180s, auxiliary/background calls 90s.
+ * Exposed for tests so the mapping cannot silently regress.
+ */
+internal fun callTimeoutSeconds(auxiliary: Boolean): Long =
+    if (auxiliary) AUXILIARY_TIMEOUT_SECONDS else HARD_TIMEOUT_SECONDS
+
+/**
  * [LlmBackend] for the OpenAI-compatible "Responses" endpoint
  * (`"$baseUrl/responses"`), matching the legacy JS transport used by
  * DeepSeek / OpenCode Go.
@@ -88,6 +104,20 @@ class ResponsesLlmBackend(
         .readTimeout(IDLE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .build()
 
+    /**
+     * Auxiliary/background calls run on a shorter budget ([AUXILIARY_TIMEOUT_SECONDS])
+     * so a stuck maintenance task cannot hold the app for the full chat timeout.
+     * Inherits the DNS resolver (DoH) from [client].
+     */
+    private val auxiliaryClient: OkHttpClient = client.newBuilder()
+        .callTimeout(AUXILIARY_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        .readTimeout(AUXILIARY_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        .build()
+
+    /** Chat turns use [client]; auxiliary calls ([LlmRequest.auxiliary]) use [auxiliaryClient]. */
+    private fun clientFor(request: LlmRequest): OkHttpClient =
+        if (request.auxiliary) auxiliaryClient else client
+
     private val json: Json = Json {
         ignoreUnknownKeys = true
         encodeDefaults = true
@@ -99,7 +129,7 @@ class ResponsesLlmBackend(
 
     override suspend fun complete(request: LlmRequest): LlmResult = withContext(Dispatchers.IO) {
         val payload = buildBody(request, stream = false)
-        client.newCall(newRequest(payload, request, stream = false)).execute().use { response ->
+        clientFor(request).newCall(newRequest(payload, request, stream = false)).execute().use { response ->
             val body = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
                 throw IllegalStateException("Responses API HTTP ${response.code}: ${body.take(500)}")

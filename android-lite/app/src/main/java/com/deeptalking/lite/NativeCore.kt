@@ -898,6 +898,7 @@ class NativeCore(context: Context) {
                 reasoningEffort = "none",
                 apiPlatform = config.apiPlatform,
                 sessionId = "deeptalking-general",
+                auxiliary = true,
             ),
         )
         return result.text.takeIf { it.isNotBlank() }
@@ -930,6 +931,7 @@ class NativeCore(context: Context) {
                 reasoningEffort = "none",
                 apiPlatform = config.apiPlatform,
                 sessionId = "deeptalking-general",
+                auxiliary = true,
             ),
         )
         return extractEmoji(result.text)
@@ -974,6 +976,7 @@ class NativeCore(context: Context) {
                 reasoningEffort = "none",
                 apiPlatform = config.apiPlatform,
                 sessionId = "deeptalking-general",
+                auxiliary = true,
                 imageResolver = { ref -> MediaRef.toDataUri(appContext, ref) },
             ),
         )
@@ -1060,6 +1063,7 @@ class NativeCore(context: Context) {
                 reasoningEffort = "none",
                 apiPlatform = config.apiPlatform,
                 sessionId = "deeptalking-general",
+                auxiliary = true,
             ),
         )
         return result.text.takeIf { it.isNotBlank() }

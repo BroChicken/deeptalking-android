@@ -1813,20 +1813,7 @@ class BackgroundTasks(
         user: String,
         sessionId: String? = null,
         taskType: String = "auxiliary",
-    ): String {
-        val request = LlmRequest(
-            model = model,
-            instructions = system,
-            input = listOf(ChatMessage(role = Role.User, content = user)),
-            temperature = normalizeTemperature(config.temperature),
-            maxOutputTokens = AppLimits.Api.AUXILIARY_MAX_OUTPUT_TOKENS,
-            stream = false,
-            reasoningEffort = "none",
-            apiPlatform = apiPlatform,
-            sessionId = sessionId ?: "deeptalking-general",
-        )
-        return completeDetailed(system, user, sessionId, taskType).text
-    }
+    ): String = completeDetailed(system, user, sessionId, taskType).text
 
     /** Text of one auxiliary call, plus the failure reason when it produced no text. */
     private data class Completion(val text: String, val error: String = "")
@@ -1854,6 +1841,7 @@ class BackgroundTasks(
             reasoningEffort = "none",
             apiPlatform = apiPlatform,
             sessionId = sessionId ?: "deeptalking-general",
+            auxiliary = true,
         )
         var attempt = 0
         while (true) {
