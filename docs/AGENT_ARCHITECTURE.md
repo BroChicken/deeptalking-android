@@ -95,10 +95,12 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 | `ask_user` | 向用户提出澄清问题 | src/js/agent/tool-definitions.js:44 |
 | `update_character_field` | 精准修改基础设定字段（说话风格、称呼等） | src/js/agent/tool-definitions.js:50 |
 | `upsert_lorebook_entry` | 写入/更新世界书条目（世界层设定唯一入口，保护用户手写条目） | src/js/agent/tool-definitions.js:56 |
-| `web_fetch` | 抓网页正文 / 图片 / B站视频（url 或 keyword） | src/js/agent/tool-definitions.js:71 |
+| `web_fetch` | 抓网页正文 / 图片 / B站视频（url 或 keyword）；**原生增强**：虎扑帖子链接、网易云歌曲链接也会被专门解析 | src/js/agent/tool-definitions.js:71 |
 | `update_memory` | 按 ID 修正记忆（用户纠正时用） | src/js/agent/tool-definitions.js:77 |
 | `send_sticker` | 发表情包（仅当角色有贴图时注册） | src/js/agent/tool-definitions.js:102 |
-| `web_search` | 联网搜索（RSS 抓取，本地 function 工具） | src/js/agent/tool-definitions.js:108 / src/js/api/web-content.js |
+| `web_search` | 联网搜索（必应 RSS，本地 function 工具；**原生增强**：`limit` 可调 1–20） | src/js/agent/tool-definitions.js:108 / src/js/api/web-content.js |
+| `hot_topics` | **原生新增**：国内平台热榜（百度热搜 / 头条热榜 / 抖音热榜 / 知乎热榜，全部免账号） | — |
+| `social_search` | **原生新增**：国内社区检索（虎扑帖子 / 网易云歌曲 / B站视频，全部免账号） | — |
 
 每个工具就是一段 JSON Schema 描述（name + description + parameters），模型据此决定何时调用。
 **工具描述是"何时用哪个工具"的权威依据**，system 提示词的规则 A 只留一句导引。
@@ -154,7 +156,7 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 | `submit-retry` | 阶段二兜底仍未拿到合法 `submit_response` | retry-submit | `正在重新整理回复…` |
 | `empty` | 无可用正文 | regenerate / fail | 有额度 → `正在重新生成（第2次）…`；否则抛错收口 |
 
-工具提示（`toolActivityHint`）：`get_current_time`→`正在确认时间…`、`search_memory`→`正在回忆…`、`list_memories`→`正在整理记忆…`、`delete_memory`→`正在清理记忆…`、`set_reminder`→`已记下，正在回应…`、`update_character_field`→`已按你的要求调整设定…`、`web_search`→`正在搜索…`、`web_fetch`→`正在读取网页…`、`send_sticker`→`正在挑表情…`，未知工具回退 `正在处理…`。
+工具提示（`toolActivityHint`）：`get_current_time`→`正在确认时间…`、`search_memory`→`正在回忆…`、`list_memories`→`正在整理记忆…`、`delete_memory`→`正在清理记忆…`、`set_reminder`→`已记下，正在回应…`、`update_character_field`→`已按你的要求调整设定…`、`web_search`→`正在搜索…`、`web_fetch`→`正在读取网页…`、`hot_topics`→`正在看热榜…`、`social_search`→`正在搜社区…`、`send_sticker`→`正在挑表情…`，未知工具回退 `正在处理…`。
 
 > 主提示词的 0/7/8 与【输出格式】都要求"以结构化方式收尾"（调用 `submit_response` 或输出单个 JSON 对象）且 `quickReplies` 恒为两条用户视角短句；但**客户端不再把 `quickReplies` 当收尾门槛**——散文/缺 quickReplies 的收尾一律直接采用，从而消除"几乎每轮都多跑一轮「正在整理回复…」"的历史问题。
 

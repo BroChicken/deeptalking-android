@@ -13,7 +13,7 @@ class WebSearchTool(private val web: WebContentProvider?) : AgentTool {
     override val definition = ToolDefinition(
         name = "web_search",
         description = "搜索实时网页资料，返回实际取得的标题、链接和摘要。失败或无结果时不得编造搜索结果；可请用户提供链接后用 web_fetch 读取。",
-        parametersJson = """{"type":"object","properties":{"query":{"type":"string","description":"搜索关键词"}},"required":["query"],"additionalProperties":false}""",
+        parametersJson = """{"type":"object","properties":{"query":{"type":"string","description":"搜索关键词"},"limit":{"type":"integer","minimum":1,"maximum":20,"description":"返回条数，默认 6"}},"required":["query"],"additionalProperties":false}""",
     )
 
     // Legacy always registers `web_search`; unavailability is reported at execution.
@@ -24,6 +24,12 @@ class WebSearchTool(private val web: WebContentProvider?) : AgentTool {
         val args = ToolArgs.parse(call.arguments)
         val query = ToolArgs.string(args, "query").trim()
         if (query.isEmpty()) return AgentToolResult(errorJson("缺少搜索关键词 query"))
-        return AgentToolResult(provider.searchWeb(query))
+        val limit = (ToolArgs.int(args, "limit") ?: DEFAULT_LIMIT).coerceIn(1, MAX_LIMIT)
+        return AgentToolResult(provider.searchWeb(query, limit))
+    }
+
+    private companion object {
+        const val DEFAULT_LIMIT = 6
+        const val MAX_LIMIT = 20
     }
 }

@@ -33,7 +33,7 @@ class HttpWebContentProvider(
         isLenient = true
     }
 
-    override suspend fun searchWeb(query: String): String = withContext(Dispatchers.IO) {
+    override suspend fun searchWeb(query: String, limit: Int): String = withContext(Dispatchers.IO) {
         val text = trimText(query, 200)
         if (text.isEmpty()) {
             return@withContext buildJsonObject {
@@ -41,6 +41,7 @@ class HttpWebContentProvider(
                 put("reason", "缺少搜索关键词 query")
             }.toString()
         }
+        val wanted = limit.coerceIn(1, MAX_SEARCH_RESULTS)
         try {
             val response = executeGet(
                 "https://www.bing.com/search?format=rss&q=" + encodeURIComponent(text),
@@ -52,18 +53,16 @@ class HttpWebContentProvider(
                 if (PARSER_ERROR.containsMatchIn(body) || HTML_DOC.containsMatchIn(body)) {
                     throw IllegalStateException("搜索响应不是 RSS")
                 }
-                val items = ITEM_RE.findAll(body).mapNotNull { match ->
-                    val item = match.groupValues[1]
-                    val title = trimText(extractTag(item, "title"), 160)
-                    val url = extractTag(item, "link")
-                    if (title.isEmpty() || !HTTP_URL.containsMatchIn(url)) return@mapNotNull null
-                    buildJsonObject {
-                        put("title", title)
-                        put("url", url)
-                        put("description", trimText(extractTag(item, "description"), 400))
+                val hits = parseBingRss(body, wanted)
+                val results = buildJsonArray {
+                    hits.forEach { hit ->
+                        add(buildJsonObject {
+                            put("title", hit.title)
+                            put("url", hit.url)
+                            put("description", hit.description)
+                        })
                     }
-                }.take(6).toList()
-                val results = buildJsonArray { items.forEach { add(it) } }
+                }
                 val ok = results.isNotEmpty()
                 buildJsonObject {
                     put("ok", ok)
@@ -84,13 +83,91 @@ class HttpWebContentProvider(
         }
     }
 
-    override suspend fun searchBilibili(keyword: String): String = withContext(Dispatchers.IO) {
-        biliSearchVideos(keyword)
+    override suspend fun searchBilibili(keyword: String, limit: Int): String = withContext(Dispatchers.IO) {
+        biliSearchVideos(keyword, limit)
     }
+
+    override suspend fun hotBoard(platform: String, limit: Int): String = withContext(Dispatchers.IO) {
+        val name = platform.trim().lowercase(Locale.ROOT)
+        if (name !in HOT_PLATFORMS) {
+            return@withContext buildJsonObject {
+                put("ok", false)
+                put("reason", "不支持的平台：只支持 baidu / toutiao / douyin / zhihu")
+            }.toString()
+        }
+        val wanted = limit.coerceIn(1, MAX_HOT_TOPICS)
+        try {
+            val body = executeGet(hotBoardUrl(name), 15_000L, hotBoardHeaders(name)).use { res ->
+                if (!res.isSuccessful) throw IllegalStateException("HTTP ${res.code}")
+                res.body?.string().orEmpty()
+            }
+            val topics = when (name) {
+                "baidu" -> parseBaiduBoard(body, wanted)
+                "toutiao" -> parseToutiaoBoard(body, wanted)
+                "douyin" -> parseDouyinBoard(body, wanted)
+                else -> parseZhihuHot(body, wanted)
+            }
+            if (topics.isEmpty()) {
+                return@withContext buildJsonObject {
+                    put("ok", false)
+                    put("platform", name)
+                    put("reason", "没有取到榜单内容（接口可能已变更），不要编造榜单")
+                }.toString()
+            }
+            val items = buildJsonArray {
+                topics.forEach { topic ->
+                    add(buildJsonObject {
+                        put("title", topic.title)
+                        if (topic.url.isNotEmpty()) put("url", topic.url)
+                        if (topic.hot.isNotEmpty()) put("hot", topic.hot)
+                    })
+                }
+            }
+            buildJsonObject {
+                put("ok", true)
+                put("platform", name)
+                put("count", topics.size)
+                put("items", items)
+            }.toString()
+        } catch (e: Exception) {
+            buildJsonObject {
+                put("ok", false)
+                put("platform", name)
+                put("reason", "热榜获取失败：" + (e.message ?: e.toString()))
+            }.toString()
+        }
+    }
+
+    override suspend fun searchSocial(platform: String, query: String, limit: Int): String =
+        withContext(Dispatchers.IO) {
+            val name = platform.trim().lowercase(Locale.ROOT)
+            val text = trimText(query, 120)
+            if (name !in SOCIAL_PLATFORMS) {
+                return@withContext buildJsonObject {
+                    put("ok", false)
+                    put("reason", "不支持的平台：只支持 hupu / netease / bilibili")
+                }.toString()
+            }
+            if (text.isEmpty()) {
+                return@withContext buildJsonObject {
+                    put("ok", false)
+                    put("platform", name)
+                    put("reason", "缺少检索关键词 query")
+                }.toString()
+            }
+            val wanted = limit.coerceIn(1, MAX_SOCIAL_RESULTS)
+            when (name) {
+                "bilibili" -> biliSearchVideos(text, wanted)
+                "netease" -> neteaseSearchSongs(text, wanted)
+                else -> hupuSearchPosts(text, wanted)
+            }
+        }
 
     override suspend fun fetch(url: String): String = withContext(Dispatchers.IO) {
         val target = url.trimJs()
         biliRoute(target)?.let { return@withContext it }
+        hupuRoute(target)?.let { return@withContext it }
+        neteaseRoute(target)?.let { return@withContext it }
 
         val looksImage = IMAGE_URL.containsMatchIn(target)
         try {
@@ -129,13 +206,14 @@ class HttpWebContentProvider(
         extractBiliVideoId(url)?.let { return biliVideoDetail(it) }
         if (BILI_SEARCH_URL.containsMatchIn(url) || BILI_SEARCH_PATH.containsMatchIn(url)) {
             val keyword = extractBiliSearchKeyword(url)
-            if (keyword.isNotEmpty()) return biliSearchVideos(keyword)
+            if (keyword.isNotEmpty()) return biliSearchVideos(keyword, WebContentProvider.DEFAULT_VIDEO_LIMIT)
         }
         return null
     }
 
-    private fun biliSearchVideos(keyword: String): String {
+    private fun biliSearchVideos(keyword: String, limit: Int): String {
         val kw = keyword.trimJs()
+        val wanted = limit.coerceIn(1, MAX_SOCIAL_RESULTS)
         if (kw.isEmpty()) {
             return buildJsonObject {
                 put("ok", false)
@@ -164,7 +242,7 @@ class HttpWebContentProvider(
                     put("url", "https://www.bilibili.com/video/$bvid")
                     put("cover", normalizeBiliPic(item["pic"].toText()))
                 }
-            }.take(8).toList()
+            }.take(wanted).toList()
             if (mapped.isEmpty()) {
                 return buildJsonObject {
                     put("ok", false)
@@ -240,6 +318,217 @@ class HttpWebContentProvider(
                 put("ok", false)
                 put("platform", "bilibili")
                 put("reason", "B站视频读取失败：" + (e.message ?: e.toString()))
+            }.toString()
+        }
+    }
+
+    // ------------------------------------------------------------------ 虎扑
+
+    /** Only `bbs.hupu.com/<数字>.html` is a thread; everything else falls back to generic fetch. */
+    private fun hupuRoute(url: String): String? {
+        if (!HUPU_THREAD_URL.containsMatchIn(url)) return null
+        val tid = HUPU_TID.find(url)?.groupValues?.get(1) ?: return null
+        return hupuThread(tid)
+    }
+
+    private fun hupuThread(tid: String): String {
+        return try {
+            val html = executeGet("https://bbs.hupu.com/$tid.html", 20_000L, CN_PAGE_HEADERS).use { res ->
+                if (!res.isSuccessful) throw IllegalStateException("HTTP ${res.code}")
+                res.body?.string().orEmpty()
+            }
+            val thread = parseHupuThread(html) ?: throw IllegalStateException("页面结构已变更")
+            val payload = buildJsonObject {
+                put("ok", true)
+                put("platform", "hupu")
+                put("tid", tid)
+                put("url", "https://bbs.hupu.com/$tid.html")
+                if (thread.title.isNotEmpty()) put("title", thread.title)
+                if (thread.author.isNotEmpty()) put("author", thread.author)
+                if (thread.board.isNotEmpty()) put("board", thread.board)
+                if (thread.stats.isNotEmpty()) put("stats", thread.stats)
+                put("content", trimText(thread.content, 3000))
+                if (thread.images.isNotEmpty()) {
+                    put("images", buildJsonArray { thread.images.forEach { add(JsonPrimitive(it)) } })
+                    put("note", "图片见 images 字段，可在 reply 中用 ![图](URL) 展示")
+                }
+                if (thread.replies.isNotEmpty()) {
+                    put("replies", buildJsonArray {
+                        thread.replies.forEach { reply ->
+                            add(buildJsonObject {
+                                if (reply.author.isNotEmpty()) put("author", reply.author)
+                                put("content", trimText(reply.content, 400))
+                            })
+                        }
+                    })
+                }
+            }
+            withPreviewImages(payload.toString(), thread.images, 2)
+        } catch (e: Exception) {
+            buildJsonObject {
+                put("ok", false)
+                put("platform", "hupu")
+                put("reason", "虎扑帖子读取失败：" + (e.message ?: e.toString()))
+            }.toString()
+        }
+    }
+
+    private fun hupuSearchPosts(keyword: String, limit: Int): String {
+        val kw = keyword.trimJs()
+        return try {
+            val html = executeGet(
+                "https://bbs.hupu.com/search?q=" + encodeURIComponent(kw),
+                20_000L,
+                CN_PAGE_HEADERS,
+            ).use { res ->
+                if (!res.isSuccessful) throw IllegalStateException("HTTP ${res.code}")
+                res.body?.string().orEmpty()
+            }
+            val hits = parseHupuSearch(html, limit)
+            if (hits.isEmpty()) {
+                return buildJsonObject {
+                    put("ok", false)
+                    put("platform", "hupu")
+                    put("keyword", kw)
+                    put("reason", "没有搜到相关帖子，可换个关键词再试")
+                }.toString()
+            }
+            buildJsonObject {
+                put("ok", true)
+                put("platform", "hupu")
+                put("keyword", kw)
+                put("count", hits.size)
+                put("results", buildJsonArray {
+                    hits.forEach { hit ->
+                        add(buildJsonObject {
+                            put("title", hit.title)
+                            put("url", hit.url)
+                            if (hit.description.isNotEmpty()) put("meta", hit.description)
+                        })
+                    }
+                })
+            }.toString()
+        } catch (e: Exception) {
+            buildJsonObject {
+                put("ok", false)
+                put("platform", "hupu")
+                put("keyword", kw)
+                put("reason", "虎扑搜索失败：" + (e.message ?: e.toString()))
+            }.toString()
+        }
+    }
+
+    // ---------------------------------------------------------------- 网易云
+
+    private fun neteaseRoute(url: String): String? {
+        val id = NETEASE_SONG_ID.find(url)?.groupValues?.get(1) ?: return null
+        return neteaseSong(id)
+    }
+
+    private fun neteaseSong(id: String): String {
+        return try {
+            val detail = executeGet(
+                "https://music.163.com/api/song/detail/?ids=[" + encodeURIComponent(id) + "]",
+                15_000L,
+                NETEASE_HEADERS,
+            ).use { res ->
+                if (!res.isSuccessful) throw IllegalStateException("HTTP ${res.code}")
+                res.body?.string().orEmpty()
+            }
+            val song = parseNeteaseSong(detail) ?: throw IllegalStateException("未取到歌曲信息")
+            val comments = runCatching { neteaseCommentBody(id) }.getOrNull()
+            val payload = buildJsonObject {
+                put("ok", true)
+                put("platform", "netease")
+                put("songId", id)
+                put("name", song.name)
+                put("artists", song.artists)
+                if (song.album.isNotEmpty()) put("album", song.album)
+                put("url", "https://music.163.com/song?id=" + id)
+                if (song.cover.isNotEmpty()) put("cover", song.cover)
+                if (comments != null) {
+                    put("commentTotal", comments.total)
+                    put("hotComments", buildJsonArray {
+                        comments.hot.forEach { comment ->
+                            add(buildJsonObject {
+                                if (comment.author.isNotEmpty()) put("author", comment.author)
+                                put("content", trimText(comment.content, 300))
+                                if (comment.liked > 0) put("liked", comment.liked)
+                            })
+                        }
+                    })
+                } else {
+                    put("commentsUnavailable", true)
+                }
+                if (song.cover.isNotEmpty()) put("note", "封面图见 cover 字段，可在 reply 中用 ![封面](URL) 展示")
+            }
+            withPreviewImages(payload.toString(), listOf(song.cover), 1)
+        } catch (e: Exception) {
+            buildJsonObject {
+                put("ok", false)
+                put("platform", "netease")
+                put("reason", "网易云歌曲读取失败：" + (e.message ?: e.toString()))
+            }.toString()
+        }
+    }
+
+    private fun neteaseCommentBody(id: String): NeteaseComments {
+        val body = executeGet(
+            "https://music.163.com/api/v1/resource/comments/R_SO_4_" + encodeURIComponent(id) +
+                "?limit=" + NETEASE_COMMENT_LIMIT + "&offset=0",
+            15_000L,
+            NETEASE_HEADERS,
+        ).use { res ->
+            if (!res.isSuccessful) throw IllegalStateException("HTTP ${res.code}")
+            res.body?.string().orEmpty()
+        }
+        return parseNeteaseComments(body, NETEASE_COMMENT_LIMIT)
+    }
+
+    private fun neteaseSearchSongs(keyword: String, limit: Int): String {
+        val kw = keyword.trimJs()
+        return try {
+            val body = executeGet(
+                "https://music.163.com/api/search/get?s=" + encodeURIComponent(kw) + "&type=1&limit=" + limit,
+                15_000L,
+                NETEASE_HEADERS,
+            ).use { res ->
+                if (!res.isSuccessful) throw IllegalStateException("HTTP ${res.code}")
+                res.body?.string().orEmpty()
+            }
+            val songs = parseNeteaseSearch(body, limit)
+            if (songs.isEmpty()) {
+                return buildJsonObject {
+                    put("ok", false)
+                    put("platform", "netease")
+                    put("keyword", kw)
+                    put("reason", "没有搜到相关歌曲，可换个关键词再试")
+                }.toString()
+            }
+            buildJsonObject {
+                put("ok", true)
+                put("platform", "netease")
+                put("keyword", kw)
+                put("count", songs.size)
+                put("results", buildJsonArray {
+                    songs.forEach { song ->
+                        add(buildJsonObject {
+                            put("id", song.id)
+                            put("name", song.name)
+                            put("artists", song.artists)
+                            if (song.album.isNotEmpty()) put("album", song.album)
+                            put("url", "https://music.163.com/song?id=" + song.id)
+                        })
+                    }
+                })
+                put("note", "要听热评可用 web_fetch 打开该歌曲链接")
+            }.toString()
+        } catch (e: Exception) {
+            buildJsonObject {
+                put("ok", false)
+                put("platform", "netease")
+                put("keyword", kw)
+                put("reason", "网易云搜索失败：" + (e.message ?: e.toString()))
             }.toString()
         }
     }
@@ -562,3 +851,338 @@ private val ENTITY_RE = Regex("&(#x?[0-9a-fA-F]+|[a-zA-Z]+);")
 private val SPACE_RUN = Regex("[ \\t\\r\\f\\v]+")
 private val NEWLINE3 = Regex("\\n{3,}")
 private val WS_RUN = Regex("[\\s\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\uFEFF]+")
+
+// ======================= 免账号的国内平台源 =======================
+//
+// 下面这些源都实测过「不需要账号」。接口形态随时可能变，所以每个源都只在
+// 自己的分支里抛错、由调用方兜成 {"ok":false,...}，坏一个不影响其它源。
+
+/** Parser entry point for the platform JSON payloads (also used by the parser tests). */
+private val PARSER_JSON = Json {
+    ignoreUnknownKeys = true
+    isLenient = true
+}
+
+private const val MAX_SEARCH_RESULTS = 20
+private const val MAX_HOT_TOPICS = 30
+private const val MAX_SOCIAL_RESULTS = 20
+private const val NETEASE_COMMENT_LIMIT = 20
+
+private val BROWSER_UA =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+private val CN_PAGE_HEADERS = mapOf("User-Agent" to BROWSER_UA)
+private val NETEASE_HEADERS = mapOf("User-Agent" to BROWSER_UA, "Referer" to "https://music.163.com/")
+private val HOT_PLATFORMS = setOf("baidu", "toutiao", "douyin", "zhihu")
+private val SOCIAL_PLATFORMS = setOf("hupu", "netease", "bilibili")
+private val HUPU_THREAD_URL = Regex("^https?://bbs\\.hupu\\.com/\\d+\\.html", RegexOption.IGNORE_CASE)
+private val HUPU_TID = Regex("bbs\\.hupu\\.com/(\\d+)\\.html", RegexOption.IGNORE_CASE)
+private val NETEASE_SONG_ID = Regex("music\\.163\\.com\\S*?[?&]id=(\\d+)", RegexOption.IGNORE_CASE)
+private val HUPU_SEARCH_LINK = Regex(
+    "<a[^>]*href=\"(https?://bbs\\.hupu\\.com/\\d+\\.html)\"[^>]*>(.*?)</a>",
+    setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+)
+private val NEXT_DATA = Regex(
+    "<script id=\"__NEXT_DATA__\"[^>]*>(.*?)</script>",
+    setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+)
+private val IMG_SRC = Regex(
+    "<img[^>]*?(?:data-origin|src)=\"(https?://[^\"]+)\"",
+    RegexOption.IGNORE_CASE,
+)
+private val SPAN_TEXT = Regex(
+    "<span[^>]*>(.*?)</span>",
+    setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+)
+private val SPAN_NUM = Regex(
+    "<span class=\"content-wrap-span1\">(.*?)</span>",
+    setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+)
+private val DATE_ONLY = Regex("\\d{4}-\\d{2}-\\d{2}")
+private val BREADCRUMB_BOARD = Regex("^/\\d+$")
+private val ZHIHU_API_QUESTION = Regex("^https?://api\\.zhihu\\.com/questions/(\\d+)", RegexOption.IGNORE_CASE)
+
+private fun hotBoardUrl(platform: String): String = when (platform) {
+    "baidu" -> "https://top.baidu.com/api/board?platform=wise&tab=realtime"
+    "toutiao" -> "https://www.toutiao.com/hot-event/hot-board/?origin=toutiao_pc"
+    "douyin" -> "https://www.iesdouyin.com/web/api/v2/hotsearch/billboard/word/"
+    else -> "https://api.zhihu.com/topstory/hot-lists/total?limit=50"
+}
+
+private fun hotBoardHeaders(platform: String): Map<String, String> = when (platform) {
+    "zhihu" -> mapOf("User-Agent" to BROWSER_UA, "Referer" to "https://www.zhihu.com/hot")
+    "toutiao" -> mapOf("User-Agent" to BROWSER_UA, "Referer" to "https://www.toutiao.com/")
+    else -> CN_PAGE_HEADERS
+}
+
+/** 一条网页/帖子搜索结果。 */
+internal data class WebHit(val title: String, val url: String, val description: String = "")
+
+/** 一条热榜话题；[hot] 是热度的人话写法（拿不到就空）。 */
+internal data class BoardTopic(val title: String, val url: String = "", val hot: String = "")
+
+/** 虎扑帖子解析结果。 */
+internal data class HupuThread(
+    val title: String,
+    val author: String,
+    val board: String,
+    val content: String,
+    val stats: String,
+    val images: List<String>,
+    val replies: List<HupuReply>,
+)
+
+internal data class HupuReply(val author: String, val content: String)
+
+internal data class NeteaseSong(
+    val id: String,
+    val name: String,
+    val artists: String,
+    val album: String,
+    val cover: String,
+)
+
+internal data class NeteaseComment(val author: String, val content: String, val liked: Long)
+
+internal data class NeteaseComments(val total: Long, val hot: List<NeteaseComment>)
+
+internal fun parseBingRss(xml: String, limit: Int): List<WebHit> =
+    ITEM_RE.findAll(xml).mapNotNull { match ->
+        val item = match.groupValues[1]
+        val title = trimText(extractTag(item, "title"), 160)
+        val url = extractTag(item, "link")
+        if (title.isEmpty() || !HTTP_URL.containsMatchIn(url)) return@mapNotNull null
+        WebHit(title, url, trimText(extractTag(item, "description"), 400))
+    }.take(limit.coerceAtLeast(1)).toList()
+
+/** 百度热搜：`data.cards[].content[].content[]`，每条含 `word` / `url`。 */
+internal fun parseBaiduBoard(body: String, limit: Int): List<BoardTopic> {
+    val root = body.toJsonObject() ?: return emptyList()
+    val cards = ((root["data"] as? JsonObject)?.get("cards") as? JsonArray).orEmpty()
+    val out = mutableListOf<BoardTopic>()
+    cards.forEach cardLoop@{ card ->
+        val groups = ((card as? JsonObject)?.get("content") as? JsonArray).orEmpty()
+        groups.forEach groupLoop@{ group ->
+            val items = ((group as? JsonObject)?.get("content") as? JsonArray).orEmpty()
+            items.forEach itemLoop@{ element ->
+                val item = element as? JsonObject ?: return@itemLoop
+                val title = item["word"].toText().trimJs()
+                if (title.isEmpty()) return@itemLoop
+                val hot = item["hotScore"].toText().trimJs().ifEmpty { item["desc"].toText().trimJs() }
+                out += BoardTopic(title, item["url"].toText().trimJs(), hot)
+            }
+        }
+    }
+    return out.take(limit.coerceAtLeast(1))
+}
+
+/** 头条热榜：`data[].Title` / `Url` / `HotValue`。 */
+internal fun parseToutiaoBoard(body: String, limit: Int): List<BoardTopic> {
+    val root = body.toJsonObject() ?: return emptyList()
+    return (root["data"] as? JsonArray).orEmpty().mapNotNull { element ->
+        val item = element as? JsonObject ?: return@mapNotNull null
+        val title = item["Title"].toText().trimJs()
+        if (title.isEmpty()) return@mapNotNull null
+        val url = item["Url"].toText().trimJs()
+        BoardTopic(
+            title = title,
+            url = if (HTTP_URL.containsMatchIn(url)) url else "",
+            hot = formatHot(item["HotValue"].toNumberOrZero()),
+        )
+    }.take(limit.coerceAtLeast(1))
+}
+
+/** 抖音热榜：`word_list[].word` / `hot_value`（老接口在根上，新的在 `data` 里）。 */
+internal fun parseDouyinBoard(body: String, limit: Int): List<BoardTopic> {
+    val root = body.toJsonObject() ?: return emptyList()
+    val list = (root["word_list"] as? JsonArray)
+        ?: ((root["data"] as? JsonObject)?.get("word_list") as? JsonArray)
+        ?: JsonArray(emptyList())
+    return list.mapNotNull { element ->
+        val item = element as? JsonObject ?: return@mapNotNull null
+        val title = item["word"].toText().trimJs()
+        if (title.isEmpty()) return@mapNotNull null
+        BoardTopic(title, "", formatHot(item["hot_value"].toNumberOrZero()))
+    }.take(limit.coerceAtLeast(1))
+}
+
+/** 知乎热榜：`data[].target.title` / `target.url` / `detail_text`（如「852 万热度」）。 */
+internal fun parseZhihuHot(body: String, limit: Int): List<BoardTopic> {
+    val root = body.toJsonObject() ?: return emptyList()
+    return (root["data"] as? JsonArray).orEmpty().mapNotNull { element ->
+        val entry = element as? JsonObject ?: return@mapNotNull null
+        val target = entry["target"] as? JsonObject ?: return@mapNotNull null
+        val title = target["title"].toText().trimJs()
+        if (title.isEmpty()) return@mapNotNull null
+        BoardTopic(title, normalizeZhihuUrl(target["url"].toText()), entry["detail_text"].toText().trimJs())
+    }.take(limit.coerceAtLeast(1))
+}
+
+/** 热榜给的是 API 链接（`api.zhihu.com/questions/<id>`），换成能打开的网页链接。 */
+internal fun normalizeZhihuUrl(url: String): String {
+    val text = url.trimJs()
+    val match = ZHIHU_API_QUESTION.find(text) ?: return text
+    return "https://www.zhihu.com/question/" + match.groupValues[1]
+}
+
+/** 虎扑搜索页是服务端直出的 HTML：每个 `content-outline` 块含一条帖子。 */
+internal fun parseHupuSearch(html: String, limit: Int): List<WebHit> {
+    val wanted = limit.coerceAtLeast(1)
+    val out = mutableListOf<WebHit>()
+    val chunks = html.split("content-outline").drop(1)
+    for (chunk in chunks) {
+        val link = HUPU_SEARCH_LINK.find(chunk) ?: continue
+        val title = stripHtmlTags(link.groupValues[2]).trimJs()
+        if (title.isEmpty()) continue
+        val meta = hupuSearchMeta(chunk.substring(link.range.last + 1))
+        out += WebHit(title, link.groupValues[1], meta)
+        if (out.size >= wanted) break
+    }
+    return out
+}
+
+/**
+ * 结果行尾的元信息：日期 + 回复 / 推荐 / 亮评（列名固定，数量对不上就少写几个）。
+ * 只取 `<span>` 里的文本，避免把下一个结果块的残标签带进来。
+ */
+private fun hupuSearchMeta(tail: String): String {
+    val spans = SPAN_TEXT.findAll(tail).map { stripHtmlTags(it.groupValues[1]).trimJs() }.toList()
+    val date = spans.firstOrNull { DATE_ONLY.containsMatchIn(it) }.orEmpty()
+    val numbers = SPAN_NUM.findAll(tail).map { it.groupValues[1].trimJs() }.filter { it.isNotEmpty() }.toList()
+    val labels = listOf("回复", "推荐", "亮评")
+    return buildList {
+        if (date.isNotEmpty()) add(date)
+        numbers.forEachIndexed { index, value -> add((labels.getOrNull(index) ?: "数") + " " + value) }
+    }.joinToString(" · ")
+}
+
+/** 虎扑帖子页把整帖塞在 `<script id="__NEXT_DATA__">` 里。 */
+internal fun parseHupuThread(html: String): HupuThread? {
+    val raw = NEXT_DATA.find(html)?.groupValues?.get(1) ?: return null
+    val root = raw.toJsonObject() ?: return null
+    val pageProps = (root["props"] as? JsonObject)?.get("pageProps") as? JsonObject ?: return null
+    val detail = pageProps["detail"] as? JsonObject ?: return null
+    val thread = detail["thread"] as? JsonObject ?: return null
+
+    val title = thread["title"].toText().trimJs()
+    val contentHtml = thread["content"].toText()
+    val content = stripHtmlTags(contentHtml)
+    if (title.isEmpty() && content.isEmpty()) return null
+
+    val author = (thread["author"] as? JsonObject)?.let { node ->
+        node["puname"].toText().trimJs().ifEmpty { node["nickname"].toText().trimJs() }
+    }.orEmpty()
+    val crumbs = (detail["breadCrumb"] as? JsonArray).orEmpty().mapNotNull { it as? JsonObject }
+    val board = (crumbs.lastOrNull { BREADCRUMB_BOARD.containsMatchIn(it["url"].toText().trimJs()) }
+        ?: crumbs.dropLast(1).lastOrNull())
+        ?.get("title").toText().trimJs().orEmpty()
+    val stats = listOfNotNull(
+        thread["read"].toNumberOrZero().takeIf { it > 0 }?.let { "阅读 $it" },
+        thread["replies"].toNumberOrZero().takeIf { it > 0 }?.let { "回复 $it" },
+        thread["lights"].toNumberOrZero().takeIf { it > 0 }?.let { "亮评 $it" },
+    ).joinToString(" · ")
+    val images = IMG_SRC.findAll(contentHtml)
+        .map { it.groupValues[1] }
+        .filter { it.isNotEmpty() }
+        .distinct()
+        .take(3)
+        .toList()
+    val replies = ((detail["replies"] as? JsonObject)?.get("list") as? JsonArray).orEmpty().mapNotNull { element ->
+        val reply = element as? JsonObject ?: return@mapNotNull null
+        val text = stripHtmlTags(reply["content"].toText())
+        if (text.isEmpty()) return@mapNotNull null
+        val replyAuthor = (reply["author"] as? JsonObject)?.let { node ->
+            node["puname"].toText().trimJs().ifEmpty { node["nickname"].toText().trimJs() }
+        }.orEmpty()
+        HupuReply(replyAuthor, text)
+    }.take(10).toList()
+
+    return HupuThread(title, author, board, content, stats, images, replies)
+}
+
+/** 网易云搜索：`result.songs[]`。 */
+internal fun parseNeteaseSearch(body: String, limit: Int): List<NeteaseSong> {
+    val root = body.toJsonObject() ?: return emptyList()
+    val songs = ((root["result"] as? JsonObject)?.get("songs") as? JsonArray).orEmpty()
+    return songs.mapNotNull { element ->
+        val song = element as? JsonObject ?: return@mapNotNull null
+        val id = song["id"].toText().trimJs()
+        val name = song["name"].toText().trimJs()
+        if (id.isEmpty() || name.isEmpty()) return@mapNotNull null
+        NeteaseSong(
+            id = id,
+            name = name,
+            artists = song["artists"].joinNames(),
+            album = (song["album"] as? JsonObject)?.get("name").toText().trimJs().orEmpty(),
+            cover = "",
+        )
+    }.take(limit.coerceAtLeast(1))
+}
+
+/** 网易云歌曲详情：`songs[0]`。 */
+internal fun parseNeteaseSong(body: String): NeteaseSong? {
+    val root = body.toJsonObject() ?: return null
+    val song = (root["songs"] as? JsonArray)?.firstOrNull() as? JsonObject ?: return null
+    val id = song["id"].toText().trimJs()
+    val name = song["name"].toText().trimJs()
+    if (id.isEmpty() || name.isEmpty()) return null
+    val album = song["album"] as? JsonObject
+    return NeteaseSong(
+        id = id,
+        name = name,
+        artists = song["artists"].joinNames(),
+        album = album?.get("name").toText().trimJs().orEmpty(),
+        cover = album?.get("picUrl").toText().trimJs().orEmpty(),
+    )
+}
+
+/** 网易云评论：`total` + `hotComments`（没有就用最新评论）。 */
+internal fun parseNeteaseComments(body: String, limit: Int): NeteaseComments {
+    val root = body.toJsonObject() ?: return NeteaseComments(0, emptyList())
+    val source = (root["hotComments"] as? JsonArray).orEmpty() + (root["comments"] as? JsonArray).orEmpty()
+    val mapped = source.mapNotNull { element ->
+        val comment = element as? JsonObject ?: return@mapNotNull null
+        val content = comment["content"].toText().trimJs()
+        if (content.isEmpty()) return@mapNotNull null
+        NeteaseComment(
+            author = (comment["user"] as? JsonObject)?.get("nickname").toText().trimJs().orEmpty(),
+            content = content,
+            liked = comment["likedCount"].toNumberOrZero(),
+        )
+    }.take(limit.coerceAtLeast(1)).toList()
+    return NeteaseComments(root["total"].toNumberOrZero(), mapped)
+}
+
+/** 热度数字的人话写法（头条/抖音给的是裸数字）。 */
+internal fun formatHot(value: Long): String = when {
+    value <= 0 -> ""
+    value >= 100_000_000 -> String.format(Locale.ROOT, "%.1f亿", value / 100_000_000.0)
+    value >= 10_000 -> String.format(Locale.ROOT, "%.1f万", value / 10_000.0)
+    else -> value.toString()
+}
+
+private fun JsonElement?.joinNames(): String =
+    (this as? JsonArray).orEmpty()
+        .mapNotNull { (it as? JsonObject)?.get("name").toText().trimJs().ifEmpty { null } }
+        .joinToString("、")
+
+private fun String.toJsonObject(): JsonObject? =
+    runCatching { PARSER_JSON.parseToJsonElement(this) as? JsonObject }.getOrNull()
+
+/** 文本 + 预览图（与 B 站封面同一形态：模型能直接看到图）。 */
+private fun withPreviewImages(text: String, images: List<String>, max: Int): String {
+    val wanted = images.filter { it.isNotEmpty() }.distinct().take(max)
+    if (wanted.isEmpty()) return text
+    return buildJsonArray {
+        add(buildJsonObject {
+            put("type", "input_text")
+            put("text", text)
+        })
+        wanted.forEach { url ->
+            add(buildJsonObject {
+                put("type", "input_image")
+                put("image_url", url)
+                put("detail", "low")
+            })
+        }
+    }.toString()
+}

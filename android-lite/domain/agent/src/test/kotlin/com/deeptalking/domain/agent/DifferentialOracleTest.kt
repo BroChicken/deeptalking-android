@@ -53,6 +53,8 @@ class DifferentialOracleTest {
      */
     private val NATIVE_TOOL_CONTRACT: Map<String, Pair<List<String>, List<String>>> = mapOf(
         "search_memory" to (emptyList<String>() to listOf("query", "date", "timeRef", "slot", "memberName")),
+        // `web_search` 增加了可选 `limit`（返回条数参数化）；required 与遗留 JS 一致。
+        "web_search" to (listOf("query") to listOf("query", "limit")),
         // The turn no longer writes short-term memory (the whole-window fold pass owns
         // the window), so `shortTerm` is gone from the turn contract.
         "submit_response" to (
@@ -69,6 +71,14 @@ class DifferentialOracleTest {
                 )
             ),
     )
+
+    /**
+     * Native-only tools with no legacy JS counterpart: the login-free CN platform tools
+     * (`hot_topics` / `social_search`) added on top of `web_search` / `web_fetch`.
+     * They are filtered out before the oracle comparison — the legacy tool order and
+     * every remaining schema are still asserted exactly.
+     */
+    private val NATIVE_ONLY_TOOLS = setOf("hot_topics", "social_search")
 
     private fun readResource(name: String): String =
         javaClass.classLoader.getResourceAsStream(name)?.bufferedReader()?.readText()
@@ -117,7 +127,10 @@ class DifferentialOracleTest {
             val expected = expectedAll[scenario.id]!!.jsonObject["body"]!!.jsonObject
             val builder = RequestBuilder(scenario.config)
             // The submit phase exposes only submit_response; the auto phase exposes the full set.
-            val allDefs = defaultTools(memory, web = null, stickersEnabled = scenario.character.stickers.isNotEmpty()).map { it.definition }
+            // Native-only tools are dropped so the legacy order/count still matches exactly.
+            val allDefs = defaultTools(memory, web = null, stickersEnabled = scenario.character.stickers.isNotEmpty())
+                .map { it.definition }
+                .filterNot { it.name in NATIVE_ONLY_TOOLS }
             val defs = if (scenario.phase == RequestPhase.SUBMIT) {
                 allDefs.filter { it.name == "submit_response" }
             } else {

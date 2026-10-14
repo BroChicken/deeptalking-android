@@ -11,7 +11,7 @@ DeepTalking 是原生 Android 应用（Kotlin + Jetpack Compose 多模块），�
 | `:app` | application | `MainActivity`（Compose）、`AppRoot`、`AppViewModel`、`NativeCore`（手动 DI）、`DeepTalkingApp`；`res/xml/network_security_config.xml` + `res/raw/*.pem`（为 `opencode.ai` 附加 TLS 信任锚） |
 | `:core:common` | core | 结果类型、文本工具、`AppLimits`（从旧前端迁移的常量/上限） |
 | `:core:model` | core | 领域模型：`Character/GroupMember`、`ChatMessage`、`LongTermMemory/ShortTermMemory`、`LorebookEntry`、`Sticker`、`AppConfig`、`TtsPhase`（朗读相位枚举）、`extractSpeechText`（回复去括号动作/`【】`/Markdown 标记，仅留台词，供朗读）、`extractSpeechSegments`（群聊回复按 `成员名：台词`（台词不加引号）切成逐发言人片段，供逐成员语气朗读）、`AlignedSources`/`alignSources`/`mergeSources`（**保持 `sourceMessageIds`↔`sourceRoles`↔`userEvidence` 逐位对齐**，任何合并都必须走它，杜绝把 `sourceRoles` 当集合去重导致来源 role 缺失） |
-| `:core:network` | core | `ResponsesLlmBackend`（OkHttp + SSE，实现 `LlmBackend`）、`WebContentProvider`/`HttpWebContentProvider`（web_search/web_fetch/B站）、`DohDns`（可插拔的 DNS-over-HTTPS 解析器，绕过运营商 DNS 劫持）。**TLS**：走 OkHttp/平台 Conscrypt，**只信设备系统信任库、且不做 AIA 补链**；旧 WebView 版由 Chromium 代管（自带根库 + AIA），故同一站点在原生可能因设备缺锚报 `CertPathValidatorException: Trust anchor ... not found`（典型：`opencode.ai` 的 Google Trust Services 链）。修复见 `:app` 的 `network_security_config.xml` |
+| `:core:network` | core | `ResponsesLlmBackend`（OkHttp + SSE，实现 `LlmBackend`）、`WebContentProvider`/`HttpWebContentProvider`（`searchWeb` 必应 RSS、`fetch` 网页/图片/B站视频 + **虎扑帖子**（页面内 `__NEXT_DATA__`）与**网易云歌曲**（详情+热评）专门路由、`searchBilibili`、`hotBoard` 四家免登录热榜、`searchSocial` 虎扑/网易云/B站检索；解析函数抽成 `internal` 纯函数并有单测）、`DohDns`（可插拔的 DNS-over-HTTPS 解析器，绕过运营商 DNS 劫持）。**TLS**：走 OkHttp/平台 Conscrypt，**只信设备系统信任库、且不做 AIA 补链**；旧 WebView 版由 Chromium 代管（自带根库 + AIA），故同一站点在原生可能因设备缺锚报 `CertPathValidatorException: Trust anchor ... not found`（典型：`opencode.ai` 的 Google Trust Services 链）。修复见 `:app` 的 `network_security_config.xml` |
 | `:core:database` | core | Room 实体/DAO/数据库（角色、消息、配置的 JSON 聚合存储） |
 | `:core:data` | core | 仓库层（`CharacterRepository/ChatRepository/ConfigRepository`）、`SettingsStore`（DataStore）、`CoreDataContainer`、`legacy`（旧数据迁移与备份） |
 | `:core:security` | core | `SecretStore`：API Key 存 Keystore/EncryptedSharedPreferences |
@@ -34,7 +34,7 @@ DeepTalking 是原生 Android 应用（Kotlin + Jetpack Compose 多模块），�
 
 - 端侧推理（`:engine:ondevice`）：调用方只依赖接口，新增模型 = 新增实现 + 在 `NativeCore` 注册。`LlmBackend` 由 `:core:network` 的 `ResponsesLlmBackend` 实现（远程）；`TtsBackend` 由 `:engine:cosyvoice` 的 `CosyVoiceController.backend` 实现（端侧 CosyVoice3）；`EmbeddingBackend/AsrBackend` 暂为 `null`。
 - 朗读播放（`:engine:ondevice` 的 `TtsSpeaker`）：呼叫做朗读者只依赖此接口，具体引擎由 `AppConfig.ttsBackend` 决定——`ondevice` 走 `:engine:cosyvoice` 的 `CosyVoiceController`，`remote` 走 `:engine:remote-tts` 的 `RemoteTtsSpeaker`。唯一的分派点是 `NativeCore.ttsSpeaker(config)`（同时把 `ttsSpeed` 写进引擎），上层与 UI 都不按后端分支。远程失败**不自动回落**端侧（按设计），由已有的「朗读失败」提示暴露。
-- Agent 工具（`:domain:agent`）：实现 `AgentTool` 接口并在 `defaultTools()` 注册即可，`AgentLoop` 不变。
+- Agent 工具（`:domain:agent`）：实现 `AgentTool` 接口并在 `defaultTools()` 注册即可，`AgentLoop` 不变。**联网类工具**共四个：`web_search`（必应 RSS，`limit` 可调 1–20）、`web_fetch`（网页/图片/B站视频；虎扑帖子链接与网易云歌曲链接有专门路由）、`hot_topics`（百度/头条/抖音/知乎热榜）、`social_search`（虎扑帖子 / 网易云歌曲 / B站视频）。四个都**不需要账号**（不存 cookie、不需要 key）；后两个原生独有，无遗留 JS 对应物，`DifferentialOracleTest.NATIVE_ONLY_TOOLS` 里显式登记为偏差。
 - 记忆（`:domain:memory`）：上层依赖 `MemoryService` 接口。
 
 ## 界面与交互（对齐旧版 WebView）
