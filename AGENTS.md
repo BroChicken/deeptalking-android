@@ -45,4 +45,4 @@
 3. `docs/`（尤其 `docs/AGENT_ARCHITECTURE.md`、`docs/NATIVE_MODULES.md`）已同步更新。
 4. 发布前跑 `powershell -File tools/native-build.ps1 -Release`（需 keystore 环境变量）确认签名打包成功。
 
-`tools/` 只保留原生侧脚本：`native-verify.ps1`（全量自检）、`native-test.ps1`（单测）、`native-build.ps1`（打包）、`native-version.ps1`（版本号）、`pull-apk.ps1`（拉取发布包）、`build-cosyvoice-android.ps1`（重建 CosyVoice 原生库），以及 `tools/native/`（环境解析）与 `tools/diff/`（JS↔Kotlin 差分 oracle，仅测试用）。旧 WebView 构建/测试脚本已删除。
+`tools/` 只保留原生侧脚本：`native-verify.ps1`（全量自检）、`native-test.ps1`（单测）、`native-build.ps1`（打包）、`native-version.ps1`（版本号）、`pull-apk.ps1`（拉取发布包）、`build-cosyvoice-android.ps1`（重建 CosyVoice 原生库），以及 `tools/native/`（环境解析）与 `tools/diff/`（JS↔Kotlin 差分 oracle，仅测试用）。另有一个 PC 侧远程朗读启动器 `run-cosyvoice-server.bat`（只是包装 `tools/.work/cosyvoice-server/run-server.ps1`，见 `docs/REMOTE_TTS.md`）。旧 WebView 构建/测试脚本已删除。

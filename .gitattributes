@@ -2,3 +2,6 @@
 src/** text eol=lf
 src/vendor/katex/fonts/** binary
 android-lite/app/src/main/assets/hub.html text eol=lf
+# Windows-only launchers must keep CRLF: cmd.exe mis-parses LF-only files with
+# labels (goto) and parenthesised blocks.
+*.bat text eol=crlf

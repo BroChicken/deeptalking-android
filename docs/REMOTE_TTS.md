@@ -24,6 +24,10 @@
 powershell -File tools/.work/cosyvoice-server/run-server.ps1 -Api -Backend cuda0
 ```
 
+Windows 上也可以直接双击 `tools\run-cosyvoice-server.bat`（默认就是上面这条 API+CUDA），
+或 `tools\run-cosyvoice-server.bat webui` 进 WebUI 模式注册音色、`... stop` 停服；
+其它参数原样转给 `run-server.ps1`（例：`... -Api -Port 9000 -Backend cpu`）。
+
 脚本做的事：自动定位 `bin/`（exe + `ggml*.dll`）、`models/`、`voices/`；缺 GGML 库直接报错；
 `-Api` 模式下把 `voices/*.gguf` **每个文件按文件名映射成一个同名音色**；默认
 **只绑定 USB 共享网卡地址**（`-Bind auto`）且**不设口令**；打印所有可达地址（标注网卡名）。
@@ -169,9 +173,9 @@ PC 端同样打前两个补丁，但 **`diffusion_steps` 保持上游的 10**（
 对照手机端（`docs/NATIVE_MODULES.md` 记录的端侧实测 RTF 4.8–8.2，且那是 3 步的旧数据、5 步更慢）：
 **同参数下 PC 快约一个数量级**，且 RTF < 1 意味着边合成边播不会中途断流。
 
-**新参数组合（10 步 / `max_llm_len 4096` / DiT 缓存 8192 / 非流式）的耗时待重测**：10 步大约比 5 步
+**新参数组合（10 步 / `max_llm_len 4096` / DiT 缓存 8192 / 非流式）的长句耗时待重测**：10 步大约比 5 步
 多一倍计算量，且必须**在没有游戏/其他 CUDA 任务占用显卡时**测（见 9.4 的实测反例：游戏占卡时
-一句 3.5 秒的话要 326 秒）。
+一句 3.5 秒的话要 326 秒）。短句单点实测：19 字 → 1.24 s 音频 / 1.46 s 用时，RTF ≈ 1.2（无 GPU 争用）。
 
 ### 内存从哪来（600MB 的模型为什么能占到 7GB）
 
