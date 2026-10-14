@@ -2,7 +2,7 @@
 
 ## 形态
 
-DeepTalking 是原生 Android 应用（Kotlin + Jetpack Compose 多模块），入口在 `android-lite/`。WebView 仅作为富文本/公式渲染子系统（`:feature:richtext` 内嵌 KaTeX）。旧 WebView 单文件前端（`src/`、`tools/`、`hub.html`）为历史遗留，只作行为/数据参照，不再是运行入口。
+DeepTalking 是原生 Android 应用（Kotlin + Jetpack Compose 多模块），入口在 `android-lite/`。WebView 仅作为富文本/公式渲染子系统（`:feature:richtext` 内嵌 KaTeX，KaTeX 资产随该模块打包）。`src/` 是已冻结的历史前端快照（见 `src/README.md`），只作行为参照，不参与构建。
 
 ## 模块清单
 
@@ -11,7 +11,7 @@ DeepTalking 是原生 Android 应用（Kotlin + Jetpack Compose 多模块），�
 | `:app` | application | `MainActivity`（Compose）、`AppRoot`、`AppViewModel`、`NativeCore`（手动 DI）、`DeepTalkingApp`；`res/xml/network_security_config.xml` + `res/raw/*.pem`（为 `opencode.ai` 附加 TLS 信任锚） |
 | `:core:common` | core | 结果类型、文本工具、`AppLimits`（从旧前端迁移的常量/上限） |
 | `:core:model` | core | 领域模型：`Character/GroupMember`、`ChatMessage`、`LongTermMemory/ShortTermMemory`、`LorebookEntry`、`Sticker`、`AppConfig`、`TtsPhase`（朗读相位枚举）、`extractSpeechText`（回复去括号动作/`【】`/Markdown 标记，仅留台词，供朗读）、`extractSpeechSegments`（群聊回复按 `成员名：台词`（台词不加引号）切成逐发言人片段，供逐成员语气朗读）、`AlignedSources`/`alignSources`/`mergeSources`（**保持 `sourceMessageIds`↔`sourceRoles`↔`userEvidence` 逐位对齐**，任何合并都必须走它，杜绝把 `sourceRoles` 当集合去重导致来源 role 缺失） |
-| `:core:network` | core | `ResponsesLlmBackend`（OkHttp + SSE，实现 `LlmBackend`）、`WebContentProvider`/`HttpWebContentProvider`（`searchWeb` 必应 RSS、`fetch` 网页/图片/B站视频 + **虎扑帖子**（页面内 `__NEXT_DATA__`）与**网易云歌曲**（详情+热评）专门路由、`searchBilibili`、`hotBoard` 四家免登录热榜、`searchSocial` 虎扑/网易云/B站检索；解析函数抽成 `internal` 纯函数并有单测）、`DohDns`（可插拔的 DNS-over-HTTPS 解析器，绕过运营商 DNS 劫持）。**TLS**：走 OkHttp/平台 Conscrypt，**只信设备系统信任库、且不做 AIA 补链**；旧 WebView 版由 Chromium 代管（自带根库 + AIA），故同一站点在原生可能因设备缺锚报 `CertPathValidatorException: Trust anchor ... not found`（典型：`opencode.ai` 的 Google Trust Services 链）。修复见 `:app` 的 `network_security_config.xml` |
+| `:core:network` | core | `ResponsesLlmBackend`（OkHttp + SSE，实现 `LlmBackend`）、`WebContentProvider`/`HttpWebContentProvider`（`searchWeb` 必应 RSS、`fetch` 网页/图片/B站视频 + **虎扑帖子**（页面内 `__NEXT_DATA__`）与**网易云歌曲**（详情+热评）专门路由、`searchBilibili`、`hotBoard` 四家免登录热榜、`searchSocial` 虎扑/网易云/B站检索；解析函数抽成 `internal` 纯函数并有单测）、`DohDns`（可插拔的 DNS-over-HTTPS 解析器，绕过运营商 DNS 劫持）。**TLS**：走 OkHttp/平台 Conscrypt，**只信设备系统信任库、且不做 AIA 补链**；设备缺锚时会报 `CertPathValidatorException: Trust anchor ... not found`（典型：`opencode.ai` 的 Google Trust Services 链）。修复见 `:app` 的 `network_security_config.xml` |
 | `:core:database` | core | Room 实体/DAO/数据库（角色、消息、配置的 JSON 聚合存储） |
 | `:core:data` | core | 仓库层（`CharacterRepository/ChatRepository/ConfigRepository`）、`SettingsStore`（DataStore）、`CoreDataContainer`、`legacy`（旧数据迁移与备份） |
 | `:core:security` | core | `SecretStore`：API Key 存 Keystore/EncryptedSharedPreferences |
@@ -34,40 +34,40 @@ DeepTalking 是原生 Android 应用（Kotlin + Jetpack Compose 多模块），�
 
 - 端侧推理（`:engine:ondevice`）：调用方只依赖接口，新增模型 = 新增实现 + 在 `NativeCore` 注册。`LlmBackend` 由 `:core:network` 的 `ResponsesLlmBackend` 实现（远程）；`TtsBackend` 由 `:engine:cosyvoice` 的 `CosyVoiceController.backend` 实现（端侧 CosyVoice3）；`EmbeddingBackend/AsrBackend` 暂为 `null`。
 - 朗读播放（`:engine:ondevice` 的 `TtsSpeaker`）：呼叫做朗读者只依赖此接口，具体引擎由 `AppConfig.ttsBackend` 决定——`ondevice` 走 `:engine:cosyvoice` 的 `CosyVoiceController`，`remote` 走 `:engine:remote-tts` 的 `RemoteTtsSpeaker`。唯一的分派点是 `NativeCore.ttsSpeaker(config)`（同时把 `ttsSpeed` 写进引擎），上层与 UI 都不按后端分支。远程失败**不自动回落**端侧（按设计），由已有的「朗读失败」提示暴露。
-- Agent 工具（`:domain:agent`）：实现 `AgentTool` 接口并在 `defaultTools()` 注册即可，`AgentLoop` 不变。**联网类工具**共四个：`web_search`（必应 RSS，`limit` 可调 1–20）、`web_fetch`（网页/图片/B站视频；虎扑帖子链接与网易云歌曲链接有专门路由）、`hot_topics`（百度/头条/抖音/知乎热榜）、`social_search`（虎扑帖子 / 网易云歌曲 / B站视频）。四个都**不需要账号**（不存 cookie、不需要 key）；后两个原生独有，无遗留 JS 对应物，`DifferentialOracleTest.NATIVE_ONLY_TOOLS` 里显式登记为偏差。
+- Agent 工具（`:domain:agent`）：实现 `AgentTool` 接口并在 `defaultTools()` 注册即可，`AgentLoop` 不变。**联网类工具**共四个：`web_search`（必应 RSS，`limit` 可调 1–20）、`web_fetch`（网页/图片/B站视频；虎扑帖子链接与网易云歌曲链接有专门路由）、`hot_topics`（百度/头条/抖音/知乎热榜）、`social_search`（虎扑帖子 / 网易云歌曲 / B站视频）。四个都**不需要账号**（不存 cookie、不需要 key）；`hot_topics`/`social_search` 是原生独有工具，无对应参照实现，在 `DifferentialOracleTest.NATIVE_ONLY_TOOLS` 里显式登记为偏差。
 - 记忆（`:domain:memory`）：上层依赖 `MemoryService` 接口。
 
-## 界面与交互（对齐旧版 WebView）
+## 界面与交互
 
-- 配色**逐值对齐** `src/styles/app.css`：`core:designsystem` 暴露 `LegacyColors`（`--bg/--text/--bubble-*/--sidebar/--input-*` 等全部 CSS 变量，四主题各一套），UI 直接用原值，不再依赖 Material 语义色派生，从根上避免"文字与气泡颜色相近看不清"。
-- 应用骨架对齐旧版 `shell.html`：顶部 header（hamburger 42dp + 头像 32 + 名称/身份 + 主题菜单 + 版本徽标，高 64dp，随状态栏 inset）+ 左侧抽屉侧栏 **258dp**（**角色 / 设置** 两标签）+ 主聊天区。缓存条 / 活动状态为 header 右下角小胶囊（对齐 `#cacheStatsBar` / `#activityStatusBar`）。
+- 配色：`core:designsystem` 暴露 `LegacyColors`（`--bg/--text/--bubble-*/--sidebar/--input-*` 等全部 CSS 变量名，四主题各一套），UI 直接用原值，不再依赖 Material 语义色派生，从根上避免"文字与气泡颜色相近看不清"。
+- 应用骨架：顶部 header（hamburger 42dp + 头像 32 + 名称/身份 + 主题菜单 + 版本徽标，高 64dp，随状态栏 inset）+ 左侧抽屉侧栏 **258dp**（**角色 / 设置** 两标签）+ 主聊天区。缓存条 / 活动状态为 header 右下角小胶囊。
 - 消息区：`max-width 56rem` 居中；气泡 `max-width min(84%,560)`、内距 `12px 14px`、圆角 12 + 尾角 4、无阴影、字号 15、行高 1.68；AI 头像 30dp 圆角方块（用户消息无头像）；typing 三点；消息 meta 行（时间 + 30dp 圆形操作按钮）。
-- 交互回退回旧版：角色**主动开口**为面板空闲 **60s** 自动触发（随应用可见性暂停/重置），非手动按钮；编辑重发/重新生成会**丢弃后续分支及相关记忆**。
+- 角色**主动开口**：面板空闲 **60s** 自动触发（随应用可见性暂停/重置），非手动按钮；编辑重发/重新生成会**丢弃后续分支及相关记忆**。
 - **热榜开场**（小概率事件，`HotTopicPolicy` + `AppViewModel.armHotTopicTurn`）：每个角色**每个逻辑日（凌晨 2 点换日）只在当天第一个要发请求的回合掷一次骰子**，命中率 10%，上限**每天 1 次、每周 2 次**（自然周，每角色独立）。命中则本轮在 volatile 上下文尾部多一条指令：先调 `hot_topics` 查热榜，挑一条与人设合得来的话题自然带入（可叠加在主动开口上）；搜不到就按平常方式回应、不得编造。计数存 DataStore 键 `deeptalking_hot_topic_v1`（JSON：角色id → `{rolledDay, weekStart, weekCount, total}`），**不进 Room、不进备份导出**，所以不牵动 `LegacyMapper`/`BackupService`。
 - 世界书条目受 `enabled` 控制：禁用的条目不参与注入（`LorebookMatcher.select` 过滤），与「常驻」互不影响。
-- 多模态：用户图片在请求装配时由 `LlmRequest.imageResolver` 解析为 `data:` URL，`buildResponsesInput` 生成 `input_text` + `input_image(detail:auto)` 内容数组（对齐 `buildUserMessageContent`）。用户主动发送的**贴图**在该轮请求副本中提升为图片一并送入模型（落盘仍保留 `Kind.Sticker` 供渲染）；`web_fetch`/B站封面/Microlink 主图等工具结果若为 `input_text`/`input_image` 数组，则原样作为 `function_call_output` 数组下发（模型可直接看图，而非 JSON 字符串）。
+- 多模态：用户图片在请求装配时由 `LlmRequest.imageResolver` 解析为 `data:` URL，`buildResponsesInput` 生成 `input_text` + `input_image(detail:auto)` 内容数组。用户主动发送的**贴图**在该轮请求副本中提升为图片一并送入模型（落盘仍保留 `Kind.Sticker` 供渲染）；`web_fetch`/B站封面/Microlink 主图等工具结果若为 `input_text`/`input_image` 数组，则原样作为 `function_call_output` 数组下发（模型可直接看图，而非 JSON 字符串）。
 - 表情包：新增后由视觉模型从 `STICKER_TAGS` 词表自动打标签（`NativeCore.tagSticker`；都不贴切时允许 1~6 字中文短词，未分类时才写）；`send_sticker` 按标签精确匹配，失败再按子串双向兜底，schema 内联该角色的标签枚举。
-- 对话循环（`AgentLoop`/`ResponsesLlmBackend`）：工具上限、提交重试、空回复在**同一循环内**最多重试 2 次并保留已累计工具往返，抢救顺序 `extractResponsesText`/内嵌 `reply` JSON（含 reasoning 项）/`extractAnyResponseText` 对齐旧版；带 180s 硬超时 + 60s 流式空闲中断；请求历史 = `instant` 窗口整窗（上限 `AppLimits.Memory.INSTANT`(60)，只作为尺寸兜底）；散文路径仍解析 `<MEM_UPDATE>`（**只取 longTerm/dynamicState，`shortTerm` 段忽略**）并从落库正文剥离隐藏标签；`styleViolations` 写回消息供 `buildStyleReview` 回顾最近 2 条；`web_search_call.*` 事件经保留状态 chunk 上报为活动提示；启动/导入时静默修损坏头像（`autoRepairAvatars`，含重试 `avatarRepairPending` 项）。`ResponsesLlmBackend` 支持 `prompt_cache_hit/miss_tokens` 与 `input_tokens_details.cached_tokens` 两种缓存字段、缺 Key 抛清晰错误、`reasoningEffort` 白名单兜底、Chat-Completions `choices[].delta.content` 流式兜底。
+- 对话循环（`AgentLoop`/`ResponsesLlmBackend`）：工具上限、提交重试、空回复在**同一循环内**最多重试 2 次并保留已累计工具往返，抢救顺序 `extractResponsesText`/内嵌 `reply` JSON（含 reasoning 项）/`extractAnyResponseText`；带 180s 硬超时 + 60s 流式空闲中断（辅助调用 90s）；请求历史 = `instant` 窗口整窗（上限 `AppLimits.Memory.INSTANT`(60)，只作为尺寸兜底）；散文路径仍解析 `<MEM_UPDATE>`（**只取 longTerm/dynamicState，`shortTerm` 段忽略**）并从落库正文剥离隐藏标签；`styleViolations` 写回消息供 `buildStyleReview` 回顾最近 2 条；`web_search_call.*` 事件经保留状态 chunk 上报为活动提示；启动/导入时静默修损坏头像（`autoRepairAvatars`，含重试 `avatarRepairPending` 项）。`ResponsesLlmBackend` 支持 `prompt_cache_hit/miss_tokens` 与 `input_tokens_details.cached_tokens` 两种缓存字段、缺 Key 抛清晰错误、`reasoningEffort` 白名单兜底、Chat-Completions `choices[].delta.content` 流式兜底。
 - 注入顺序：世界书按 **常驻优先 → `order`（默认 100）→ 最近更新（`updatedAt` 新的在前）→ 名称（中文 `Collator`）** 排序后按字符预算挑选；预算装不下的条目**跳过、继续尝试后面的短条目**（不再"遇到长条目就停"——旧行为下一条 600 字的常驻条目就能把后面全部挡死），只有单条自身超预算才截断；共享书与成员书合并时按 `id`（空则 `name|content`）去重；命中记 `mentions` 并重置 `misses`。
 - **DoH 解析（绕过 DNS 劫持）** `DohDns`（`:core:network`）：部分运营商对特定域名劫持明文 DNS（对 `opencode.ai` 返回无法连接的假 IP），而 Chromium 因内置 Secure DNS 不受影响、OkHttp 走系统 DNS 受害。故给所有 HTTP 客户端（`ResponsesLlmBackend`、`HttpWebContentProvider`、`testApiConnection` 探针）装上同一个 `DohDns`：按 RFC 8484 wire-format 走 DoH，默认**阿里 AliDNS**（`dns.alidns.com`，bootstrap `223.5.5.5/223.6.6.6`）、失败兜底**腾讯 DoH.pub**（`1.12.12.12/120.53.53.53`），DoH 端点用固定 IP 自举（SNI 保留）；A 优先、带 TTL 缓存；任何失败回退 `Dns.SYSTEM`（不受限网络无感知）。设置页「加密 DNS 解析（DoH）」开关 + 提供方选择（`AppConfig.dohEnabled`/`dohProvider`，默认开 + 阿里），策略经 `NativeCore.currentConfig()`/`applyDohPolicy` 实时刷新。
 - 语音朗读（端侧 CosyVoice3 或远程服务器，链路搭建见 `docs/REMOTE_TTS.md`）：设置页可下载模型（ModelScope，Q4_K_M GGUF ~630MB + ONNX 前端 ~253MB）；导入**任意音频文件**（mp3/m4a/wav…，不限时长，`AudioLoader` 流式解码并自动截取 ~3s 最清晰人声片段）生成音色，可选填「参考文本」（仅零样本用，instruct 模式会忽略，一般留空）；音色可命名/重命名/删除并保存到列表（`VoiceStore`，内置「内置音色 1/2」，来自 `assets/voices/sample_1/2.wav`）。**朗读气泡**：AI 气泡的「朗读」按钮有状态反馈——合成中显示进度圈 + 实时秒数、播放中变停止键、完成短暂 ✓ 后回到喇叭；点击正在朗读的气泡即停止；**同一时刻仅一个合成，新请求会抢占（停止）旧的**（原生 `cosyvoice_request_stop`）。合成前先 `extractSpeechText` 去掉 `（）/()` 动作与 `【】`/Markdown 标记只留台词；语气指令**不再额外调用 API**，直接取角色动态字段 `currentTone`（模型每轮更新、写成朗读播报指令），以 `instruct` 模式合成。**群聊**：用 `extractSpeechSegments` 按 `成员名：台词`（台词不加引号；动作写全角括号）把回复切成逐发言人片段，每段取该成员 `memberDynamicState.currentTone`，逐段合成后拼接为一次播放（仍用同一参考音色）。自动朗读新回复同样走此流程。同一音色的 prompt-speech GGUF 与派生的 prompt/TTS 上下文会缓存复用（换音色或释放引擎时失效），避免每次朗读重复加载。设备需 arm64（APK 含 `libcosyvoice/libggml*/libonnxruntime/libomp` `.so`）。
 - 语音朗读·远程引擎（`:engine:remote-tts`）：设置页把「朗读引擎」切到「远程服务器（电脑）」后，朗读改由 PC 上的 `cosyvoice-server --api` 合成，手机只收 PCM 边收边播（首音延迟与质量由 PC 决定，不再受手机 CPU 限制）。请求映射：`input`=台词、`voice`=服务端音色名、`instructions`=该发言人的 `currentTone`（非空即 instruct 模式，与端侧语义一致）、`speed`=`ttsSpeed`、`model`=`--served-model-name`；`response_format=pcm` 返回 24kHz 单声道 16-bit LE，直通 `PcmOutput` 无需解码，也不依赖服务端 FFmpeg；**`stream:false`（非流式）**——流式下服务端边生成边吐、手机边收边播，PC 生成慢于实时就会饿死播放缓冲（实测游戏占卡时一句 3.5 秒的话要 326 秒）；非流式一次性返回整段，且走的是与端侧同一个入口 `cosyvoice_tts_instruct`。**音色两端共用**：`voice` 留空时取**端侧当前音色**的文件名（去 `.gguf`），服务端以同名注册即两家同音色（`NativeCore.remoteTtsConfig` 负责解析）；App 的音色下拉直接列端侧音色（显示端侧名 + 服务端文件名），并按服务端返回的清单标注「服务端未注册/仅服务端」（API 模式从 `/healthz` 的 `voices` 取，WebUI 模式从 `/speaker` 取）。**「上传本机音色到电脑」**：把每个端侧音色的 gguf 按同名 POST 到服务端的 `POST /v1/voices`（`RemoteTtsClient.uploadVoice` → `NativeCore.uploadTtsVoice` → `AppViewModel.uploadVoicesToRemote`），服务端落盘到 `--voice-dir` 并立即注册，之后自动重新探测刷新标注；端侧已做过裁剪/编码，故两端是逐字节同一个音色（见 `docs/REMOTE_TTS.md` §8）。**高级选项（两端共用，8 项）**（设置页折叠区，**两个引擎都显示**，同一个值既写给端侧 `cosyvoice_set_generation_config`/`set_chunk_tokens`，又随请求体发给 PC，所以调一次两端一起变；框内带模型元数据默认值 `chunk_tokens 28 / temperature 1.0 / top_k 25 / top_p 0.8 / win_size 10 / tau_r 0.1 / min_token_text_ratio 2.0 / max_token_text_ratio 20.0`，可「恢复默认」；存储里的 `0` 按"未设置"回落到默认值）：`chunk_tokens`（速度/峰值内存）、`temperature`/`top_k`/`top_p`（稳定性与表现力）、`tau_r`/`win_size`（重复抑制）、`min|max_token_text_ratio`（漏字/拖长）；访问口令也在其中（仅远程引擎显示）。flow（扩散步数）是编译期常量（**手机 5、PC 10**），DiT 缓存与 `n_max_seq` 属加载期参数，均不在 App 里。**停止**：远程下取消合成＝断开连接（服务端「客户端断开即尽快停止推理」），故 `cancel()` 与 `stop()` 等价；`PcmOutput.write` 返回 false 时立即取消 HTTP 请求。**寻址**：「查找并测试电脑」一个动作完成"扫本机网段 + 验证连通性"——按**手机自身接口的前缀**推 /24 并发扫 `:8080`（`/v1/models`、`/healthz`、`/ping` 任一响应即命中，多网段交错扫描，短于 /24 的前缀收敛到所在 /24 以免扫蜂窝的大网段），命中即写入地址；切到远程引擎且地址为空时会自动执行一次。**回落策略**：远程失败不自动降级到端侧（按设计），由已有的「朗读失败：…」提示暴露，用户可在设置里切回端侧。
-- 角色功能对齐旧版（`feature:characters`，纯助手无 Android 依赖、可单测）：
-  - 一句话建卡/群组升级的 prompt 覆盖完整静态 12 字段 + 7 项 `dynamicState` + 2-4 条 `lorebook`（`CharacterParity.buildQuickGeneratePrompt`），模型 JSON 解析保留全部字段（`parseGeneratedDraft` / `parseGroupMembersJson`）。
+- 角色功能（`feature:characters`，纯助手、无 Android 依赖、可单测）：
+  - 一句话建卡/群组升级的 prompt 覆盖完整静态 12 字段 + 6 项 `dynamicState`（含 `currentTone`）+ 2-4 条 `lorebook`（`CharacterParity.buildQuickGeneratePrompt`），模型 JSON 解析保留全部字段（`parseGeneratedDraft` / `parseGroupMembersJson`）。
   - 头像描述含群内定位（`buildAvatarDescription`，成员版追加 `roleInGroup`）。
   - 编辑器保存前对基础/动态字段做清洗与相对时间→绝对日期换算、`userAddress` 归一化（`normalizeEditedDraft` / `FieldCleaning.cleanFieldValue` / `parseRelativeText`）。
-  - 成员一句话补全只填空字段并覆盖静态 + `roleInGroup` + 7 项动态状态（`applyMemberFillPayload`）。
+  - 成员一句话补全只填空字段并覆盖静态 + `roleInGroup` + 6 项动态状态（`applyMemberFillPayload`）。
   - 世界书新增条目默认 `alwaysActive=true`（`newUserLorebookEntry`），名称/内容受 `AppLimits.Lorebook` 上限约束，关键词清空即转常驻（`keywordsToAlwaysActive`）。
 
 ## 数据与迁移
 
 - 数据唯一入口：`:core:data` 仓库层（Room + DataStore）。禁止绕过仓库访问数据库。
-- 旧版 WebView 的 localStorage 数据通过 `legacy/LegacyImportService` 一次性导入；`legacy/BackupService` 保留旧 JSON 根结构（`{config, characters, activeCharacterId, activeTheme, version}`）的导入导出，导出时每个角色的会话从聊天表（`ChatRepository`）读入 `memory.instant`，不再依赖 `character.instant`。UI 通过系统文件选择器（SAF）导出/导入备份；**导入为整体替换（先清空再写入，带覆盖确认），按 `decodeImportBytes`（UTF-8→GBK→UTF-8 兜底）解码，并迁移同一天重复事件记忆、恢复 `activeCharacterId`、导入后静默补全并询问迁移**。导入还对齐旧版归一化：`ensureMessageSequences` 修补消息/场景序号、非 events 长期记忆按分类去重、群组成员限 8 且过滤空名、未知平台归一到 `custom`、`activeTheme` 白名单、按平台预设重建全部 `platformSettings` 槽、损坏头像回退默认 emoji 并置 `avatarRepairPending`、消息 `styleViolations`/`quickReplyIssues` 按词表白名单过滤；导出 `version` 写 `BuildConfig.VERSION_NAME`（不再是 `"native"`）。
+- 旧数据导入：**先在旧版（或旧备份 JSON）导出，再在原生「导入备份」里经系统文件选择器一次性导入**（`legacy/LegacyImportService`；原生不读取 WebView 的 localStorage）。`legacy/BackupService` 保留旧 JSON 根结构（`{config, characters, activeCharacterId, activeTheme, version}`）的导入导出，导出时每个角色的会话从聊天表（`ChatRepository`）读入 `memory.instant`，不再依赖 `character.instant`。UI 通过系统文件选择器（SAF）导出/导入备份；**导入为整体替换（先清空再写入，带覆盖确认），按 `decodeImportBytes`（UTF-8→GBK→UTF-8 兜底）解码，并迁移同一天重复事件记忆、恢复 `activeCharacterId`、导入后静默补全并询问迁移**。导入还套用同一套归一化：`ensureMessageSequences` 修补消息/场景序号、非 events 长期记忆按分类去重、群组成员限 8 且过滤空名、未知平台归一到 `custom`、`activeTheme` 白名单、按平台预设重建全部 `platformSettings` 槽、损坏头像回退默认 emoji 并置 `avatarRepairPending`、消息 `styleViolations`/`quickReplyIssues` 按词表白名单过滤；导出 `version` 写 `BuildConfig.VERSION_NAME`（不再是 `"native"`）。
 - 每平台配置槽 `AppConfig.platformSettings` 保存非密的 Base URL/模型；API Key 走 `SecretStore` 的按平台键（切换平台互不覆盖）。
 - 媒体/表情以文件（`filesDir`）存放（`app/MediaStore`：图片压到 ≤1280px/2MB，表情 ≤384px/120KB），不再以 base64 进库；压缩在透明区填白底，质量按 82→70→58→46→34 降级，选图校验 `image/*`。
 - API Key 存 `:core:security` 的 `SecretStore`（Keystore），UI 只见脱敏状态；导出时剔除。
 
-## 记忆维护任务（对齐旧版 `src/js/memory/tasks.js`）
+## 记忆维护任务
 
 每轮后台执行（`BackgroundTasks.scheduleTurn` → `runMemoryMaintenance`）；**各任务互不排队、也不设并发上限**（`BackgroundTaskQueue` 去掉了共享锁：一次补课不再把场景/世界书/快捷回复堵在后面），均可用假后端单测：
 
@@ -109,10 +109,10 @@ powershell -File tools/native-version.ps1 [-BumpPatch]
 ```
 
 等价于在 `android-lite/` 下用 JDK17 / Android SDK35 运行：
-`gradle :app:assembleDebug` + `gradle :engine:ondevice:test :domain:agent:test :core:network:test :domain:memory:test :core:data:testDebugUnitTest :feature:richtext:testDebugUnitTest`。
+`gradle :app:assembleDebug` + `gradle :engine:ondevice:test :engine:audio:testDebugUnitTest :engine:cosyvoice:testDebugUnitTest :engine:remote-tts:testDebugUnitTest :domain:agent:test :core:network:test :domain:memory:test :core:data:testDebugUnitTest :core:model:test :feature:richtext:testDebugUnitTest`。
 
 工具链本地路径（开发机）：JDK17 `D:\devtools\temurin17\jdk-17.0.20.1+1`、SDK `D:\Android`（`local.properties` 的 `sdk.dir`）、Gradle `D:\devtools\gradle\gradle-8.10.2`。可用 `JAVA_HOME` / `DEVTOOLS_JDK17` / `ANDROID_SDK_ROOT` / `DEVTOOLS_GRADLE` 覆盖。
 
 ## CI
 
-CI（`.github/workflows/build-lite-apk.yml`）用固定 release keystore 构建签名的 release APK 并发布。包名、WebView 渲染入口、存储键与签名的稳定性是覆盖升级的兼容要求。
+CI（`.github/workflows/build-lite-apk.yml`）在 `android-lite/**` 变化时编译 + 跑与本地自检相同的全部单测，再用固定 release keystore 构建签名的 release APK 并发布。包名、签名与数据迁移链的稳定是覆盖升级的兼容要求。

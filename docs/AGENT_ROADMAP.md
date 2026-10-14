@@ -1,29 +1,29 @@
 # Agent 后续方向（Roadmap）
 
-> 记录已评估的优化方向，标注实施状态。已实施内容见 `src/` 与 `docs/AGENT_ARCHITECTURE.md`。
-> 本文件是根目录旧 `AGENT_OPTIMIZATIONS.md` 的迁移版，按"架构层 / 体验层 / 记忆 / 性能安全"重组，并补充了原理对照。
+> 记录已评估的优化方向并标注状态。已实现的能力以 [NATIVE_MODULES.md](NATIVE_MODULES.md) 与 [AGENT_ARCHITECTURE.md](AGENT_ARCHITECTURE.md) 为准（本文件只写方向与结论）。
 
-## 已弃用功能（试验失败品，请勿再使用/扩展）
+## 已弃用功能（请勿再使用/扩展）
 
 | 功能 | 状态 | 结论 |
 |---|---|---|
-| **像素头像**（`avatarPixel` 16×16 网格 + `requestPixelAvatar` / "生成像素头像"按钮） | 已弃用，2026-08 起移除展示与自动修复入口 | 试验失败品：模型输出网格常缺行/缺色/尺寸错误，不稳定；代码仅保留 `normalizePixelAvatar` 做历史数据兼容，不再渲染；头像统一走 emoji |
-| **TTS 语音合成**（早期 `tts/` 目录、`android-app` 的 sherpa-onnx 方案） | 已弃用 → **已重新立项** | 旧方案为试验失败品（模型体积大、合成不稳定、体验差）。现已改用端侧 `Fun-CosyVoice3-0.5B`（`:engine:cosyvoice`，社区 `cosyvoice.cpp`/GGML），模型按需下载，支持中文+中英混读、零样本音色克隆与自由情绪指令；v1.5.0 起提供朗读 AI 回复 |
+| **像素头像**（16×16 网格） | 已从代码库移除 | 试验失败品：模型输出网格常缺行/缺色/尺寸错误，不稳定；头像统一走 emoji。旧数据里的该字段在导入时直接丢弃（`LegacyMapper`），不保留渲染路径 |
+| **TTS 语音合成**（早期 `tts/` 目录、sherpa-onnx 方案） | 旧方案弃用 → **已重新立项并落地** | 旧方案为试验失败品（模型体积大、合成不稳定）。现为端侧 `Fun-CosyVoice3-0.5B`（`:engine:cosyvoice`，社区 `cosyvoice.cpp`/GGML），模型按需下载，支持中文+中英混读、零样本音色克隆与自由情绪指令；另有可选远程引擎 `:engine:remote-tts`（PC 合成 / 手机播放，见 `docs/REMOTE_TTS.md`） |
 
-**当前头像方案**：emoji（角色/群组各一个字符）。损坏/缺失的 emoji 头像由 AI 自动生成贴切 emoji（`requestEmojiAvatar` / `autoRepairAvatars`），编辑器提供"AI 生成 emoji 头像"按钮。
+**当前头像方案**：emoji（角色/群组各一个字符）。损坏/缺失的 emoji 头像由 AI 自动生成贴切 emoji（`NativeCore.requestEmojiAvatar` / `AppViewModel.autoRepairAvatars`），编辑器提供"AI 生成 emoji 头像"按钮。
 
-## 已实施（2026-08）
+## 现状（已实现）
 
 | 项 | 说明 | 代码锚点 |
 |---|---|---|
-| 记忆冲突自动裁决 | 同 key 新值不再静默覆盖：标记 `conflictedAt` + `conflicts` 保留双方，`resolveMemoryConflicts` 按"时间晚 > 证据长 > 保持主值"自动合并，用户全程无感 | `upsertLongTermMemory` / `resolveMemoryConflicts` / `memoriesSemanticallyDiffer` |
-| 话题切换显式跟踪 | `detectTopicSwitch` 用双字 bigram 判断新话题，向上下文注入"先收束旧话题再进入新话题"的软指令 | `detectTopicSwitch` / `buildVolatileContext` |
-| 记忆重要性自学习 | `usageCount` 累计使用量，30 天内被使用自动升权（每 2 次 +1 封顶 +3）；userProfile/habits 45/90/180 天未召回逐档降权（只降不删） | `selfLearnMemoryImportance` / `handleRecall` / `search_memory` 工具 |
-| 剧情弧线摘要 | 记忆分析可输出 `arcOf`（持续情节线）+ `arcStage`（起始/发展/转折/现状），叙事性 events 检索时加权，角色可自然提起旧事 | `analyzeShortToLongTerm` prompt / `retrieveRelevantMemories` |
-| 成员记忆隔离 | 群组每个成员独立 `member.memory.longTerm`；工具与 `submit_response.longTerm` 支持 `memberName` 路由；上下文分注入各成员私人记忆 | `getMemberMemory` / `buildVolatileContext` / `applyMemoryUpdate` |
-| API 请求级自动重试 | 瞬时失败（网络/超时/429/5xx）自动重试 3 次（1s/2s/4s 退避），业务 4xx 不重试，仍失败走原错误提示 | `performChatRequestWithRetry` / `isTransientApiError` |
-| 工具失败可恢复 | 记忆工具失败回传"可修正参数"提示，模型下一轮自行修正；`web_search` 失败事件已捕获，角色自行应对 | `executeToolCall` / SSE handler |
-| 主动话题避免冷场 | `buildTopicSuggestions` 从角色背景+记忆抽取候选话题库；冷场识别（`isColdFieldRequest`）时强制角色主动开话题，不反问"你想聊什么" | `buildTopicSuggestions` / `isColdFieldRequest` / `buildVolatileContext` |
+| 记忆冲突自动裁决 | 同 key 新值不再静默覆盖：标记 `conflictedAt` + `conflicts` 保留双方，按"时间晚 > 证据长 > 保持主值"自动合并，用户全程无感 | `MemoryPolicy.resolveMemoryConflict` / `MemoryEvidence.memoriesSemanticallyDiffer` |
+| 话题切换显式跟踪 | `detectTopicSwitch` 用双字 bigram 判断新话题，向上下文注入"先收束旧话题再进入新话题"的软指令 | `Prompts.detectTopicSwitch` / `buildVolatileContext` |
+| 记忆重要性自学习 | `usageCount` 累计使用量，30 天内被使用自动升权（每 2 次 +1 封顶 +3）；userProfile/habits 45/90/180 天未召回逐档降权（只降不删） | `MemoryEvidence.selfLearnMemoryImportance` / `MemoryServiceImpl.setPendingRecall` / `search_memory` 工具 |
+| 剧情弧线摘要 | 记忆分析可输出 `arcOf`（持续情节线）+ `arcStage`（起始/发展/转折/现状），叙事性 events 检索时加权，角色可自然提起旧事 | `BackgroundTasks.analyzeShortTermBatch` 提示词 / `Retrieval.rankMemories` |
+| 成员记忆隔离 | 群组每个成员独立 `member.memory.longTerm`；工具与 `submit_response.longTerm` 支持 `memberName` 路由；上下文分注入各成员私人记忆 | `MemoryServiceImpl.longTermStoreOf` / `buildVolatileContext` / `ChatOrchestrator.applyLongTerm` |
+| API 请求级自动重试 | 瞬时失败（网络/超时/429/5xx）自动重试 3 次（1s/2s/4s 退避），业务 4xx 不重试 | `ApiRetry` + `AgentLoop.collectResultWithRetry`（后台辅助调用在 `BackgroundTasks.completeDetailed` 同策略） |
+| 工具失败可恢复 | 记忆工具失败回传"可修正参数"提示，模型下一轮自行修正；`web_fetch`/`web_search` 失败返回 `ok:false` 由角色自行应对 | `ToolRegistry.execute` / 各 `AgentTool` |
+| 主动话题避免冷场 | `buildTopicSuggestions` 从角色背景+记忆抽取候选话题库；冷场识别（`isColdFieldRequest`）时强制角色主动开话题，不反问"你想聊什么" | `Prompts.buildTopicSuggestions` / `isColdFieldRequest` / `buildVolatileContext` |
+| 热榜开场 | 小概率（每角色每逻辑日掷一次 10%、每天 1 次/每周 2 次）让角色先查热榜再挑一条话题带入 | `HotTopicPolicy` / `AppViewModel.armHotTopicTurn` |
 
 ## 一、架构层改进（待实施）
 
@@ -82,4 +82,4 @@
 ## 附录：与现有实现的关系
 
 - 所有优化都在现有五大部件（API 载体 / 工具清单 / 工具实现 / 运行循环 / 结构化收尾）内扩展，不改整体架构。
-- 涉及记忆写入的项需同步约束 `isValidAutomaticMemory`（src/js/memory/updates.js:96）与 `applyMemoryUpdate` 的校验逻辑，防止"记录了什么"与"校验规则"脱节。
+- 涉及记忆写入的项需同步约束 `MemoryEvidence.isValidAutomaticMemory` 与 `ChatOrchestrator.applyMemory` 的校验逻辑，防止"记录了什么"与"校验规则"脱节。

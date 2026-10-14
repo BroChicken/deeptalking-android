@@ -1,312 +1,305 @@
-﻿# Agent 架构文档（DeepTalking / 模块化前端）
+﻿# Agent 架构文档（原生 Android）
 
-> **原生现状**：应用已迁移为原生 Android（`android-lite/`，Kotlin + Compose 多模块）。Agent 循环、工具、记忆/世界书、场景概要、后台任务（文风校对、快速回应换位、记忆抽取/分析、世界书整理、空字段补全、一次性迁移）均已按本文档描述的语义在 `:domain:agent` / `:domain:memory` 重新实现；`src/js/` 与 `hub.html` 仅作行为/数据参照，不再是运行入口。原生模块与记忆维护任务的实现说明见 [NATIVE_MODULES.md](NATIVE_MODULES.md)；下方行号仍指向旧 WebView 源码，用于对照语义。
+> 本文档描述 **当前实现**：原生 Android 应用的 Agent 机制（`:domain:agent` / `:domain:memory`，宿主在 `:app`）。只写最新状态，历史看 git。
+> 模块职责、依赖方向与构建流程见 [NATIVE_MODULES.md](NATIVE_MODULES.md)；解析机制链见 [PARSE_GRAPH.md](PARSE_GRAPH.md)；朗读链路见 [REMOTE_TTS.md](REMOTE_TTS.md)。
+> 代码锚点用**模块:函数名**（行号会漂移，用 grep 函数名定位）；改动 agent 循环、工具清单、提示词、记忆系统、字段或常量时必须同步更新本文档。
 
-> 本文档记录 `src/js/` 中 Agent 功能的定义与构造（只描述**当前最新状态**，历史变更看 git）。源码按职责拆分，APK 的 `hub.html` 为构建产物。行号随源码调整会偏移，**以模块路径与函数名检索为准**；改动 Agent 循环、工具、提示词、记忆、字段或常量时，必须同步更新本文档。
+## 模块锚点
 
-## 源码与运行边界
-
-后续开发以拆开的 `src/` 模块为唯一源码，单文件不再维护。模块顺序由 `src/manifest.json` 声明，`node tools/build-hub.mjs` 将 `src/shell.html`、样式和 JavaScript 构建为 APK 资产 `android-lite/app/src/main/assets/hub.html`，并把 `src/vendor/katex/` 复制到 `assets/katex/`；这些资产仅为生成产物。脚本保留原有经典脚本全局作用域和执行顺序，跨模块函数调用、DOM 事件、提示词、Agent 循环和存储格式均维持原有契约。Android 仍从固定 `file:///android_asset/hub.html` 加载，localStorage 主键仍为 `deeptalking_data_v1`。
-
-| 模块 | 关键锚点 |
+| 关注点 | 原生锚点 |
 |---|---|
-| `src/js/chat/conversation.js` | `sendMessage`、`performChatRequest`、主动开口与流式主链路 |
-| `src/js/agent/tool-definitions.js` | `MAX_TOOL_ROUNDS`、`buildAgentTools` |
-| `src/js/agent/tool-execution.js` | `executeToolCall` |
-| `src/js/api/responses.js` | `buildSubmitResponseTool`、`extractSubmitResponse`、`buildResponsesRequestBody` |
-| `src/js/prompts/context.js` | `buildRoleContext`、人格、承诺与话题上下文 |
-| `src/js/prompts/volatile.js` | `buildVolatileContext`、本轮动态上下文的预算与取舍 |
-| `src/js/prompts/style.js` | 文风检查、快速回应视角、`queueBackgroundTask` |
-| `src/js/prompts/request.js` | `buildRequestPayload`、`callAPI`、`extractProseTurnMemory`、后台记忆补写 |
-| `src/js/memory/updates.js` | `retrieveRelevantMemories`、`applyMemoryUpdate` |
-| `src/js/memory/lorebook.js` | 世界书检索、写入、证据与保护规则 |
-| `src/js/memory/tasks.js` | `checkMemoryTriggers`、整理与退避 |
-| `src/js/core/config.js` | 字段与记忆/世界书/提示词预算常量 |
-| `src/js/ui/status-settings.js` | `toolActivityHint`、`chatStageDecision`、设置 |
-
-完整模块职责和开发/构建流程见 [FRONTEND_MODULES.md](FRONTEND_MODULES.md)。`APP_VERSION` 在源码中使用占位符，构建器从 Android 的 `versionName` 注入；`sync-version.mjs` 也调用同一构建器。`build-hub.mjs --check` 和 `verify-hub.mjs` 验证源码与 APK 生成资产一致，并检查独立模块语法边界。
-
-Android 打包的 `preBuild` 自动执行 `buildHubAssets`，直接从 `src/`（含 `src/vendor/`）生成运行资源 `assets/hub.html` 与 `assets/katex/`，再由 Gradle 打包 APK。这些资产是这一流程的产物，不是打包时需要手工维护的输入源码。
+| 宿主接线（回合、状态、指标、主动开口） | `:app` 的 `AppViewModel`（`submitTurn` / `proactiveLoop` / `recordMetrics` / `armHotTopicTurn`）、`NativeCore`（装配 `ChatOrchestrator`、后台任务、辅助调用） |
+| Agent 循环 | `:domain:agent` 的 `AgentLoop`（`run` / `collectStream` / `attempt` / `salvageText` / `toolActivityHint`） |
+| 回合编排与落盘 | `:domain:agent` 的 `ChatOrchestrator.run`（`applyMemory` / `applyLongTerm` / `applyDynamicStateFields` / `applyPromiseUpdate`） |
+| 工具注册 | `:domain:agent` 的 `Tools.defaultTools`（+ `tools/*Tool.kt`） |
+| 工具实现 | `:domain:agent` 的 `tools/*`（`SearchMemoryTool` 等） |
+| 提示词装配 | `:domain:agent` 的 `prompts/Prompts.kt`（`buildSystemPrompt` / `buildVolatileContext` / `buildShortTermBlock` / `TimeContext`）、`RequestBuilder` |
+| 结构化解析 | `:domain:agent` 的 `ResponseParser`、`StreamText` |
+| 后台任务与文风守卫 | `:domain:agent` 的 `background/BackgroundTasks`、`background/StyleGuard`、`background/AnalysisSalvage` |
+| 记忆系统 | `:domain:memory` 的 `MemoryServiceImpl` / `MemoryPolicy` / `Retrieval` / `MemoryEvidence` / `LorebookMatcher` / `LorebookStore` / `TimeUtils` / `RelativeTimeMigration` |
+| 传输与联网 | `:core:network` 的 `ResponsesLlmBackend`（`buildBody` / `newRequest` / `ResponsesSseInterpreter`）、`HttpWebContentProvider` |
+| 模型与常量 | `:core:model`（`Character` / `ChatMessage` / `AppConfig` / `RequestMetric`）、`:core:common` 的 `AppLimits` |
+| 数据与迁移 | `:core:data` 的仓库层、`SettingsStore`、`legacy/LegacyImportService`、`legacy/BackupService` |
 
 ## 一、Agent 是什么
 
-本项目的"agent"不是一个类或对象，而是一套 **LLM + 人格 + 记忆 + 工具 + 运行循环** 的组合。核心思想：
+本项目的"agent"不是某个类，而是 **LLM + 人格 + 记忆 + 工具 + 运行循环** 的组合：
 
 - 模型不再只输出一段文字，而是可以在一次回复中**主动调用工具 → 拿到执行结果 → 继续推理**，循环往复，直到给出最终答案。
-- 这种"思考（reasoning）→ 行动（tool call）→ 观察（tool output）→ 收尾（structured reply）"的循环，就是 agent 的本质。
-
-一句话概括：
+- 这种"思考（reasoning）→ 行动（tool call）→ 观察（tool output）→ 收尾（结构化 reply）"的循环就是 agent 的本质。
 
 > **人格 + 记忆 + 世界书** 提供身份与状态 → **`while` 循环**让模型反复"想→调工具→看结果" → **`submit_response`** 保证最终以结构化 JSON 收尾并落盘记忆。
 
 ## 二、总体数据流
 
 ```
-用户输入
+用户输入（或主动开口 / 热榜开场）
    │
    ▼
-buildRequestPayload(src/js/prompts/request.js:1, requestContext)
-   ├─ 人格注入 buildRoleContext(src/js/prompts/context.js:15)（staticOnly=true → 进可缓存前缀）
-   ├─ 世界书匹配 buildLorebookContext(src/js/memory/lorebook.js:237)（常驻条目必进 + 关键词命中，模型维护）
-   ├─ 记忆注入 buildVolatileContext(src/js/prompts/volatile.js:1) / retrieveRelevantMemories(src/js/memory/updates.js:1)
-   └─ 消息历史（逐字稳定，volatile 追加为独立的末尾 user 项，src/js/prompts/request.js:53 起）
+ChatOrchestrator.run
+   ├─ buildSystemPrompt            人格 + 交互规则（纯静态 → 可缓存前缀）
+   ├─ buildShortTermBlock          短期窗口整块，注入到历史之前
+   ├─ RequestBuilder.mapHistory    历史（append-only）+ 本轮用户消息
+   └─ buildVolatileContext         记忆召回 / 世界书 / 状态 / 时间基准 / 本轮指令（末尾 user 项）
    │
    ▼
-while(true) 循环 (sendMessage 内 src/js/chat/conversation.js:163)
-   │
-   ├─ performChatRequest(src/js/chat/conversation.js:450)  → 流式 SSE，解析 function_call / reasoning 事件
-   ├─ 有工具调用？→ executeToolCall(src/js/agent/tool-execution.js:1) 执行一个 → 结果回传 toolState.items → continue
-   ├─ 只调 ask_user？→ 直接把问题当回复（特判）
-   ├─ 有合法 submit_response 工具调用？→ break
-   ├─ 有正文（合法 JSON 或散文）？→ break（散文即终稿）
-   └─ 否则（连正文都没有）→ 切换阶段二，强制 submit_response（兜底，必要时重试一次）
+AgentLoop.run  loop
+   ├─ ResponsesLlmBackend.stream   SSE：text / reasoning / function_call / web_search_call
+   ├─ 有工具调用？→ ToolRegistry.execute 执行一个 → 结果回传 → continue
+   ├─ 只调 ask_user？→ syntheticSubmitReply（把问题当回复）
+   ├─ 拿到合法正文（submit_response / 结构化 JSON / 散文）？→ break
+   └─ 否则 → 阶段二强制 submit_response（兜底，必要时重试）
    │
    ▼
-applyMemoryUpdate(src/js/memory/updates.js:642) 落盘 shortTerm / longTerm / dynamicState / promiseUpdates
+ChatOrchestrator.applyMemory  落盘 longTerm / dynamicState / promiseUpdates（短期窗口不由主对话写）
    │
    ▼
-checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长期记忆 / 场景概要 / 世界书
+BackgroundTasks.scheduleTurn  后台串行维护：文风校对、快速回应换位、记忆抽取/分析、场景概要、世界书整理、空字段补全
    │
    ▼
-渲染用户可见回复 + quickReplies（缺失/视角不对时后台换位生成补齐）
+渲染回复 + quickReplies（缺失或视角不对时后台换位生成补齐）
 ```
 
 ## 三、五大部件
 
 ### 1. API 载体（Responses API）
 
-- `buildResponsesRequestBody()` — src/js/api/responses.js:56
-- 请求体字段：`model`、`input`（首条 system 提升为 `instructions`）、`stream`、`temperature`、`max_output_tokens=8192`、`tools`、`tool_choice`、`reasoning.effort`。
-- 端点：`getResponsesEndpoint()` — src/js/prompts/request.js:180（把 base URL 归一化为 `/responses`）。
-- 阶段一（auto）的工具数组里**包含 `submit_response`**（`buildAgentTools()` src/js/agent/tool-definitions.js:9 末尾 push），模型可以在同一轮里"调完信息工具 → 调 `submit_response` 提交"，一次请求收尾。
-- 阶段二（submit）为**兜底**：只有阶段一连正文都没拿到时才进入，此时强制 `tool_choice = { type: 'function', name: 'submit_response' }`，且 `reasoning = { effort: 'none' }`（DeepSeek 仅支持 effort=none 时锁定工具）。
+- `ResponsesLlmBackend.buildBody()`（`:core:network`）+ `ResponsesDto`：请求体字段 `model`、`input`（首条 system 提升为 `instructions`）、`stream`、`temperature`、`max_output_tokens=8192`、`tools`、`tool_choice`、`reasoning.effort`。
+- 端点：`responsesEndpoint()`（把 base URL 归一化为 `/responses`；DeepSeek 去尾 `/v1`，OpenCode Go 保留）。
+- 请求头：`Content-Type`、`User-Agent`、`Authorization: Bearer`（缺 Key 抛清晰错误）、流式加 `Accept: text/event-stream`、`opencode` 平台加 `x-opencode-session`（`deeptalking-<charId>` / `deeptalking-general`）。
+- 阶段一（auto）的工具数组里**包含 `submit_response`**（`Tools.defaultTools` 末尾），模型可以在同一轮里"调完信息工具 → 调 `submit_response` 提交"，一次请求收尾。
+- 阶段二（submit）为**兜底**：只有阶段一连正文都没拿到时才进入，此时 `tools` 只有 `submit_response`、`tool_choice` 锁定，且 `reasoning.effort='none'`（DeepSeek 仅在该 effort 下支持锁定工具）。
+- 传输超时：chat 180s（call + read），SSE 空闲 60s；**辅助/后台调用 90s**（`LlmRequest.auxiliary`，见"健壮性"）。
 
 ### 2. 工具清单（agent 的能力）
 
-`buildAgentTools()` — src/js/agent/tool-definitions.js:9，通过 `isAgentToolsEnabled()`（src/js/agent/tool-definitions.js:5）控制开关（当前即启用）。
+`Tools.defaultTools(memory, web, stickersEnabled)`——**13 个信息工具 + 条件 `send_sticker` + `submit_response`**（顺序即注册顺序）：
 
-| 工具 | 作用 | 定义位置 |
+| 工具 | 作用 | 实现 |
 |---|---|---|
-| `get_current_time` | 获取当前时间/时区 | src/js/agent/tool-definitions.js:14 |
-| `search_memory` | 按关键词检索长期记忆（可指定成员私人记忆）；**原生新增按日期召回**（`date`/`timeRef`/`slot`，返回那天的原始对话+摘要+长期记忆） | src/js/agent/tool-definitions.js:20 |
-| `list_memories` | 按分类盘点记忆清单（不含详情） | src/js/agent/tool-definitions.js:26 |
-| `delete_memory` | 按 ID 删除记忆 | src/js/agent/tool-definitions.js:32 |
-| `set_reminder` | 记录待办/约定（promises，须用户发起 + 原话证据） | src/js/agent/tool-definitions.js:38 |
-| `ask_user` | 向用户提出澄清问题 | src/js/agent/tool-definitions.js:44 |
-| `update_character_field` | 精准修改基础设定字段（说话风格、称呼等） | src/js/agent/tool-definitions.js:50 |
-| `upsert_lorebook_entry` | 写入/更新世界书条目（世界层设定唯一入口，保护用户手写条目） | src/js/agent/tool-definitions.js:56 |
-| `web_fetch` | 抓网页正文 / 图片 / B站视频（url 或 keyword）；**原生增强**：虎扑帖子链接、网易云歌曲链接也会被专门解析 | src/js/agent/tool-definitions.js:71 |
-| `update_memory` | 按 ID 修正记忆（用户纠正时用） | src/js/agent/tool-definitions.js:77 |
-| `send_sticker` | 发表情包（仅当角色有贴图时注册） | src/js/agent/tool-definitions.js:102 |
-| `web_search` | 联网搜索（必应 RSS，本地 function 工具；**原生增强**：`limit` 可调 1–20） | src/js/agent/tool-definitions.js:108 / src/js/api/web-content.js |
-| `hot_topics` | **原生新增**：国内平台热榜（百度热搜 / 头条热榜 / 抖音热榜 / 知乎热榜，全部免账号） | — |
-| `social_search` | **原生新增**：国内社区检索（虎扑帖子 / 网易云歌曲 / B站视频，全部免账号） | — |
+| `get_current_time` | 获取当前时间/时区 | `GetCurrentTimeTool` |
+| `search_memory` | 按关键词检索长期记忆（可指定成员私人记忆）；**支持按日期召回**（`date`/`timeRef`/`slot`，返回那天的原始对话+摘要+长期记忆） | `SearchMemoryTool` |
+| `list_memories` | 按分类盘点记忆清单（不含详情） | `ListMemoriesTool` |
+| `delete_memory` | 按 ID 删除记忆（`short_` 前缀可删短期条目） | `DeleteMemoryTool` |
+| `set_reminder` | 记录待办/约定（promises，须用户发起 + 原话证据） | `SetReminderTool` |
+| `ask_user` | 向用户提出澄清问题 | `AskUserTool` |
+| `update_character_field` | 精准修改基础设定字段（说话风格、称呼等） | `UpdateCharacterFieldTool` |
+| `upsert_lorebook_entry` | 写入/更新世界书条目（世界层设定唯一入口，保护人工维护条目） | `UpsertLorebookEntryTool` |
+| `web_fetch` | 抓网页正文 / 图片 / B站视频（url 或 keyword）；虎扑帖子链接、网易云歌曲链接有专门解析 | `WebFetchTool` → `HttpWebContentProvider` |
+| `update_memory` | 按 ID 修正记忆（用户纠正时用） | `UpdateMemoryTool` |
+| `send_sticker` | 发表情包（**仅当角色有贴图时注册**，schema 内联该角色的标签枚举） | `SendStickerTool` |
+| `web_search` | 联网搜索（必应 RSS，`limit` 可调 1–20） | `WebSearchTool` |
+| `hot_topics` | 国内平台热榜（百度 / 头条 / 抖音 / 知乎，全部免账号） | `HotTopicsTool` |
+| `social_search` | 国内社区检索（虎扑 / 网易云 / B站，全部免账号） | `SocialSearchTool` |
+| `submit_response` | 结构化收尾（见下） | `SubmitResponseTool` |
 
 每个工具就是一段 JSON Schema 描述（name + description + parameters），模型据此决定何时调用。
 **工具描述是"何时用哪个工具"的权威依据**，system 提示词的规则 A 只留一句导引。
+新增工具 = 新增 `AgentTool` 实现 + 在 `defaultTools` 注册，`AgentLoop` 不变。
 
 ### 3. 工具实现（agent 的手）
 
-`executeToolCall(call, char, toolState)` — src/js/agent/tool-execution.js:1
-- 模型只"说"要调用，真正干活的是这段代码：读写 `char.memory.longTerm`、返回时间、记约定等。
-- 统一返回 JSON 字符串，异常安全（`try/catch` 兜底，失败返回 `{ ok: false, reason }`）。
+`ToolRegistry.execute()`（`:domain:agent`）：
+
+- 模型只"说"要调用，真正干活的是工具类：读写长期记忆、返回时间、记约定等。
+- 统一返回 JSON 字符串，异常安全（`try/catch` 兜底，失败返回 `{ ok: false, reason }`），**异常不中断整轮**。
 
 ### 4. Agent 循环（大脑）
 
-`sendMessage(options)` 内的 `while(true)` — src/js/chat/conversation.js:163：
+`AgentLoop.run()`（`:domain:agent`）：
 
-- **工具调用（每轮一个）**：DeepSeek thinking 模式**不支持并行 `function_call` 回传（会 400）**，因此模型一次返回多个 `function_call` 时，`conversation.js` 只执行并回传**第一个信息类工具**，其余调用丢弃、由模型在下一轮基于结果重发；`reasoning` 必须先于 `function_call`、再跟配对的 `function_call_output`。`toolState.executedCalls` 与 `MAX_TOOL_CALLS` 作为总量安全上限。若同一轮里既有信息类工具又有 `submit_response`，先执行该工具；只有工具失败时才丢弃这一轮的 `submit_response`，继续让模型修正。**`web_search` 是本地 function 工具**：DeepSeek Responses 会静默忽略内置 `web_search`，故本地注册同名工具，经 `searchWebContent()` 实际检索 RSS 后回传结果。
-- **上限**：`MAX_TOOL_ROUNDS = 5`（src/js/agent/tool-definitions.js:2）与 `MAX_TOOL_CALLS = 12`（:3）；达到任一上限后，未执行的调用回传 `ok:false` 的说明，并按 `chatStageDecision('auto-tool-limit', …)` 收尾。
-- **reasoning 回传**：thinking 模式的 `reasoning_text` 必须先回传，否则上下文断裂。
-- **ask_user 特判**：本轮只调 `ask_user` 且没有 `submit_response` 时，直接把问题包装成结构化回复输出，不进入工具循环。若同一轮既有改动工具又有 `submit_response`，先执行工具、再采用提交（避免"回复说设置已改、实际没改"）。
-- **工具改变可缓存 system 后重建请求**：`update_character_field` / `upsert_lorebook_entry` 修改的是静态设定或世界书，会影响 system 前缀；`sendMessage` 在工具调用后比较 `toolState.staticChanges` / `lorebookChanges`，若发生变化则用 `buildRequestPayload` 重建 `messages` 再进入下一轮，保证后续请求与最新设定一致。
-- **一次提交 + 兜底**（不再每轮重发）：阶段一 `phase='auto'`（工具自由，含 `submit_response`）。只要拿到正文——`submit_response` 工具调用、合法 JSON 正文、或**散文**——就直接采用，**散文即终稿**，不再为了补 `quickReplies`/记忆而重发一轮（旧行为是几乎每轮都出现「正在整理回复…」甚至「正在重新整理回复…」）。阶段二 `phase='submit'` 只作为"阶段一连正文都没有"时的兜底，`quickReplies` 也**不再阻塞收尾**（缺失/非法直接接受，由后台换位生成补齐）。
-- **散文轮的记忆/状态后台补**：散文收尾时正文立即显示，`extractProseTurnMemory()` 在后台把这一轮整理成 shortTerm / longTerm / dynamicState 落盘（`queueBackgroundTask` 串行，不阻塞也不改写正文）。
-- **状态显示**：循环内所有右上角文案都来自纯函数 `chatStageDecision(stage, ctx)`（src/js/ui/status-settings.js:19），工具提示来自 `toolActivityHint(name)`（src/js/ui/status-settings.js:1），`setActivity()` 只负责写入 DOM。阶段事件计数由 `noteStageEvent(key)` 记入 `state.config.stageStats`，可在调试面板里核对「整理回复」是否真的不再出现。
+- **工具调用（每轮一个）**：DeepSeek thinking 模式**不支持并行 `function_call` 回传（会 400）**，因此模型一次返回多个 `function_call` 时只执行并回传**第一个信息类工具**，其余丢弃、由模型下一轮基于结果重发；`reasoning` 必须先于 `function_call`、再跟配对的 `function_call_output`。`AppLimits.Agent.MAX_TOOL_CALLS`(12) 是整轮总量上限。若同一轮里既有信息类工具又有 `submit_response`，先执行该工具；只有工具失败（`ok:false`）时才丢弃这一轮的提交，继续让模型修正。**`web_search` 是本地 function 工具**（DeepSeek Responses 会静默忽略内置 `web_search`）：本地注册同名工具，经 `HttpWebContentProvider.searchWeb()` 实际检索 RSS 后回传结果。
+- **上限**：`MAX_TOOL_ROUNDS = 5`（`AppLimits.Agent`）与 `MAX_TOOL_CALLS = 12`；达到任一上限后未执行的调用回传 `ok:false` 说明，并按"有正文就收尾、没有才转阶段二"处理。
+- **reasoning 回传**：thinking 模式的 reasoning 项必须先回传，否则上下文断裂。
+- **ask_user 特判**：本轮只调 `ask_user`（且无 `submit_response`）时，直接把问题包成结构化回复（`AgentLoop.syntheticSubmitReply`），不进入工具循环。
+- **一次提交 + 兜底**（不再每轮重发）：阶段一 `RequestPhase.AUTO`（工具自由，含 `submit_response`）。只要拿到正文——`submit_response` 调用、合法 JSON 正文、或**散文**——就直接采用，**散文即终稿**，不再为了补 `quickReplies`/记忆而重发一轮。阶段二 `RequestPhase.SUBMIT` 只作为"阶段一连正文都没有"时的兜底，`quickReplies` **不阻塞收尾**（缺失/非法直接接受，由后台换位生成补齐）。
+- **空回复重试**：同一循环内最多重试 2 次（共 3 次请求），保留已累计的工具往返。
+- **散文轮的记忆/状态后台补**：散文收尾时正文立即显示，`BackgroundTasks.extractProseTurnMemory()` 在后台把这一轮整理成 shortTerm / longTerm / dynamicState 落盘（串行队列，不阻塞也不改写正文）。
+- **状态显示**：循环内所有右上角文案经 `onStatus` 回调驱动（`AppViewModel.statusState`）；工具提示来自纯函数 `AgentLoop.toolActivityHint(name)`；阶段分支（`auto-tool` / `auto-tool-limit` / `auto-final` / `submit-retry` / `empty`）在 `AgentLoop.run` 内一一对应下表。
 
 ### 5. 结构化收尾协议（agent 的手续）
 
-`buildSubmitResponseTool()` — src/js/api/responses.js:1；`extractSubmitResponse()` — src/js/api/responses.js:31。
+`SubmitResponseTool`（`:domain:agent` 的 `tools/`）+ `ResponseParser.parseSubmitResponse()`。
 
 推荐每轮调用一次 `submit_response` 收尾（阶段一工具里就有它），用 JSON Schema（`strict: true`）强制校验，一次性输出：
 
 | 字段 | 说明 |
 |---|---|
-| `reply` | 用户可见回复正文（Markdown，动作/表情/心理活动用括号） |
+| `reply` | 用户可见回复正文（Markdown，动作/表情/心理活动用全角括号） |
 | `quickReplies` | 恰好两条**用户视角**短句（用户下一句可直接发送；不得是角色的台词、表态或角色对用户的提问） |
-| `shortTerm` | 本轮事件流程摘要 |
 | `longTerm` | 未来仍有价值的稳定事实（category∈userProfile/relationship/events/promises/habits） |
 | `dynamicState` | 角色动态状态（6 字段） |
 | `memberDynamicState` | 群组成员动态状态（仅群组） |
 | `promiseUpdates` | 用户明确完成/取消的承诺（resolved/cancelled） |
 | `recall` | 主动召回记忆的请求 |
 
-这是"回复 + 写记忆"合一的契约，保证每轮回复结构合法。
+这是"回复 + 写记忆"合一的契约，保证每轮回复结构合法。**没有 `shortTerm` 字段**：短期窗口只由整窗抽取写入（见"记忆子任务"）。
 
 ### 6. 右上角状态显示（全分支）
 
-`chatStageDecision` 是状态文案的唯一来源（verify-hub 第 2b 节断言主循环内不再出现裸 `setActivity('…')`）：
-
-| stage | 触发条件 | action | 右上角文案 |
+| stage | 触发条件 | 动作 | 右上角文案 |
 |---|---|---|---|
 | `auto-tool` | 阶段一模型发起工具调用 | run-tool | `工具结果已返回，正在继续推理…` + 对应工具提示 |
-| `auto-tool-limit` | 工具轮次达 `MAX_TOOL_ROUNDS` | accept-text / force-submit | 有正文 → `工具调用已达上限，直接收尾…`；无正文 → `正在整理回复…` |
-| `auto-final` | 阶段一未调用工具、拿到正文 | accept-text / force-submit | 合法 JSON **或散文** → 直接采用（无提示）；完全没有正文 → `正在整理回复…` |
-| `quick-replies-missing` | `submit_response` 有 `reply` 但缺/非法 `quickReplies` | accept-reply | 直接接受正文（`obj` 里其余记忆字段照常落盘），`quickReplies` 交后台补齐（无提示） |
-| `submit-retry` | 阶段二兜底仍未拿到合法 `submit_response` | retry-submit | `正在重新整理回复…` |
-| `empty` | 无可用正文 | regenerate / fail | 有额度 → `正在重新生成（第2次）…`；否则抛错收口 |
+| `auto-tool-limit` | 工具轮次达 `MAX_TOOL_ROUNDS` | accept-text / force-submit | 有正文 → `工具调用已达上限，直接收尾…`；无正文 → 正在整理 |
+| `auto-final` | 阶段一未调用工具、拿到正文 | accept-text / force-submit | 合法 JSON **或散文** → 直接采用（无提示）；完全没有正文 → 正在整理 |
+| `quick-replies-missing` | `submit_response` 有 `reply` 但缺/非法 `quickReplies` | accept-reply | 直接接受正文，`quickReplies` 交后台补齐（无提示） |
+| `submit-retry` | 阶段二兜底仍未拿到合法 `submit_response` | retry-submit | 正在重新整理 |
+| `empty` | 无可用正文 | regenerate / fail | 有额度 → `正在重新生成（第2次）…`；否则提示失败并保留用户消息 |
 
-工具提示（`toolActivityHint`）：`get_current_time`→`正在确认时间…`、`search_memory`→`正在回忆…`、`list_memories`→`正在整理记忆…`、`delete_memory`→`正在清理记忆…`、`set_reminder`→`已记下，正在回应…`、`update_character_field`→`已按你的要求调整设定…`、`web_search`→`正在搜索…`、`web_fetch`→`正在读取网页…`、`hot_topics`→`正在看热榜…`、`social_search`→`正在搜社区…`、`send_sticker`→`正在挑表情…`，未知工具回退 `正在处理…`。
+工具提示（`AgentLoop.toolActivityHint`）：`get_current_time`→`正在确认时间…`、`search_memory`→`正在回忆…`、`list_memories`→`正在整理记忆…`、`delete_memory`→`正在清理记忆…`、`set_reminder`→`已记下，正在回应…`、`update_character_field`→`已按你的要求调整设定…`、`upsert_lorebook_entry`→`已更新世界书…`、`web_search`→`正在搜索…`、`web_fetch`→`正在读取网页…`、`hot_topics`→`正在看热榜…`、`social_search`→`正在搜社区…`、`send_sticker`→`正在挑表情…`，未知工具回退 `正在处理…`。
 
-> 主提示词的 0/7/8 与【输出格式】都要求"以结构化方式收尾"（调用 `submit_response` 或输出单个 JSON 对象）且 `quickReplies` 恒为两条用户视角短句；但**客户端不再把 `quickReplies` 当收尾门槛**——散文/缺 quickReplies 的收尾一律直接采用，从而消除"几乎每轮都多跑一轮「正在整理回复…」"的历史问题。
+> 主提示词的 0/7/8 与【输出格式】都要求"以结构化方式收尾"（调用 `submit_response` 或输出单个 JSON 对象）且 `quickReplies` 恒为两条用户视角短句；但**客户端不把 `quickReplies` 当收尾门槛**——散文/缺 quickReplies 的收尾一律直接采用。
 
 ## 四、记忆系统
 
-### 三层结构 + 场景层
+### 三层结构 + 场景层 + 存档
 
-`MEMORY_LIMITS` — src/js/core/config.js:104
+常量集中在 `:core:common` 的 `AppLimits`。
 
 | 层 | 内容 | 上限 |
 |---|---|---|
-| `instant` | 最近原始消息 | 高水位 60 / 低水位 20（追加式，整窗折叠后压回 20） |
+| `instant` | 最近原始消息（发给模型的历史窗口） | 高水位 60 / 低水位 20（追加式，整窗折叠后压回 20） |
 | `shortTerm` | 事件流程摘要 | 高水位 40 / 低水位 20（整窗注入，靠整窗折叠消化而非截断） |
-| `longTerm` | 分类长期记忆 | 无数量上限（仅 `applyMemoryDecay` 时效遗忘；旧版"每类 40 条"上限已移除） |
-| `scenes` | 场景概要 | 保留最近 8 条（`AppLimits.Scene.RETAIN`），注入最近 2 条 |
-| `history`（存档） | 完整聊天记录队列 | 上限 `AppLimits.History.ARCHIVE_MESSAGES`(400)，纯 FIFO，与窗口互不影响 |
+| `longTerm` | 分类长期记忆 | 无数量上限（仅 `applyMemoryDecay` 时效遗忘） |
+| `scenes` | 场景概要 | 保留最近 8 条（`Scene.RETAIN`），注入最近 2 条（`Scene.SUMMARIES`） |
+| `history`（存档） | 完整聊天记录队列 | 上限 `History.ARCHIVE_MESSAGES`(400)，纯 FIFO，与窗口互不影响 |
 
 **上下文窗口（高/低水位 + 整窗折叠）**：`INSTANT=60` / `INSTANT_TRIM_FLOOR=20`、`SHORT_TERM=40` / `SHORT_TERM_TRIM_FLOOR=20`。两个窗口都是同一形态：
 
-- **窗口内容就是状态**，且是**追加式**的：每轮只把窗口没见过的消息追加进 `instant`（`AppViewModel.growInstantWindow`），**绝不从聊天存档重建**——旧实现把存档并回窗口，等于把折叠裁掉的消息捞回来，窗口只涨不缩。只有折叠那一轮才把窗口压回低水位；`shortTerm` 同理——只有整窗抽取会追加、只有同一轮折叠会压缩，所以窗口在两次折叠之间**逐字不变**。
-- **到高水位折叠（两条通道，绝不按位置截断）**：`instant` 满 60 → **正常通道发送整个窗口**（60、61、62 条都发，**绝不先砍成正好 60**）→ `shortTerm` 追加条目 → **只消费刚读过的那一批**，保留最新 20 条作原文上下文；`shortTerm` 满 40 → 一次整窗分析（输入=整个 40 条窗口）→ 产出 `longTerm` → 落回最新 20 条。低水位留下的 20 条会作为下一次折叠的上下文被**再读一遍**（连贯性）；重复靠**提示词注入已有短期条目**压，不靠标记。**窗口超过 `INSTANT_MIGRATION_THRESHOLD`(120) 视为旧档遗留**，走**补课通道**（`migrateOversizedWindow`：每批最旧的 60 条，折完即丢，**一次跑完**）；启动时检测到会**先弹确认框**（含「以后不再询问」，「稍后」下次启动再问），确认后弹**阻塞式**进度框，与正常通道严格分开。`trimInstant` 已删除——"按位置保留最新 20 条"在超大窗口上会丢掉从未读过的消息。世界书条目内容超过 `Lorebook.CONTENT_CHARS`(400) 时同样由一次性重写处理（见"世界书"小节）。
-- **抽取不点名消息 id**：模型把整窗压成按"日期+时段"划分的事件摘要，**原话证据由客户端按同一时段从窗口里采**（挂成 `userEvidence`/`sourceRoles`）。因此没有"id 必须存在""必须连续覆盖"这类硬约束，单条出错不再作废整批；短期→长期仍要求 `evidence` 逐字命中被引用短期条目携带的原话（模型给错 id 会被重锚定，不丢条目）。
-- **注入**：`instant` 整窗进历史；`shortTerm` 整窗进 **历史之前**的一条 user 块（见下文"请求装配"），因此它落在缓存前缀里。
+- **窗口内容就是状态**，且是**追加式**的：每轮只把窗口没见过的消息追加进 `instant`（`AppViewModel.growInstantWindow`），**绝不从聊天存档重建**（否则折叠裁掉的消息会被捞回来，窗口只涨不缩）。只有折叠那一轮才把窗口压回低水位；`shortTerm` 同理——只有整窗抽取会追加、只有同一轮折叠会压缩，所以窗口在两次折叠之间**逐字不变**。
+- **到高水位折叠（绝不按位置截断）**：`instant` 满 60 → **发送整个窗口**（60、61、62 条都发，绝不先砍成正好 60）→ `shortTerm` 追加条目 → **只消费刚读过的那一批**，保留最新 20 条作原文上下文；`shortTerm` 满 40 → 一次整窗分析（输入=整个 40 条窗口）→ 产出 `longTerm` → 落回最新 20 条。低水位留下的 20 条会作为下一次折叠的上下文被**再读一遍**（连贯性）；重复靠**提示词注入已有短期条目**压，不靠标记。**窗口超过 `INSTANT_MIGRATION_THRESHOLD`(120) 视为旧档遗留**，走**补课通道**（`BackgroundTasks.migrateOversizedWindow`：每批最旧的 60 条，折完即丢，**一次跑完**）；启动时检测到会**先弹确认框**（含「以后不再询问」），确认后弹**阻塞式**进度框，与正常通道严格分开。世界书条目内容超过 `Lorebook.CONTENT_CHARS`(400) 时同样由一次性重写处理（见"世界书"）。
+- **抽取不点名消息 id**：模型把整窗压成按"日期+时段"划分的事件摘要，**原话证据由客户端按同一时段从窗口里采**（挂成 `userEvidence`/`sourceRoles`）。因此没有"id 必须存在""必须连续覆盖"这类硬约束，单条出错不再作废整批。
+- **注入**：`instant` 整窗进历史；`shortTerm` 整窗进 **历史之前**的一条 user 块（`buildShortTermBlock`），因此它落在缓存前缀里。
 - **紧急上限**：`INSTANT_HARD_CAP=120` / `SHORT_TERM_HARD_CAP=80`，仅在折叠持续失败时生效（丢最旧的并在 `counters.analysisLastError` 写明原因，绝不静默）。
-- 更早内容由 `scenes` + 长期记忆 + `search_memory` 承载。`Scene.SPAN=12`（旧版 24）。
+- 更早内容由 `scenes` + 长期记忆 + `search_memory` 承载。`Scene.SPAN=12`。
 
 ### longTerm 五类
 
 `userProfile`（用户信息）、`relationship`（关系）、`events`（共同事件）、`promises`（约定）、`habits`（习惯）。
 
-- subject 仅限 `user` / `relationship` / `world` / `character`（`MEMORY_SUBJECTS` src/js/core/config.js:117；`legacy` 仅作历史兼容，不再写入）。
-- `isValidAutomaticMemory()` 校验来源引用与证据逐字摘录，防止模型编造记忆。
-- 短期记忆在捕获时写入 `sourceRoles` 与 `userEvidence`（用户消息逐字摘录，`[{sourceMessageId,text}]`），短期→长期分析据此在源消息滚出 `instant` 后仍能校验 `evidence` 逐字来自声明的用户消息（对齐 `tasks.js:424` 的 `allowedUserEvidence`）。**`sourceRoles` 与 `sourceMessageIds` 是逐位对齐的平行数组**：合并来源必须走 `:core:model` 的 `alignSources`/`mergeSources` 逐位重建——历史 bug 把它当集合 `.distinct()`，角色塌缩成 `["user","assistant"]`，之后每个来源都变成无 role，`resolveMemorySources` 直接判失败。
-- 主对话的结构化写入（`submit_response` 的 `longTerm`/`staticFields`/`dynamicState`/`promiseUpdates`）同样过证据/意图校验（`ChatOrchestrator.applyMemory` → `upsertLongTermMemory` / `hasValidUserEvidence` / `hasStaticEditIntent` / `resolveDynamicStateSources`）。
-- **短期记忆不由主对话写**：`submit_response` 没有 `shortTerm` 字段（旧版 `<MEM_UPDATE>.shortTerm` 也已忽略），`ChatOrchestrator.applyShortTerm` / `BackgroundTasks.applyMemoryUpdate` 的短期分支均已删除——窗口唯一的写入者是整窗抽取（`extractInstantToShortTermTask`）。这样窗口在两次折叠之间不会被写在中部或提前压缩，注入块才能保持逐字稳定。
+- subject 仅限 `user` / `relationship` / `world` / `character`（`legacy` 仅作历史兼容，不再写入）。
+- `MemoryEvidence.isValidAutomaticMemory()` 校验来源引用与证据逐字摘录，防止模型编造记忆。
+- 短期记忆在捕获时写入 `sourceRoles` 与 `userEvidence`（用户消息逐字摘录，`[{sourceMessageId,text}]`），短期→长期分析据此在源消息滚出 `instant` 后仍能校验 `evidence` 逐字来自声明的用户消息。**`sourceRoles` 与 `sourceMessageIds` 是逐位对齐的平行数组**：合并来源必须走 `:core:model` 的 `alignSources`/`mergeSources` 逐位重建——把它当集合去重会让来源 role 塌缩，之后所有来源都变无 role、校验直接失败。
+- 主对话的结构化写入（`submit_response` 的 `longTerm`/`staticFields`/`dynamicState`/`promiseUpdates`）同样过证据/意图校验（`ChatOrchestrator.applyMemory` → `MemoryPolicy.upsertLongTermMemory` / `MemoryEvidence.hasValidUserEvidence` / `hasStaticEditIntent` / `resolveDynamicStateSources`）。
+- **短期记忆不由主对话写**：`submit_response` 没有 `shortTerm` 字段，窗口唯一的写入者是整窗抽取（`BackgroundTasks.analyzeShortTermBatch`）。这样窗口在两次折叠之间不会被写在中部或提前压缩，注入块才能保持逐字稳定。
 - **短期条目可被修正/删除**：`update_memory`（`short_` 前缀 ID，支持 `value`/`eventTime`；改正后 `revision+1` 并移到队尾，等下一轮折叠写进长期记忆）与 `delete_memory`（同前缀）都能作用于短期；`search_memory` 的关键词召回也返回 `shortTerm` 命中。
 
 ### 相关度检索
 
-`retrieveRelevantMemories(char, query, memoryStore)` — src/js/memory/updates.js:1；原生为 `:domain:memory` 的 `Retrieval.rankMemories` / `topK`。
-- 旧版评分 = 有效重要度×0.45 + 关键词命中加分（每命中一个词 +2 / 长词 +4） + 时效加分（90 天内递增） + 剧情弧线 `arcOf` +3。
-- **原生改进（有意偏离）**：每个命中词按「归一化特异性（IDF 式：含该词的记忆越少、权重越高）× 命中字段（`tags`×2 / `key`×1.5 / `value`×1）× 词长」加权，再乘覆盖率加成，压掉"晚上/事情"这类泛词；`topK` 先过相关性下限 `MIN_MATCH_SCORE`(1.5)，再按「同一事件（日期+时段）只留一条 + 每类最多 `MAX_PER_CATEGORY`(3) 条」去重；若下限会清空结果则回退到完整排序（不会召回为空）。该评分被自动注入与 `search_memory` 工具共用。
-- 取 top 12，配合 `pendingRecall`（待召回记忆，强制置顶）。
-- 可传入 `memoryStore` 以检索群组成员的私人记忆。
+`Retrieval.rankMemories` / `topK`（`:domain:memory`）：
+
+- 每个命中词按「归一化特异性（IDF 式：含该词的记忆越少、权重越高）× 命中字段（`tags`×2 / `key`×1.5 / `value`×1）× 词长」加权，再乘覆盖率加成，压掉"晚上/事情"这类泛词。
+- `topK` 先过相关性下限 `MIN_MATCH_SCORE`(1.5)，再按「同一事件（日期+时段）只留一条 + 每类最多 `MAX_PER_CATEGORY`(3) 条」去重；若下限会清空结果则回退到完整排序（不会召回为空）。
+- 取 top 12，配合 `pendingRecall`（待召回记忆，强制置顶，上限 `PENDING_RECALL`(6)）。
+- 自动注入与 `search_memory` 工具共用同一评分；群组可指定 `memberName` 检索成员私人记忆。
 
 ### 注入与衰减
 
-- `buildVolatileContext(character, query, memory, now, proactiveTurn, hotTopicTurn, recentAssistantReplies)` — 把最相关的记忆与本轮动态上下文注入本轮 prompt（只注入 `AppLimits.Agent.TOOL_MEMORY_INJECT_LIMIT = 5` 条长期记忆，其余提示模型用 `search_memory` 检索）。**没有任何区块预算**：这是主对话请求体，所有块整块注入（只保留"每条条目"级别的兜底上限，靠提示词的软限制让它尽量不触发）。区块顺序按"越靠后越近"排列：可选话题库 → 角色当前状态 → 待跟进承诺 → 世界书 → 群成员私人记忆 → 用户最新纠正 → 互动节奏 → 场景概要 → 长期召回 + 取用说明/主体约定 → 时间基准 → 消息时间元数据 → 风格尾块 + 本轮指令。**最末尾两条系统触发的本轮指令**：`proactiveTurn`（主动开场）与 `hotTopicTurn`（热榜开场，见 `HotTopicPolicy`：每角色每逻辑日掷一次、10%、每天 1 次/每周 2 次；命中时要求先调 `hot_topics` 再挑一条话题带入）。两条都只加在 volatile 上下文尾部，**不进 system prompt**，所以不会打乱缓存前缀。`metadata` 回传本轮真正注入的召回 ID 与世界书条目，供主线在回复落盘后精确清除 `pendingRecall` 与累计 `mentions`（不依赖会被后台任务改写的全局字段）。检索查询经 `buildMemoryQuery()` 扩展：用户明显指代前文时附加最近对话，避免短指代召回不到正确记忆。
-- `applyMemoryDecay()` — src/js/memory/policy.js:143：按时间衰减 events/promises 的重要性与状态。
-- `computeEffectiveImportance()` — src/js/memory/policy.js:2：`(importance + learnedBonus) × decay`（0-10 封顶）。
+- `buildVolatileContext(character, query, memory, now, proactiveTurn, hotTopicTurn, recentAssistantReplies)` — 把最相关的记忆与本轮动态上下文注入本轮 prompt（只注入 `AppLimits.Agent.TOOL_MEMORY_INJECT_LIMIT = 5` 条长期记忆，其余提示模型用 `search_memory` 检索）。**没有任何区块预算**：这是主对话请求体，所有块整块注入（只保留"每条条目"级别的兜底上限，靠提示词的软限制让它尽量不触发）。区块顺序按"越靠后越近"排列：可选话题库 → 角色当前状态 → 待跟进承诺 → 世界书 → 群成员私人记忆 → 用户最新纠正 → 互动节奏 → 场景概要 → 长期召回 + 取用说明/主体约定 → 时间基准 → 消息时间元数据 → 风格尾块 + 本轮指令。**最末尾两条系统触发的本轮指令**：`proactiveTurn`（主动开场）与 `hotTopicTurn`（热榜开场，见 `HotTopicPolicy`：每角色每逻辑日掷一次、10%、每天 1 次/每周 2 次；命中时要求先调 `hot_topics` 再挑一条话题带入）。两条都只加在 volatile 上下文尾部，**不进 system prompt**，所以不会打乱缓存前缀。`metadata` 回传本轮真正注入的召回 ID 与世界书条目，供主线在回复落盘后精确清除 `pendingRecall` 与累计 `mentions`。检索查询经 `buildMemoryQuery()` 扩展：用户明显指代前文时附加最近对话，避免短指代召回不到正确记忆。
+- `MemoryPolicy.applyMemoryDecay()`：按时间衰减 events/promises 的重要性与状态。
+- `MemoryPolicy.computeEffectiveImportance()`：`(importance + learnedBonus) × decay`（0-10 封顶）。
 
 ### 记忆子任务
 
-| 任务 | 触发 | 计数器（`memoryTaskKeys`） | 说明 |
+由 `BackgroundTasks.scheduleTurn()` → `runMemoryMaintenance()` 每轮后台调度（各任务互不排队、可用假后端单测）：
+
+| 任务 | 触发 | 计数器 | 说明 |
 |---|---|---|---|
-| `extraction` | `instant` 满 30 | `extractionRetryAt` / `extractionFailures` | 即时消息 → 短期摘要 |
-| `analysis` | `shortTerm` 满 80 且积压 ≥ 60 | `analysisRetryAt` / `analysisFailures` | 短期摘要 → 长期记忆（**逐条容错**：单条校验不过只丢该条；**ack 宽容**：只承认批次内 id，缺的下轮再送、混入的忽略；**小批降级** `ANALYSIS_ITEM_LIMIT` 8→4→2；**截断抢救** `salvageAnalysisReply`；显式 `max_output_tokens`） |
-| `scene` | 场景切换或跨度 ≥ 12 条（按消息序号） | `sceneRetryAt` / `sceneFailures` | 场景概要 |
-| `lorebook` | 有已分析摘要尚未整理（或积压 ≥ 8，`consolidateSpan`） | `lorebookRetryAt` / `lorebookFailures` | 沉淀世界书条目 + 自动淘汰 |
+| 抽取（instant→shortTerm） | `instant` 满 `INSTANT`(60) | `extractionRetryAt` / `extractionFailures` | 整窗折叠成"日期+时段"事件摘要 |
+| 分析（shortTerm→longTerm） | `shortTerm` 低水位之上攒够 20 条 | `analysisRetryAt` / `analysisFailures` | **逐条容错**（单条校验不过只丢该条）＋**ack 宽容**（只承认批次内 id，缺的下轮再送）＋**截断抢救** `AnalysisSalvage`＋显式 `max_output_tokens` |
+| 场景概要 | 场景切换或跨度 ≥ `Scene.SPAN`(12) 条 | `sceneRetryAt` / `sceneFailures` | `summarizeScene` |
+| 世界书整理 | 跟随分析：处理刚消费掉的那批短期 | `lorebookRetryAt` / `lorebookFailures` | `consolidateLorebook` + 淘汰 |
 
-`scheduleMemoryRetry()` 统一指数退避（5 分钟 → 30 分钟封顶）；`resetMemoryRetry()` 成功后清零。`checkMemoryTriggers()` — src/js/memory/tasks.js:199 依次调度这四个任务。
+`scheduleMemoryRetry()` 统一指数退避（5 分钟 → 30 分钟封顶）；成功后清零。
 
-**短期摘要按位置消费（没有逐条标记）**：短期窗口是高低水位对（40 → 20），**位置就是状态**——比最新 `shortTermTrimFloor`(20) 条更老的那一段（每批最多 `ANALYSIS_BATCH`(40) 条）就是本批要消化的，分析成功即**原样丢掉这一批**，最新 20 条留作下一批（以及注入块）的上下文。因此不再有 `analyzedAt` / `analyzedRevision` / `lorebookScannedAt` / `lorebookScannedRevision` 这套"两个消费者都确认同一 revision 才允许裁剪"的记账（它一旦和位置错位就会死锁：标记说"都处理过" → 每轮都判"没有待办" → 窗口只涨不降、弹窗反复出现）。`revision` 只剩一个用途：条目被 `update_memory` 改写时自增，用来把**请求飞行期间刚改过**的条目扣在窗口里、下一轮再读。`summarizeScene()` 跳过 `sequence ≤ sceneState.startSequence` 的旧消息，消费后仍能稳定统计"距上次场景已过多少条"。
+**短期摘要按位置消费（没有逐条标记）**：短期窗口是高低水位对（40 → 20），**位置就是状态**——比最新 20 条更老的那一段（每批最多 `ANALYSIS_BATCH`(40) 条）就是本批要消化的，分析成功即**原样丢掉这一批**，最新 20 条留作下一批（以及注入块）的上下文。因此不需要 `analyzedAt`/`analyzedRevision` 这类"两个消费者都确认才允许裁剪"的记账（一旦和位置错位就会死锁：标记说"都处理过" → 每轮都判"没有待办" → 窗口只涨不降）。`revision` 只剩一个用途：条目被 `update_memory` 改写时自增，用来把**请求飞行期间刚改过**的条目扣在窗口里、下一轮再读。
 
-**证据与时间精度**：`evidenceMatchesSummary()` 要求证据与实际回复有 ≥2 个双字片段重叠（≥35%），不再"满 8 字即采信"，防止无关文本改写情绪/静态设定；`applyStaticFieldUpdates` 与 `update_character_field` 都额外要求 `hasStaticEditIntent()`（用户原话提到该字段且是修改意图）。`resolveTimeRef` 对带时分秒的 explicit ISO 原样保留（含时区偏移），只给"仅日期有理"的结果补时段起点，不再把明确时刻改写成"当天 12:00"。
+**证据与时间精度**：`MemoryEvidence.evidenceMatchesSummary()` 要求证据与实际回复有 ≥2 个双字片段重叠（≥35%），不"满 8 字即采信"；`applyStaticFields` 与 `update_character_field` 都额外要求 `hasStaticEditIntent()`（用户原话提到该字段且是修改意图）。`TimeUtils.resolveTimeRef` 对带时分秒的 explicit ISO 原样保留（含时区偏移），只给"仅日期有理"的结果补时段起点。
 
 ### 动态状态（6 字段）
 
-`DYNAMIC_STATE_FIELDS`（`:domain:agent` 的 `prompts/Prompts.kt`）：`currentSituation` / `currentLocation` / `currentMood` / `currentOccupation` / `currentGoal` / `currentTone`。
-**有意偏离旧 WebView**：旧版的 `currentRelationship`（当前关系）与 `currentImportantOthers`（当前重要他人）已删除（旧值不再迁移，下次保存即抹除）；新增 `currentTone`（当前语气），由模型每轮更新，写成面向朗读的 TTS 播报指令（按需描述语气/情绪/语速/节奏/停顿/重音，可短可长、软上限约 60 字），朗读时直接作为 `TtsTurn.style` 传给当前朗读引擎（端侧 CosyVoice 的 instruct 指令，或远程服务器的 `instructions` 字段），省去旧版"朗读前再调一次 API 生成语气指令"的开销。
-除 `currentTone` 外，每个字段的 value 必须带 `sourceMessageIds` + `evidence` 溯源；群组整体只维护 `currentSituation` + `currentLocation`（`GROUP_SHARED_DYNAMIC_FIELDS`），成员各自的完整状态（含 `currentTone`）写入 `memberDynamicState`。`currentTone` 是朗读投递属性（自指、非事实状态），**每轮必填且免证据门**（`applyDynamicStateFields` / `applyDynamicStateUpdate` 对 `currentTone` 跳过 `resolveDynamicStateSources`），是唯一不受"仅更新有依据字段"约束的动态字段。
+`Prompts.DYNAMIC_STATE_FIELDS`（`:domain:agent`）：`currentSituation` / `currentLocation` / `currentMood` / `currentOccupation` / `currentGoal` / `currentTone`。
+
+`currentTone`（当前语气）由模型每轮更新，写成面向朗读的 TTS 播报指令（按需描述语气/情绪/语速/节奏/停顿/重音，可短可长、软上限约 60 字），朗读时直接作为 `TtsTurn.style` 传给当前朗读引擎（端侧 CosyVoice 的 instruct 指令，或远程服务器的 `instructions` 字段），省去"朗读前再调一次 API 生成语气指令"的开销。旧的 `currentRelationship`（当前关系）与 `currentImportantOthers`（当前重要他人）已不再使用，其旧值不迁移。
+
+除 `currentTone` 外，每个字段的 value 必须带 `sourceMessageIds` + `evidence` 溯源；群组整体只维护 `currentSituation` + `currentLocation`（`GROUP_SHARED_DYNAMIC_FIELDS`），成员各自的完整状态（含 `currentTone`）写入 `memberDynamicState`。`currentTone` 是朗读投递属性（自指、非事实状态），**每轮必填且免证据门**（`applyDynamicStateFields` 对 `currentTone` 跳过来源解析），是唯一不受"仅更新有依据字段"约束的动态字段。
 
 ### 世界书（lorebook）
 
 `char.lorebook = [{ id, name, keywords[], content, enabled, order, alwaysActive, origin, mentions, lastMentionedAt, misses }]`
 
-**定位：世界层设定的唯一去处**（时代与世界观、地点、组织、专有名词、历史、规则）。静态字段只承载"人/群组本人"的设定（群组 `description` = 群组前提、单角色 `basicInfo.background` = 个人背景），世界观一律不写进静态字段——这解决了旧版"世界观写描述还是写世界书"的两处重复。
+**定位：世界层设定的唯一去处**（时代与世界观、地点、组织、专有名词、历史、规则）。静态字段只承载"人/群组本人"的设定（群组 `description` = 群组前提、单角色 `basicInfo.background` = 个人背景），世界观一律不写进静态字段。
 
-- **两种模式**：`alwaysActive: true`（常驻，每轮都注入，用于世界前提/规则）与关键词命中（被提到才注入，省 token）。**没关键词的条目不再被拒收**：系统改用**条目名当触发词**，条目照样会在名字被提到时注入（模型写世界前提/规则时仍可把 `alwaysActive` 设为 true，常驻数量受 `MAX_ALWAYS_ACTIVE`(6) 约束）。
-- **来源与保护**：`origin: 'user' | 'ai'`（编辑界面显示为「人工维护」/「AI 维护」，点一下即可切换）。`user` 的条目**不会被模型覆盖，也不参与自动淘汰**；`ai` 的条目模型可维护（更新=整条替换）。**归属只由这个开关决定**：编辑名字/关键词/内容、勾「启用」「常驻」都不再改变归属（旧实现一改就自动打成 `user` 并永久定死，用户想交回模型也交不回去）；界面新建条目默认 `ai`。
+- **两种模式**：`alwaysActive: true`（常驻，每轮都注入，用于世界前提/规则）与关键词命中（被提到才注入，省 token）。**没关键词的条目不被拒收**：改用**条目名当触发词**。常驻数量受 `MAX_ALWAYS_ACTIVE`(6) 约束（超限只是降级、绝不整条丢弃）。
+- **来源与保护**：`origin: 'user' | 'ai'`（界面显示为「人工维护」/「AI 维护」，点一下即可切换）。`user` 的条目**不会被模型覆盖，也不参与自动淘汰**；`ai` 的条目模型可维护（更新=整条替换）。**归属只由这个开关决定**：编辑名字/关键词/内容、勾「启用」「常驻」都不改变归属；界面新建条目默认 `ai`。
 - **模型维护（三入口）**：
-  1. 建卡/群组升级时由模型产出初始条目（`quickGenerateCharacter` / `upgradeToGroup` 的 `lorebook` 字段，2-4 条，`normalizeGeneratedLorebook()` 标记 `ai`）。无关键词条目按常驻处理，但常驻数量同样受 `maxAlwaysActive` 约束（显式 `alwaysActive` 的条目优先占位，超出的无名条目保持非常驻）。
-  2. 主循环工具 `upsert_lorebook_entry`（`executeToolCall`）——先按 `entryId`/`name` 精确匹配：**精确命中时用新 `content` 替换该条目原有内容**（模型点名即"更新这一条"，故须写全完整内容），未命中再用 `findSimilarLorebookEntry()` 按名称 bigram 相似度（≥`nameSimilarity`）、共享关键词、内容 bigram 相似度（≥`contentSimilarity`）找**同一事物的近似条目**并**整条替换**（用这次写的完整内容覆盖该条目：允许变短、允许把 `alwaysActive` 改回 false——"逐句追加"与"常驻只增不减"都已删除），只有确实没有近似条目才新建；要求 `sourceMessageIds` + `evidence` 可回溯到已存在的消息，且**不得覆盖 `origin:user` 条目**（精确/近似命中用户条目时返回 `mergedIntoUser`，不新建重复条目）。
-  3. 记忆子任务 `consolidateLorebook()` — src/js/memory/tasks.js:142：每积累 8 条短期记忆跑一次，把现有条目的**完整内容**（最近 12 条/累计 ≤6000 字；其余只给名字+关键词并注明"本轮不要更新此条"）给模型，明确要求"同一事物只一条：沿用原名，把完整原文里仍有效的部分 + 新事实**重新总结成一条去整条替换**该条目（允许变短、一条只讲一件事、≤400 字）"（`autoEntriesPerPass` 上限 3 条，按 `sourceShortTermIds` 校验），写完后本地再跑一次 `dedupeLorebook()` 兜底（同主题只保留更新的那条），并顺带执行淘汰。另有一次性重写 `rebuildOversizedLorebook`：内容 >400 字的旧 AI 条目交给模型按主题拆成 1~3 条并原地替换。
-   - **本地去重** `dedupeLorebook(list)` — src/js/memory/lorebook.js：只保留 `origin:'ai'` 近重复簇里**更新**的那条（用户条目永不动；关键词取并集，不再拼接内容）；判定用预建的 `lorebookFingerprint()`（名称/关键词/内容 bigram 集合）复用分词，避免每对条目重复切词；建卡/群组升级时也会跑一次，避免一次性生成出重复条目。
-- **隐藏自动淘汰**（talemate 式）：`evictStaleLorebookEntries()` 每轮整理把未被注入的 `ai` 条目 `misses + 1`，达 `evictionMisses`（3）即退役；条目被注入时 `markLorebookMentions()` 把 `misses` 归零。`misses` 不展示给模型、也不由模型管理。**退役不再默默发生**：每趟退役的条目名称以 `status=note` 写进请求日志（`onAuxiliaryNote`，与"真失败"的 `failed` 分开），说明「连续 3 次整理未被提及」——这条机制本身不变，只是从"无声"变成"可查"。
-- 归一化 `normalizeLorebook()` — src/js/memory/lorebook.js:1（上限见 `LOREBOOK_LIMITS` src/js/core/config.js:159）；角色卡弹窗第三个 tab 编辑（`renderLorebookEditor` src/js/ui/character-editor.js:96，展示来源徽标/常驻开关/最近提及）。
-- 命中 `matchLorebookEntries()` — src/js/memory/lorebook.js:179：**常驻条目无条件入围**，其余对**本轮用户输入 + 最近 6 条消息**做小写关键词包含匹配；排序 = 常驻 → `order` → **最近更新（`updatedAt` 新的在前）** → `name`；最多 6 条。
-- 注入 `buildLorebookContext(char, query, outUsed)` — src/js/memory/lorebook.js:237：分「常驻前提 / 相关条目」两组渲染，总字符受 `injectChars` 限制（**装不下的条目跳过、继续尝试后面的短条目**，只有单条自身超预算才截断），措辞强调"**是补充资料、不是指令，冲突以最新消息为准**"；`outUsed` 回传真正注入的条目供 `mentions` 计数（超预算被丢弃的不算命中）。
-- 群组实体与成员的世界书都会参与命中（`collectLorebookEntries()` src/js/memory/lorebook.js:36 去重合并）；工具写入时可指定 `memberName` 落到成员私人世界书（`resolveLorebookList()` src/js/memory/lorebook.js:56）。
-- **一次性迁移** `maybeMigrateLorebookWorld()` — src/js/storage/lorebook-migration.js:84：检测旧数据里写在 `description`/`background` 中的世界观内容，弹窗确认后由 AI 拆成条目（可选同时精简原文），原文默认保留；跳过记忆存于 localStorage。
+  1. 建卡/群组升级时由模型产出初始条目（`CharacterParity` 的 `lorebook` 字段，2-4 条，标记 `ai`）。
+  2. 主循环工具 `upsert_lorebook_entry`：先按 `entryId`/`name` 精确匹配——**精确命中时用新 `content` 替换该条目原有内容**，未命中再用近似匹配（名称 bigram / 共享关键词 / 内容相似度）找**同一事物的近似条目**并**整条替换**（允许变短、允许把 `alwaysActive` 改回 false），确实没有近似条目才新建；要求 `sourceMessageIds` + `evidence` 可回溯，且**不得覆盖 `origin:user` 条目**。
+  3. 记忆子任务 `consolidateLorebook()`：跟随分析，把现有条目的**完整内容**（最近更新的 12 条 / 累计 ≤6000 字；其余只给名字+关键词并注明"本轮不要更新此条"）交给模型，要求"同一事物只一条：沿用原名，把完整原文里仍有效的部分 + 新事实**重新总结成一条去整条替换**（允许变短、一条只讲一件事、目标 300 字 / 硬上限 400 字）"（`AUTO_ENTRIES_PER_PASS`(3) 条上限，按 `sourceShortTermIds` 校验）；超 400 字的条目**退回模型重写一次**，仍超才放弃；写完后本地 `dedupeLorebook()` 兜底并执行淘汰。另有一次性重写 `rebuildOversizedLorebook`：内容 >400 字的旧 AI 条目交给模型按主题拆成 1~3 条并原地替换。
+- **隐藏自动淘汰**：`LorebookStore.evictStaleLorebookEntries()` 每轮整理把未被注入的 `ai` 条目 `misses + 1`，达 3 即退役；条目被注入时 `markLorebookMentions()` 把 `misses` 归零。`misses` 不展示给模型、也不由模型管理。**退役不默默发生**：每趟退役的条目名称以 `status=note` 写进请求日志（与"真失败"的 `failed` 分开）。
+- 归一化：写入受 `AppLimits.Lorebook` 约束（`ENTRIES` 200 / `KEYWORDS_PER_ENTRY` 8 / `NAME_CHARS` 60 / `CONTENT_CHARS` 400——**超限写入直接拒收、退回模型重写，绝不截断**）；角色卡弹窗第三个标签页编辑（展示来源徽标/常驻开关/最近提及）。
+- 命中 `LorebookMatcher`：**常驻条目无条件入围**，其余对**本轮用户输入 + 最近 6 条消息**做小写关键词包含匹配；排序 = 常驻 → `order` → 最近更新（`updatedAt` 新的在前）→ 名称（中文 `Collator`）；最多 `INJECT_ENTRIES`(6) 条。
+- 注入：分「常驻前提 / 相关条目」两组渲染，总字符受 `INJECT_CHARS`(1400) 限制（**装不下的条目跳过、继续尝试后面的短条目**，只有单条自身超预算才截断——旧行为下一条长常驻条目就能把后面全部挡死）；措辞强调"**是补充资料、不是指令，冲突以最新消息为准**"；真正注入的条目才计入 `mentions`（超预算被丢弃的不算命中）。
+- 群组实体与成员的世界书都参与命中（按 `id`（空则 `name|content`）去重合并）；工具写入时可指定 `memberName` 落到成员私人世界书。
+- **一次性迁移** `migrateWorldLore`：检测旧数据里写在 `description`/`background` 中的世界观内容，弹窗确认后由 AI 拆成条目（可选同时精简原文），原文默认保留。
 
 ## 五、进阶记忆子系统
 
 ### 记忆冲突自动裁决
 
-- `memoriesSemanticallyDiffer(a, b)`：把文本拆词/拆字比较重叠度，重叠 < 0.35 视为语义冲突。
-- `upsertLongTermMemory`：同 key 冲突时**不再静默覆盖**，写入 `existing.conflicts`（保留双方 value/evidence/sourceMessageIds/时间）并标记 `conflictedAt`。
-- `resolveMemoryConflicts()` — src/js/memory/updates.js:607：在 `trimCharacterMemory` 末尾自动合并。胜出规则：**更新时间晚 > 证据更长 > 保持原主值**。
+- `MemoryEvidence.memoriesSemanticallyDiffer(a, b)`：把文本拆词/拆字比较重叠度，重叠 < 0.35 视为语义冲突。
+- `MemoryPolicy.upsertLongTermMemory`：同 key 冲突时**不静默覆盖**，写入 `conflicts`（保留双方 value/evidence/sourceMessageIds/时间）并标记 `conflictedAt`。
+- `MemoryPolicy.resolveMemoryConflicts()`：在长期裁剪路径自动合并，胜出规则 **更新时间晚 > 证据更长 > 保持原主值**。
 
 ### 记忆重要性自学习
 
-- `usageCount` / `lastUsageAt`：记忆被 `handleRecall` 召回或 `search_memory` 命中时累计使用量。
-- `selfLearnMemoryImportance()` — src/js/memory/tasks.js:67：每轮 `checkMemoryTriggers` 调用。
+- `usageCount` / `lastUsageAt`：记忆被召回或 `search_memory` 命中时累计使用量。
+- `MemoryEvidence.selfLearnMemoryImportance()`：每轮维护任务调用。
   - **升权**：30 天内被使用过，`learnedBonus = min(3, floor(usageCount/2))`；
   - **降权**：userProfile/habits 45/90/180 天未召回，`learnedBonus` 逐档降到 -3（只降权不删除）。
 
 ### 剧情弧线（故事线）
 
-- 记忆分析 prompt（`analyzeShortToLongTerm`）可输出 `arcOf` + `arcStage`，同一 `arcOf` 只保留一条带弧线标注的事件。
-- `retrieveRelevantMemories` 对带 `arcOf` 的记忆额外 +3 权重。
+- 记忆分析提示词可输出 `arcOf` + `arcStage`，同一 `arcOf` 只保留一条带弧线标注的事件。
+- `Retrieval.rankMemories` 对带 `arcOf` 的记忆额外加权。
 
 ### 成员记忆隔离（群组）
 
-- 每个成员持有独立 `member.memory.longTerm`（`createCharacterObj`）。
+- 每个成员持有独立 `member.memory.longTerm`。
 - 路由：`submit_response.longTerm` 可带 `memberName` → 写入该成员记忆；记忆工具同样支持 `memberName`。
-- 注入：`buildVolatileContext` 为每个成员单独注入私人记忆（标记"仅该成员知道"），规则 11 要求不得张冠李戴。
-- 加载时 `normalizeGroupMembers()` src/js/storage/schema.js:237 归一化成员记忆与世界书。
+- 注入：`buildVolatileContext` 为每个成员单独注入私人记忆（标记"仅该成员知道"），群组规则要求不得张冠李戴。
 
 ### 话题系统（主动提话题 + 冷场 + 话题切换）
 
-- `buildTopicSuggestions()` — src/js/prompts/context.js:141：从 `basicInfo` + 记忆抽取最多 5 条候选话题。
-- `isColdFieldRequest()` — src/js/prompts/context.js:184：识别"不知道聊什么/你说吧"等冷场信号，注入强指令要求角色主动开话题。
-- `detectTopicSwitch()` — src/js/prompts/context.js:191：对 `currentGoal + currentSituation`（dynamicState）与用户消息做双字 bigram 重叠检测，不同则注入"先收束旧话题"的软指令。
+- `Prompts.buildTopicSuggestions()`：从 `basicInfo` + 记忆抽取最多 5 条候选话题。
+- `Prompts.isColdFieldRequest()`：识别"不知道聊什么/你说吧"等冷场信号，注入强指令要求角色主动开话题。
+- `Prompts.detectTopicSwitch()`：对 `currentGoal + currentSituation` 与用户消息做双字 bigram 重叠检测，不同则注入"先收束旧话题"的软指令。
 
 ### 场景概要
 
-- `getSceneKey()` — src/js/memory/tasks.js:102：以 `dynamicState.currentLocation` 作为场景标识。
-- `summarizeScene(char, sceneKey)` — src/js/memory/tasks.js:108：把"这一段已告一段落的情节"压缩成 1-2 段（≤300 字）**只含剧情要点**的记忆（谁做了什么/学到或决定了什么/地点物品伤势关系变化/新发现/未解决的目标承诺威胁期限）；写明主体、绝对日期、不引对白、不编造。
-- 触发（`checkMemoryTriggers` src/js/memory/tasks.js:199）：**场景切换**（location 变化）或**场景超长**（`CONTEXT_BUDGET.sceneSpan = 24` 条消息），且消息数 ≥ 6。
-- 重试计数复用 `memoryTaskKeys('scene')` → `sceneFailures` / `sceneRetryAt`。
+- `BackgroundTasks.checkScene()`：以 `dynamicState.currentLocation` 作为场景标识。
+- `summarizeScene()`：把"这一段已告一段落的情节"压缩成 1-2 段（≤300 字）**只含剧情要点**的记忆（谁做了什么/学到或决定了什么/地点物品伤势关系变化/新发现/未解决的目标承诺威胁期限）；写明主体、绝对日期、不引对白、不编造。
+- 触发：**场景切换**（location 变化）或**场景超长**（`Scene.SPAN`(12) 条消息），且消息数 ≥ `Scene.MIN_MESSAGES`(6)。
+- 游标存 `character.sceneState`（`key`/`startCount`/`startSequence`/`messageCount`，按消息 `sequence` 推进）。
 - 注入：最近 2 条渲染为 `【场景概要（较早情节的压缩记录…）】`。
 
 ## 六、上下文与预算
 
 ### 记忆预算
 
-**volatile 不再有区块预算**（旧版 `CONTEXT_BUDGET` 与 `add(text, limit)` 已删除）：该段属于主对话请求体，所有块整块注入，取舍只剩"条数上限 × 每条兜底上限"。旧的预算池有两个问题：①`volatileChars`(6000) 里先被 `角色当前状态`/`世界书` 吃掉，短期摘要常被压到几百字、长期召回整块跳过；②检索与摘要共享额度，长期召回一变，短期块的**长度**也跟着变，前缀在稳定期内被无谓打破。
+**volatile 没有区块预算**：该段属于主对话请求体，所有块整块注入，取舍只剩"条数上限 × 每条兜底上限"。
 
 | 项 | 值 | 说明 |
 |---|---|---|
 | 短期窗口注入 | 整窗（20~40 条） | 注入到**历史之前**的独立 user 块，不进 volatile |
 | `TOOL_MEMORY_INJECT_LIMIT` | 5 | 每轮注入的长期记忆条数 |
-| 世界书注入 | `Lorebook.INJECT_ENTRIES`(6) 条 | 整条注入（`CONTENT_CHARS`(400) 是**写入约束**：提示词要求目标 300 字、硬上限 400 字，超限**退回重写一次**、仍超才丢弃，绝不把内容截成半句；只有一次性重写还没处理到的旧超长条目才走注入侧兜底截断）。预算 `INJECT_CHARS`(1400) 装不下的条目**跳过、继续装后面的**（不再"遇长即停"）|
-| 场景概要 | `Scene.SUMMARIES`(2) 条 | 整条注入（写入时已受 2000 约束） |
-| 每条兜底上限 | 短期正文/长期 value/群私人 1200、长期 key 120 | 仅为兜底；提示词软限制（短期 ≤120 字、长期 value ≤200 字、arc ≤300 字、世界书条目 ≤200 字、场景 ≤300 字）让它尽量不触发 |
+| 世界书注入 | `Lorebook.INJECT_ENTRIES`(6) 条 | 预算 `INJECT_CHARS`(1400) 装不下的条目**跳过、继续装后面的** |
+| 场景概要 | `Scene.SUMMARIES`(2) 条 | 整条注入（写入时已受 300/400 字约束） |
+| 每条兜底上限 | 短期正文/长期 value/群私人 1200、长期 key 120 | 仅为兜底；提示词软限制让它尽量不触发 |
 
 ### 请求装配与缓存前缀
 
-一轮请求的形状（`RequestBuilder` + `ChatOrchestrator.run`）：
+一轮请求的形状（`ChatOrchestrator.run` + `RequestBuilder`）：
 
 ```
 instructions（system，纯静态角色设定）
@@ -319,29 +312,28 @@ tools: AUTO 阶段全部工具 / SUBMIT 阶段只有 submit_response
 ```
 
 - **短期块放在历史之前**是有意的：它只在折叠那一轮变化，而折叠同时把历史 rebase 掉——即"它变的时候前缀本来就要断"。中间那段它逐字不变，于是和"追加式历史"一起待在缓存前缀里。
-- 前缀缓存的失配只应来自三处：`instructions-changed`（角色静态资料被改）、以及两个窗口各自的 `history-rebased`（折叠，约每 20 轮一次）。`AppViewModel.requestTrace` 把短期块作为首个伪条目纳入前缀快照，否则它的变化会被误报成 `history-extended`。
-- 历史**不再逐轮滑动**：`growInstantWindow` 只追加窗口没见过的消息（`ChatOrchestrator` 末尾也不再 `takeLast(INSTANT)`），所以"每轮从头部丢一条"那种每轮 100% 失配的形态被消除。
+- 前缀缓存的失配只应来自三处：`instructions-changed`（角色静态资料被改）、`tools-changed`、以及两个窗口各自的 `history-rebased`（折叠，约每 20 轮一次）。`AppViewModel.requestTrace` 把短期块作为首个伪条目纳入前缀快照，否则它的变化会被误报成 `history-extended`。
+- 历史**不逐轮滑动**：`AppViewModel.growInstantWindow` 只追加窗口没见过的消息，`ChatOrchestrator` 只取窗口末尾 `INSTANT`(60) 条作尺寸兜底。
 - 图片保留窗口 `AppLimits.Media.IMAGE_RETENTION_MESSAGES`(60) 必须 ≥ `INSTANT`(60)：否则还在窗口内的消息会被剪掉图片，等于在稳定期中间改写前缀，还让模型"忘掉"刚看过的图。
 
 ### 提示词字符上限
 
-`PROMPT_LIMITS` — src/js/core/config.js:113：`roleChars: 8000`（单角色设定）/ `memberChars: 900`（群组成员）。
-历史消息按条数与单条字符截断，且**同一消息无论是否为本轮都使用同一上限（用户 2000 / assistant 1200）**——保证同一段文字在"当前轮"与"下一轮变历史"时编码逐字一致，避免前缀缓存整段失效。`API_LIMITS`（src/js/core/config.js:98）另有 `auxiliaryTimeoutMs: 90000`（后台小请求超时）、`requestMetrics: 60`（保留记录条数）、`prefixSnapshots: 12`（前缀快照数）。
+`AppLimits.Prompt`：`ROLE_CHARS = 8000`（单角色设定）/ `MEMBER_CHARS = 900`（群组成员）。
+历史消息按条数与单条字符截断，且**同一消息无论是否为本轮都使用同一上限（用户 2000 / assistant 1200）**——保证同一段文字在"当前轮"与"下一轮变历史"时编码逐字一致，避免前缀缓存整段失效。
 
 ### 前缀缓存策略
 
 - system = 交互规则 + 【角色设定（固定，不随对话变化）】+【硬性约束与语气锁定】+【输出格式】，全部为静态内容，跨轮不变。
 - **首尾放最高优先级**：规则块开头是优先级阶梯，静态块**末尾**再放硬性约束（0.5 禁令 + 2.5 语气锁定）与输出格式 —— 兼顾 primacy 与 recency，同时保持全部静态可缓存。
-- 历史消息逐字按序（最旧→最新）拼接、不重排、不注入消息 ID；**同一条消息在任何一轮都用同一编码**（含 `trimText` 上限），因此上一轮的"当前用户消息"在下一轮变成历史时字节不变。
-- **所有随轮变化的内容（记忆、世界书、场景概要、节奏骨架、违规纠正提醒、语气回顾、声音契约（单角色）/群聊声音锁定（群聊）、回复节奏等）汇总进 `buildVolatileContext`，作为独立的末尾 user 项追加**，不写进任何历史消息体内；`buildResponsesRequestBody` 只用 `instructions` + `input` 数组原样发送，不改变内容顺序。
-- 生成示例固定使用 `JSON_EXAMPLE_BRIEF`（不再随 `assistantTurnCount` 在完整/精简间切换），system 从首轮起稳定，避免前 6 轮前缀随轮变化。
-- 群组静态设定 `buildRoleContext(char, true)` 不再回退读取 `dynamicState.currentLocation`，location 变化不会改写可缓存 system。
+- 历史消息逐字按序（最旧→最新）拼接、不重排、不注入消息 ID；**同一条消息在任何一轮都用同一编码**（含 `trimTo` 上限），因此上一轮的"当前用户消息"在下一轮变成历史时字节不变。
+- **所有随轮变化的内容（记忆、世界书、场景概要、节奏骨架、违规纠正提醒、语气回顾、声音契约/群聊声音锁定、本轮指令）汇总进 `buildVolatileContext`，作为独立的末尾 user 项追加**，不写进任何历史消息体内。
+- 生成示例固定使用同一份精简 JSON 示例，system 从首轮起稳定。
 - 语气相关注入在 volatile 尾部按固定顺序排列：节奏骨架 → 违规纠正提醒 → 每 N 轮语气回顾 → 声音契约（单角色）/群聊声音锁定（群聊，每位有说话风格的成员各一块、块数随成员数、不封顶）（越靠后越接近生成点，遵从度越高）。
 - 禁止：把随轮内容插进历史中间、每轮改写 system 措辞、volatile 各段随机换序（都会打掉前缀命中）。
 
 ### 逐请求缓存与耗时统计
 
-`startRequestTrace(body, metadata)` + `recordCacheUsage(usage, metadata)` — src/js/api/responses.js：每次请求记录 `taskType`（`chat` / `auxiliary` / `extraction` / `analysis` / `scene` / `lorebook` / `prose-memory` / `quick-replies` / `style-critique`）、`platform`、`phase`、`inputTokens` / `outputTokens` / `hitTokens` / `missTokens` / `hitRate`、`durationMs`、`instructionsHash` / `toolsHash` / `historyHash`、`commonHistoryMessages`、`prefixChange`（`first-request` / `instructions-changed` / `tools-changed` / `history-rebased` / `history-extended`）、`contextChars` / `inputChars`。记录保留最近 60 条（`API_LIMITS.requestMetrics`）。只有 `taskType: 'chat'` 且非失败时更新右上角 `cacheStats`，后台小请求不再覆盖主对话缓存显示。缺失命中数据写 `null`（不再被 `Number(null)` 误算成 0）。`renderCacheStats()` 显示本轮命中率与最近 10 次对话请求均值；调试面板的 `requestMetrics` 段展示逐请求明细，用于定位前缀失效原因与新增 token 成本。
+`AppViewModel.recordMetrics`（chat）/ `recordAuxiliaryUsage`（辅助调用）写 `RequestMetric`：`taskType`（`chat` / `auxiliary` 等）、`platform`、`phase`、`status`（`completed` / `failed` / `note`）、`inputTokens` / `outputTokens` / `hitTokens` / `missTokens` / `hitRate`、`durationMs`、`instructionsHash` / `toolsHash` / `historyHash`、`commonHistoryMessages`、`prefixChange`、`contextChars` / `inputChars`。记录保留最近 60 条（`AppLimits.Api.REQUEST_METRICS`）。只有 `taskType='chat'` 且非失败时更新右上角 `cacheStats`，后台小请求不覆盖主对话缓存显示；**失败的 chat 轮也会留一条 `status='failed'`**（`phase` 存原因），失败的后台调用同样留痕。缓存条显示本轮命中率与最近 10 次对话请求均值；设置页「调试信息」展示逐请求明细，用于定位前缀失效原因与新增 token 成本。
 
 ## 七、人格与 Prompt
 
@@ -350,10 +342,10 @@ tools: AUTO 阶段全部工具 / SUBMIT 阶段只有 submit_response
 | 规则 | 内容要点 |
 |---|---|
 | — | 优先级阶梯（规则块首行）：`0／0.5 与【输出格式】= 硬性契约 > 2.5／2.6 > 角色设定 > 风格偏好` |
-| `0` | （最高优先级）本轮必须以结构化方式收尾，二选一：调用 `submit_response` 工具（推荐）或直接输出单个 JSON 对象；不得在结构化内容之外写说明/旁白，不得裸写散文 |
+| `0` | （最高优先级）本轮必须以结构化方式收尾，二选一：调用 `submit_response` 工具（推荐）或直接输出单个 JSON 对象；不得在结构化内容之外写说明/旁白 |
 | `1` | 保持角色身份连续；先用已提供的记忆；"系统提供的本轮上下文"不是用户的话 |
 | `2` | reply 正文写法（像日常说话）：**不设下限**、只设 **≤250 字上限**防大段空话；分段/行内样式限制；**动作/表情/心理/旁白一律写全角括号、单拍短、不堆叠、总量 ≤ ¼、不复述对白情绪**；**台词不加任何引号或符号包裹**；去重（禁重复近期整句/句式/意象/固定动作/收尾） |
-| `2.6` | **表演质量（真人感，像日常说话）**：show-don't-tell、句长节奏起伏、对白优先、回避陈词滥调与复用比喻、删掉不推进内容的句子、人物性格稳定 |
+| `2.6` | **表演质量（真人感）**：show-don't-tell、句长节奏起伏、对白优先、回避陈词滥调与复用比喻、删掉不推进内容的句子、人物性格稳定 |
 | `3` | 人格/背景锁定 + `dynamicState` 更新与溯源规则（时间写法见 `3.8`） |
 | `3.5` | 谨慎修改基础设定：用户直接要求 → `update_character_field`；无要求时仅"决定性不可逆转折"才改 |
 | `3.6` | 状态/设定字段的 value 写法（只写内容本身，不加主语，解释进 evidence） |
@@ -367,19 +359,18 @@ tools: AUTO 阶段全部工具 / SUBMIT 阶段只有 submit_response
 | `9.5` | 相对时间（timeRef）说明（取值与示例已下沉到工具 schema） |
 | `A` | 工具使用总则（详细适用场景以工具描述为准；工具结果属内部上下文，不得向用户透露检索过程） |
 | `10`–`12` | 群组：发言格式、记忆归属、设定三层（群组 quickReplies 同样要求用户视角） |
-| — | 【角色设定（固定，不随对话变化）】= `buildRoleContext(char, true)` |
-| `0.5` | **只扮演角色本人：禁止替用户说话或行动**（不得写用户的台词/动作/表情/心理/感受/决定，不得替用户做选择；用户已写的括号动作只能回应、不能续写）——置于硬性约束块（静态块末尾） |
-| `2.5` | 语气锁定：腔调只能来自设定的"说话风格"与"对用户的称呼"，优先级高于模型通用文风，不同角色差异必须显著；并硬性要求口癖/句尾助词/称呼等签名标记真的出现（≥2 处），禁止中和成通用书面语或默认 AI 助手腔——与 0.5 同在硬性约束块 |
-| — | 【输出格式】工具调用与单个 JSON 对象二选一收尾（静态块最后一行；即使本轮调用过其他工具也必须用它收尾） |
+| — | 【角色设定（固定，不随对话变化）】= `buildSystemPrompt` 的静态角色块 |
+| `0.5` | **只扮演角色本人：禁止替用户说话或行动**——置于硬性约束块（静态块末尾） |
+| `2.5` | 语气锁定：腔调只能来自设定的"说话风格"与"对用户的称呼"，并硬性要求口癖/句尾助词/称呼等签名标记真的出现（≥2 处），禁止中和成通用书面语或默认 AI 助手腔——与 0.5 同在硬性约束块 |
+| — | 【输出格式】工具调用与单个 JSON 对象二选一收尾（静态块最后一行） |
 
 ### 节奏骨架
 
-`NARRATIVE_PATTERNS` — src/js/core/config.js:144（10 条结构模板：动作/描写 → 对白 → 描写 的排列组合）
-`buildNarrativePatternDirective()` — src/js/prompts/context.js:266：每轮随机取一条，注入 volatile 尾部的 `【本轮节奏骨架（每轮随机给出，仅作节奏参考）】`，用于打破"每轮结构雷同"。
+`Prompts.buildNarrativePatternDirective()`：从 10 条结构模板（动作/描写 → 对白 → 描写的排列组合）里每轮随机取一条，注入 volatile 尾部的 `【本轮节奏骨架（每轮随机给出，仅作节奏参考）】`，用于打破"每轮结构雷同"。
 
 ### volatile 段落（按顺序）
 
-可选话题库 → 角色当前状态（+群成员状态）→ **待跟进承诺** → **世界书资料** → 成员私人记忆 → 用户最新纠正 → 互动节奏（重连/久别）→ **场景概要** → 本轮主动召回的相关长期记忆 + 记忆取用说明 + 记忆主体约定 → 时间基准 → 消息时间元数据 → 结尾多样性 → **本轮节奏骨架** → 冷场/话题切换指令 →（主动开场时）角色主动开场 → **快速回应视角提醒** → **违规纠正提醒** → **每 N 轮语气回顾** → **声音契约（单角色）/群聊声音锁定（群聊）**。
+可选话题库 → 角色当前状态（+群成员状态）→ **待跟进承诺** → **世界书资料** → 成员私人记忆 → 用户最新纠正 → 互动节奏（重连/久别）→ **场景概要** → 本轮主动召回的相关长期记忆 + 记忆取用说明 + 记忆主体约定 → 时间基准 → 消息时间元数据 → 结尾多样性 → **本轮节奏骨架** → 冷场/话题切换指令 →（主动开场时）角色主动开场 →（热榜开场时）热榜指令 → **快速回应视角提醒** → **违规纠正提醒** → **每 N 轮语气回顾** → **声音契约（单角色）/群聊声音锁定（群聊）**。
 
 > 顺序原则是"越靠后越近"：更早的背景（话题库/状态/承诺/世界书）在前，较早情节（场景）→ 较早记忆（长期召回）→ 现在（时间基准/时间线）→ 本轮指令（尾块）在后。**短期窗口不在这里**：它整窗注入到历史之前（见"请求装配与缓存前缀"）。
 >
@@ -387,108 +378,98 @@ tools: AUTO 阶段全部工具 / SUBMIT 阶段只有 submit_response
 
 ### 语气/风格遵从（attention）
 
-把最容易违反的约束尽量贴近生成点，并用客户端检测闭环（纯函数，可单测；常量见 `STYLE_GUARD` src/js/core/config.js:182）：
+把最容易违反的约束尽量贴近生成点，并用客户端检测闭环（纯函数，可单测；在 `StyleGuard`）：
 
 - **优先级阶梯**：规则块开头声明"0／0.5 与【输出格式】= 硬性契约 > 2.5 语气锁定与 2.6 表演质量 > 角色设定 > 风格偏好"。
 - **静态块末尾重申**：`【硬性约束与语气锁定（最高优先级，冲突时以这里为准）】` 内含 0.5 禁令与 2.5 语气锁定，紧跟【输出格式】（recency，且全部静态可缓存）。
-- **声音契约** `buildStyleAnchor()` — `:domain:agent` 的 `background/StyleGuard.kt`（对照 src/js/prompts/style.js:15 语气锚）：每轮在 volatile 最末尾给出「说话风格摘要 + 3 条逐字示例台词 + 对用户的称呼 + 本轮硬约束」，硬约束要求回复**至少自然带出设定的口头禅/句尾助词/称呼共 2 处**并保持标点习惯，**禁止通用书面语与默认 AI 助手腔**；示例从完整 `speakingStyle` 抽取后再截断摘要，避免长风格丢示例。`speakingStyle` 为空时不出契约（依赖补全字段功能填充）。
-- **群聊声音锁定** `buildGroupVoiceContract()` — 同上文件：群聊时在 volatile 最末尾为**每位有 `speakingStyle` 的成员**各出一块（成员名 + 说话风格摘要 + 3 条示例 + 称呼 + 该成员专属要求），块数随成员数、不封顶；总纲要求成员之间语气显著不同、不得互换语气或向默认助手腔靠拢。无说话风格的成员跳过。
-- **违规检测** `detectStyleViolations(reply, char, prevReplies)` — src/js/prompts/style.js:32：纯函数返回标签
-  `metaTalk`（元话术）／`speaksForUser`（替用户说话）／`cliche`（陈词滥调表 `STYLE_CLICHES`）／`reusedImagery`（复用近期意象，8 字独特片段）／`toneDrift`（声明的口癖缺失或句长过于整齐）／`recitedLore`（复述世界书条目）。
-- **内部提醒**（不展示给用户）：违规标签随消息持久化（`message.styleViolations`），下一轮由 `buildStyleCorrectionReminder()` — src/js/prompts/style.js:239 在 volatile 尾部点名纠正。
-- **每 N 轮语气回顾** `buildStyleReview()` — src/js/prompts/style.js:226：`STYLE_GUARD.reviewEveryTurns`（默认 3）轮一次，汇总近期违规并重申语气契约。
-- **critique 调用** `critiqueReplyStyle()` — src/js/prompts/style.js:247（来源：talemate 的 `arc-expand-critique`）：命中违规且 `state.config.styleCritique !== false` 时追加一次**只改文风、不改剧情**的修订请求；解析失败或长度超出 `critiqueMinRatio`/`critiqueMaxRatio`/`critiqueMaxChars` 一律**回退原文**；修订后重新检测并以剩余违规为准。
+- **声音契约** `StyleGuard.buildStyleAnchor()`：每轮在 volatile 最末尾给出「说话风格摘要 + 3 条逐字示例台词 + 对用户的称呼 + 本轮硬约束」，硬约束要求回复**至少自然带出设定的口头禅/句尾助词/称呼共 2 处**并保持标点习惯，**禁止通用书面语与默认 AI 助手腔**；示例从完整 `speakingStyle` 抽取后再截断摘要，避免长风格丢示例。`speakingStyle` 为空时不出契约（依赖补全字段功能填充）。
+- **群聊声音锁定** `StyleGuard.buildGroupVoiceContract()`：群聊时为**每位有 `speakingStyle` 的成员**各出一块（成员名 + 说话风格摘要 + 3 条示例 + 称呼 + 该成员专属要求），块数随成员数、不封顶；总纲要求成员之间语气显著不同。无说话风格的成员跳过。
+- **违规检测** `StyleGuard.detectStyleViolations(reply, char, prevReplies)`：纯函数返回标签
+  `metaTalk`（元话术）／`speaksForUser`（替用户说话）／`cliche`（陈词滥调表）／`reusedImagery`（复用近期意象）／`toneDrift`（声明的口癖缺失或句长过于整齐）／`recitedLore`（复述世界书条目）。
+- **内部提醒**（不展示给用户）：违规标签随消息持久化（`message.styleViolations`），下一轮由 `StyleGuard.buildStyleCorrectionReminder()` 在 volatile 尾部点名纠正。
+- **每 N 轮语气回顾** `StyleGuard.buildStyleReview()`：`reviewEveryTurns`（3）轮一次，汇总近期违规并重申语气契约。
+- **critique 调用** `BackgroundTasks`（只改文风、不改剧情）：命中违规且 `AppConfig.styleCritique` 开启时追加一次修订请求；解析失败或长度比例异常一律**回退原文**；修订后重新检测并以剩余违规为准。
 
 ### 快速回应视角（quickReplies）
 
-「快速回应」必须是**用户**下一句会发的话，而模型容易写成角色口吻或角色的提问。这里同样用"校验 + 后台修正"闭环（常量 `QUICK_REPLY_GUARD` src/js/core/config.js:208）：
+「快速回应」必须是**用户**下一句会发的话，而模型容易写成角色口吻或角色的提问。这里同样用"校验 + 后台修正"闭环：
 
-- **提示词层**：规则 `7`（src/js/prompts/request.js:32）明确三类禁止写法（角色口吻 / **角色视角的提问** / 复述角色台词）并给出对比例句；`submit_response` 的 `quickReplies` 描述与群组规则 `10` 同步收紧；规则 `8` 的示例把 quickReplies 换成真实用户视角短句（只示范视角，措辞不得照抄）。
-- **校验层** `detectQuickReplyIssues(replies, char, replyText)` — src/js/prompts/style.js:124：纯函数返回标签 `missing` / `placeholder`（照抄"短句一/短句二"占位文字）/ `action`（带括号动作）/ `mirrored`（与角色本轮台词逐字或镜像重复）/ `characterName`（出现角色名）/ `tooLong`。
-- **修正层** `generateQuickRepliesAsUser()` — src/js/prompts/style.js:181 + `repairQuickRepliesAsUser()` — src/js/prompts/request.js:114：**换位生成**——用一个身份为"用户本人"的后台小调用重写（system 明写"你就是这位用户本人…不要扮演<角色名>"），成功后只更新快速回应按钮，**不触碰已显示的正文**；失败回退 `['嗯','继续']`。开关 `state.config.quickReplyRepair`（默认开，设置面板 `quickReplyRepairToggle`）。
-- **不阻塞**：quickReplies 不再参与"是否重发一轮"的判定，也不再触发「正在补齐快速回应…」；缺失/非法一律先接受正文，由后台补上。
-- **内部提醒**：问题随消息持久化（`message.quickReplyIssues`），下一轮由 `buildQuickReplyPerspectiveReminder()` 在 volatile 尾部点名（与语气纠正同一机制）。
+- **提示词层**：规则 `7` 明确三类禁止写法（角色口吻 / **角色视角的提问** / 复述角色台词）并给出对比例句；`submit_response` 的 `quickReplies` 描述与群组规则 `10` 同步收紧。
+- **校验层** `StyleGuard.detectQuickReplyIssues(replies, char, replyText)`：纯函数返回标签 `missing` / `placeholder`（照抄占位文字）/ `action`（带括号动作）/ `mirrored`（与角色本轮台词逐字或镜像重复）/ `characterName`（出现角色名）/ `tooLong`。
+- **修正层** `BackgroundTasks.repairQuickReplies()`：**换位生成**——用一个身份为"用户本人"的后台小调用重写（system 明写"你就是这位用户本人…不要扮演<角色名>"），成功后只更新快速回应按钮，**不触碰已显示的正文**；失败回退兜底短句。开关 `AppConfig.quickReplyRepair`（默认开）。
+- **不阻塞**：quickReplies 不参与"是否重发一轮"的判定；缺失/非法一律先接受正文，由后台补上。
+- **内部提醒**：问题随消息持久化（`message.quickReplyIssues`），下一轮由 `StyleGuard.buildQuickReplyPerspectiveReminder()` 在 volatile 尾部点名。
 
 ### 人格组装
 
-- `buildRoleContext(char, staticOnly)` — src/js/prompts/context.js:15：从 `char.basicInfo` 拼人格（主字段 + 次字段，共 12 项 `STATIC_PROFILE_FIELDS` src/js/core/config.js:130）；群组则拼群组信息 + 成员清单（`buildMemberContext` src/js/prompts/context.js:2）。
-- `buildDynamicStateContext()` — src/js/prompts/context.js:44：把动态字段渲染为"状态"文本（未设置的显示 `(未设置)`；volatile 里的角色/成员状态块同样用 `(未设置)` 且经 `maskUserWord` 脱敏，与其它注入路径一致）。
-- `buildRequestPayload(char, query)` — src/js/prompts/request.js:1：装配 system + 历史 + 本轮 volatile。
+- `buildSystemPrompt()`（`:domain:agent` 的 `prompts/Prompts.kt`）：从 `char.basicInfo` 拼人格（主字段 + 次字段，共 12 项 `STATIC_PROFILE_FIELDS`）；群组则拼群组信息 + 成员清单。
+- 动态状态渲染为"状态"文本（未设置的显示 `(未设置)`；volatile 里的角色/成员状态块同样用 `(未设置)` 并脱敏"用户"词）。
+- `RequestBuilder.build()` / `mapHistory()`：装配 system + 历史 + 本轮 volatile；`mapHistory` 对空 assistant 消息整条丢弃、非空包成 `{"reply": …}` 作格式示范、贴图转图片。
 
 ### 子任务提示词（非主对话）
 
-主对话之外的每个 `callAPI` 调用都有独立 prompt，各司其职：
+主对话之外的每次辅助调用都有独立 prompt，各司其职（`BackgroundTasks` / `NativeCore` / `CharacterParity`）：
 
 | 提示词 | 位置 | 关键约束 |
 |---|---|---|
-| 一键建卡 `quickGenerateCharacter` | src/js/characters/generation.js:2 | 输出完整字段 JSON；**禁止套路名字与模板人设**；`personality` 写行为倾向；`background` 只写角色本人经历（世界观写 `lorebook`）；`speakingStyle` 必须是「调性描述；示例：<台词1> / <台词2> / <台词3>」（`CHARACTER_QUALITY_RULE` + `SPEAKING_STYLE_SAMPLES_RULE`）；群组分支要求成员说话方式显著不同，并输出 2-4 条初始 `lorebook` 条目 |
-| 群组升级 `upgradeToGroup` | src/js/characters/generation.js:117 | 与建卡同一套质量约束；`additionalMembers` 不得重复原角色与彼此姓名；可补 0-3 条 `lorebook`（只补近期已出现的世界层设定，没有就空数组）；原角色世界书并入群组 |
-| 世界书整理 `consolidateLorebook` | src/js/memory/tasks.js:142 | 只从**已发生的短期摘要**里沉淀世界层设定（`sourceShortTermIds` 必须可回溯）、禁止推测扩写；把现有条目的**完整内容**给模型（最近 12 条 / 累计 ≤6000 字，其余只给名字+关键词并注明"本轮不要更新此条"——旧实现只给前 160 字，模型看不到正文就只能乱堆），要求"同一事物只一条：沿用原名，把**完整原文里仍有效的部分 + 新事实重新总结成一条、整条替换**旧条目（允许变短、一条只讲一件事、≤400 字）"；≤`autoEntriesPerPass`(3) 条；写后本地 `dedupeLorebook()` 兜底（同主题只保留**更新**的那条，不再拼接内容），并执行 `misses` 淘汰 |
-| 世界书一次性迁移 `migrateWorldLoreForEntity` | src/js/storage/lorebook-migration.js:44 | 把旧数据 `description`/`background` 里的世界观拆成条目（≤6 条，只整理已有信息）；用户手写条目不受影响；可选同时精简原文（仅在确实变短时替换） |
-| 成员补全 `fillGroupMemberFields` | src/js/ui/character-editor.js:236 | **已有字段是绝对权威，不得改写/润色/替换**；只填空字段；说话方式须与群内其他成员显著不同；无把握则省略 |
-| 空字段补全 `fillStaticFieldsForJob` | src/js/characters/profile-completion.js:33 | 只补 `job.missing` 中的字段，绝不覆盖已有设定；缺 `speakingStyle` 时套用示例台词约束；群组成员再叠加"彼此不同" |
-| 即时→短期摘要 `extractInstantToShortTerm` | src/js/memory/tasks.js:259 | **整窗折叠**：`instant` 满 60 触发，输入是**整个窗口**；按"日期+时段"合并；**只保留影响后续剧情的内容**（决策/地点物品伤势关系变化/发现/未决目标承诺威胁期限）；**每条 ≤120 字**；禁止文学化与对白原文；续写旧事件时**旧摘要中仍有效的信息必须原样保留**。**不要求模型点名消息 id**（也**没有**"连续覆盖"约束）：原话证据由客户端按同一"日期+时段"从窗口里采成 `userEvidence`/`sourceRoles`；重复靠提示词注入**已有短期事件**来压。成功后**只消费刚读过的那一批**：正常通道保留最新 20 条作原文上下文；旧档遗留的超大窗口改走 `migrateOversizedWindow` 分批（每批最旧 60 条、折完即丢、一次跑完、启动时阻塞） |
-| 短期→长期 `analyzeShortToLongTerm` | src/js/memory/tasks.js:345 | **整窗折叠**：`shortTerm` 满 40 触发，输入是**整个窗口**（低水位留下的 20 条带 `analyzed=true` 只作上下文，保证跨轮连贯），只为 `analyzed=false` 的条目产出；**价值判据**（可跨轮复用/影响后续/用户明确表达）才记，**证据不足宁可不记**；`arcOf` 命名一旦确定保持稳定；**取证链锚在短期条目上**：`evidence` 必须逐字命中被引用条目携带的 `userEvidence`（模型给错消息 id 会被重锚定到命中的那条原话，**不丢条目**）；**每条 value ≤200 字、arc 叙事 ≤300 字** |
-| 场景概要 `summarizeScene` | src/js/memory/tasks.js:108 | 1-2 段 ≤300 字，只含剧情要点，不引对白、不编造、写绝对日期 |
-| 文风校对 `critiqueReplyStyle` | src/js/prompts/style.js:247 | **只改文风、不改剧情**（情节/事实/对话含义/人物关系不动，大体长度与段落数保持）；不得复述规则；只返回 `{"reply":"…"}`；空结果或长度比例异常一律回退原文 |
-| 快速回应换位生成 `generateQuickRepliesAsUser` | src/js/prompts/style.js:181 | 身份是**用户本人**（system：你就是这位用户本人…不要扮演角色）；只输出 `{"quickReplies":[...]}`；结果再过一遍 `detectQuickReplyIssues`，不通过就放弃（回退兜底） |
-| 散文轮记忆整理 `extractProseTurnMemory` | src/js/prompts/request.js:126 | 复用"对话记录整理助手"把散文轮补成结构化记忆；**后台执行**（`queueBackgroundTask` 串行）、不改写已显示正文、还原 `lastInjectedRecallIds` |
-| 其余 | src/js/characters/avatar.js:98 emoji 头像 / src/js/prompts/request.js:88 散文转 JSON / src/js/storage/profile-migration.js:68 字段重排 / src/js/storage/lorebook-migration.js:124 群组字段迁移 / src/js/media/stickers.js:92 贴图标签 | 低价值路径，未做经验对齐 |
-
-> 像素头像提示词 `PIXEL_AVATAR_PROMPT`（src/js/characters/avatar.js:72）**不参与任何建卡/补全 prompt**（像素头像为已废弃试验品），仅保留定义与遗留生成器 `requestPixelAvatar`。
->
-> 原生化：建卡/群组升级/成员补全的 prompt 拼装与 JSON 解析已按同一约束移植到 `:feature:characters` 的 `CharacterParity`（静态 12 + `dynamicState` 7 + 2-4 条 `lorebook`，成员全字段解析、头像描述含 `roleInGroup`、只补空字段），网络调用仍在 `:app` 的 `NativeCore`；详见 `docs/NATIVE_MODULES.md`。
+| 一键建卡 `buildQuickGeneratePrompt` | `feature:characters` 的 `CharacterParity` | 输出完整字段 JSON；**禁止套路名字与模板人设**；`personality` 写行为倾向；`background` 只写角色本人经历（世界观写 `lorebook`）；`speakingStyle` 必须是「调性描述；示例：<台词1> / <台词2> / <台词3>」（`CHARACTER_QUALITY_RULE` + `SPEAKING_STYLE_SAMPLES_RULE`）；群组分支要求成员说话方式显著不同，并输出 2-4 条初始 `lorebook` 条目 |
+| 群组升级 `upgradeToGroup` | `:app` 的 `AppViewModel` | 与建卡同一套质量约束；`additionalMembers` 不得重复原角色与彼此姓名；可补 0-3 条 `lorebook`（只补近期已出现的世界层设定）；原角色世界书并入群组 |
+| 世界书整理 `consolidateLorebook` | `BackgroundTasks` | 只从**已发生的短期摘要**里沉淀世界层设定（`sourceShortTermIds` 必须可回溯）、禁止推测扩写；给出已有条目的完整内容；"同一事物只一条：整条替换、允许变短、≤400 字"；≤`AUTO_ENTRIES_PER_PASS`(3) 条；写后本地去重并执行 `misses` 淘汰 |
+| 世界书一次性迁移 `migrateWorldLore` | `BackgroundTasks` / `NativeCore.runWorldLoreMigration` | 把旧数据 `description`/`background` 里的世界观拆成条目（只整理已有信息）；人工维护条目不受影响；可选同时精简原文 |
+| 成员补全 `fillMemberFields` | `NativeCore` / `CharacterParity.applyMemberFillPayload` | **已有字段是绝对权威，不得改写/润色/替换**；只填空字段；说话方式须与群内其他成员显著不同；无把握则省略 |
+| 空字段补全 `autoFillStaticFields` | `BackgroundTasks` | 只补缺失字段，绝不覆盖已有设定；缺 `speakingStyle` 时套用示例台词约束；群组成员再叠加"彼此不同" |
+| 即时→短期摘要 `analyzeShortTermBatch`（抽取） | `BackgroundTasks` | **整窗折叠**：`instant` 满 60 触发，输入是**整个窗口**；按"日期+时段"合并；**只保留影响后续剧情的内容**；**每条 ≤120 字**；禁止文学化与对白原文。**不要求模型点名消息 id**：原话证据由客户端按同一"日期+时段"从窗口里采；重复靠提示词注入**已有短期事件**来压 |
+| 短期→长期 `analyzeShortTermBatch`（分析） | `BackgroundTasks` | **整窗折叠**：`shortTerm` 满 40 触发，输入是**整个窗口**（低水位留下的 20 条只作上下文）；**价值判据**（可跨轮复用/影响后续/用户明确表达）才记，**证据不足宁可不记**；`arcOf` 命名一旦确定保持稳定；**取证链锚在短期条目上**；**每条 value ≤200 字、arc 叙事 ≤300 字** |
+| 场景概要 `summarizeScene` | `BackgroundTasks` | 1-2 段 ≤300 字，只含剧情要点，不引对白、不编造、写绝对日期 |
+| 文风校对（critique） | `BackgroundTasks` | **只改文风、不改剧情**；不得复述规则；只返回 `{"reply":"…"}`；空结果或长度比例异常一律回退原文 |
+| 快速回应换位生成 `repairQuickReplies` | `BackgroundTasks` | 身份是**用户本人**；只输出 `{"quickReplies":[...]}`；结果再过一遍 `detectQuickReplyIssues`，不通过就放弃（回退兜底） |
+| 散文轮记忆整理 `extractProseTurnMemory` | `BackgroundTasks` | 复用"对话记录整理助手"把散文轮补成结构化记忆；**后台执行**、不改写已显示正文、还原已注入召回 |
+| 其他 | emoji 头像（`NativeCore.requestEmojiAvatar`）、散文转 JSON（`convertProseToJson`）、字段重排（`remapFields`）、贴图标签（`NativeCore.tagSticker`） | 低价值路径，未做经验对齐 |
 
 ## 八、健壮性
 
-- **API 请求级重试**：`performChatRequestWithRetry`（src/js/api/retry.js:14）对瞬时失败（网络错误 / 超时 Abort / HTTP 429 / 5xx）自动重试最多 `MAX_API_RETRIES = 3` 次（1s/2s/4s 指数退避）。
-- **工具失败可恢复**：`executeToolCall` 失败时回传可修正的提示（如 `delete_memory` 找不到 ID 时提示先 `list_memories`）。本轮工具 `ok:false` 时不采用同一轮的 `submit_response`，继续让模型修正，避免"回复说改了、实际没改"。
-- **每轮一个工具 + 上限**：DeepSeek thinking 模式不支持并行 `function_call` 回传，每轮只执行并回传第一个信息类工具；`MAX_TOOL_CALLS` 约束整轮总数；跨轮复用 `call_id` 时自动改用新 `call_id`，保证回传项内 `call_id` 唯一。
-- **记忆任务重试**：`memoryTaskKeys(task)` — src/js/memory/tasks.js:34 统一映射 `extraction` / `analysis` / `scene` / `lorebook` 四组计数器（`*Failures` / `*RetryAt`），`scheduleMemoryRetry` 指数退避（5→30 分钟封顶）。
-- **后台任务过期保护**：`captureMemoryTask(char)` 记录角色引用、`memory.revision` 与末条消息 ID；`isMemoryTaskCurrent()` 在后台调用返回后校验，过期（角色被删、轮次推进、分支被删）就直接丢弃。`extractProseTurnMemory` 在快照副本上运行 `convertProseToJson`，不修改真实 `lastInjectedRecallIds`；回写前要求 `revision` 未变、原 assistant 消息仍在，并只接受引用本轮用户消息或本轮回复的记忆。快速回应换位生成、空字段补全同样带 guard。
-- **摘要不被提前丢弃**：消费只发生在读它的那一趟之后——分析失败的批次原样留在窗口里、由退避门控重试；世界书整理读的是分析刚消费的同一批，逐条校验来源与字段，坏条目跳过（其余照常入库）并记录原因，避免一次坏输出造成误淘汰。**窗口去重只在消费这一刻做**：折叠/分析消费结束后跑一次确定性去重（`settleShortTerm` → `dedupeShortTerm`），把"折叠重读低水位时把同一件事又写一遍"造成的近重复合并掉（同一逻辑日+时段且相似度 ≥0.6，或全局 ≥0.72）；稳定期内不碰窗口，否则已发出的请求前缀会变得不可预测（每轮都缓存未命中）。
-- **检索相关性下限**：`rankMemories` 只保留至少命中一个非停用词的候选，并用特异性下限 `MIN_MATCH_SCORE`(1.5) 过滤"泛词"命中，避免纯高重要性但无关的旧记忆挤占注入；`pendingRecall`（模型主动召回）优先占位，即使候选取满也一定注入；短指代查询经 `buildMemoryQuery` 补上下文；**用户提到具体日期时，由模型用 `search_memory` 的 `date`/`timeRef` 按日期召回那天的原始对话与记忆**（口语日期→绝对日期由模型依据时间基准换算）。
-- **断言前先核对**：系统提示词要求模型在说"第一次/从来没/总是/每次/以前也…"这类**可被记忆证伪**的话之前先 `search_memory` 确认，查不到依据就不下断言（改说不确定或反问），禁止编造——治"明明不是第一次却说第一次"（关键词通道召回不到时，模型凭直觉断言）。
-- **短期记忆上限靠"消费即丢"不靠"截断"**：分析一趟读走**低水位之上的那一段**（每批最多 `ANALYSIS_BATCH`(40) 条），成功后原样丢掉；**没读到的（最新 `SHORT_TERM_TRIM_FLOOR`(20) 条）永不丢**，所以稳态就是 20~40，不存在"积压越滚越大"。图片只保留最近 `AppLimits.Media.IMAGE_RETENTION_MESSAGES`(60，**必须 ≥ `INSTANT`**，否则会在窗口内部剪图、改写前缀) 条消息（更早的删附件与文件、正文保留）。**一次弹窗、之后自动跑完**：`checkMemoryCleanupPrompt` 只在短期超出高水位或有超窗图片时询问一次；确认后 `NativeCore.pruneOldMessageImages` 立即剪图片，`drainShortTermBacklog` 把积压消费成长期记忆（每批最多 40 条，`CLEANUP_BATCHES_PER_RUN`(1) 批、空闲每分钟 1 批），直到降到低水位 20 才清除标记 —— 同一批积压不会问第二次，绝不截断。**去重/修复这类 O(n²) 重活一律在 `Dispatchers.Default`/`IO` 上跑**（`viewModelScope.launch` 默认主线程；放主线程会 ANR 且修复标记写不进去 → 每次启动重跑）。
-- **时间精度**：`resolveTimeRef` 保留带时区/时分的 explicit ISO，仅"日期或时段"表达才落整点/时段起点，避免把明确时刻改写成正午。记忆衰减/排序的时间基准逐级回退（`Date.parse(lastRecalled) || Date.parse(updatedAt) || Date.parse(createdAt)`），`lastRecalled` 非空但不可解析时不会短路掉更新的时间戳、也不会被当成 1970 年。
-- **联网工具超时**：`fetchWithTimeout()`（src/js/api/web-content.js）给 B站 API、短链解析、Microlink、网页直连统一加超时，避免任意外部请求卡死工具循环（后台任务无重试兜底）。
-- **请求失败也留痕**：`performChatRequest` / `callAI` 的 fetch 失败或非 2xx 也会写入 `requestMetrics`（`status: 'failed'`），并取消未读完的流式 reader，便于诊断网络与限流问题。`buildApiHeaders` 在 apiKey 缺失时提前抛出明确错误，不发出 `Bearer undefined` 请求。
-- **文风校对可回退**：`critiqueReplyStyle` 在任何异常（解析失败、空结果、长度超出 `critiqueMinRatio`/`critiqueMaxRatio`/`critiqueMaxChars`）下都返回原文，绝不因校对失败影响回复。
-- **快速回应后台补齐可回退**：`repairQuickRepliesAsUser` 的换位生成失败（或生成结果仍不过校验）时退回 `['嗯','继续']`；回来太晚（`state.quickReplyMessageId` 已被下一轮覆盖）直接丢弃，不会覆盖新一轮的快速回应。
-- **后台任务串行**：`queueBackgroundTask`（src/js/prompts/style.js:208）把"散文轮记忆整理""快速回应补写"串成一条 Promise 链，避免交错写同一份角色状态；两者都不阻塞正文显示。
-- **散文即终稿不再重写**：阶段一拿到散文就直接采用，旧行为（`convertProseToJson` 阻塞在可见链路里、把用户已看到的正文换成"整理"后的版本）已移除；实机可用调试面板的 `stageStats` / `activityLog` 核对「正在整理回复…」是否真的不再出现。
-- **共享 HTML 工具**：`decodeBasicHtmlEntities()`（src/js/core/config.js）是 HTML 实体解码的唯一实现，`htmlToReadableText`（去 script/style 后可读文本）与 `stripHtmlTags`（B站标题清洗）都复用它，避免两处实现漂移。
-- **导入/导出归一化**：`normalizeAppData` → `normalizeCharacter`（src/js/storage/schema.js:40）逐字段校验，包含世界书、场景概要、场景状态与新增计数器。
-- **版本号单一来源**：右上角 `APP_VERSION`（src/js/core/config.js:73）由 `versionName` 派生，`tools/sync-version.mjs` 负责写入生成资产 `hub.html`；CI 在 `assembleRelease` 前执行该脚本并校验产物与源码一致，本地用 `node tools/sync-version.mjs --check` 复核。
+- **API 请求级重试**：`ApiRetry`（`:domain:agent`）对瞬时失败（网络错误 / 超时 / HTTP 429 / 5xx）自动重试最多 3 次（1s/2s/4s 指数退避）；**用户主动取消不重试**（`CancellationException` 直接抛出）。后台辅助调用在 `BackgroundTasks.completeDetailed` 用同一策略。
+- **工具失败可恢复**：工具失败时回传可修正的提示（如 `delete_memory` 找不到 ID 时提示先 `list_memories`）。本轮工具 `ok:false` 时不采用同一轮的提交，继续让模型修正，避免"回复说改了、实际没改"。
+- **每轮一个工具 + 上限**：每轮只执行并回传第一个信息类工具；`MAX_TOOL_CALLS` 约束整轮总数。
+- **记忆任务重试**：`extraction` / `analysis` / `scene` / `lorebook` 四组计数器（`*Failures` / `*RetryAt`），`scheduleMemoryRetry` 指数退避（5→30 分钟封顶）。
+- **后台任务过期保护**：`captureGuard` / `isGuardCurrent`（`revision` + 末条消息 ID）保护**会覆盖用户可见状态**的任务（场景概要、静态补全、动态状态）；**折叠/分析这类只做增量的任务改为合并写回**——重读最新角色后把新条目追加到最新列表、只移除刚刚折过的那批，所以用户中途又发消息时折叠结果照样落地（不再整批判 `Stale` 丢弃）。
+- **摘要不被提前丢弃**：消费只发生在读它的那一趟之后——分析失败的批次原样留在窗口里、由退避门控重试；世界书整理读的是分析刚消费的同一批，逐条校验来源与字段，坏条目跳过（其余照常入库）并记录原因。**窗口去重只在消费这一刻做**（`BackgroundTasks.settleShortTerm` → `MemoryPolicy.dedupeShortTerm`）：同一逻辑日+时段且相似度 ≥0.6，或全局 ≥`NEAR_DUP_SIMILARITY`(0.72) 合并；稳定期内不碰窗口，否则已发出的请求前缀会变得不可预测。
+- **检索相关性下限**：`rankMemories` 只保留至少命中一个非停用词的候选，并用特异性下限 `MIN_MATCH_SCORE`(1.5) 过滤泛词命中；`pendingRecall` 优先占位；短指代查询经 `buildMemoryQuery` 补上下文；**用户提到具体日期时由模型用 `search_memory` 的 `date`/`timeRef` 按日期召回那天的原始对话与记忆**。
+- **断言前先核对**：系统提示词要求模型在说"第一次/从来没/总是/每次"这类**可被记忆证伪**的话之前先 `search_memory` 确认，查不到依据就不下断言（改说不确定或反问）。
+- **短期记忆上限靠"消费即丢"不靠"截断"**：分析一趟读走低水位之上的那一段（每批最多 `ANALYSIS_BATCH`(40) 条），成功后原样丢掉；没读到的最新 20 条永不丢，稳态就是 20~40。图片只保留最近 `IMAGE_RETENTION_MESSAGES`(60) 条消息（更早的删附件与文件、正文保留）。**一次弹窗、之后自动跑完**：`AppViewModel.checkMemoryCleanupPrompt` 只在短期超出高水位或有超窗图片时询问一次；确认后 `NativeCore.pruneOldMessageImages` 把超窗图片**原地压成缩略图**，`drainShortTermBacklog` 把积压消费成长期记忆（每次 1 批、空闲每分钟 1 批），直到降到低水位 20 才清除标记。**去重/修复这类 O(n²) 重活跑在 `Dispatchers.Default`/`IO` 上**（放主线程会 ANR，且修复标记写不进去 → 每次启动重跑）。
+- **时间精度**：`TimeUtils.resolveTimeRef` 保留带时区/时分的 explicit ISO，仅"日期或时段"表达才落整点/时段起点。记忆衰减/排序的时间基准逐级回退（`lastRecalled` → `updatedAt` → `createdAt`），不可解析时不短路更新的时间戳、也不被当成 1970 年。
+- **联网工具超时**：`HttpWebContentProvider` 给 B站 API、短链解析、Microlink、网页直连统一设超时，避免任意外部请求卡死工具循环。
+- **请求失败也留痕**：chat 轮失败、辅助调用失败都会写 `RequestMetric`（`status='failed'`，原因在 `phase`）；`authorizationHeader` 在 API Key 缺失时提前抛清晰错误，不发出 `Bearer undefined` 请求。
+- **文风校对可回退**：critique 在任何异常（解析失败、空结果、长度比例异常）下都返回原文。
+- **快速回应后台补齐可回退**：换位生成失败（或结果仍不过校验）时退回兜底短句；回来太晚（已被下一轮覆盖）直接丢弃，不会覆盖新一轮。
+- **后台任务串行**：后台队列把"散文轮记忆整理""快速回应补写"等串成一条链，避免交错写同一份角色状态；都不阻塞正文显示。
+- **散文即终稿不再重写**：阶段一拿到散文就直接采用，`convertProseToJson` 只在后台补记忆，不会把用户已看到的正文换成"整理"后的版本。
+- **共享 HTML 工具**：HTML 实体解码/去标签/可读文本抽取是同一份实现，避免多处漂移。
+- **导入/导出归一化**：`LegacyImportService` / `BackupService` 逐字段校验（世界书、场景概要、场景状态、计数器、来源数组），坏角色跳过并计入 `ImportSummary.skipped`。
+- **版本号单一来源**：`android-lite/app/build.gradle.kts` 的 `versionName` / `versionCode`，应用内版本徽标读 `BuildConfig`；改动用 `tools/native-version.ps1`。
 
 ## 九、关键常量速查
 
-| 常量 | 值 | 位置 |
+常量集中在 `:core:common` 的 `AppLimits`（`:core:model` 的 `BuiltinPlatforms` 定义平台预设）。
+
+| 常量 | 值 | 备注 |
 |---|---|---|
-| `MAX_TOOL_ROUNDS` | 5 | src/js/agent/tool-definitions.js:2 |
-| `MAX_TOOL_CALLS` | 12 | src/js/agent/tool-definitions.js:3 |
-| `AGENT_TOOL_MEMORY_INJECT_LIMIT` | 5 | src/js/agent/tool-definitions.js:4 |
-| `MAX_API_RETRIES` | 3（退避 1s/2s/4s） | src/js/api/retry.js:2 |
-| `MEMORY_LIMITS` | instant **60**(低水位 20，**超过 120 即视为旧档遗留 → 补课通道分批、启动时阻塞跑完**；窗口不再做任何按位置截断) / shortTerm **40**(低水位 20，紧急上限 80，**靠整窗折叠而非截断**，写入只允许追加、近似合并只看队尾 5 条) / longTerm 无上限（仅时效 `applyMemoryDecay`） / pendingRecall 6 / analysisBatch=shortTerm(40) / summarySources=instant(60) / **auxiliaryMaxOutputTokens 8192** / nearDupSimilarity 0.72 / minMatchScore 1.5 / maxPerCategory 3 / **lorebookContentChars 400**(一条只讲一件事；**超限写入直接拒收、让模型重写，绝不截断**，旧数据由一次性重写拆开，`keywordPerEntry 8`、注入 6 条/`injectChars` 1400，**装不下就跳过继续装**) / imageRetentionMessages **60**(=instant，超窗图片**原地压成 384px 缩略图**而非删除) / cleanupBatches **1** / **archiveMessages 400 + chatPage 50**（`AppLimits.History`：聊天存档上限与分页大小；正文与长期 value 不再按字数截断） | src/js/core/config.js:104 |
-| `API_LIMITS` | auxiliaryTimeoutMs 90000 / requestMetrics 60 / prefixSnapshots 12 | src/js/core/config.js:98 |
-| `PROMPT_LIMITS` | roleChars 8000 / memberChars 900 | src/js/core/config.js:113 |
-| ~~`CONTEXT_BUDGET`~~ | **已删除**：volatile 不再有区块预算（旧 retrievedChars 1200 / summaryChars 1600 / sceneSummaries 2 / sceneInjectionChars 600 / volatileChars 6000），改为整块注入 + 每条兜底上限 + 提示词软限制；场景条数走 `AppLimits.Scene.SUMMARIES`(2) | src/js/core/config.js:173 |
-| `LOREBOOK_LIMITS` | entries 200 / keywordsPerEntry **8** / nameChars 60 / contentChars **400**(写入约束，超限拒收不截断) / injectEntries 6 / injectChars 1400 / scanMessages 6 / autoEntriesPerPass 3 / evictionMisses 3 / consolidateSpan 8 / maxAlwaysActive 6 / nameSimilarity 0.5 / contentSimilarity 0.45（更新语义是**整条替换**，无关键词时用条目名当触发词；`mergeSentenceSimilarity` 及所有"末尾追加"实现已删除） | src/js/core/config.js:159 |
-| `NARRATIVE_PATTERNS` | 10 条节奏骨架 | src/js/core/config.js:144 |
-| `DYNAMIC_STATE_FIELDS` | 6 个动态字段（原生：currentTone 取代 currentRelationship/currentImportantOthers） | src/js/core/config.js:119 |
-| `STATIC_PROFILE_FIELDS` | 12 个基础设定字段 | src/js/core/config.js:130 |
-| `CHARACTER_QUALITY_RULE` / `SPEAKING_STYLE_SAMPLES_RULE` | 建卡与补全共用的质量/示例台词约束 | src/js/characters/avatar.js:76 / src/js/characters/avatar.js:76 |
-| `STYLE_GUARD` | reviewEveryTurns 3 / lookbackReplies 2 / anchorStyleChars 300 / anchorSamples 3 / critiqueMaxChars 1600 / critiqueMinRatio 0.5 / critiqueMaxRatio 2 | src/js/core/config.js:182 |
-| `STYLE_CLICHES` | 11 条陈词滥调（违规检测用） | src/js/core/config.js:194 |
-| `QUICK_REPLY_GUARD` | maxChars 60 / mirrorChars 8 / repairMaxChars 40 | src/js/core/config.js:208 |
-| `QUICK_REPLY_ISSUE_LABELS` | 6 类快速回应视角问题说明（内部提醒用） | src/js/core/config.js:214 |
-| `QUICK_REPLY_PLACEHOLDERS` | 示例占位串黑名单（短句一/短句二/用户下一句…） | src/js/core/config.js:224 |
-| `APP_VERSION` | 由 `versionName` 写入（`tools/sync-version.mjs`） | src/js/core/config.js:73 |
-| JSON 示例 | 固定使用 `JSON_EXAMPLE_BRIEF`（不再随轮切换），保证 system 前缀从首轮起稳定 | src/js/core/normalization.js:2 |
-| `max_output_tokens` | 8192 | src/js/api/responses.js:63 |
-| 摘要消费字段 | 短期条目 `revision`（仅用于扣住飞行期被改写的条目）；消息 `sequence`；场景 `sceneState.startSequence` | src/js/memory/tasks.js / src/js/storage/schema.js |
-| 请求追踪字段 | `requestMetrics[]`（taskType/platform/phase/tokens/hitRate/durationMs/prefixChange/commonHistoryMessages/hashes） | src/js/api/responses.js:227 |
-
-
-
-
+| `Agent.MAX_TOOL_ROUNDS` / `MAX_TOOL_CALLS` / `TOOL_MEMORY_INJECT_LIMIT` | 5 / 12 / 5 | 工具循环上限与每轮注入记忆条数 |
+| `Api.AUXILIARY_TIMEOUT_MS` | 90 000 | 辅助/后台调用的传输超时（chat 为 180s） |
+| `Api.AUXILIARY_MAX_OUTPUT_TOKENS` | 8 192 | 辅助调用显式输出上限 |
+| `Api.REQUEST_METRICS` | 60 | 请求指标保留条数 |
+| `Memory.INSTANT` / `INSTANT_TRIM_FLOOR` / `INSTANT_HARD_CAP` / `INSTANT_MIGRATION_THRESHOLD` | 60 / 20 / 120 / 120 | 历史窗口高低水位、紧急上限、补课阈值 |
+| `Memory.SHORT_TERM` / `SHORT_TERM_TRIM_FLOOR` / `SHORT_TERM_HARD_CAP` / `SHORT_TERM_MERGE_WINDOW` / `SHORT_TERM_LOW_WATER` | 40 / 20 / 80 / 5 / 20 | 短期窗口形态 |
+| `Memory.ANALYSIS_BATCH` / `SUMMARY_SOURCES` / `CLEANUP_BATCHES_PER_RUN` / `NEAR_DUP_SIMILARITY` / `PENDING_RECALL` | 40 / 60 / 1 / 0.72 / 6 | 折叠批大小、清理批数、近似去重阈值、待召回上限 |
+| `Memory.LONG_TERM_PER_CATEGORY` | 40 | 保留常量，长期记忆当前无数量淘汰 |
+| `Prompt.ROLE_CHARS` / `MEMBER_CHARS` | 8 000 / 900 | 单角色设定 / 群组成员注入上限 |
+| `Lorebook.ENTRIES` / `KEYWORDS_PER_ENTRY` / `NAME_CHARS` / `CONTENT_CHARS` / `INJECT_ENTRIES` / `INJECT_CHARS` / `MAX_ALWAYS_ACTIVE` / `AUTO_ENTRIES_PER_PASS` | 200 / 8 / 60 / 400 / 6 / 1 400 / 6 / 3 | `CONTENT_CHARS` 是写入约束（超限拒收不截断） |
+| `Scene.RETAIN` / `SUMMARIES` / `SPAN` / `MIN_MESSAGES` | 8 / 2 / 12 / 6 | 场景概要保留/注入条数与触发跨度 |
+| `History.ARCHIVE_MESSAGES` / `PAGE` | 400 / 50 | 聊天存档上限与分页 |
+| `Media.IMAGE_RETENTION_MESSAGES` / `THUMBNAIL_DIMENSION` / `THUMBNAIL_QUALITY` / `IMPORTED_IMAGE_*` | 60 / 384 / 60 / 512 / 70 | 图片保留与缩略/导入压缩 |
+| `Sticker.MAX_DIMENSION` / `TARGET_BYTES` | 384 / 120 KB | 贴图压缩目标 |
+| `max_output_tokens` | 8 192 | 主对话请求体 |
+| `DYNAMIC_STATE_FIELDS` | 6 | `Prompts`（`currentTone` 取代旧关系两字段） |
+| `STATIC_PROFILE_FIELDS` | 12 | `Prompts` |
+| JSON 示例 | 固定一份精简示例 | system 前缀从首轮起稳定 |
+| 请求追踪字段 | `RequestMetric[]` | taskType/platform/phase/status/tokens/hitRate/durationMs/prefixChange/commonHistoryMessages/hashes |

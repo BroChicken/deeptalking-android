@@ -3,12 +3,12 @@
 ## 0. 项目形态（已迁移为原生 Android）
 - 项目是**原生 Android 应用（Kotlin + Compose 多模块）**，位于 `android-lite/`。WebView 只保留为富文本/公式渲染子系统（`:feature:richtext`，内嵌 KaTeX）。
 - **唯一开发入口是 `android-lite/` 下的 Kotlin 模块源码**（见 `android-lite/settings.gradle.kts` 的模块清单）。
-- **`src/`（旧 WebView 单文件前端）、`tools/build-hub.mjs`、`hub.html`、`assets/hub.html`、`assets/katex/` 为历史遗留**：仅作行为/数据参照，不再是运行入口，不再作为开发/修复目标。旧构建脚本与旧 JS 不再维护。
+- **`src/` 是已冻结的历史前端快照**（`src/js/`、`src/styles/`、`src/shell.html`、`src/manifest.json`）：不再是运行入口，不再作为开发/修复目标，只作行为参照。**唯一活依赖是 `tools/diff/run-js.mjs`**——它在 Node `vm` 里加载 `src/js` 复现 `:domain:agent` 差分测试用的 oracle，所以 `src/js/` 不能删除；除此之外没有任何构建/CI/打包步骤读它。曾在此的 `src/vendor/katex` 已迁到 `android-lite/feature/richtext/src/main/assets/katex`。
 
 ## 1. 试验失败品
 | 功能 | 位置 | 结论 |
 |---|---|---|
-| **像素头像**（16×16 网格） | `archive/experimental_failures/pixel_test/` | 失败品：网格常缺行/缺色；不再渲染，头像走 emoji |
+| **像素头像**（16×16 网格） | 已从代码库移除（`core:model` 的 `Character` 无该字段，导入时直接丢弃） | 失败品：网格常缺行/缺色；不再渲染，头像统一 emoji |
 | **TTS 语音合成** | 曾归档于 `archive/experimental_failures/tts/` | **已解禁并落地**。端侧 `:engine:cosyvoice`（CosyVoice3 GGUF）已完整实现；另有可选的远程引擎 `:engine:remote-tts`（PC 合成 / 手机播放，链路见 `docs/REMOTE_TTS.md`）。朗读统一经 `:engine:ondevice` 的 `TtsSpeaker` 接口，引擎由 `AppConfig.ttsBackend` 选择 |
 
 ## 2. 模块架构与接口（必须遵守）
@@ -27,7 +27,7 @@
 
 ## 4. 覆盖升级
 - `applicationId`、签名 keystore（`android-lite/keystore/deeptalking-release.jks`，CI secret `ANDROID_KEYSTORE_BASE64`）必须稳定，否则无法覆盖安装。
-- **数据兼容**：旧版 WebView 的 localStorage 数据通过 `:core:data` 的 `LegacyImportService`（`legacy/`）一次性导入；`BackupService` 保留旧 JSON 结构的导入导出。改动仓库/模型时必须保持这条迁移链可用。
+- **数据兼容**：旧 WebView 的数据需**先在旧版导出 JSON、再由原生经系统文件选择器导入**（`:core:data` 的 `legacy/LegacyImportService`；原生不读取 WebView 的 localStorage）；`BackupService` 保留旧 JSON 结构的导入导出。改动仓库/模型时必须保持这条迁移链可用。
 
 ## 5. 改完必跑的自检（全部通过才算完成）
 统一入口：`powershell -File tools/native-verify.ps1`（自动解析 JDK17/Android SDK/Gradle，见 `tools/native/env.ps1`）。
@@ -39,4 +39,4 @@
 3. `docs/`（尤其 `docs/AGENT_ARCHITECTURE.md`、`docs/NATIVE_MODULES.md`）已同步更新。
 4. 发布前跑 `powershell -File tools/native-build.ps1 -Release`（需 keystore 环境变量）确认签名打包成功。
 
-`tools/` 只保留原生侧脚本：`native-verify.ps1`（全量自检）、`native-test.ps1`（单测）、`native-build.ps1`（打包）、`native-version.ps1`（版本号）、`pull-apk.ps1`（拉取发布包）。旧 WebView 构建/测试脚本已删除。
+`tools/` 只保留原生侧脚本：`native-verify.ps1`（全量自检）、`native-test.ps1`（单测）、`native-build.ps1`（打包）、`native-version.ps1`（版本号）、`pull-apk.ps1`（拉取发布包）、`build-cosyvoice-android.ps1`（重建 CosyVoice 原生库），以及 `tools/native/`（环境解析）与 `tools/diff/`（JS↔Kotlin 差分 oracle，仅测试用）。旧 WebView 构建/测试脚本已删除。
