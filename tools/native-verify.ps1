@@ -25,8 +25,8 @@ $env:JAVA_HOME = $javaHome
 $env:ANDROID_SDK_ROOT = $sdkRoot
 $env:ANDROID_HOME = $sdkRoot
 
-# [0/2] Static assertions (parity with the legacy verify-hub checks):
-# version format/code and required docs must be present before building.
+# [0/2] Static assertions: version format/code and required docs must be
+# present before building.
 Write-Host '== [0/2] Static checks (version + docs) ==' -ForegroundColor Cyan
 $staticBad = 0
 $gradleKts = Get-Content -LiteralPath (Join-Path $android 'app\build.gradle.kts') -Raw
