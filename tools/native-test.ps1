@@ -59,7 +59,7 @@ foreach ($m in @('engine\ondevice','domain\agent','core\network','domain\memory'
   $dir = Join-Path $android ($m + '\build\test-results')
   if (-not (Test-Path -LiteralPath $dir)) { continue }
   Get-ChildItem -LiteralPath $dir -Recurse -Filter 'TEST-*.xml' | ForEach-Object {
-    [xml]$x = Get-Content -LiteralPath $_.FullName
+    [xml]$x = Get-Content -LiteralPath $_.FullName -Encoding UTF8
     $total += [int]$x.testsuite.tests
     $fail += ([int]$x.testsuite.failures + [int]$x.testsuite.errors)
   }

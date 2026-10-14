@@ -91,7 +91,7 @@ foreach ($m in @('engine\ondevice','engine\audio','engine\cosyvoice','engine\rem
   if (-not (Test-Path -LiteralPath $dir)) { continue }
   $modTotal = 0; $modFail = 0
   Get-ChildItem -LiteralPath $dir -Recurse -Filter 'TEST-*.xml' | ForEach-Object {
-    [xml]$x = Get-Content -LiteralPath $_.FullName
+    [xml]$x = Get-Content -LiteralPath $_.FullName -Encoding UTF8
     $modTotal += [int]$x.testsuite.tests
     $modFail += ([int]$x.testsuite.failures + [int]$x.testsuite.errors)
   }

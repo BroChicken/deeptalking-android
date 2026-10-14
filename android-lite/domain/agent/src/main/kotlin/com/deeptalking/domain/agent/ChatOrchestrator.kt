@@ -110,6 +110,11 @@ class ChatOrchestrator(
         onToolActivity: (String) -> Unit = {},
         onQuickRepliesRepaired: (List<String>) -> Unit = {},
         proactive: Boolean = false,
+        /**
+         * 小概率的「热榜开场」轮（见 [HotTopicPolicy]）：本轮先查热榜再起话题。只影响
+         * 本轮 volatile 上下文里那条指令，不进 system prompt，所以不会打乱缓存前缀。
+         */
+        hotTopicTurn: Boolean = false,
     ): OrchestratorResult {
         val builder = RequestBuilder(config, imageResolver)
         val instructions = buildSystemPrompt(PersonaInputs(character, config, proactive))
@@ -129,6 +134,7 @@ class ChatOrchestrator(
             query = userText,
             memory = memory,
             proactiveTurn = proactive,
+            hotTopicTurn = hotTopicTurn,
             recentAssistantReplies = recentAssistantReplies,
         )
         val contextMessage = ChatMessage(

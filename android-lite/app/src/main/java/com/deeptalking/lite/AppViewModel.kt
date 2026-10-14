@@ -21,6 +21,8 @@ import com.deeptalking.core.model.TtsPhase
 import com.deeptalking.core.model.SpeechSegment
 import com.deeptalking.core.model.extractSpeechSegments
 import com.deeptalking.core.model.extractSpeechText
+import com.deeptalking.domain.agent.HotTopicCounters
+import com.deeptalking.domain.agent.HotTopicPolicy
 import com.deeptalking.domain.agent.OrchestratorResult
 import com.deeptalking.domain.agent.prompts.buildShortTermBlock
 import com.deeptalking.engine.ondevice.TtsSpeaker
@@ -1185,6 +1187,10 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 statusState.value = "生成中…"
                 streamingState.value = ""
 
+                // 小概率「热榜开场」（HotTopicPolicy）：每个角色每个逻辑日只掷一次骰子，
+                // 每天最多 1 次、每周最多 2 次；命中则本轮先查热榜再起话题。掷在真正发请求之前。
+                val hotTopicTurn = armHotTopicTurn(id)
+
                 val orchestrator = core.createOrchestrator(
                     cfg,
                     onCharacterUpdated = { updated ->
@@ -1224,6 +1230,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                         onToolActivity = { statusState.value = it },
                         onQuickRepliesRepaired = { quickRepliesState.value = it },
                         proactive = proactive,
+                        hotTopicTurn = hotTopicTurn,
                     )
                     result = outcome
                     if (outcome.reply.isNotBlank()) break
@@ -1739,6 +1746,22 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         lastUserActivityAt.value = System.currentTimeMillis()
     }
 
+    /**
+     * 「热榜开场」小概率事件（[HotTopicPolicy]）：每个角色每个逻辑日只在当天第一个
+     * 回合掷一次骰子（10%），命中冲 每天 1 次 / 每周 2 次 上限，每角色独立。计数存在
+     * DataStore 的 [HOT_TOPIC_KEY]（不进 Room、不进备份），坏数据当成没记过。
+     */
+    private suspend fun armHotTopicTurn(characterId: String): Boolean {
+        val settings = core.data.settings
+        val store = HotTopicPolicy.decode(runCatching { settings.getString(HOT_TOPIC_KEY) }.getOrNull())
+        val roll = HotTopicPolicy.roll(counters = store[characterId] ?: HotTopicCounters())
+        if (!roll.rolled) return false
+        runCatching {
+            settings.putString(HOT_TOPIC_KEY, HotTopicPolicy.encode(store + (characterId to roll.counters)))
+        }
+        return roll.triggered
+    }
+
     /** Called by the Activity on visibility changes so proactive pauses when hidden. */
     fun setAppVisible(visible: Boolean) {
         appVisible.value = visible
@@ -1757,6 +1780,9 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
 
         /** Set when the user chose "以后不再询问" on the oversized-window catch-up. */
         const val MEMORY_WINDOW_MIGRATION_SKIP_KEY = "deeptalking_memory_window_migration_skip_v1"
+
+        /** 每个角色的「热榜开场」计数（JSON：角色id → HotTopicCounters）。 */
+        const val HOT_TOPIC_KEY = "deeptalking_hot_topic_v1"
 
         /**
          * Set while a confirmed cleanup is still consuming the short-term backlog: the

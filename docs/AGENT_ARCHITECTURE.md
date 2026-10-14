@@ -204,7 +204,7 @@ checkMemoryTriggers(src/js/memory/tasks.js:199) 异步整理短期记忆 / 长�
 
 ### 注入与衰减
 
-- `buildVolatileContext(character, query, memory, now, proactiveTurn, recentAssistantReplies)` — 把最相关的记忆与本轮动态上下文注入本轮 prompt（只注入 `AppLimits.Agent.TOOL_MEMORY_INJECT_LIMIT = 5` 条长期记忆，其余提示模型用 `search_memory` 检索）。**没有任何区块预算**：这是主对话请求体，所有块整块注入（只保留"每条条目"级别的兜底上限，靠提示词的软限制让它尽量不触发）。区块顺序按"越靠后越近"排列：可选话题库 → 角色当前状态 → 待跟进承诺 → 世界书 → 群成员私人记忆 → 用户最新纠正 → 互动节奏 → 场景概要 → 长期召回 + 取用说明/主体约定 → 时间基准 → 消息时间元数据 → 风格尾块 + 本轮指令。`metadata` 回传本轮真正注入的召回 ID 与世界书条目，供主线在回复落盘后精确清除 `pendingRecall` 与累计 `mentions`（不依赖会被后台任务改写的全局字段）。检索查询经 `buildMemoryQuery()` 扩展：用户明显指代前文时附加最近对话，避免短指代召回不到正确记忆。
+- `buildVolatileContext(character, query, memory, now, proactiveTurn, hotTopicTurn, recentAssistantReplies)` — 把最相关的记忆与本轮动态上下文注入本轮 prompt（只注入 `AppLimits.Agent.TOOL_MEMORY_INJECT_LIMIT = 5` 条长期记忆，其余提示模型用 `search_memory` 检索）。**没有任何区块预算**：这是主对话请求体，所有块整块注入（只保留"每条条目"级别的兜底上限，靠提示词的软限制让它尽量不触发）。区块顺序按"越靠后越近"排列：可选话题库 → 角色当前状态 → 待跟进承诺 → 世界书 → 群成员私人记忆 → 用户最新纠正 → 互动节奏 → 场景概要 → 长期召回 + 取用说明/主体约定 → 时间基准 → 消息时间元数据 → 风格尾块 + 本轮指令。**最末尾两条系统触发的本轮指令**：`proactiveTurn`（主动开场）与 `hotTopicTurn`（热榜开场，见 `HotTopicPolicy`：每角色每逻辑日掷一次、10%、每天 1 次/每周 2 次；命中时要求先调 `hot_topics` 再挑一条话题带入）。两条都只加在 volatile 上下文尾部，**不进 system prompt**，所以不会打乱缓存前缀。`metadata` 回传本轮真正注入的召回 ID 与世界书条目，供主线在回复落盘后精确清除 `pendingRecall` 与累计 `mentions`（不依赖会被后台任务改写的全局字段）。检索查询经 `buildMemoryQuery()` 扩展：用户明显指代前文时附加最近对话，避免短指代召回不到正确记忆。
 - `applyMemoryDecay()` — src/js/memory/policy.js:143：按时间衰减 events/promises 的重要性与状态。
 - `computeEffectiveImportance()` — src/js/memory/policy.js:2：`(importance + learnedBonus) × decay`（0-10 封顶）。
 

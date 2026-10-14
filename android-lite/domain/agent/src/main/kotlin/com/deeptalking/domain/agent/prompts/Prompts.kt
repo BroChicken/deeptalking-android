@@ -713,6 +713,7 @@ suspend fun buildVolatileContext(
     memory: MemoryService,
     now: Instant = Instant.now(),
     proactiveTurn: Boolean = false,
+    hotTopicTurn: Boolean = false,
     recentAssistantReplies: List<String> = emptyList(),
 ): String {
     val time = TimeContext.snapshot(now)
@@ -849,6 +850,9 @@ suspend fun buildVolatileContext(
     var context = sb.toString()
     if (proactiveTurn) {
         context += "【角色主动开场（系统触发，不是用户陈述）】用户此刻正停留在与你的对话里但暂时没有说话。请角色主动发起一次开场：自然地打招呼或问候，或提起最近一次共同经历、一件待跟进的事项、一个角色此刻想聊的话题。开场要贴合角色性格、自然不突兀；不要问\"你想聊什么\"\"怎么不说话\"之类把话题推回给用户的话；不要把\"系统触发\"这件事说给用户听。\n\n"
+    }
+    if (hotTopicTurn) {
+        context += "【本轮热榜话题（系统触发，不是用户陈述）】先调用 hot_topics 查一次热榜（平台任选：zhihu 话题性最强、建议优先，baidu/toutiao/douyin 更偏社会新闻），从结果里挑**一条**与角色人设、与你们的共同兴趣最合得来、能自然引入的话题。把它带进这一轮：本轮若是主动开场就围绕它起个头，若是回应对方就在合适时自然引到它。只挑一条，不要罗列榜单、不要复读热度数字，也不要提\"热搜/热榜/系统/工具\"这类词。若对方此刻在说严肃、紧急或伤心的事，就正常回应，不必强行提话题。工具没取到内容（ok:false）就按平常方式回应，不得编造话题。\n\n"
     }
     return context
 }
