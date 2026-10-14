@@ -4,20 +4,9 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
-// KaTeX is the only runtime WebView asset (formula rendering). It lives in the
-// repo at src/vendor/katex and is copied into the APK assets at build time so
-// RichTextWebView can load it from file:///android_asset/katex/.
-val vendorRoot = rootProject.projectDir.parentFile.resolve("src/vendor/katex")
-val syncKatexAssets by tasks.registering(Copy::class) {
-    group = "build"
-    description = "Copy vendored KaTeX into app assets for the rich-text WebView"
-    from(vendorRoot)
-    into(project.file("src/main/assets/katex"))
-}
-
-tasks.named("preBuild") {
-    dependsOn(syncKatexAssets)
-}
+// KaTeX (formula rendering) ships as an asset of :feature:richtext, the only
+// module that uses it; library assets merge into the APK, so RichTextWebView
+// keeps loading it from file:///android_asset/katex/. No copy step needed.
 
 android {
     namespace = "com.deeptalking.lite"
