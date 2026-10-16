@@ -24,14 +24,20 @@
 powershell -File tools/.work/cosyvoice-server/run-server.ps1 -Api -Backend cuda0
 ```
 
-Windows 上也可以直接双击 `tools\run-cosyvoice-server.bat`（默认就是上面这条 API+CUDA），
-或 `tools\run-cosyvoice-server.bat webui` 进 WebUI 模式注册音色、`... stop` 停服；
+Windows 上也可以直接双击 `tools\run-cosyvoice-server.bat`（默认就是上面这条 API+CUDA）；
+它的子命令：`webui`（WebUI 模式注册音色）、`stop`（停服）、`restart`（停掉再起，换线后地址变了就用它）、
+`status`（在跑吗？监听在哪个地址？该地址还有效吗）、`diag`（网卡/口令/防火墙/监听一次性报告）。
 其它参数原样转给 `run-server.ps1`（例：`... -Api -Port 9000 -Backend cpu`）。
 
+**访问口令（必须）**：口令放在 `tools\tts-token.txt`（已在 `.gitignore`，不会提交），启动时自动读取，
+服务端要求 `Authorization: Bearer <口令>`，手机端「访问口令」必须填同一个值。临时关掉用 `-NoToken`
+（仅本机调试）。日志只打印口令长度，不打印口令本身。
+
 脚本做的事：自动定位 `bin/`（exe + `ggml*.dll`）、`models/`、`voices/`；缺 GGML 库直接报错；
-`-Api` 模式下把 `voices/*.gguf` **每个文件按文件名映射成一个同名音色**；默认
-**只绑定 USB 共享网卡地址**（`-Bind auto`）且**不设口令**；打印所有可达地址（标注网卡名）。
-等价的手工命令是：
+`-Api` 模式下把 `voices/*.gguf` **每个文件按文件名映射成一个同名音色**；监听地址由 `-Bind auto`
+决定——**只有恰好一张"活着"的 USB 共享网卡（Status=Up）时**才绑它，否则（没有 / 多于一张 / 无法确定）
+一律绑 `0.0.0.0`，因为口令已经把入口守住了；**起服后自检实际监听地址**并打印
+`PHONE -> http://<地址>:8080`（模型加载要 30–90 秒，这行会在加载完之后出现）。等价的手工命令是：
 
 ```powershell
 cosyvoice-server --model models\CosyVoice3-2512_Q4_K_M.gguf `
@@ -235,9 +241,10 @@ powershell -File tools/.work/cosyvoice-server/run-server.ps1 -Stop
 
 | 现象 | 原因 / 处理 |
 |---|---|
-| 测试连接报「无法连接」 | PC 服务没起、绑在 `127.0.0.1`（改 `--host 0.0.0.0`）、或防火墙没放行（见第 2 节的规则） |
+| 测试连接报「无法连接」 | PC 服务没起、绑在 `127.0.0.1`（改 `--host 0.0.0.0`）、或防火墙没放行（见第 2 节的规则）。先跑 `tools\run-cosyvoice-server.bat diag` 一次性看网卡/绑定/防火墙 |
+| 换线、重插或换 USB 口后连不上（同一根线之前可以） | 服务绑的地址过期了：Windows 会给**断开**的适配器保留 IP，旧实例可能一直绑在死地址上。`run-cosyvoice-server.bat status` 里该地址会标 `STALE` → 用 `restart` 重起（或 `-Bind any`）；手机侧地址变了也可以点 App 的「自动发现」 |
 | 手机浏览器打不开 WebUI | 同上；另外确认手机是「USB 网络共享」而不是「USB 文件传输」 |
-| 「服务器要求访问口令（HTTP 401/403）」 | `--api-key` 与 App 的口令不一致，或漏填 |
+| 「服务器要求访问口令（HTTP 401/403）」 | `tools\tts-token.txt` 里的值、App 的「访问口令」必须完全一致（一边填一边没填也算）；改完口令要重启服务 |
 | `{"code":"model_not_found"}` | App 里「模型名」必须等于服务端的对外模型名（`--served-model-name`，缺省时是架构名如 `cosyvoice3-2512`）。`--api` 模式下 `run-server.ps1` 固定传 `cosyvoice-3`，与 App 默认值一致 |
 | 「端点不存在」/「服务器已响应但端点不匹配」 | 该端口不是 `cosyvoice-server`，或路径写错（地址只写到 `http://IP:8080`，不要带 `/v1`） |
 | 朗读没有声音但没报错 | 音色名与服务器注册名不一致；服务端日志会显示未找到 speaker |
