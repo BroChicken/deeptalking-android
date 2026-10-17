@@ -154,10 +154,12 @@ class BackgroundTasksTest {
         val (status, updated) = background.consolidateLorebook(character, character.shortTerm)
         assertEquals(BackgroundTasks.TaskStatus.Success, status)
         assertTrue(updated.lorebook.isEmpty())
-        assertEquals(1, notes.size)
-        assertEquals("lorebook", notes[0].first)
-        assertTrue(notes[0].second.contains("淘汰了 1 条"))
-        assertTrue(notes[0].second.contains("底线测试与约定"))
+        // The pass also reports how many entries it wrote, so the retirement note is looked
+        // up by content instead of by position.
+        val retirement = notes.firstOrNull { it.second.contains("淘汰了 1 条") }
+        assertTrue("没有上报淘汰", retirement != null)
+        assertEquals("lorebook", retirement!!.first)
+        assertTrue(retirement.second.contains("底线测试与约定"))
     }
 
     @Test
@@ -878,5 +880,126 @@ class BackgroundTasksTest {
         assertTrue(outcome.character.shortTerm.none { it.id == "s1" })
         assertEquals(20, outcome.character.shortTerm.size)
         assertTrue(outcome.character.shortTerm.all { it.id.startsWith("f") })
+    }
+
+    // ------------------------------------------------- world-book trigger (per turn)
+
+    /**
+     * The window is full (the fold unit) and nothing else in the turn needs a model call:
+     * the scene step is pinned past the window so it stays out of the scripted responses.
+     */
+    private fun fullWindowCharacter(): Character = Character(
+        id = "c1",
+        instant = (0 until AppLimits.Memory.INSTANT).map { index ->
+            ChatMessage(
+                id = "m$index",
+                role = if (index % 2 == 0) Role.User else Role.Assistant,
+                content = "第 $index 条消息",
+                timestamp = "2026-08-01T10:00:00Z",
+            )
+        },
+    )
+
+    private fun quietCharacter(): Character = Character(
+        id = "c1",
+        instant = (0 until 20).map { index ->
+            ChatMessage(
+                id = "m$index",
+                role = if (index % 2 == 0) Role.User else Role.Assistant,
+                content = "第 $index 条消息",
+                timestamp = "2026-08-01T10:00:00Z",
+            )
+        },
+        // The scene cursor is already past the window, so the scene pass does not fire.
+        sceneState = SceneState(key = "未说明", startSequence = Int.MAX_VALUE),
+    )
+
+    private fun job(
+        background: BackgroundTasks,
+        character: Character,
+        updated: MutableList<Character> = mutableListOf(),
+    ) = background.scheduleTurn(
+        character = character,
+        reply = "回复",
+        userText = "你好",
+        currentQuickReplies = listOf("嗯", "好"),
+        messages = character.instant,
+        critiqueEnabled = false,
+        quickReplyRepairEnabled = false,
+        onCharacterUpdated = { after -> updated += after },
+    )
+
+    @Test
+    fun theExtractionBatchIsWorldBookedInTheSameTurn() = runBlocking {
+        // The world-book pass used to wait for the long→term analysis batch, which needs the
+        // short-term window to pile up first. It now reads what the fold just produced — and
+        // it must run before the analysis consumes (drops) those entries.
+        val extracted = "银月商会在西街，经营药材"
+        val llm = ScriptedLlm(
+            mutableListOf(
+                """[{"content":"$extracted","eventTime":"2026-08-01T15:00:00Z","participants":["用户"],"location":"西街","sourceMessageIds":["m1"]}]""",
+                """{"entries":[]}""",
+            ),
+        )
+        val notes = mutableListOf<Pair<String, String>>()
+        val background = BackgroundTasks(llm, MemoryServiceImpl(), onAuxiliaryNote = { t, n -> notes += t to n })
+
+        job(background, fullWindowCharacter()).join()
+
+        val lorebookRequest = llm.requests.firstOrNull { request ->
+            request.input.any { it.content.contains("现有条目清单") }
+        }
+        assertTrue("世界书整理请求没有发出", lorebookRequest != null)
+        // Its source is the batch the fold just produced (raw content, from the same turn).
+        assertTrue(lorebookRequest!!.input.any { it.content.contains(extracted) })
+        // "写了几条" is answerable from the device.
+        assertTrue(notes.any { it.first == "lorebook" && it.second.contains("本次整理写入") })
+    }
+
+    @Test
+    fun aHeldWorldBookBatchIsRetriedWithoutANewExtraction() = runBlocking {
+        val store = LorebookRetryStore(maxAttempts = 3)
+        store.recordFailure(
+            "c1",
+            listOf(ShortTermMemory(id = "s1", content = "银月商会在西街，经营药材", sourceMessageIds = listOf("m1"))),
+        )
+        val llm = ScriptedLlm(mutableListOf("""{"entries":[]}"""))
+        val background = BackgroundTasks(llm, MemoryServiceImpl(), lorebookRetries = store)
+
+        // No extraction this turn (the window is far from the fold watermark): the held
+        // batch alone must trigger the pass, otherwise a transient failure loses the batch.
+        job(background, quietCharacter()).join()
+
+        assertTrue(store.batch("c1").isEmpty())
+        assertEquals(
+            1,
+            llm.requests.count { request -> request.input.any { it.content.contains("现有条目清单") } },
+        )
+    }
+
+    @Test
+    fun aRepeatedlyFailingWorldBookBatchIsHandedToTheUser() = runBlocking {
+        val store = LorebookRetryStore(maxAttempts = 1)
+        val handoffs = mutableListOf<String>()
+        // A blank world-book reply is the pass's failure mode; the extraction folds the
+        // window so the pass has a batch to work on.
+        val llm = ScriptedLlm(
+            mutableListOf(
+                """[{"content":"银月商会在西街","eventTime":"2026-08-01T15:00:00Z","participants":["用户"],"location":"西街","sourceMessageIds":["m1"]}]""",
+                "",
+            ),
+        )
+        val background = BackgroundTasks(
+            llm,
+            MemoryServiceImpl(),
+            lorebookRetries = store,
+            onLorebookRetryNeeded = { id -> handoffs += id },
+        )
+
+        job(background, fullWindowCharacter()).join()
+
+        assertEquals(listOf("c1"), handoffs)
+        assertTrue(store.batch("c1").isNotEmpty())
+        assertTrue(store.awaitingUser("c1"))
     }
 }

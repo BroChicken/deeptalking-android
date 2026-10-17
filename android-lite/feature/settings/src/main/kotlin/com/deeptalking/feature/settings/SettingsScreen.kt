@@ -520,6 +520,10 @@ private fun DebugInfoPanel(config: AppConfig, context: Context) {
                 entry.put("taskType", metric.taskType)
                 entry.put("status", metric.status)
                 if (metric.phase.isNotBlank()) entry.put("reason", metric.phase)
+                // Why the request prefix moved this round (`instructions-changed` /
+                // `tools-changed` / `history-rebased` / `history-extended`): the only way
+                // to tell a real cache miss caused by an edit from normal history growth.
+                if (!metric.prefixChange.isNullOrBlank()) entry.put("prefixChange", metric.prefixChange)
                 entry.put("characterId", metric.characterId ?: JSONObject.NULL)
                 entry.put("inputTokens", metric.inputTokens ?: JSONObject.NULL)
                 entry.put("hitTokens", metric.hitTokens ?: JSONObject.NULL)

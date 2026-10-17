@@ -18,6 +18,7 @@ import com.deeptalking.core.model.MessageAttachment
 import com.deeptalking.core.model.RequestMetric
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.StaticProfile
+import com.deeptalking.core.model.mergeCharacterChanges
 import com.deeptalking.core.model.TTS_BACKEND_REMOTE
 import com.deeptalking.core.network.HttpWebContentProvider
 import com.deeptalking.core.network.DohDns
@@ -42,6 +43,7 @@ import com.deeptalking.domain.agent.ChatOrchestrator
 import com.deeptalking.domain.agent.ToolRegistry
 import com.deeptalking.domain.agent.background.BackgroundTaskQueue
 import com.deeptalking.domain.agent.background.BackgroundTasks
+import com.deeptalking.domain.agent.background.LorebookRetryStore
 import com.deeptalking.domain.agent.defaultTools
 import com.deeptalking.domain.memory.MemoryServiceImpl
 import com.deeptalking.domain.memory.MEMORY_REPAIR_VERSION
@@ -254,6 +256,13 @@ class NativeCore(context: Context) {
             onAuxiliaryNote = { taskType, note ->
                 recordAuxMetric(config, taskType, System.currentTimeMillis(), null, "note", note)
             },
+            lorebookRetries = lorebookRetries,
+            onLorebookRetryNeeded = { characterId ->
+                onLorebookRetryNeeded?.invoke(
+                    characterId,
+                    lastAuxFailure?.takeIf { it.taskType == "lorebook" }?.reason.orEmpty(),
+                )
+            },
         )
 
     /** Task type, reason and time of the most recent failed background call. */
@@ -261,6 +270,63 @@ class NativeCore(context: Context) {
 
     @Volatile
     private var lastAuxFailure: AuxFailure? = null
+
+    /**
+     * World-book batches whose pass failed, held in memory across background passes so the
+     * next opportunity can re-feed them. Shared by every [BackgroundTasks] instance (a fresh
+     * one is built per turn). See [LorebookRetryStore].
+     */
+    private val lorebookRetries = LorebookRetryStore()
+
+    /**
+     * Raised once a world-book batch has failed enough times that the app should ask the
+     * user: `(characterId, reason)`. Set by the view model; unset means "retry silently".
+     */
+    @Volatile
+    var onLorebookRetryNeeded: ((String, String) -> Unit)? = null
+
+    /** True when a world-book batch is waiting for the user's retry/drop decision. */
+    fun hasPendingLorebookRetry(characterId: String): Boolean = lorebookRetries.awaitingUser(characterId)
+
+    /**
+     * Re-runs the held world-book batch for [characterId] (the "重试" answer): reads the
+     * freshest row, runs the pass on it, and persists only what the pass changed. Returns
+     * an empty string on success, otherwise the reason to show the user.
+     */
+    suspend fun retryPendingLorebook(config: AppConfig, characterId: String): String =
+        withContext(Dispatchers.IO) {
+            val batch = lorebookRetries.batch(characterId)
+            if (batch.isEmpty()) return@withContext ""
+            val character = data.characters.get(characterId) ?: return@withContext "角色不存在"
+            val tasks = backgroundTasks(config)
+            val (status, updated) = tasks.consolidateLorebook(character, batch)
+            if (status == BackgroundTasks.TaskStatus.Failure) {
+                lorebookRetries.recordFailure(characterId, batch)
+                return@withContext lastFailureNote("lorebook").ifEmpty { "整理没有成功" }
+            }
+            persistMemory(character, updated)
+            lorebookRetries.clear(characterId)
+            ""
+        }
+
+    /**
+     * Drops the held world-book batch (the "忽略" answer) and records what was dropped, so
+     * "这几条没进世界书" is answerable instead of silent. Returns the dropped count.
+     */
+    suspend fun discardPendingLorebook(config: AppConfig, characterId: String): Int {
+        val dropped = lorebookRetries.drop(characterId)
+        if (dropped.isNotEmpty()) {
+            recordAuxMetric(
+                config,
+                "lorebook",
+                System.currentTimeMillis(),
+                null,
+                "note",
+                "按你的选择丢弃了 ${dropped.size} 条未能写入世界书的记录",
+            )
+        }
+        return dropped.size
+    }
 
     /**
      * The reason of the most recent background failure for [taskType] (when it happened
@@ -636,18 +702,10 @@ class NativeCore(context: Context) {
      */
     private suspend fun persistMemory(original: Character, updated: Character) {
         val fresh = data.characters.get(original.id) ?: original
-        data.characters.upsert(
-            fresh.copy(
-                instant = if (updated.instant != original.instant) updated.instant else fresh.instant,
-                shortTerm = if (updated.shortTerm != original.shortTerm) updated.shortTerm else fresh.shortTerm,
-                longTerm = if (updated.longTerm != original.longTerm) updated.longTerm else fresh.longTerm,
-                members = if (updated.members != original.members) updated.members else fresh.members,
-                scenes = if (updated.scenes != original.scenes) updated.scenes else fresh.scenes,
-                sceneState = if (updated.sceneState != original.sceneState) updated.sceneState else fresh.sceneState,
-                lorebook = if (updated.lorebook != original.lorebook) updated.lorebook else fresh.lorebook,
-                counters = if (updated.counters != original.counters) updated.counters else fresh.counters,
-            ),
-        )
+        // Only what this pass actually changed is written: a concurrent writer (the chat
+        // turn, the user's world-book edit, another maintenance pass) keeps its own fields
+        // and its own entries instead of being rolled back by a whole-row write.
+        data.characters.upsert(mergeCharacterChanges(original, updated, fresh))
     }
 
     /** One-time world-book migration for characters whose background has not been migrated. */
@@ -1108,7 +1166,7 @@ class NativeCore(context: Context) {
      */
     fun createOrchestrator(
         config: AppConfig,
-        onCharacterUpdated: (Character) -> Unit = {},
+        onCharacterUpdated: (Character, Character) -> Unit = { _, _ -> },
         onStatus: (String) -> Unit = {},
         onAuxiliaryUsage: (String, com.deeptalking.engine.ondevice.TokenUsage) -> Unit = { _, _ -> },
     ): ChatOrchestrator {
@@ -1130,6 +1188,13 @@ class NativeCore(context: Context) {
             onAuxiliaryUsage = onAuxiliaryUsage,
             onAuxiliaryNote = { taskType, note ->
                 recordAuxMetric(config, taskType, System.currentTimeMillis(), null, "note", note)
+            },
+            lorebookRetries = lorebookRetries,
+            onLorebookRetryNeeded = { characterId ->
+                onLorebookRetryNeeded?.invoke(
+                    characterId,
+                    lastAuxFailure?.takeIf { it.taskType == "lorebook" }?.reason.orEmpty(),
+                )
             },
         )
         return ChatOrchestrator(

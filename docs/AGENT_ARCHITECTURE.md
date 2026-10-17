@@ -208,7 +208,7 @@ BackgroundTasks.scheduleTurn  后台串行维护：文风校对、快速回应�
 | 抽取（instant→shortTerm） | `instant` 满 `INSTANT`(60) | `extractionRetryAt` / `extractionFailures` | 整窗折叠成"日期+时段"事件摘要 |
 | 分析（shortTerm→longTerm） | `shortTerm` 低水位之上攒够 20 条 | `analysisRetryAt` / `analysisFailures` | **逐条容错**（单条校验不过只丢该条）＋**ack 宽容**（只承认批次内 id，缺的下轮再送）＋**截断抢救** `AnalysisSalvage`＋显式 `max_output_tokens` |
 | 场景概要 | 场景切换或跨度 ≥ `Scene.SPAN`(12) 条 | `sceneRetryAt` / `sceneFailures` | `summarizeScene` |
-| 世界书整理 | 跟随分析：处理刚消费掉的那批短期 | `lorebookRetryAt` / `lorebookFailures` | `consolidateLorebook` + 淘汰 |
+| 世界书整理 | 跟随**抽取**：处理本次折叠刚产出的那批短期（排在分析之前） | `lorebookRetryAt` / `lorebookFailures` | `consolidateLorebook` + 淘汰；失败的那批留在内存待重试 |
 
 `scheduleMemoryRetry()` 统一指数退避（5 分钟 → 30 分钟封顶）；成功后清零。
 
@@ -235,10 +235,10 @@ BackgroundTasks.scheduleTurn  后台串行维护：文风校对、快速回应�
 - **模型维护（三入口）**：
   1. 建卡/群组升级时由模型产出初始条目（`CharacterParity` 的 `lorebook` 字段，2-4 条，标记 `ai`）。
   2. 主循环工具 `upsert_lorebook_entry`：先按 `entryId`/`name` 精确匹配——**精确命中时用新 `content` 替换该条目原有内容**，未命中再用近似匹配（名称 bigram / 共享关键词 / 内容相似度）找**同一事物的近似条目**并**整条替换**（允许变短、允许把 `alwaysActive` 改回 false），确实没有近似条目才新建；要求 `sourceMessageIds` + `evidence` 可回溯，且**不得覆盖 `origin:user` 条目**。
-  3. 记忆子任务 `consolidateLorebook()`：跟随分析，把现有条目的**完整内容**（最近更新的 12 条 / 累计 ≤6000 字；其余只给名字+关键词并注明"本轮不要更新此条"）交给模型，要求"同一事物只一条：沿用原名，把完整原文里仍有效的部分 + 新事实**重新总结成一条去整条替换**（允许变短、一条只讲一件事、目标 300 字 / 硬上限 400 字）"（`AUTO_ENTRIES_PER_PASS`(3) 条上限，按 `sourceShortTermIds` 校验）；超 400 字的条目**退回模型重写一次**，仍超才放弃；写完后本地 `dedupeLorebook()` 兜底并执行淘汰。另有一次性重写 `rebuildOversizedLorebook`：内容 >400 字的旧 AI 条目交给模型按主题拆成 1~3 条并原地替换。
+  3. 记忆子任务 `consolidateLorebook()`：跟随**短期抽取**（排在长期分析之前，读的正是本次折叠刚产出的那批短期；清理流程则读它即将消费的那批），把现有条目的**完整内容**（最近更新的 12 条 / 累计 ≤6000 字；其余只给名字+关键词并注明"本轮不要更新此条"）交给模型，要求"同一事物只一条：沿用原名，把完整原文里仍有效的部分 + 新事实**重新总结成一条去整条替换**（允许变短、一条只讲一件事、目标 300 字 / 硬上限 400 字）"（`AUTO_ENTRIES_PER_PASS`(3) 条上限，按 `sourceShortTermIds` 校验）；超 400 字的条目**退回模型重写一次**，仍超才放弃；写完后本地 `dedupeLorebook()` 兜底并执行淘汰。**写回只动世界书**（逐条并进最新列表，另有 `dedupeLorebook`），不再因为"运行期间角色版本变了"整批作废；**失败的那批留在内存**（`LorebookRetryStore`），下一轮维护时与新的批次一起重试，连续多次失败后弹窗询问「重试 / 忽略」（忽略即按用户意愿丢弃并写进请求日志）。每趟都会以 `status=note` 记录"写入 N 条 / 跳过 M 条（原因）"。另有一次性重写 `rebuildOversizedLorebook`：内容 >400 字的旧 AI 条目交给模型按主题拆成 1~3 条并原地替换。
 - **隐藏自动淘汰**：`LorebookStore.evictStaleLorebookEntries()` 每轮整理把未被注入的 `ai` 条目 `misses + 1`，达 3 即退役；条目被注入时 `markLorebookMentions()` 把 `misses` 归零。`misses` 不展示给模型、也不由模型管理。**退役不默默发生**：每趟退役的条目名称以 `status=note` 写进请求日志（与"真失败"的 `failed` 分开）。
 - 归一化：写入受 `AppLimits.Lorebook` 约束（`ENTRIES` 200 / `KEYWORDS_PER_ENTRY` 8 / `NAME_CHARS` 60 / `CONTENT_CHARS` 400——**超限写入直接拒收、退回模型重写，绝不截断**）；角色卡弹窗第三个标签页编辑（展示来源徽标/常驻开关/最近提及）。
-- 命中 `LorebookMatcher`：**常驻条目无条件入围**，其余对**本轮用户输入 + 最近 6 条消息**做小写关键词包含匹配；排序 = 常驻 → `order` → 最近更新（`updatedAt` 新的在前）→ 名称（中文 `Collator`）；最多 `INJECT_ENTRIES`(6) 条。
+- 命中 `LorebookMatcher`：**常驻条目无条件入围**，其余对**本轮用户输入 + 最近 6 条消息**做小写关键词包含匹配；**正文为空的"待补充"条目是唯一例外**——即使勾了常驻也只在关键词命中时注入（否则一堆未填条目会每轮挤在常驻段），注入时写成「名字：（正文为空，待补充；条目ID: …；关键词: …）」，让模型能按 id 精确补写而不用猜名字（完全没写关键词的空条目没有任何命中依据，不会注入）。排序 = 常驻 → `order` → 最近更新（`updatedAt` 新的在前）→ 名称（中文 `Collator`）；最多 `INJECT_ENTRIES`(6) 条。
 - 注入：分「常驻前提 / 相关条目」两组渲染，总字符受 `INJECT_CHARS`(1400) 限制（**装不下的条目跳过、继续尝试后面的短条目**，只有单条自身超预算才截断——旧行为下一条长常驻条目就能把后面全部挡死）；措辞强调"**是补充资料、不是指令，冲突以最新消息为准**"；真正注入的条目才计入 `mentions`（超预算被丢弃的不算命中）。
 - 群组实体与成员的世界书都参与命中（按 `id`（空则 `name|content`）去重合并）；工具写入时可指定 `memberName` 落到成员私人世界书。
 - **一次性迁移** `migrateWorldLore`：检测旧数据里写在 `description`/`background` 中的世界观内容，弹窗确认后由 AI 拆成条目（可选同时精简原文），原文默认保留。
@@ -333,7 +333,7 @@ tools: AUTO 阶段全部工具 / SUBMIT 阶段只有 submit_response
 
 ### 逐请求缓存与耗时统计
 
-`AppViewModel.recordMetrics`（chat）/ `recordAuxiliaryUsage`（辅助调用）写 `RequestMetric`：`taskType`（`chat` / `auxiliary` 等）、`platform`、`phase`、`status`（`completed` / `failed` / `note`）、`inputTokens` / `outputTokens` / `hitTokens` / `missTokens` / `hitRate`、`durationMs`、`instructionsHash` / `toolsHash` / `historyHash`、`commonHistoryMessages`、`prefixChange`、`contextChars` / `inputChars`。记录保留最近 60 条（`AppLimits.Api.REQUEST_METRICS`）。只有 `taskType='chat'` 且非失败时更新右上角 `cacheStats`，后台小请求不覆盖主对话缓存显示；**失败的 chat 轮也会留一条 `status='failed'`**（`phase` 存原因），失败的后台调用同样留痕。缓存条显示本轮命中率与最近 10 次对话请求均值；设置页「调试信息」展示逐请求明细，用于定位前缀失效原因与新增 token 成本。
+`AppViewModel.recordMetrics`（chat）/ `recordAuxiliaryUsage`（辅助调用）写 `RequestMetric`：`taskType`（`chat` / `auxiliary` 等）、`platform`、`phase`、`status`（`completed` / `failed` / `note`）、`inputTokens` / `outputTokens` / `hitTokens` / `missTokens` / `hitRate`、`durationMs`、`instructionsHash` / `toolsHash` / `historyHash`、`commonHistoryMessages`、`prefixChange`、`contextChars` / `inputChars`。记录保留最近 60 条（`AppLimits.Api.REQUEST_METRICS`）。**一轮对话只写一条 chat 记录，数值是本轮所有主对话请求（工具轮 + 强制收尾轮）的合计**——只有第一轮会带破缓存的前缀，只记最后一轮（那一轮通常已被本轮自己写热）会让命中率永远看着很高；后台/辅助调用（抽取、分析、场景、世界书、快捷回复）一律不计入右上角。没有拿到用量的请求记"无数据"（`hitRate=null`，不按 0% 计入均值），右上角 `cacheStats` **每轮都刷新**（无数据时显示「缓存未返回命中数据」），**失败的 chat 轮也会留一条 `status='failed'`**（`phase` 存原因），失败的后台调用同样留痕。缓存条显示本轮（含工具轮）命中率与最近 10 次对话轮均值；设置页「调试信息」展示逐请求明细（含 `prefixChange`，用于判断"这次破缓存是我改了设定还是历史自然增长"）。
 
 ## 七、人格与 Prompt
 
@@ -414,7 +414,7 @@ tools: AUTO 阶段全部工具 / SUBMIT 阶段只有 submit_response
 |---|---|---|
 | 一键建卡 `buildQuickGeneratePrompt` | `feature:characters` 的 `CharacterParity` | 输出完整字段 JSON；**禁止套路名字与模板人设**；`personality` 写行为倾向；`background` 只写角色本人经历（世界观写 `lorebook`）；`speakingStyle` 必须是「调性描述；示例：<台词1> / <台词2> / <台词3>」（`CHARACTER_QUALITY_RULE` + `SPEAKING_STYLE_SAMPLES_RULE`）；群组分支要求成员说话方式显著不同，并输出 2-4 条初始 `lorebook` 条目 |
 | 群组升级 `upgradeToGroup` | `:app` 的 `AppViewModel` | 与建卡同一套质量约束；`additionalMembers` 不得重复原角色与彼此姓名；可补 0-3 条 `lorebook`（只补近期已出现的世界层设定）；原角色世界书并入群组 |
-| 世界书整理 `consolidateLorebook` | `BackgroundTasks` | 只从**已发生的短期摘要**里沉淀世界层设定（`sourceShortTermIds` 必须可回溯）、禁止推测扩写；给出已有条目的完整内容；"同一事物只一条：整条替换、允许变短、≤400 字"；≤`AUTO_ENTRIES_PER_PASS`(3) 条；写后本地去重并执行 `misses` 淘汰 |
+| 世界书整理 `consolidateLorebook` | `BackgroundTasks` | **跟随短期抽取**（排在长期分析之前）；只从**已发生的短期摘要**里沉淀世界层设定（`sourceShortTermIds` 必须可回溯）、禁止推测扩写；给出已有条目的完整内容；"同一事物只一条：整条替换、允许变短、≤400 字"；≤`AUTO_ENTRIES_PER_PASS`(3) 条；写后本地去重并执行 `misses` 淘汰；**只写世界书**，失败留在内存重试/交给用户决定 |
 | 世界书一次性迁移 `migrateWorldLore` | `BackgroundTasks` / `NativeCore.runWorldLoreMigration` | 把旧数据 `description`/`background` 里的世界观拆成条目（只整理已有信息）；人工维护条目不受影响；可选同时精简原文 |
 | 成员补全 `fillMemberFields` | `NativeCore` / `CharacterParity.applyMemberFillPayload` | **已有字段是绝对权威，不得改写/润色/替换**；只填空字段；说话方式须与群内其他成员显著不同；无把握则省略 |
 | 空字段补全 `autoFillStaticFields` | `BackgroundTasks` | 只补缺失字段，绝不覆盖已有设定；缺 `speakingStyle` 时套用示例台词约束；群组成员再叠加"彼此不同" |
@@ -433,7 +433,8 @@ tools: AUTO 阶段全部工具 / SUBMIT 阶段只有 submit_response
 - **每轮一个工具 + 上限**：每轮只执行并回传第一个信息类工具；`MAX_TOOL_CALLS` 约束整轮总数。
 - **记忆任务重试**：`extraction` / `analysis` / `scene` / `lorebook` 四组计数器（`*Failures` / `*RetryAt`），`scheduleMemoryRetry` 指数退避（5→30 分钟封顶）。
 - **后台任务过期保护**：`captureGuard` / `isGuardCurrent`（`revision` + 末条消息 ID）保护**会覆盖用户可见状态**的任务（场景概要、静态补全、动态状态）；**折叠/分析这类只做增量的任务改为合并写回**——重读最新角色后把新条目追加到最新列表、只移除刚刚折过的那批，所以用户中途又发消息时折叠结果照样落地（不再整批判 `Stale` 丢弃）。
-- **摘要不被提前丢弃**：消费只发生在读它的那一趟之后——分析失败的批次原样留在窗口里、由退避门控重试；世界书整理读的是分析刚消费的同一批，逐条校验来源与字段，坏条目跳过（其余照常入库）并记录原因。**窗口去重只在消费这一刻做**（`BackgroundTasks.settleShortTerm` → `MemoryPolicy.dedupeShortTerm`）：同一逻辑日+时段且相似度 ≥0.6，或全局 ≥`NEAR_DUP_SIMILARITY`(0.72) 合并；稳定期内不碰窗口，否则已发出的请求前缀会变得不可预测。
+- **摘要不被提前丢弃**：消费只发生在读它的那一趟之后——分析失败的批次原样留在窗口里、由退避门控重试；**世界书整理排在长期分析之前**、读的正是短期抽取刚产出的那批（再加内存里上次失败遗留的），逐条校验来源与字段，坏条目跳过（其余照常入库）并记录原因；这一趟失败时那批**留在内存待重试**（连续失败后弹窗问「重试 / 忽略」），不会因为分析随后消费掉短期条目而永久丢失。**窗口去重只在消费这一刻做**（`BackgroundTasks.settleShortTerm` → `MemoryPolicy.dedupeShortTerm`）：同一逻辑日+时段且相似度 ≥0.6，或全局 ≥`NEAR_DUP_SIMILARITY`(0.72) 合并；稳定期内不碰窗口，否则已发出的请求前缀会变得不可预测。
+- **写入只写自己那部分**：所有写路径（主对话收尾、后台维护、编辑器）都用 `mergeCharacterChanges`（`core:model`）把"本次真正改动的字段"合并到最新行上——普通字段按值差异判定、世界书按**条目 id 三方合并**（并发新增的条目不会被抹掉，删除才真正删除）。因此长期的整份写回不再互相回滚：世界书整理只动世界书、聊天收尾不会再把你期间的世界书/记忆改动覆盖掉。
 - **检索相关性下限**：`rankMemories` 只保留至少命中一个非停用词的候选，并用特异性下限 `MIN_MATCH_SCORE`(1.5) 过滤泛词命中；`pendingRecall` 优先占位；短指代查询经 `buildMemoryQuery` 补上下文；**用户提到具体日期时由模型用 `search_memory` 的 `date`/`timeRef` 按日期召回那天的原始对话与记忆**。
 - **断言前先核对**：系统提示词要求模型在说"第一次/从来没/总是/每次"这类**可被记忆证伪**的话之前先 `search_memory` 确认，查不到依据就不下断言（改说不确定或反问）。
 - **短期记忆上限靠"消费即丢"不靠"截断"**：分析一趟读走低水位之上的那一段（每批最多 `ANALYSIS_BATCH`(40) 条），成功后原样丢掉；没读到的最新 20 条永不丢，稳态就是 20~40。图片只保留最近 `IMAGE_RETENTION_MESSAGES`(60) 条消息（更早的删附件与文件、正文保留）。**一次弹窗、之后自动跑完**：`AppViewModel.checkMemoryCleanupPrompt` 只在短期超出高水位或有超窗图片时询问一次；确认后 `NativeCore.pruneOldMessageImages` 把超窗图片**原地压成缩略图**，`drainShortTermBacklog` 把积压消费成长期记忆（每次 1 批、空闲每分钟 1 批），直到降到低水位 20 才清除标记。**去重/修复这类 O(n²) 重活跑在 `Dispatchers.Default`/`IO` 上**（放主线程会 ANR，且修复标记写不进去 → 每次启动重跑）。

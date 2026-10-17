@@ -21,6 +21,7 @@ import com.deeptalking.core.model.TtsPhase
 import com.deeptalking.core.model.SpeechSegment
 import com.deeptalking.core.model.extractSpeechSegments
 import com.deeptalking.core.model.extractSpeechText
+import com.deeptalking.core.model.mergeCharacterChanges
 import com.deeptalking.domain.agent.HotTopicCounters
 import com.deeptalking.domain.agent.HotTopicPolicy
 import com.deeptalking.domain.agent.OrchestratorResult
@@ -126,6 +127,16 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     private val lorebookMigrationState = MutableStateFlow<Int?>(null)
     val lorebookMigrationPrompt: StateFlow<Int?> = lorebookMigrationState
 
+    /**
+     * Non-null when a world-book pass failed repeatedly and the user must decide whether to
+     * retry the held batch or drop it. The batch lives in memory in `NativeCore`, so this
+     * dialog only ever appears for a failure that happened in this run.
+     */
+    private val lorebookRetryState = MutableStateFlow<LorebookRetryPrompt?>(null)
+    val lorebookRetryPrompt: StateFlow<LorebookRetryPrompt?> = lorebookRetryState
+
+    data class LorebookRetryPrompt(val characterId: String, val characterName: String, val reason: String)
+
     private val media = MediaStore(DeepTalkingApp.core.appContext)
 
     // --------------------------------------------------------- migrations
@@ -222,6 +233,41 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         memoryCleanupState.value = null
         viewModelScope.launch { core.data.settings.putBoolean(MEMORY_CLEANUP_SKIP_KEY, true) }
         askLorebookRebuildOnce()
+    }
+
+    // ------------------------------------------------------ world-book retry
+
+    /** "重试": re-runs the held world-book batch on the freshest row. */
+    fun retryLorebookNow() {
+        val target = lorebookRetryState.value ?: return
+        lorebookRetryState.value = null
+        viewModelScope.launch {
+            val cfg = core.currentConfig()
+            val failure = runCatching { core.retryPendingLorebook(cfg, target.characterId) }
+                .getOrElse { it.message ?: "整理失败" }
+            if (failure.isNotBlank()) {
+                eventsState.tryEmit(UiEvent("世界书整理仍未成功：$failure"))
+                // The batch is still held, so the dialog comes back with the new reason and
+                // the user can either retry again or drop it — it must never sit in memory
+                // with no way to resolve it.
+                if (core.hasPendingLorebookRetry(target.characterId)) {
+                    lorebookRetryState.value = target.copy(reason = failure)
+                }
+            } else {
+                eventsState.tryEmit(UiEvent("世界书已整理完成"))
+            }
+        }
+    }
+
+    /** "忽略": the user decided not to retry — drop the held batch (and record that). */
+    fun dismissLorebookRetry() {
+        val target = lorebookRetryState.value ?: return
+        lorebookRetryState.value = null
+        viewModelScope.launch {
+            val cfg = core.currentConfig()
+            runCatching { core.discardPendingLorebook(cfg, target.characterId) }
+                .onFailure { DeepTalkingApp.recordError(it) }
+        }
     }
 
     /**
@@ -636,6 +682,19 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 val live = core.data.characters.get(characterId) ?: return@withLock
                 core.data.characters.upsert(transform(live).copy(updatedAt = Instant.now().toString()))
             }
+        }
+    }
+
+    /**
+     * Persists only what [after] changed relative to [before], merged onto the freshest
+     * stored row (see [mergeCharacterChanges]). A whole-row write would roll back anything
+     * a concurrent writer changed while this writer was working — a world-book entry, a
+     * memory, the user's own edit — which is exactly the bug the scoped write fixes.
+     */
+    private suspend fun writeCharacterChanges(before: Character, after: Character) {
+        characterWriteMutex.withLock {
+            val live = core.data.characters.get(after.id) ?: after
+            core.data.characters.upsert(mergeCharacterChanges(before, after, live))
         }
     }
 
@@ -1197,9 +1256,9 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
 
                 val orchestrator = core.createOrchestrator(
                     cfg,
-                    onCharacterUpdated = { updated ->
+                    onCharacterUpdated = { before, updated ->
                         core.appScope.launch {
-                            core.data.characters.upsert(updated)
+                            writeCharacterChanges(before, updated)
                         }
                     },
                     onStatus = { statusState.value = it },
@@ -1272,7 +1331,11 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                     )
                 }
                 val withReminders = scheduleDueReminders(finalResult.updatedCharacter)
-                core.data.characters.upsert(withReminders)
+                // Write only what this turn changed. The turn's result is built from the
+                // snapshot taken when the turn started, so writing it whole would roll back
+                // anything a background pass changed while the model was answering (and a
+                // background world-book write would be rolled back likewise).
+                writeCharacterChanges(character, withReminders)
                 quickRepliesState.value = finalResult.quickReplies
                 statusState.value = ""
                 recordMetrics(
@@ -1474,9 +1537,13 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         durationMs: Long,
     ) {
         val at = Instant.now().toString()
-        val hitTokens = result.cachedTokens
-        val missTokens = (result.inputTokens - hitTokens).coerceAtLeast(0)
-        val hitRate = if (result.inputTokens > 0) hitTokens.toDouble() / result.inputTokens else 0.0
+        // Turn totals (all main-chat requests of this turn). `hasUsage == false` means no
+        // request reported usage: the turn is recorded as "no data" — never as a 0 % hit,
+        // which used to pollute the 10-turn average.
+        val hasUsage = result.inputTokens > 0
+        val hitTokens = if (hasUsage) result.cachedTokens.coerceAtLeast(0) else null
+        val missTokens = if (hasUsage) (result.inputTokens - result.cachedTokens).coerceAtLeast(0) else null
+        val hitRate = if (hasUsage) result.cachedTokens.toDouble() / result.inputTokens else null
         val trace = requestTrace(characterId, requestHistory, shortTermBlock, result.instructionsHash, result.toolsHash)
         val metric = RequestMetric(
             at = at,
@@ -1493,23 +1560,21 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             commonHistoryMessages = trace.commonHistoryMessages,
             contextChars = result.contextChars,
             inputChars = trace.inputChars,
-            inputTokens = result.inputTokens,
-            outputTokens = result.outputTokens,
+            inputTokens = if (hasUsage) result.inputTokens else null,
+            outputTokens = if (hasUsage) result.outputTokens else null,
             hitTokens = hitTokens,
             missTokens = missTokens,
             hitRate = hitRate,
         )
-        // Legacy `recordCacheUsage`: a successful chat refreshes the header cache snapshot.
-        val cacheStats = if (result.inputTokens > 0) {
-            CacheStats(
-                hitTokens = hitTokens,
-                missTokens = missTokens,
-                promptTokens = result.inputTokens,
-                updatedAt = at,
-            )
-        } else {
-            cfg.cacheStats
-        }
+        // A completed chat turn always refreshes the header snapshot — including the
+        // "no data" case (nulls → the pill shows 缓存未返回命中数据). Keeping the previous
+        // numbers here is what made the header look "stuck" after a prefix change.
+        val cacheStats = CacheStats(
+            hitTokens = hitTokens,
+            missTokens = missTokens,
+            promptTokens = if (hasUsage) result.inputTokens else null,
+            updatedAt = at,
+        )
         // Legacy `DEBUG_REPLY_STORAGE_KEY`: a JSON object with the config snapshot,
         // display/full text and quick replies, rendered as two sections in Settings.
         val debug = buildJsonObject {
@@ -1556,23 +1621,29 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         viewModelScope.launch {
             val cfg = core.currentConfig()
             val at = Instant.now().toString()
-            val hit = usage.cachedTokens ?: 0
-            val miss = (usage.inputTokens - hit).coerceAtLeast(0)
+            // No usage reported → record "no data" (nulls), never a 0 % cache hit: auxiliary
+            // calls are excluded from the header average, but the debug list must not lie.
+            val hasUsage = usage.inputTokens > 0
+            val hit = if (hasUsage) (usage.cachedTokens ?: 0).coerceAtLeast(0) else null
+            val miss = if (hasUsage) (usage.inputTokens - (cachedOrZero(usage))).coerceAtLeast(0) else null
             val metric = RequestMetric(
                 at = at,
                 taskType = taskType,
                 model = cfg.modelName,
                 platform = cfg.apiPlatform,
                 status = "completed",
-                inputTokens = usage.inputTokens,
-                outputTokens = usage.outputTokens,
+                inputTokens = if (hasUsage) usage.inputTokens else null,
+                outputTokens = if (hasUsage) usage.outputTokens else null,
                 hitTokens = hit,
                 missTokens = miss,
-                hitRate = if (usage.inputTokens > 0) hit.toDouble() / usage.inputTokens else 0.0,
+                hitRate = if (hasUsage) (cachedOrZero(usage)).toDouble() / usage.inputTokens else null,
             )
             appendMetric { it + metric }
         }
     }
+
+    private fun cachedOrZero(usage: com.deeptalking.engine.ondevice.TokenUsage): Int =
+        usage.cachedTokens?.coerceAtLeast(0) ?: 0
 
     /** Removes [message] and everything after it, then re-sends [message]'s text. */
     fun editAndResend(messageId: String, newText: String) {
@@ -2258,6 +2329,19 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     // ttsState, lastUserActivityAt, appVisible, themeState, ...) before they are
     // initialized -> NullPointerException. Declared last, every property is ready.
     init {
+        // A world-book batch that failed repeatedly is held in memory; ask the user whether
+        // to retry it or drop it (dropping is their call and is recorded, not silent).
+        core.onLorebookRetryNeeded = { characterId, reason ->
+            viewModelScope.launch {
+                if (lorebookRetryState.value?.characterId == characterId) return@launch
+                val name = core.data.characters.get(characterId)?.name.orEmpty()
+                lorebookRetryState.value = LorebookRetryPrompt(
+                    characterId = characterId,
+                    characterName = name.ifBlank { "该角色" },
+                    reason = reason,
+                )
+            }
+        }
         viewModelScope.launch {
             core.data.characters.observeAll().collect { list ->
                 if (activeIdState.value == null && list.isNotEmpty()) {

@@ -324,6 +324,18 @@ class BackgroundTasks(
      * drop stops being silent without being reported as a failure.
      */
     private val onAuxiliaryNote: suspend (String, String) -> Unit = { _, _ -> },
+    /**
+     * Failed world-book batches, held in memory so the next maintenance opportunity can
+     * re-feed them (the batch would otherwise be dropped together with the short-term
+     * entries the analysis consumed). See [LorebookRetryStore].
+     */
+    private val lorebookRetries: LorebookRetryStore? = null,
+    /**
+     * Raised once a world-book batch has failed [LorebookRetryStore.DEFAULT_MAX_ATTEMPTS]
+     * times: the app asks the user whether to retry it once more or drop it. Not called
+     * again for the same batch until it is cleared or dropped.
+     */
+    private val onLorebookRetryNeeded: (String) -> Unit = {},
 ) {
 
     private val json = Json {
@@ -602,9 +614,39 @@ class BackgroundTasks(
         // The world book / scene steps run even after a failed analysis: each has its own
         // retry gate, and the old "analysis failed → skip everything" short-circuit is how
         // a stuck analysis silently stopped the world book from ever being updated.
-        val maintained = runMemoryMaintenance(base, outcome.consumed)
+        //
+        // This path consumes a batch without an extraction, so it is the world book's own
+        // trigger here: feed it the batch this pass is about to drop (this is also what a
+        // user-invoked "整理记忆" relies on). A failure is held in memory for the next pass.
+        var working = runMemoryMaintenance(base)
+        if (outcome.consumed.isNotEmpty()) {
+            val held = lorebookRetries?.batch(base.id).orEmpty()
+            val batch = (outcome.consumed + held).distinctBy { it.id }
+            if (lorebookRetries?.awaitingUser(base.id) != true &&
+                canRunMemoryTask(countersOf(working), MemoryTaskKind.Lorebook)
+            ) {
+                val (lorebookStatus, afterLorebook) = consolidateLorebook(working, batch)
+                when (lorebookStatus) {
+                    TaskStatus.Success -> {
+                        working = afterLorebook
+                        lorebookRetries?.clear(base.id)
+                        working = working.withCounters(
+                            resetMemoryRetry(countersOf(working), MemoryTaskKind.Lorebook),
+                        )
+                    }
+                    TaskStatus.Failure -> {
+                        val state = lorebookRetries?.recordFailure(base.id, batch)
+                        if (state?.awaitingUser == true) onLorebookRetryNeeded(base.id)
+                        working = working.withCounters(
+                            scheduleMemoryRetry(countersOf(working), MemoryTaskKind.Lorebook),
+                        )
+                    }
+                    TaskStatus.Stale -> Unit
+                }
+            }
+        }
         return DrainOutcome(
-            character = maintained,
+            character = working,
             progressed = outcome.status == TaskStatus.Success && outcome.consumed.isNotEmpty(),
         )
     }
@@ -915,11 +957,9 @@ class BackgroundTasks(
         val prompt = LOREBOOK_PROMPT_HEAD + (existingLines.joinToString("\n").ifEmpty { "（空）" }) +
             LOREBOOK_PROMPT_TAIL + "（角色名：" + speakerName + "）：\n" + sourceLines.joinToString("\n")
 
-        val guard = captureGuard(character)
         onStatus("正在整理世界书…")
         val reply = completeDetailed(LOREBOOK_SYSTEM, prompt, sessionId = sessionIdFor(character), taskType = "lorebook")
         val raw = reply.text
-        if (!isGuardCurrent(guard)) return TaskStatus.Stale to character
         if (raw.isBlank()) {
             if (reply.error.isNotBlank()) onAuxiliaryFailure("lorebook", reply.error)
             return TaskStatus.Failure to character
@@ -969,7 +1009,6 @@ class BackgroundTasks(
             }
             onStatus("正在压缩世界书条目…")
             val fixReply = completeDetailed(LOREBOOK_SYSTEM, fixPrompt, sessionId = sessionIdFor(character), taskType = "lorebook")
-            if (!isGuardCurrent(guard)) return TaskStatus.Stale to character
             val fixEntries = (ResponseParser.parseJsonLenient(fixReply.text) as? JsonObject)?.get("entries") as? JsonArray
             val fixed = mutableSetOf<String>()
             for (element in fixEntries ?: JsonArray(emptyList())) {
@@ -1013,6 +1052,8 @@ class BackgroundTasks(
                 member.copy(lorebook = kept ?: member.lorebook)
             },
         )
+        var written = 0
+        val refused = mutableListOf<String>()
         items.forEach { obj ->
             val proposal = LorebookProposal(
                 name = obj.string("name"),
@@ -1023,8 +1064,22 @@ class BackgroundTasks(
                 alwaysActive = optionalBoolean(obj, "alwaysActive"),
             )
             val ids = stringList(obj["sourceShortTermIds"]).map { it.trim() }.filter { it.isNotEmpty() }
-            working = upsertLorebookEntryForCharacter(working, proposal, ids).first
+            val (next, result) = upsertLorebookEntryForCharacter(working, proposal, ids)
+            working = next
+            when {
+                !result.ok -> refused += "${proposal.name}（${result.reason}）"
+                result.mergedIntoUser -> refused += "${proposal.name}（已有同设定的用户手写条目）"
+                else -> written++
+            }
         }
+        // "写了几条 / 为什么没写" must be answerable from the device: a refused write used
+        // to be dropped on the floor, so a world book that never grew looked like a model
+        // that never tried.
+        onAuxiliaryNote(
+            "lorebook",
+            "本次整理写入 $written 条（来源 ${fresh.size} 条短期记忆）" +
+                (if (refused.isNotEmpty()) "，跳过 ${refused.size} 条：${refused.joinToString("；").take(300)}" else ""),
+        )
         working = working.copy(
             lorebook = dedupeLorebook(working.lorebook),
             members = working.members.map { it.copy(lorebook = dedupeLorebook(it.lorebook)) },
@@ -1141,16 +1196,15 @@ class BackgroundTasks(
     }
 
     /**
-     * Scene summaries + world-book consolidation + adaptive importance.
+     * Scene summaries + adaptive importance.
      *
-     * [freshlyAnalyzed] is the batch the analysis pass just consumed: the world book reads
-     * exactly those events (one step later), so nothing has to be tracked per entry and a
-     * world-book failure simply means those events are not world-booked — by design there
-     * is no backstop for it.
+     * The world-book pass is **not** here any more: it runs from the short-term extraction
+     * step (see [scheduleTurn]) on the batch the fold just produced, which is both earlier
+     * and safer — the batch is still in the window, so a failed pass can be re-fed instead
+     * of vanishing with the entries the analysis consumes.
      */
     suspend fun runMemoryMaintenance(
         character: Character,
-        freshlyAnalyzed: List<ShortTermMemory> = emptyList(),
     ): Character {
         var working = ensureMessageSequences(character)
         working = applyMemoryDecay(working)
@@ -1164,18 +1218,6 @@ class BackgroundTasks(
             counters = when (sceneStatus) {
                 TaskStatus.Success -> resetMemoryRetry(counters, MemoryTaskKind.Scene)
                 TaskStatus.Failure -> scheduleMemoryRetry(counters, MemoryTaskKind.Scene, nowMillis)
-                TaskStatus.Stale -> counters
-            }
-        }
-
-        if (freshlyAnalyzed.isNotEmpty() && canRunMemoryTask(counters, MemoryTaskKind.Lorebook, nowMillis)) {
-            val (status, afterLore) = consolidateLorebook(working, freshlyAnalyzed)
-            counters = when (status) {
-                TaskStatus.Success -> {
-                    working = afterLore
-                    resetMemoryRetry(counters, MemoryTaskKind.Lorebook)
-                }
-                TaskStatus.Failure -> scheduleMemoryRetry(counters, MemoryTaskKind.Lorebook, nowMillis)
                 TaskStatus.Stale -> counters
             }
         }
@@ -1698,6 +1740,8 @@ class BackgroundTasks(
         var counters = countersOf(working)
         val nowMillis = System.currentTimeMillis()
         val lastUser = working.instant.lastOrNull { it.role == Role.User && !it.isLoading }
+        /** Short-term entries the extraction pass produced in this turn (world-book source). */
+        var newlyExtracted: List<ShortTermMemory> = emptyList()
 
         // Extraction: the *only* producer of short-term memory (the single whole-window
         // pass at the high watermark). Nothing else may append to the window in
@@ -1707,8 +1751,12 @@ class BackgroundTasks(
         // until it is back inside the normal range. The whole-window fold below cannot
         // send hundreds of messages at once, so the two paths are kept strictly apart.
         if (hasOversizedWindow(working) && canRunMemoryTask(counters, MemoryTaskKind.Extraction, nowMillis)) {
+            val hadIds = working.shortTerm.mapTo(HashSet()) { it.id }
             val (status, migrated) = migrateOversizedWindow(working)
             working = migrated
+            if (status == TaskStatus.Success) {
+                newlyExtracted = working.shortTerm.filterNot { it.id in hadIds }
+            }
             counters = when (status) {
                 TaskStatus.Success -> resetMemoryRetry(counters, MemoryTaskKind.Extraction)
                 TaskStatus.Failure -> scheduleMemoryRetry(counters, MemoryTaskKind.Extraction, nowMillis)
@@ -1717,14 +1765,46 @@ class BackgroundTasks(
         } else if (working.instant.size >= AppLimits.Memory.INSTANT &&
             canRunMemoryTask(counters, MemoryTaskKind.Extraction, nowMillis)
         ) {
+            val hadIds = working.shortTerm.mapTo(HashSet()) { it.id }
             val (extractStatus, extracted) = extractMemoryStatus(working, messages)
             when (extractStatus) {
                 TaskStatus.Success -> {
                     working = extracted
+                    // The entries this fold produced: the world-book pass below reads them
+                    // while they are still in the window (the analysis drops them later).
+                    newlyExtracted = working.shortTerm.filterNot { it.id in hadIds }
                     counters = resetMemoryRetry(counters, MemoryTaskKind.Extraction)
                 }
                 TaskStatus.Failure -> counters = scheduleMemoryRetry(counters, MemoryTaskKind.Extraction, nowMillis)
                 TaskStatus.Stale -> Unit
+            }
+        }
+
+        // World-book pass. It used to hang off the long→term analysis batch; it now reads
+        // the batch the extraction just produced, **before** the analysis consumes (drops)
+        // it, plus whatever an earlier failure left in memory. A transient failure therefore
+        // delays the entries instead of losing them, and the pass is no longer thrown away
+        // when the user happens to type while it runs.
+        if (newlyExtracted.isNotEmpty() || (lorebookRetries?.batch(working.id)?.isNotEmpty() == true)) {
+            val held = lorebookRetries?.batch(working.id).orEmpty()
+            val lorebookBatch = (newlyExtracted + held).distinctBy { it.id }
+            if (lorebookRetries?.awaitingUser(working.id) != true &&
+                canRunMemoryTask(counters, MemoryTaskKind.Lorebook, nowMillis)
+            ) {
+                val (lorebookStatus, afterLorebook) = consolidateLorebook(working, lorebookBatch)
+                when (lorebookStatus) {
+                    TaskStatus.Success -> {
+                        working = afterLorebook
+                        lorebookRetries?.clear(working.id)
+                        counters = resetMemoryRetry(counters, MemoryTaskKind.Lorebook)
+                    }
+                    TaskStatus.Failure -> {
+                        counters = scheduleMemoryRetry(counters, MemoryTaskKind.Lorebook, nowMillis)
+                        val state = lorebookRetries?.recordFailure(working.id, lorebookBatch)
+                        if (state?.awaitingUser == true) onLorebookRetryNeeded(working.id)
+                    }
+                    TaskStatus.Stale -> Unit
+                }
             }
         }
 
@@ -1741,12 +1821,11 @@ class BackgroundTasks(
         }
 
         // Consolidate the consumable part of the short-term window into long-term memories
-        // (legacy analyzeShortToLongTerm). The batch is what sits above the low-water mark,
-        // and the same batch is handed to the world-book pass, so both consumers read
-        // exactly the same events.
+        // (legacy analyzeShortToLongTerm). The batch is what sits above the low-water mark.
+        // The world book ran on the same batch *before* this point (see above), so an entry
+        // is world-booked before the analysis drops it.
         val consumable = (working.shortTerm.size - AppLimits.Memory.SHORT_TERM_TRIM_FLOOR).coerceAtLeast(0)
         val analyzeSpan = AppLimits.Memory.SHORT_TERM - AppLimits.Memory.SHORT_TERM_TRIM_FLOOR
-        var freshlyAnalyzed: List<ShortTermMemory> = emptyList()
         if (consumable >= analyzeSpan && canRunMemoryTask(counters, MemoryTaskKind.Analysis, nowMillis)) {
             val outcome = analyzeShortToLongTermStatus(working)
             // Carry the failure diagnostic (or its clearing) into the persisted counters.
@@ -1754,7 +1833,6 @@ class BackgroundTasks(
             when (outcome.status) {
                 TaskStatus.Success -> {
                     working = outcome.character
-                    freshlyAnalyzed = outcome.consumed
                     counters = resetMemoryRetry(counters, MemoryTaskKind.Analysis)
                 }
                 TaskStatus.Failure -> counters = scheduleMemoryRetry(counters, MemoryTaskKind.Analysis, nowMillis)
@@ -1763,8 +1841,8 @@ class BackgroundTasks(
         }
         working = working.withCounters(counters)
 
-        // Scene summaries + world-book consolidation + adaptive importance.
-        val maintained = runMemoryMaintenance(working, freshlyAnalyzed)
+        // Scene summaries + adaptive importance (the world book ran earlier, above).
+        val maintained = runMemoryMaintenance(working)
         if (maintained != working) working = maintained
 
         if (working != character) onCharacterUpdated(working)

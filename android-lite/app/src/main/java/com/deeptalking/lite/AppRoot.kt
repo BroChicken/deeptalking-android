@@ -111,6 +111,7 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
     val memoryMigration by vm.memoryMigration.collectAsState()
     val lorebookRebuildPrompt by vm.lorebookRebuildPrompt.collectAsState()
     val lorebookRebuild by vm.lorebookRebuild.collectAsState()
+    val lorebookRetryPrompt by vm.lorebookRetryPrompt.collectAsState()
     val tts by vm.tts.collectAsState()
 
     val activeCharacter = characters.firstOrNull { it.id == activeId }
@@ -460,6 +461,31 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
             title = { Text("正在整理短期记忆…") },
             text = { Text("分批转成长期记忆，请稍候。") },
             confirmButton = {},
+        )
+    }
+
+    // A world-book pass failed repeatedly: the batch is held in memory (it would otherwise
+    // be dropped with the short-term entries the analysis consumed), so the user decides.
+    lorebookRetryPrompt?.let { prompt ->
+        AlertDialog(
+            onDismissRequest = { vm.dismissLorebookRetry() },
+            title = { Text("世界书整理失败") },
+            text = {
+                Column {
+                    Text("「${prompt.characterName}」有一批内容没有整理进世界书。")
+                    if (prompt.reason.isNotBlank()) {
+                        Spacer(Modifier.height(6.dp))
+                        Text("原因：${prompt.reason}", fontSize = 13.sp, color = MaterialTheme.legacy.textMuted)
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "重试会再跑一次这次整理；忽略则放弃这批内容（不会影响其它记忆）。",
+                        fontSize = 13.sp,
+                    )
+                }
+            },
+            confirmButton = { TextButton(onClick = { vm.retryLorebookNow() }) { Text("重试") } },
+            dismissButton = { TextButton(onClick = { vm.dismissLorebookRetry() }) { Text("忽略") } },
         )
     }
 

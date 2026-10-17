@@ -136,7 +136,7 @@ STATIC_PROFILE_FIELDS ─┬─► submit_response schema (staticFieldProperties
 
 - [ ] 是否碰到 `parseJsonLenient` / `repairFreetextFields*`？→ 跑下面的"自测样例"（含未转义引号、真实换行、嵌套对象）。
 - [ ] 是否改 `DYNAMIC_STATE_FIELDS` / `STATIC_PROFILE_FIELDS`？→ 逐一核对第 3 节所有下游 + 迁移 + 提示词 + 编辑器。
-- [ ] 是否改 system prompt 文本？→ 检查前缀缓存（INV-4）与 `DifferentialOracleTest`。
+- [ ] 是否改 system prompt 文本？→ 检查前缀缓存（INV-4）；改 `RULE_A` 之类文本会让每个角色一次性破缓存。
 - [ ] 是否改 `versionName`？→ 同步 `versionCode`，跑 `tools/native-verify.ps1`。
 - [ ] 是否新增 `parseJsonLenient` 调用？→ 检查返回类型守卫。
 - [ ] 是否改请求体阶段（`RequestBuilder`/`ResponsesLlmBackend`）？→ 核对阶段二 tools/tool_choice（INV-5）。

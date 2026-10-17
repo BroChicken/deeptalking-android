@@ -67,7 +67,11 @@ data class OrchestratorResult(
     val stickerFileRef: String? = null,
     /** Raw (pre-processing) model reply, for the settings debug panel. */
     val rawReply: String = "",
-    /** Token usage of the last model request, when reported. */
+    /**
+     * Token usage totalled over **every** model request this turn made, or all-zero
+     * when no request reported usage (the caller then records "no data" rather than a
+     * 0 % cache hit).
+     */
     val inputTokens: Int = 0,
     val outputTokens: Int = 0,
     val cachedTokens: Int = 0,
@@ -98,7 +102,13 @@ class ChatOrchestrator(
     private val config: AppConfig = AppConfig(),
     private val backgroundTasks: BackgroundTasks? = null,
     private val runBackgroundTasks: Boolean = true,
-    private val onCharacterUpdated: (Character) -> Unit = {},
+    /**
+     * Background-pass result: `(before, after)`, where `before` is the character the pass
+     * started from. The app writes **only** the difference between the two onto the
+     * freshest stored row (see `mergeCharacterChanges`), so a pass that took seconds can no
+     * longer roll back a world-book entry or a memory the user/chat added meanwhile.
+     */
+    private val onCharacterUpdated: (Character, Character) -> Unit = { _, _ -> },
     private val imageResolver: ((String) -> String?)? = null,
 ) {
 
@@ -280,7 +290,7 @@ class ChatOrchestrator(
                 messages = history.filter { !it.isLoading } + assistantMessage,
                 critiqueEnabled = config.styleCritique,
                 quickReplyRepairEnabled = config.quickReplyRepair,
-                onCharacterUpdated = onCharacterUpdated,
+                onCharacterUpdated = { bg -> onCharacterUpdated(characterWithInstant, bg) },
                 onQuickRepliesRepaired = onQuickRepliesRepaired,
                 styleViolations = styleViolations,
                 proseFallback = parsed.raw == null && memUpdate == null,
@@ -296,9 +306,15 @@ class ChatOrchestrator(
             lorebookChanges = diffLorebookChanges(character, characterWithInstant),
             stickerFileRef = outcome.stickerFileRef,
             rawReply = outcome.text,
-            inputTokens = outcome.usage?.inputTokens ?: 0,
-            outputTokens = outcome.usage?.outputTokens ?: 0,
-            cachedTokens = outcome.usage?.cachedTokens ?: 0,
+            // Turn totals across **every** request the turn made (tool rounds + the
+            // forced submit round). The first request is the one that carries a
+            // cache-breaking prefix, so reporting only the last one (which is usually
+            // re-warmed by the same turn) hid every real cache miss. A round that
+            // reported usage without cache detail counts as uncached, matching the
+            // provider's own "no cache detail = no hit reported" semantics.
+            inputTokens = outcome.roundUsages.sumOf { it.inputTokens },
+            outputTokens = outcome.roundUsages.sumOf { it.outputTokens },
+            cachedTokens = outcome.roundUsages.sumOf { it.cachedTokens ?: 0 },
             instructionsHash = instructionsHash,
             toolsHash = toolsHash,
             contextChars = contextMessage.content.length,

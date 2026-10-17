@@ -53,8 +53,7 @@ class LorebookMatcherTest {
     }
 
     @Test
-    fun scanMessagesWindowFeedsKeywordHaystack() {
-        val hit = entry("hit", "潮汐", keywords = listOf("潮汐镇"))
+    fun scanMessagesWindowFeedsKeywordHaystack() {        val hit = entry("hit", "潮汐", keywords = listOf("潮汐镇"))
 
         assertTrue(matchLorebookEntries(listOf(hit), "潮汐镇").any { it.id == "hit" })
 
@@ -65,6 +64,25 @@ class LorebookMatcherTest {
             matchLorebookEntries(listOf(hit), "你好", older, LorebookLimits(scanMessages = 2))
                 .any { it.id == "hit" },
         )
+    }
+
+    @Test
+    fun aBodyLessPlaceholderIsInjectedOnlyWhileItsKeywordsHit() {
+        // The entry the user created but has not filled in yet: it must never ride along as
+        // 常驻 (it would sit in every prompt), but it must become visible exactly when its
+        // own trigger words are on the table — that is when the model can fill it in.
+        val placeholder = entry("p1", "赤月王国", keywords = listOf("赤月"), alwaysActive = true, content = "")
+
+        assertTrue(matchLorebookEntries(listOf(placeholder), "我们去赤月看看吧").any { it.id == "p1" })
+        assertTrue(matchLorebookEntries(listOf(placeholder), "今天天气不错").isEmpty())
+    }
+
+    @Test
+    fun aBodyLessPlaceholderWithoutKeywordsIsNeverInjected() {
+        val placeholder = entry("p1", "赤月王国", keywords = emptyList(), alwaysActive = true, content = "")
+
+        assertTrue(matchLorebookEntries(listOf(placeholder), "今天天气不错").isEmpty())
+        assertTrue(matchLorebookEntries(listOf(placeholder), "赤月王国在哪").isEmpty())
     }
 
     @Test

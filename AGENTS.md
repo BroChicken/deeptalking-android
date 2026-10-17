@@ -3,7 +3,7 @@
 ## 0. 项目形态（已迁移为原生 Android）
 - 项目是**原生 Android 应用（Kotlin + Compose 多模块）**，位于 `android-lite/`。WebView 只保留为富文本/公式渲染子系统（`:feature:richtext`，内嵌 KaTeX）。
 - **唯一开发入口是 `android-lite/` 下的 Kotlin 模块源码**（见 `android-lite/settings.gradle.kts` 的模块清单）。
-- **`src/` 是已冻结的历史前端快照**（`src/js/`、`src/styles/`、`src/shell.html`、`src/manifest.json`）：不再是运行入口，不再作为开发/修复目标，只作行为参照。**唯一活依赖是 `tools/diff/run-js.mjs`**——它在 Node `vm` 里加载 `src/js` 复现 `:domain:agent` 差分测试用的 oracle，所以 `src/js/` 不能删除；除此之外没有任何构建/CI/打包步骤读它。曾在此的 `src/vendor/katex` 已迁到 `android-lite/feature/richtext/src/main/assets/katex`。
+- **`src/` 是已冻结的历史前端快照**（`src/js/`、`src/styles/`、`src/shell.html`、`src/manifest.json`）：不再是运行入口，不再作为开发/修复目标，也不再作为行为参照——**与旧 WebView 的差分对照已下线**（原 `tools/diff/run-js.mjs` 及对应测试已删除），当前实现以原生版本为唯一基准。该目录下没有任何构建/CI/打包步骤会读取它，保留只为翻阅历史。曾在此的 `src/vendor/katex` 已迁到 `android-lite/feature/richtext/src/main/assets/katex`。
 
 ## 1. 试验失败品
 | 功能 | 位置 | 结论 |
@@ -45,4 +45,4 @@
 3. `docs/`（尤其 `docs/AGENT_ARCHITECTURE.md`、`docs/NATIVE_MODULES.md`）已同步更新。
 4. 发布前跑 `powershell -File tools/native-build.ps1 -Release`（需 keystore 环境变量）确认签名打包成功。
 
-`tools/` 只保留原生侧脚本：`native-verify.ps1`（全量自检）、`native-test.ps1`（单测）、`native-build.ps1`（打包）、`native-version.ps1`（版本号）、`pull-apk.ps1`（拉取发布包）、`build-cosyvoice-android.ps1`（重建 CosyVoice 原生库），以及 `tools/native/`（环境解析）与 `tools/diff/`（JS↔Kotlin 差分 oracle，仅测试用）。另有一个 PC 侧远程朗读启动器 `run-cosyvoice-server.bat`（只是包装 `tools/.work/cosyvoice-server/run-server.ps1`，见 `docs/REMOTE_TTS.md`）。旧 WebView 构建/测试脚本已删除。
+`tools/` 只保留原生侧脚本：`native-verify.ps1`（全量自检）、`native-test.ps1`（单测）、`native-build.ps1`（打包）、`native-version.ps1`（版本号）、`pull-apk.ps1`（拉取发布包）、`build-cosyvoice-android.ps1`（重建 CosyVoice 原生库），以及 `tools/native/`（环境解析）。另有一个 PC 侧远程朗读启动器 `run-cosyvoice-server.bat`（只是包装 `tools/.work/cosyvoice-server/run-server.ps1`，见 `docs/REMOTE_TTS.md`）。旧 WebView 构建/测试脚本与 JS↔Kotlin 差分 oracle（`tools/diff/`）均已删除。

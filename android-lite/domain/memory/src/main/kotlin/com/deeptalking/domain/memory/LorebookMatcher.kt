@@ -166,7 +166,10 @@ private fun applyCharCap(hits: List<LorebookEntry>, maxChars: Int): List<Loreboo
 /**
  * Raw hits from `matchLorebookEntries`: always-active entries are unconditional,
  * keyword entries match the haystack built from [query] plus the last
- * [LorebookLimits.scanMessages] of [recentMessages] (case-insensitive). Sorted by
+ * [LorebookLimits.scanMessages] of [recentMessages] (case-insensitive). A **body-less
+ * placeholder** (an entry the user created but has not filled in yet) is the one
+ * exception to the always-active rule: it is injected only while its own keywords are
+ * on the table, which is exactly when the model can see it and fill it in. Sorted by
  * always-active, then [orderOf] ascending, then most recently updated first
  * (entries without an [LorebookEntry.updatedAt] sort last), then name as a final
  * tie-break, and capped at [LorebookLimits.injectEntries].
@@ -186,13 +189,13 @@ fun matchLorebookEntries(
     val haystack = parts.joinToString("\n").lowercase()
     val collator = Collator.getInstance(Locale.CHINA)
     val hits = entries.filter { entry ->
-        if (!entry.enabled || entry.content.isBlank()) return@filter false
-        if (entry.alwaysActive) return@filter true
-        if (haystack.isBlank()) return@filter false
-        entry.keywords.any { keyword ->
+        if (!entry.enabled) return@filter false
+        val keywordHit = haystack.isNotBlank() && entry.keywords.any { keyword ->
             val needle = keyword.trim().lowercase()
             needle.isNotEmpty() && haystack.contains(needle)
         }
+        if (entry.content.isBlank()) return@filter keywordHit
+        entry.alwaysActive || keywordHit
     }.sortedWith { a, b ->
         val alwaysDiff = (if (b.alwaysActive) 1 else 0) - (if (a.alwaysActive) 1 else 0)
         if (alwaysDiff != 0) {

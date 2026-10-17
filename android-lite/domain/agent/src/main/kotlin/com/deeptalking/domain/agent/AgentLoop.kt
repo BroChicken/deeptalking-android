@@ -35,6 +35,14 @@ data class LoopOutcome(
     val stickerFileRef: String? = null,
     /** Token usage of the last model request, when the backend reported it. */
     val usage: com.deeptalking.engine.ondevice.TokenUsage? = null,
+    /**
+     * Usage of **every** model request this turn made, in order, for requests whose
+     * backend reported one. One chat turn can issue several requests (tool rounds plus
+     * the forced submit round), and only the first of them can carry the cache-breaking
+     * prefix — keeping them all is what lets the caller report the turn's real cache
+     * behaviour instead of just its last (usually re-warmed) request.
+     */
+    val roundUsages: List<com.deeptalking.engine.ondevice.TokenUsage> = emptyList(),
 )
 
 /**
@@ -73,6 +81,7 @@ class AgentLoop(
         var latestCharacter: Character? = null
         var latestSticker: String? = null
         var lastUsage: com.deeptalking.engine.ondevice.TokenUsage? = null
+        val roundUsages = mutableListOf<com.deeptalking.engine.ondevice.TokenUsage>()
         var lastReasoning: List<String> = emptyList()
         var phase = RequestPhase.AUTO
         var submitAttempted = false
@@ -83,7 +92,10 @@ class AgentLoop(
             val request = builder.build(phase, instructions, messages, tools, model, sessionIdFor(workingCharacter))
             val turn = collectResultWithRetry(request, onDelta, onToolActivity)
             val result = turn.result
-            result.usage?.let { lastUsage = it }
+            result.usage?.let {
+                lastUsage = it
+                roundUsages += it
+            }
             lastReasoning = result.reasoning
             val responseText = salvageText(result)
             val salvaged = turn.salvaged
@@ -104,6 +116,7 @@ class AgentLoop(
                         updatedCharacter = latestCharacter,
                         stickerFileRef = latestSticker,
                         usage = lastUsage,
+                        roundUsages = roundUsages,
                     )
                 }
             }
@@ -117,7 +130,7 @@ class AgentLoop(
                     val accumulated = responseText.ifBlank { salvaged.orEmpty() }
                     if (accumulated.isNotBlank()) {
                         onToolActivity("工具调用已达上限，直接收尾…")
-                        return LoopOutcome(accumulated, null, rounds, executedCalls, latestCharacter, latestSticker, lastUsage)
+                        return LoopOutcome(accumulated, null, rounds, executedCalls, latestCharacter, latestSticker, lastUsage, roundUsages)
                     }
                     onToolActivity("正在整理回复…")
                     phase = RequestPhase.SUBMIT
@@ -159,13 +172,13 @@ class AgentLoop(
             }
 
             if (parsedSubmit != null) {
-                return LoopOutcome(responseText, submitCall, rounds, executedCalls, latestCharacter, latestSticker, lastUsage)
+                return LoopOutcome(responseText, submitCall, rounds, executedCalls, latestCharacter, latestSticker, lastUsage, roundUsages)
             }
 
             if (phase == RequestPhase.AUTO) {
                 // chatStageDecision('auto-final'): prose or valid JSON text is final.
                 if (responseText.isNotBlank()) {
-                    return LoopOutcome(responseText, null, rounds, executedCalls, latestCharacter, latestSticker, lastUsage)
+                    return LoopOutcome(responseText, null, rounds, executedCalls, latestCharacter, latestSticker, lastUsage, roundUsages)
                 }
                 onToolActivity("正在整理回复…")
                 appendReasoning(messages, result.reasoning, rounds)
@@ -183,7 +196,7 @@ class AgentLoop(
             }
             val usable = responseText.ifBlank { salvaged.orEmpty() }
             if (usable.isNotBlank()) {
-                return LoopOutcome(usable, null, rounds, executedCalls, latestCharacter, latestSticker, lastUsage)
+                return LoopOutcome(usable, null, rounds, executedCalls, latestCharacter, latestSticker, lastUsage, roundUsages)
             }
             // Legacy `chatStageDecision('empty')`: an empty turn is retried up to twice
             // within the same loop, keeping the accumulated tool round-trips.
@@ -194,7 +207,7 @@ class AgentLoop(
             }
             break
         }
-        return LoopOutcome("", null, rounds, executedCalls, latestCharacter, latestSticker, lastUsage)
+        return LoopOutcome("", null, rounds, executedCalls, latestCharacter, latestSticker, lastUsage, roundUsages)
     }
 
     /**
