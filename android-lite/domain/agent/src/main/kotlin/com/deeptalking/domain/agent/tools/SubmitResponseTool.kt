@@ -21,14 +21,31 @@ class SubmitResponseTool : AgentTool {
     override val definition = ToolDefinition(
         name = "submit_response",
         description = "结束本轮回复：提交用户可见的回复正文与全部记忆更新。每轮对话结束时必须且只能调用一次此工具（推荐用它收尾，而不是在正文里手写 JSON）；回复正文写入 reply 字段。",
-        parametersJson = buildSchema().toString(),
+        parametersJson = buildSchema(isGroup = true).toString(),
         strict = true,
     )
+
+    /**
+     * Single-character requests get the same schema minus the group-only blocks
+     * (`memberDynamicState`, `longTerm[].memberName`, the "群组成员名" party values):
+     * a solo character can never use them, and they are the bulk of the schema.
+     */
+    private val soloDefinition: ToolDefinition by lazy {
+        ToolDefinition(
+            name = "submit_response",
+            description = definition.description,
+            parametersJson = buildSchema(isGroup = false).toString(),
+            strict = true,
+        )
+    }
+
+    override fun definitionFor(context: AgentContext): ToolDefinition =
+        if (context.character.isGroup) definition else soloDefinition
 
     override suspend fun execute(call: ToolCall, context: AgentContext): AgentToolResult =
         AgentToolResult("""{"ok":true}""")
 
-    private fun buildSchema(): JsonElement {
+    private fun buildSchema(isGroup: Boolean): JsonElement {
         val dynField = dynamicStateFieldSchema()
         val dynProps = buildJsonObject {
             dynamicStateKeys().forEach { key ->
@@ -48,7 +65,7 @@ class SubmitResponseTool : AgentTool {
                         "reply",
                         buildJsonObject {
                             put("type", "string")
-                            put("description", "用户可见的回复正文，支持Markdown；按语义可自然分段；动作、表情、心理、环境与旁白描写必须用全角括号（如“（轻轻叹气）我知道了。”）穿插在语句之间，除台词与直接陈述外的一切描写都要落在括号里；每处只写一个短节拍、不连续堆叠、括号动作总长不超过正文四分之一；你自己说的话直接写、不加引号包裹，只有引用他人话语、歌词、诗句、书名/作品名或专有名词原文时才用符号标明（引号用「」、书名用《》，逐字照抄、不得改写；不要用英文直引号）；口吻一律以角色设定的“说话风格”为准")
+                            put("description", "用户可见的回复正文（写法见规则 2：长度、排版、全角括号动作、引号与引用、去重）")
                         },
                     )
                     put(
@@ -57,11 +74,11 @@ class SubmitResponseTool : AgentTool {
                             put("type", "array")
                             put("minItems", 2)
                             put("maxItems", 2)
-                            put("description", "恰好两条\"用户下一句\"的短句：用户视角，是用户可以原样发给角色的话（其中\"我\"只能指用户）。不得是角色的台词、角色的表态或角色对用户的提问（如\"你今天怎么了？\"\"要不要早点休息？\"），也不得复述角色刚说过的话。写前先把自己换成用户。")
+                            put("description", "恰好两条用户视角的短句（三类禁止与新句要求见规则 7）")
                             put("items", buildJsonObject { put("type", "string") })
                         },
                     )
-                    put("longTerm", longTermSchema())
+                    put("longTerm", longTermSchema(isGroup))
                     put(
                         "dynamicState",
                         buildJsonObject {
@@ -77,39 +94,11 @@ class SubmitResponseTool : AgentTool {
                         buildJsonObject {
                             put("type", "object")
                             put("additionalProperties", false)
-                            put("description", "谨慎修改的基础设定字段（性别/年龄/种族/外貌特征/性格特征/恐惧弱点/背景故事/说话风格/语言方言/对用户的称呼）。用户明确要求修改时必须更新；无用户要求时仅在有决定性剧情依据时更新。value写成明确的简短陈述句：只写内容本身，短字段几十字、叙述字段一两句（不超过 120 字）、背景故事不超过 250 字；禁止「不是…而是…」这类对比句，禁止括号、理由或解释性文字")
+                            put("description", "谨慎修改的基础设定字段（字段清单、长度上限与句式要求见规则 3.5）")
                             put("properties", staticProps)
                         },
                     )
-                    put(
-                        "memberDynamicState",
-                        buildJsonObject {
-                            put("type", "array")
-                            put("description", "群组成员动态状态（仅群组对话使用）")
-                            put(
-                                "items",
-                                buildJsonObject {
-                                    put("type", "object")
-                                    put("additionalProperties", false)
-                                    put(
-                                        "properties",
-                                        buildJsonObject {
-                                            put("memberName", buildJsonObject { put("type", "string") })
-                                            put(
-                                                "dynamicState",
-                                                buildJsonObject {
-                                                    put("type", "object")
-                                                    put("additionalProperties", false)
-                                                    put("properties", dynProps)
-                                                },
-                                            )
-                                        },
-                                    )
-                                    put("required", buildJsonArray { add("memberName") })
-                                },
-                            )
-                        },
-                    )
+                    if (isGroup) put("memberDynamicState", memberDynamicStateSchema(dynProps))
                     put(
                         "promiseUpdates",
                         buildJsonObject {
@@ -179,7 +168,7 @@ class SubmitResponseTool : AgentTool {
                 )
                 put("sourceMessageIds", stringArraySchema())
                 put("evidence", buildJsonObject { put("type", "string") })
-                put("timeRef", timeRefSchema())
+                put("timeRef", timeRefPointerSchema())
             },
         )
         put("required", buildJsonArray { add("value") })
@@ -196,7 +185,7 @@ class SubmitResponseTool : AgentTool {
                     "value",
                     buildJsonObject {
                         put("type", "string")
-                        put("description", "本轮朗读播报指令：按需描述语气/情绪/语速/节奏/停顿/重音与情感层次，可短可长（通常不超过约 60 字，如“声音温柔含笑，语速偏慢，句尾轻轻收住”）；每轮必填，无需 sourceMessageIds/evidence")
+                        put("description", "本轮朗读播报指令（每轮必填、免证据；写法见规则 3）")
                     },
                 )
             },
@@ -204,9 +193,14 @@ class SubmitResponseTool : AgentTool {
         put("required", buildJsonArray { add("value") })
     }
 
-    private fun longTermSchema(): JsonElement = buildJsonObject {
+    private fun longTermSchema(isGroup: Boolean): JsonElement = buildJsonObject {
+        val partyValues = if (isGroup) {
+            "user（用户）/character（角色自己）/relationship（双方）/群组成员名"
+        } else {
+            "user（用户）/character（角色自己）/relationship（双方）"
+        }
         put("type", "array")
-        put("description", "未来仍有价值的稳定事实；category 只能是 userProfile|relationship|events|promises|habits；evidence 逐字摘录用户原话；key与value必须写明主体（用户写“用户”，角色写角色名）并写绝对日期，不得写“明晚/上周”这类相对时间词（相对时间改用timeRef）；约定必须填promisor与promisee；群组对话中若该事实只属于某位成员（只有那位成员知道/记得），填 memberName 记入其私人记忆，否则记入群组共享记忆")
+        put("description", "未来仍有价值的稳定事实（判据见规则 4/5/9；各字段写法见本对象字段说明）")
         put(
             "items",
             buildJsonObject {
@@ -249,17 +243,19 @@ class SubmitResponseTool : AgentTool {
                         })
                         put("promisor", buildJsonObject {
                             put("type", "string")
-                            put("description", "可选但约定必填，承诺方：user（用户）/character（角色自己）/relationship（双方）/群组成员名")
+                            put("description", "可选但约定必填，承诺方：$partyValues")
                         })
                         put("promisee", buildJsonObject {
                             put("type", "string")
-                            put("description", "可选但约定必填，受约方：user（用户）/character（角色自己）/relationship（双方）/群组成员名")
+                            put("description", "可选但约定必填，受约方：$partyValues")
                         })
                         put("timeRef", timeRefSchema())
-                        put("memberName", buildJsonObject {
-                            put("type", "string")
-                            put("description", "可选，群组对话中指定记入某位成员的私人记忆（不传则记入群组共享记忆）")
-                        })
+                        if (isGroup) {
+                            put("memberName", buildJsonObject {
+                                put("type", "string")
+                                put("description", "可选，群组对话中指定记入某位成员的私人记忆（不传则记入群组共享记忆）")
+                            })
+                        }
                     },
                 )
                 put("required", buildJsonArray { add("category"); add("key"); add("value") })
@@ -267,7 +263,36 @@ class SubmitResponseTool : AgentTool {
         )
     }
 
-    // timeRefSchema() is shared; see ToolSchemas.kt.
+    // timeRefSchema() is the single canonical definition (used by longTermSchema and
+    // set_reminder); every other site uses the compact timeRefPointerSchema().
+
+    /** Group-only: per-member dynamic state; reuses the same field shape as `dynamicState`. */
+    private fun memberDynamicStateSchema(dynProps: JsonElement): JsonElement = buildJsonObject {
+        put("type", "array")
+        put("description", "群组成员动态状态（仅群组对话使用）")
+        put(
+            "items",
+            buildJsonObject {
+                put("type", "object")
+                put("additionalProperties", false)
+                put(
+                    "properties",
+                    buildJsonObject {
+                        put("memberName", buildJsonObject { put("type", "string") })
+                        put(
+                            "dynamicState",
+                            buildJsonObject {
+                                put("type", "object")
+                                put("additionalProperties", false)
+                                put("properties", dynProps)
+                            },
+                        )
+                    },
+                )
+                put("required", buildJsonArray { add("memberName") })
+            },
+        )
+    }
 
     private fun stringArraySchema(): JsonElement = buildJsonObject {
         put("type", "array")

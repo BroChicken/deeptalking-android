@@ -46,7 +46,7 @@ class UpdateMemoryTool(private val memory: MemoryService) : AgentTool {
                 put("promisee", buildJsonObject { put("type", "string"); put("description", "可选，约定的受约方（user / character / relationship / 群组成员名）") })
                 put("eventTime", buildJsonObject { put("type", "string"); put("description", "可选，修正事件发生时间（ISO格式）") })
                 put("dueAt", buildJsonObject { put("type", "string"); put("description", "可选，修正约定的截止时间（ISO格式）") })
-                put("timeRef", timeRefSchema())
+                put("timeRef", timeRefPointerSchema())
                 put("sourceMessageIds", buildJsonObject {
                     put("type", "array"); put("items", buildJsonObject { put("type", "string") })
                     put("description", "用户纠正原话所在的消息ID")

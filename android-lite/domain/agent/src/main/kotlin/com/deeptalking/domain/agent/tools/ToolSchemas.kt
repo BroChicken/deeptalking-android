@@ -60,3 +60,27 @@ internal fun timeRefSchema(): JsonElement = buildJsonObject {
         },
     )
 }
+
+/**
+ * Compact stand-in for [timeRefSchema], used at every site except the one canonical
+ * definition (`submit_response.longTerm.timeRef`).
+ *
+ * The full contract is already in the same request, so repeating its ~1.1k-char
+ * descriptions 20+ times only dilutes attention. Key names stay visible so the
+ * model still emits the right shape; client-side parsing is unchanged.
+ */
+internal fun timeRefPointerSchema(): JsonElement = buildJsonObject {
+    put("type", "object")
+    put("additionalProperties", false)
+    put("description", "相对时间词元：结构、取值与示例见 submit_response.longTerm.timeRef（本请求内已有完整定义）")
+    put(
+        "properties",
+        buildJsonObject {
+            put("anchor", buildJsonObject { put("type", "string") })
+            put("offsetDays", buildJsonObject { put("type", "integer") })
+            put("weekday", buildJsonObject { put("type", "string") })
+            put("slot", buildJsonObject { put("type", "string") })
+            put("explicit", buildJsonObject { put("type", "string") })
+        },
+    )
+}

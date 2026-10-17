@@ -26,7 +26,7 @@ class SendStickerTool(private val stickersEnabled: Boolean = true) : AgentTool {
     )
 
     /** Per-character schema: the `tag` enum mirrors the legacy `buildAgentTools` tag list. */
-    fun definitionFor(context: AgentContext): ToolDefinition {
+    override fun definitionFor(context: AgentContext): ToolDefinition {
         val tags = context.character.stickers.map { it.tag }.distinct()
         if (tags.isEmpty()) return definition
         val description = "给用户发一个表情包（贴图）。tag 必须从这些可用标签中选择其一：" +

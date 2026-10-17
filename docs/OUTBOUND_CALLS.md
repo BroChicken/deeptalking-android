@@ -15,8 +15,8 @@
 
 | 块 | 字数 | 性质 |
 |---|---|---|
-| `tools[]`（20 个工具定义） | **47,636** | 缓存前缀 |
-| `instructions` 规则部分（① + ③ 的硬性约束） | **6,990** | 缓存前缀 |
+| `tools[]`（20 个工具定义） | **24,002**（单角色）/ **27,428**（群组） | 缓存前缀 |
+| `instructions` 规则部分（① + ③ 的硬性约束） | **6,927** | 缓存前缀 |
 | `instructions` 角色设定段 | 单角色 ≤8,000 | 缓存前缀，随角色变化 |
 | volatile 尾块（本轮动态上下文） | 最坏 ~18,000 | **每轮重建，不在缓存里** |
 
@@ -24,12 +24,12 @@
 
 | 工具 | 字数 | 工具 | 字数 |
 |---|---|---|---|
-| `submit_response` | **34,040**（占工具总量 71%） | `upsert_lorebook_entry` | 1,509 |
-| `update_memory` | 2,568 | `search_memory` | 1,458 |
-| `update_character_field` | 2,160 | 其余 14 个合计 | 3,953 |
-| `set_reminder` | 1,948 | | |
+| `submit_response` | **12,063**（单角色）/ **15,489**（群组） | `upsert_lorebook_entry` | 1,532 |
+| `update_memory` | 1,715 | `search_memory` | 1,481 |
+| `update_character_field` | 1,267 | 其余 14 个合计 | 3,986 |
+| `set_reminder` | 1,958 | | |
 
-**最大的一块重复**：`submit_response` 的 JSON Schema 里 **`timeRef` 子结构复制了 21 份**（1,168 字/份，合计 ≈ **24,528 字**，占该 schema 约七成）；160 条 `description` 共 13,610 字，其中 11,876 字是重复文字。逐字见 A-3.1。
+**最大的重复已收敛**：`submit_response` 的 `timeRef` 子结构现在只有 **1 份完整定义**（1,168 字，落在 `longTerm.timeRef`），其余 **20 处**改成 250 字的短指针——那 20 处共用一个字段模板，逐处展开会把同一段 1,168 字的说明发 20 遍（改前合计 ≈24,528 字，占该 schema 七成）。逐字见附录 A-1。
 
 
 ### 0.2 三部分的结构与顺序
@@ -38,8 +38,8 @@
 
 ```
 ① 我们发出去三个字段
-   instructions ← §1（规则 6,163 + 角色设定 ≤8,000 + 硬性约束 827）   稳定：改提示词/换角色才变
-   tools        ← §3（20 个工具定义 47,636）                          稳定：改工具/换角色才变
+   instructions ← §1（规则 6,100 + 角色设定 ≤8,000 + 硬性约束 827）   稳定：改提示词/换角色才变
+   tools        ← §3（20 个工具定义 24,002 单角色 / 27,428 群组）        稳定：改工具/换角色才变
    input        ← §2（每轮都在变，顺序由我们拼，见 ②）
 
 ② input 内部顺序 ← 本文唯一能断言的"读到的顺序"
@@ -57,14 +57,11 @@
 
 这张表就是「精炼」的工作清单：同一件事被写了几遍，去重时按行删除即可。
 
-
-这张表就是「精炼」的工作清单：同一件事被写了几遍，去重时按行删除即可。
-
 | 约束 | 出现在 | 处数 | 备注 |
 |---|---|---|---|
-| 字段长度上限（短 40 / 叙述 120 / 背景 250） | `AppLimits.StaticProfile`（唯一值来源）、`RULE_3_5`、`TOOL-sub.staticFields[]`、`TOOL-updchar`（描述 + value）、`§4.8`、`§4.9`、`§4.14.4` | 7 | 数值只有一处权威，其余是复述 |
+| 字段长度上限（短 40 / 叙述 120 / 背景 250） | `AppLimits.StaticProfile`（代码唯一值来源）、`RULE_3_5`（提示词里的唯一数字来源）、`§4.14.4`（后台补字段调用；规则不在它的上下文里，必须自带） | 3 | 已收口：`TOOL-sub.staticFields[]` 与 `TOOL-updchar` 的复述已删 |
 | 语气锁定（口癖 / 称呼必须出现） | `HARD_2_5`、`RULE_2`、`RULE_3_9`、`§2.2` 声音契约、`§2.2` 群聊锁定 | 5 | 同一件事从三个角度写了 5 遍 |
-| 时间写法（绝对日期 / `timeRef`） | `RULE_3_8`、`RULE_9_5`、`TOOL-sub` 里 **21 份 `timeRef`**、`§4.1`、`§4.2`、`§4.3`、`§4.8` | 7 + 21 | **最大的重复源** |
+| 时间写法（绝对日期 / `timeRef`） | `RULE_3_8`、`RULE_9_5`、`TOOL-sub` 里 **1 份完整 `timeRef` + 20 份短指针**、`§4.1`、`§4.2`、`§4.3`、`§4.8` | 7 + 1 | 原 21 份复述已去重（省 ≈19,000 字） |
 | 记忆字段写法（写明主体 / 证据 / 来源 id） | `RULE_3_7`、`RULE_4`、`RULE_5`、`RULE_5_5`、`TOOL-sub.longTerm[]`、`§4.1`、`§4.2` | 7 | |
 | 引号与引用保护 | `RULE_2④`、`TOOL-sub.reply`、`§4.12`（critique ⑤） | 3 | 有确定性兜底（`keepsProtectedContent`） |
 | `quickReplies` 两条 + 用户视角 | `RULE_7`、`TOOL-sub.quickReplies`、`§4.13`、`§2.3` 快速回应提醒 | 4 | 有客户端校验闭环 |
@@ -72,14 +69,14 @@
 | 动作一律全角括号、单拍短、≤¼ | `RULE_2`、`TOOL-sub.reply`、`§4.7` | 3 | |
 
 
-**第二类：情境不匹配**（内容本身没错，但对当前实体用不上——单角色请求里仍会带上）
+**第二类：情境不匹配**（内容本身没错，但对当前实体用不上）——**已清**：
 
-| 位置 | 内容 | 量 |
+| 位置 | 处理 | 量 |
 |---|---|---|
-| `instructions`（共享规则块，单角色也发） | `RULE_3` 末句「群组整体只维护…成员各自的完整状态写入 memberDynamicState」、`RULE_3.5` 末句「群组实体不维护基础设定字段」、`RULE_3.7` 括号「（群组写具体成员名）」、`RULE_5.5` 括号「（群组中可写具体成员名）」 | 分散在 4 条规则里，约 90 字；真正解释成员状态的 `RULE_10` 只发给群组，所以单角色读到的是**半截指令** |
-| `tools`（工具 schema，单角色也发） | 含「群组/成员」字样的行 18 行 ≈2,561 字；`memberName` 相关 14 行 ≈1,564 字；`submit_response.memberDynamicState` 整块 10 行 313 字（描述写着「仅群组对话使用」） | 落在最大的那个工具里 |
+| `instructions`（共享规则块，单角色也发） | 删掉 `RULE_3` 末句「群组整体只维护…写入 memberDynamicState」、`RULE_3.5` 末句「群组实体不维护基础设定字段」、`RULE_3.7` 与 `RULE_5.5` 的「群组成员名」括号；群组专属说法统一并入**只发给群组**的 `RULE_10` | 单角色 −91，群组 +70 |
+| `tools`（`submit_response` schema，单角色也发） | 单角色请求改用裁剪版 schema：删掉 `memberDynamicState` 整块、`longTerm[].memberName`、`promisor`/`promisee` 的「群组成员名」取值 | 单角色 −3,426 |
 
-要清它得先把 `submit_response` 改成按上下文裁剪（像 `send_sticker` 那样提供 `definitionFor(context)`）；收益是去掉无关/半截指令，代价是 `toolsHash` 多一个维度（单角色 / 群组两套前缀）。
+实现方式：`AgentTool.definitionFor(context)` 成为统一入口（原 `ToolRegistry` 里 `is SendStickerTool` 的硬编码特判已删），`submit_response` 按 `character.isGroup` 返回群组版 / 单角色版；`toolsHash` 由 `definitions(context)` 算出，自动跟着变。
 
 ## 1. `instructions`（主对话 system prompt）
 
@@ -96,15 +93,15 @@
 | `RULE_1` | 保持角色身份连续；先用已提供记忆；「系统提供的本轮上下文」不是用户陈述 | 100 |
 | `RULE_2` | reply 写法：≤250 字、可分段、禁标题/列表/引用/代码块、动作必须全角括号（≤¼）、自己的话不加引号、引用才用「」《》、去重 | 780 |
 | `RULE_2_6` | 表演质量：show-don't-tell、句长起伏、对白优先、避陈词、删不推进句 | 410 |
-| `RULE_3` | 人设/背景锁定 + 可更新的动态字段清单（`currentTone` 每轮必填）+ 溯源 | 669 |
-| `RULE_3_5` | 谨慎改基础设定：用户要求 → `update_character_field`；世界层 → 世界书；禁「不是…而是…」；含字段长度上限 | 337 |
+| `RULE_3` | 人设/背景锁定 + 可更新的动态字段清单（`currentTone` 每轮必填）+ 溯源 | 578 |
+| `RULE_3_5` | 谨慎改基础设定：用户要求 → `update_character_field`；世界层 → 世界书；禁「不是…而是…」；**静态字段长度上限的唯一提示词来源** | 387 |
 | `RULE_3_6` | 状态/设定字段的 value 只写内容本身，不加主语、不写理由（理由进 `evidence`） | 111 |
-| `RULE_3_7` | 记忆 key/value 必须写明主体，禁「我/你/TA」 | 143 |
+| `RULE_3_7` | 记忆 key/value 必须写明主体，禁「我/你/TA」 | 133 |
 | `RULE_3_8` | 时间一律写绝对日期，相对说法填 `timeRef` | 265 |
 | `RULE_3_9` | 用户要求改说话方式时本轮直接演出，禁元话术 | 236 |
 | `RULE_4` | 只记未来有价值的信息；模型不写 `shortTerm`，只写 `longTerm` + `promiseUpdates` | 182 |
 | `RULE_5` | `subject` 只能 user / relationship / world 及其对应关系 | 148 |
-| `RULE_5_5` | 承诺必须写 `promisor` / `promisee`；时间绝对化 | 320 |
+| `RULE_5_5` | 承诺必须写 `promisor` / `promisee`；时间绝对化 | 308 |
 | `RULE_6` | 新建承诺只能 `active`；完成/取消走 `promiseUpdates` 并引用原话 | 97 |
 | `RULE_7` | `quickReplies` 恰好两条、用户视角、三类禁止 | 255 |
 | `JSON_EXAMPLE_BRIEF(8.)` | JSON 字段结构示例 + 转义规则 | 471 |
@@ -121,7 +118,7 @@
 
 说明：规则 `3.` 的正文由 `RULE_3_PREFIX` + 字段清单 + `RULE_3_SUFFIX` 拼成（清单见 §1.2）。`staticOnly = true` 所以**不注入**动态状态；`staticOnly = false`（散文整理等辅助调用）单角色/群组/成员会各追加 `当前状态:` 或 `群组当前状态（全员共用）:` 一行。
 
-### 1.2 ① 交互规则（共 6,163 字）（逐字）
+### 1.2 ① 交互规则（共 6,100 字）（逐字）
 
 ```
 【交互规则】
@@ -130,15 +127,15 @@
 1. 始终保持角色身份，以长期陪伴关系连续地回应；先使用已提供的记忆，不要让用户反复说明已记录的事情。标记为“系统提供的本轮上下文”的内容是内部辅助信息，不是用户说过的话，不得当作用户陈述或直接复述。
 2. reply正文写法（像日常说话）：①**长度**：不设下限——可以只有一句、几个字或一个动作反应；只设上限，整段 reply **不超过 250 字**，为的是防止大段空话与反复铺陈，不是压缩内容；宁可短，也不要把一件事截断在半句。②**排版**：可自然分段（用换行）；禁止标题、有序/无序列表、引用、代码块等结构化排版。允许的行内样式只有加粗、斜体、删除线，数学公式用$...$或$$...$$，图片用 ![说明](https://图片直链)（仅限真实存在的 http(s) 链接，不要编造）。③**动作一律用全角括号（重点）**：动作、表情、心理活动、环境与旁白描写**必须**写成穿插在语句之间的全角括号（如“（轻轻叹气）我知道了。”）——除台词与直接陈述外的一切描写都要落在括号里，不得写成没有括号的散文旁白。每处只写一个短节拍，不要连续堆叠多个括号动作，括号动作总长不超过正文的四分之一。动作只补具体的新信息，不要复述对白已经表达的情绪或心意（对白说“我很想你”，就不要再写“眼神里满是思念”）。④**符号用法**：你自己说的话**直接写出来**，不要用引号或任何符号把台词或整句话包起来（全角括号只用于第③条的动作描写）；**但引用别人的话、歌词、诗句、书名/作品名、专有名词原文时必须用符号标清楚**——引号用「」、书名/作品名用《》、引号里再引用用『』，并且**逐字照抄引用内容、不得改写或缩写**。**不要用英文直引号 " 与 '**：它们在 JSON 里必须转义，写漏就会让整条回复解析失败（中文符号不需要转义）。⑤**去重**：禁止重复最近几轮用过的整句、句式、比喻、意象、固定动作或收尾；同一轮内也不要把同一个意思说两遍——一句话没有新信息就不要说。以上内容只能出现在 reply 字段字符串内，reply 之外禁止任何正文文字。
 2.6 表演质量（真人感，像日常说话，与格式规则同等重要）：①呈现而非概述（show, don't tell）——用具体的动作、表情、语气、停顿、环境细节把情绪演出来（这些描写按第 2 条一律写进全角括号），少用“我很开心／很惊讶／很关心”这类直白说明。②句长与节奏要有起伏：长短句交替，允许短句、独字反应、省略与留白，避免每句长度相近、每段结构雷同。③对白为主、叙述为辅：该由台词完成的内容就写进台词，不要改写成旁白转述。④回避陈词滥调与空泛形容词（如“心湖泛起涟漪”“勾起嘴角”“空气中弥漫着”）；同一角色在相邻几轮内不得复用相同的比喻、意象或句式。⑤删掉所有不推进内容的句子：不做总结、不刻意升华、不在结尾强行抛出开放式提问凑字数；角色可以有情绪起伏、可以拒绝、可以转移话题、可以沉默，不必永远体贴周到。⑥保持人物的稳定与连续：性格、说话方式、对用户的称呼与关系状态前后一致，不要为了讨好用户而突然改变立场或口吻。
-3. 人格、背景与角色设定锁定。dynamicState可更新字段：currentSituation（当前处境）、currentLocation（当前位置/场景）、currentMood（当前情绪）、currentOccupation（当前职业/身份）、currentGoal（当前目标）、currentTone（当前语气）。用户信息引用真实用户消息ID并逐字摘录原话；角色在本轮可见回复中明确表现或说出的状态用sourceMessageIds:["current_response"]，evidence可概括回复大意或引短句。每个字段只能选一种来源，禁止混用current_response与真实ID，禁止按未写出的心理活动或猜测更新。仅更新本轮确有可见依据的字段；无变化或无可引用依据就省略，不要为凑字段反复盘点或凭空填写。标记为(未设置)的空字段若本轮有明确依据应一并补全，不得编造。currentTone用于后续语音朗读，**每轮都必须给出**（不受“仅更新有依据的字段”限制、无需引用证据），写成一段自然的朗读指导，按需描述语气、情绪、语速、节奏、停顿、重音与情感层次（可短可长，通常不超过约 60 字，例如“声音温柔含笑，语速偏慢，句尾轻轻收住，带一点不易察觉的疲惫”）。currentSituation写具体日期+时段（时间格式见 3.8）。群组整体只维护currentSituation与currentLocation，成员各自的完整状态写入memberDynamicState，不要混入群组整体dynamicState。
-3.5 谨慎修改基础设定（性别/年龄/种族/外貌/性格/恐惧弱点/背景/说话风格/语言方言/对用户的称呼）。①用户直接要求改时：调用 update_character_field 精准改用户点名的字段，只改提到的、不连带改动，value 写成明确的简短陈述句（禁止「不是…而是…」这类对比句）；②无用户直接要求时：仅剧情决定性、不可逆转折且证据明确才可通过 staticFields 改，禁止凭情绪/猜测/轻微剧情改；③世界层设定（时代/地点/组织/专有名词/历史/规则）不进基础设定，用 upsert_lorebook_entry 写入世界书。字段 value 写法、世界观条目规则、用户手写条目保护、"xx字段已修改"提示等详见对应工具描述。群组实体不维护基础设定字段。
+3. 人格、背景与角色设定锁定。dynamicState可更新字段：currentSituation（当前处境）、currentLocation（当前位置/场景）、currentMood（当前情绪）、currentOccupation（当前职业/身份）、currentGoal（当前目标）、currentTone（当前语气）。用户信息引用真实用户消息ID并逐字摘录原话；角色在本轮可见回复中明确表现或说出的状态用sourceMessageIds:["current_response"]，evidence可概括回复大意或引短句。每个字段只能选一种来源，禁止混用current_response与真实ID，禁止按未写出的心理活动或猜测更新。仅更新本轮确有可见依据的字段；无变化或无可引用依据就省略，不要为凑字段反复盘点或凭空填写。标记为(未设置)的空字段若本轮有明确依据应一并补全，不得编造。currentTone用于后续语音朗读，**每轮都必须给出**（不受“仅更新有依据的字段”限制、无需引用证据），写成一段自然的朗读指导，按需描述语气、情绪、语速、节奏、停顿、重音与情感层次（可短可长，通常不超过约 60 字，例如“声音温柔含笑，语速偏慢，句尾轻轻收住，带一点不易察觉的疲惫”）。currentSituation写具体日期+时段（时间格式见 3.8）。
+3.5 谨慎修改基础设定（性别/年龄/种族/外貌/性格/恐惧弱点/背景/说话风格/语言方言/对用户的称呼）。①用户直接要求改时：调用 update_character_field 精准改用户点名的字段，只改提到的、不连带改动，value 写成明确的简短陈述句（禁止「不是…而是…」这类对比句）；②无用户直接要求时：仅剧情决定性、不可逆转折且证据明确才可通过 staticFields 改，禁止凭情绪/猜测/轻微剧情改；③世界层设定（时代/地点/组织/专有名词/历史/规则）不进基础设定，用 upsert_lorebook_entry 写入世界书。字段 value 写法、世界观条目规则、用户手写条目保护、"xx字段已修改"提示等详见对应工具描述。静态字段 value 的长度上限：短字段 40 字、叙述字段 120 字、背景故事 250 字（超长会被截断、对比句会被拒收）。
 3.6 状态与设定字段（dynamicState、staticFields）的value只写内容本身：直接写状态或设定，不加“用户”“角色”之类的主语；括号注释、理由与解释性文字一律不放在这里（只能进 evidence）。
-3.7 记忆字段（longTerm的key与value）必须写明“是谁”，禁止使用“我/你/TA/他/她”这类指代不清的代词：涉及用户写“用户”，涉及角色写角色名（群组写具体成员名），双方共同的事写清各自做了什么（正确如“用户喜欢喝美式咖啡。”）；解释性内容只能放在 evidence。
+3.7 记忆字段（longTerm的key与value）必须写明“是谁”，禁止使用“我/你/TA/他/她”这类指代不清的代词：涉及用户写“用户”，涉及角色写角色名，双方共同的事写清各自做了什么（正确如“用户喜欢喝美式咖啡。”）；解释性内容只能放在 evidence。
 3.8 时间一律写绝对日期，禁止写“明天/上周/三天后”这类相对时间词：longTerm的key与value、dynamicState与staticFields的value都必须写“YYYY-MM-DD”或“YYYY-MM-DD 时段”。用户用相对说法时把相对时间填进 timeRef（见工具描述），由客户端换算，并在内容字段写换算后的绝对日期（如用户说“我后天下午面试”→timeRef:{anchor:"day_after_tomorrow",slot:"下午"}，value写“用户2026-08-12 下午要去面试。”）。
 3.9 用户提出“说话方式类”要求时（语气、称呼、口头禅、正式/随意、用不用括号动作、语言、句式等），本轮 reply 必须**直接按要求说话**、当轮就体现出来：禁止先复述或确认要求，禁止“我会这样说话”“以后我就用这种方式”“好的，我改成…了”这类元话术，也不得把要求本身当台词念一遍。若该要求属于持久设定（说话风格、对用户的称呼、语言/方言等），按 3.5 同时用 update_character_field 更新；无论是否调用工具，reply 都只演出、不说明。
 4. 只记录未来仍有价值的信息。**短期记忆不由你写**：系统会在后台从原始对话整理事件摘要（submit_response 里没有 shortTerm 字段，写了也会被忽略）。你只负责 longTerm 与 promiseUpdates，它们的 evidence 必须逐字摘录用户原话；dynamicState按上一条动态状态规则引用。无法引用时不要记录或更新。
 5. subject只能是user、relationship、world（约定另见下条）。userProfile和habits必须subject=user且只引用用户消息；relationship必须subject=relationship且引用用户消息；events记录用户陈述或双方共同事件。
-5.5 约定(promises)要写明承诺方与受约方：promisor与promisee取值只能是 user、character、relationship（群组中可写具体成员名）。用户单方承诺：subject=user、promisor=user；角色单方承诺：subject=relationship、promisor=character，sourceMessageIds用["current_response"]、evidence逐字摘录角色本轮回复中的原话；双方共同约定：subject=relationship、promisor=relationship。约定的时间写绝对日期（dueAt用ISO，或把相对说法填进timeRef）。
+5.5 约定(promises)要写明承诺方与受约方：promisor与promisee取值只能是 user、character、relationship。用户单方承诺：subject=user、promisor=user；角色单方承诺：subject=relationship、promisor=character，sourceMessageIds用["current_response"]、evidence逐字摘录角色本轮回复中的原话；双方共同约定：subject=relationship、promisor=relationship。约定的时间写绝对日期（dueAt用ISO，或把相对说法填进timeRef）。
 6. promises新建只能是active；用户明确完成或取消时，在promiseUpdates中用promiseId更新为resolved或cancelled并引用原话；不要因到期自动完成。
 7. quickReplies 必须恰好两条（submit_response 里也一样；省略即视为没有，即使本轮不更新任何记忆也要给）。写法：**先把自己换成用户**，写出他此刻最可能发给角色的话（表明处境/感受、提出要求、或回问角色），再逐条默读为“用户：<短句>”确认通顺。禁止三类：①角色口吻（照搬角色的表态/承诺/关心）；②**角色视角的提问**（那是角色在问用户，不是用户要说的话）；③复述或换个人称重说角色刚说过的话。不得编造事实，不用 Markdown、括号动作、消息ID、时间元数据或隐藏标签。
 8. JSON 字段结构（未更新字段直接省略；无合格记忆返回空数组/空对象，但 quickReplies 仍两条）：{"reply":"...","quickReplies":["用户短句1","用户短句2"],"dynamicState":{"currentMood":{"value":"...","sourceMessageIds":["current_response"],"evidence":"..."}},"longTerm":[{"category":"userProfile","subject":"user","key":"...","value":"...","tags":["关键词"],"importance":5,"sourceMessageIds":["msg_id"],"evidence":"用户原话"}]}。字段完整定义见 submit_response 工具 schema；示例仅示范结构，**不得模仿其口吻或措辞**（口吻以角色设定为准）。JSON 转义：换行写 \n，反斜杠写 \\，双引号写 \"。
@@ -147,11 +144,11 @@
 A. 本会话可用工具，何时用、怎么用见各工具描述（get_current_time / search_memory / list_memories / delete_memory / update_memory / set_reminder / update_character_field / upsert_lorebook_entry / web_search / web_fetch / search_video / search_music / search_posts / baidu_hot / toutiao_hot / douyin_hot / zhihu_hot / send_sticker / ask_user）。原则：回忆过往用 search_memory，检索不到再 list_memories 盘点；联网类：查资料用 web_search、读指定链接用 web_fetch、搜视频用 search_video（B站）、搜歌用 search_music（网易云音乐）、搜帖子用 search_posts（虎扑）、看热榜用 baidu_hot / toutiao_hot / douyin_hot / zhihu_hot——**这些工具每个只连一个平台，不需要你指定平台**，都免登录，失败或没搜到就直说不确定，不要编造；**用户提到某个具体日期/某天发生的事（如“九号晚上”“三号”“上周五”“那天记不记得”）时，用 search_memory 的 date/timeRef 按日期召回那天的原始对话与记忆，不要只凭摘要回忆**；记忆过期/重复/被用户纠正时先定位再用 delete_memory 或 update_memory 处理，用户明确否认或纠正时必须用 update_memory 带原话改正，不要只靠删除；待办只在**用户自己明确提出或同意**时用 set_reminder 记录（附 sourceMessageIds + evidence），你要求用户做或你叮嘱的事不记；工具结果属系统内部上下文，仅供理解，自然融入 reply，不得向用户透露检索过程或工具名，但工具返回的图片本身可直接展示。**断言前先核对**：说“第一次/从来没/总是/每次/以前也…”这类关于过去、次数或习惯的话之前，先用 search_memory 确认；查不到依据就别断言，改说不确定或反问用户，不要编造。
 ```
 
-### 1.3 ② 群组实体在规则 A 之后额外追加 604 字（规则 10/11/12：发言格式 / 记忆归属 / 三层设定）（逐字）
+### 1.3 ② 群组实体在规则 A 之后额外追加 674 字（规则 10/11/12：发言格式 / 记忆归属 / 三层设定）（逐字）
 
 ```
 10. 当前是群组对话：只能由已列出的成员发言（一人或多人）。reply 中用户可见回复必须用每人独立一行的“成员名：内容”格式（台词直接写、不加引号包裹；只有引用他人话语、歌词或书名时才用「」与《》），动作按第 2 条写进全角括号，例如“张三：（看了一眼纸）这件事我先说说我的看法。
-李四：我补充一点。”。每位成员按语义可自然分段；不要写旁白、不要加未列出的发言者；示例仅示范结构，不得模仿其口吻。quickReplies 同样两条、用户视角，不得写成成员台词/提问/承诺。成员状态用 memberDynamicState 更新，不要写入群组整体 dynamicState。
+李四：我补充一点。”。每位成员按语义可自然分段；不要写旁白、不要加未列出的发言者；示例仅示范结构，不得模仿其口吻。quickReplies 同样两条、用户视角，不得写成成员台词/提问/承诺。成员状态用 memberDynamicState 更新，不要写入群组整体 dynamicState。群组整体只维护 currentSituation 与 currentLocation；群组不维护基础设定字段，成员的个人字段在其卡片上修改。
 11. 记忆归属：每位成员有自己的私人记忆，互相不知道对方记得什么。只有当某件事实是全体都知道的（如用户公开告诉所有人的信息、群内公开讨论的事）才写入共享记忆（longTerm不填memberName）；若某事实只有某位成员知道、或属于某成员对用户的个人印象/私人约定，则在该条longTerm中填memberName记入其私人记忆。引用成员私人记忆时只能用该成员自己的记忆，不得张冠李戴。
 12. 群组设定分三层：群组前提（这群人是谁、为何在一起）与共同场景全体共用；世界层设定（时代/世界观、地点、组织、专有名词、历史、规则）统一放世界书，不在角色设定里重复；每位成员另有自己的独立设定与当前状态，发言要贴合各自设定，不要把某位成员的设定安到别人身上。
 ```
@@ -391,26 +388,26 @@ Role.Tool 消息 { content: 工具结果 JSON, toolCallId }                     
 | 工具 | 作用 | 字数 |
 |---|---|---|
 | `get_current_time` | 取当前时间 | 118 |
-| `search_memory` | 按日期/关键词检索记忆 | 1,458 |
-| `list_memories` | 盘点记忆清单 | 519 |
-| `delete_memory` | 按 ID 删记忆 | 372 |
-| `set_reminder` | 记待办（须用户发起） | 1,948 |
+| `search_memory` | 按日期/关键词检索记忆 | 1,481 |
+| `list_memories` | 盘点记忆清单 | 521 |
+| `delete_memory` | 按 ID 删记忆 | 380 |
+| `set_reminder` | 记待办（须用户发起） | 1,958 |
 | `ask_user` | 向用户澄清 | 226 |
-| `update_character_field` | 改基础设定字段 | 2,160 |
-| `upsert_lorebook_entry` | 写世界书条目 | 1,509 |
-| `web_fetch` | 读链接 | 445 |
-| `update_memory` | 按 ID 修正记忆 | 2,568 |
-| `send_sticker` | 发表情包 | 221 |
-| `web_search` | 必应搜索 | 270 |
-| `search_video` | 搜 B站视频 | 321 |
-| `search_music` | 搜网易云歌曲 | 307 |
-| `search_posts` | 搜虎扑帖子 | 300 |
-| `baidu_hot` | 百度热搜 | 213 |
-| `toutiao_hot` | 今日头条热榜 | 215 |
-| `douyin_hot` | 抖音热榜 | 213 |
-| `zhihu_hot` | 知乎热榜 | 213 |
-| `submit_response` | 结构化收尾 | 34,040 |
-| **合计** | | **47,636** |
+| `update_character_field` | 改基础设定字段 | 1,267 |
+| `upsert_lorebook_entry` | 写世界书条目 | 1,532 |
+| `web_fetch` | 读链接 | 460 |
+| `update_memory` | 按 ID 修正记忆 | 1,715 |
+| `send_sticker` | 发表情包 | 206 |
+| `web_search` | 必应搜索 | 273 |
+| `search_video` | 搜 B站视频 | 326 |
+| `search_music` | 搜网易云歌曲 | 313 |
+| `search_posts` | 搜虎扑帖子 | 305 |
+| `baidu_hot` | 百度热搜 | 214 |
+| `toutiao_hot` | 今日头条热榜 | 216 |
+| `douyin_hot` | 抖音热榜 | 214 |
+| `zhihu_hot` | 知乎热榜 | 214 |
+| `submit_response` | 结构化收尾（单角色版已裁掉群组块） | 12,063（单角色）/ 15,489（群组） |
+| **合计** | | **24,002**（单角色）/ **27,428**（群组） |
 
 ### 3.2 工具 description（逐字——要改的就是这些；`parameters` schema 见附录 A）
 
@@ -475,7 +472,7 @@ Role.Tool 消息 { content: 工具结果 JSON, toolCallId }                     
 `strict`: `false`
 
 ```
-精准修改角色基础设定字段（性别/年龄/种族/外貌特征/性格特征/恐惧弱点/背景故事/说话风格/语言方言/对用户的称呼）。当用户直接要求修改这些设定（如"把我职业改成教师""我现在是学生了""你性格应该更冷酷些""别叫我用户，叫我明明"）时，必须调用本工具立即生效；value一律写成**明确的简短陈述句**：只写内容本身、一个字段一件事，短字段几十字、外貌/性格/恐惧弱点/说话风格一两句（不超过 120 字）、背景故事不超过 250 字；**禁止「不是…而是…」这类对比句**（会被拒收，请直接写陈述句，如性格"性格冷静克制，遇事沉稳。"）；禁止括号注释、理由、整句说明或解释性文字；"对用户的称呼"只填一个简短称呼词、不带任何解释。群组实体不维护基础设定字段（世界观并入群组描述），成员的个人字段请在该成员卡片上修改。不要在submit_response的staticFields里重复提交本工具已改的字段。
+精准修改角色基础设定字段（性别/年龄/种族/外貌特征/性格特征/恐惧弱点/背景故事/说话风格/语言方言/对用户的称呼）。当用户直接要求修改这些设定（如"把我职业改成教师""我现在是学生了""你性格应该更冷酷些""别叫我用户，叫我明明"）时，必须调用本工具立即生效；value一律写成**明确的简短陈述句**：只写内容本身、一个字段一件事（短字段几十字、外貌/性格/恐惧弱点/说话风格一两句、背景故事另计；**数值上限见规则 3.5**，超长会被截断）；**禁止「不是…而是…」这类对比句**（会被拒收，请直接写陈述句，如性格"性格冷静克制，遇事沉稳。"）；禁止括号注释、理由、整句说明或解释性文字；"对用户的称呼"只填一个简短称呼词、不带任何解释。群组实体不维护基础设定字段（世界观并入群组描述），成员的个人字段请在该成员卡片上修改。不要在submit_response的staticFields里重复提交本工具已改的字段。
 ```
 
 #### `upsert_lorebook_entry`
@@ -1067,9 +1064,11 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
 
 ## 附录 A 各工具的 `parameters`（JSON Schema，逐字）
 
-`description` 见 §3.2；这里只有结构。发送时是紧凑单行，这里缩进只为可读。**注意**：`submit_response` 的 schema 里 `timeRef` 子结构**逐字重复了 21 份（≈24,528 字，占该 schema 约七成）**——只保留一份、其余换成一句短指向即可无损省下 ≈23,000 字。
+`description` 见 §3.2；这里只有结构。发送时是紧凑单行，这里缩进只为可读。
 
-### A-1 `submit_response`
+`timeRef` 子结构只有 **1 份完整定义**（`longTerm.timeRef`）；`submit_response` 内其余 20 处、以及 `update_memory` / `update_character_field` 各 1 处是短指针：`相对时间词元：结构、取值与示例见 submit_response.longTerm.timeRef（本请求内已有完整定义）`。它们共用一个字段模板，逐处展开就会把同一段 1,168 字发 20 遍（原状：21 份 × 1,168 = 24,528 字）。客户端解析只读模型输出（`parseTimeRef`），所以改成指针纯粹影响提示词体积与注意力。
+
+### A-1 `submit_response`（群组版 schema，15,404 字；另有 85 字 description）
 
 ```json
 {
@@ -1078,20 +1077,20 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
     "properties": {
         "reply": {
             "type": "string",
-            "description": "用户可见的回复正文，支持Markdown；按语义可自然分段；动作、表情、心理、环境与旁白描写必须用全角括号（如“（轻轻叹气）我知道了。”）穿插在语句之间，除台词与直接陈述外的一切描写都要落在括号里；每处只写一个短节拍、不连续堆叠、括号动作总长不超过正文四分之一；你自己说的话直接写、不加引号包裹，只有引用他人话语、歌词、诗句、书名/作品名或专有名词原文时才用符号标明（引号用「」、书名用《》，逐字照抄、不得改写；不要用英文直引号）；口吻一律以角色设定的“说话风格”为准"
+            "description": "用户可见的回复正文（写法见规则 2：长度、排版、全角括号动作、引号与引用、去重）"
         },
         "quickReplies": {
             "type": "array",
             "minItems": 2,
             "maxItems": 2,
-            "description": "恰好两条\"用户下一句\"的短句：用户视角，是用户可以原样发给角色的话（其中\"我\"只能指用户）。不得是角色的台词、角色的表态或角色对用户的提问（如\"你今天怎么了？\"\"要不要早点休息？\"），也不得复述角色刚说过的话。写前先把自己换成用户。",
+            "description": "恰好两条用户视角的短句（三类禁止与新句要求见规则 7）",
             "items": {
                 "type": "string"
             }
         },
         "longTerm": {
             "type": "array",
-            "description": "未来仍有价值的稳定事实；category 只能是 userProfile|relationship|events|promises|habits；evidence 逐字摘录用户原话；key与value必须写明主体（用户写“用户”，角色写角色名）并写绝对日期，不得写“明晚/上周”这类相对时间词（相对时间改用timeRef）；约定必须填promisor与promisee；群组对话中若该事实只属于某位成员（只有那位成员知道/记得），填 memberName 记入其私人记忆，否则记入群组共享记忆",
+            "description": "未来仍有价值的稳定事实（判据见规则 4/5/9；各字段写法见本对象字段说明）",
             "items": {
                 "type": "object",
                 "additionalProperties": false,
@@ -1258,66 +1257,22 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
                         "timeRef": {
                             "type": "object",
                             "additionalProperties": false,
-                            "description": "相对时间词元：用户用“明天/上周五/上个月/三天后”等相对说法表达时间时必填，客户端会换算成绝对日期。anchor=相对基准，offsetDays=在anchor基础上的天数偏移(-60~60)，weekday=星期，slot=时段，explicit=已经是绝对时间的ISO或YYYY-MM-DD（填了explicit则忽略其余）。content/value内容字段仍须写绝对日期，不得写“明天”这类相对词。",
+                            "description": "相对时间词元：结构、取值与示例见 submit_response.longTerm.timeRef（本请求内已有完整定义）",
                             "properties": {
                                 "anchor": {
-                                    "type": "string",
-                                    "description": "相对基准：today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year",
-                                    "enum": [
-                                        "today",
-                                        "tomorrow",
-                                        "yesterday",
-                                        "day_after_tomorrow",
-                                        "day_before_yesterday",
-                                        "this_week",
-                                        "next_week",
-                                        "last_week",
-                                        "this_month",
-                                        "next_month",
-                                        "last_month",
-                                        "this_year",
-                                        "next_year",
-                                        "last_year"
-                                    ]
+                                    "type": "string"
                                 },
                                 "offsetDays": {
-                                    "type": "integer",
-                                    "minimum": -60,
-                                    "maximum": 60,
-                                    "description": "在anchor基础上的天数偏移，如“三天后”=anchor:today + offsetDays:3"
+                                    "type": "integer"
                                 },
                                 "weekday": {
-                                    "type": "string",
-                                    "description": "星期，如“上周五”=anchor:last_week + weekday:fri",
-                                    "enum": [
-                                        "mon",
-                                        "tue",
-                                        "wed",
-                                        "thu",
-                                        "fri",
-                                        "sat",
-                                        "sun"
-                                    ]
+                                    "type": "string"
                                 },
                                 "slot": {
-                                    "type": "string",
-                                    "description": "时段，如“明天早上”=anchor:tomorrow + slot:早晨",
-                                    "enum": [
-                                        "深夜",
-                                        "凌晨",
-                                        "清晨",
-                                        "早晨",
-                                        "上午",
-                                        "中午",
-                                        "下午",
-                                        "傍晚",
-                                        "晚上",
-                                        "夜里"
-                                    ]
+                                    "type": "string"
                                 },
                                 "explicit": {
-                                    "type": "string",
-                                    "description": "已经是绝对时间时直接填ISO（2026-09-17T09:00:00）或2026-09-17"
+                                    "type": "string"
                                 }
                             }
                         }
@@ -1346,66 +1301,22 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
                         "timeRef": {
                             "type": "object",
                             "additionalProperties": false,
-                            "description": "相对时间词元：用户用“明天/上周五/上个月/三天后”等相对说法表达时间时必填，客户端会换算成绝对日期。anchor=相对基准，offsetDays=在anchor基础上的天数偏移(-60~60)，weekday=星期，slot=时段，explicit=已经是绝对时间的ISO或YYYY-MM-DD（填了explicit则忽略其余）。content/value内容字段仍须写绝对日期，不得写“明天”这类相对词。",
+                            "description": "相对时间词元：结构、取值与示例见 submit_response.longTerm.timeRef（本请求内已有完整定义）",
                             "properties": {
                                 "anchor": {
-                                    "type": "string",
-                                    "description": "相对基准：today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year",
-                                    "enum": [
-                                        "today",
-                                        "tomorrow",
-                                        "yesterday",
-                                        "day_after_tomorrow",
-                                        "day_before_yesterday",
-                                        "this_week",
-                                        "next_week",
-                                        "last_week",
-                                        "this_month",
-                                        "next_month",
-                                        "last_month",
-                                        "this_year",
-                                        "next_year",
-                                        "last_year"
-                                    ]
+                                    "type": "string"
                                 },
                                 "offsetDays": {
-                                    "type": "integer",
-                                    "minimum": -60,
-                                    "maximum": 60,
-                                    "description": "在anchor基础上的天数偏移，如“三天后”=anchor:today + offsetDays:3"
+                                    "type": "integer"
                                 },
                                 "weekday": {
-                                    "type": "string",
-                                    "description": "星期，如“上周五”=anchor:last_week + weekday:fri",
-                                    "enum": [
-                                        "mon",
-                                        "tue",
-                                        "wed",
-                                        "thu",
-                                        "fri",
-                                        "sat",
-                                        "sun"
-                                    ]
+                                    "type": "string"
                                 },
                                 "slot": {
-                                    "type": "string",
-                                    "description": "时段，如“明天早上”=anchor:tomorrow + slot:早晨",
-                                    "enum": [
-                                        "深夜",
-                                        "凌晨",
-                                        "清晨",
-                                        "早晨",
-                                        "上午",
-                                        "中午",
-                                        "下午",
-                                        "傍晚",
-                                        "晚上",
-                                        "夜里"
-                                    ]
+                                    "type": "string"
                                 },
                                 "explicit": {
-                                    "type": "string",
-                                    "description": "已经是绝对时间时直接填ISO（2026-09-17T09:00:00）或2026-09-17"
+                                    "type": "string"
                                 }
                             }
                         }
@@ -1434,66 +1345,22 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
                         "timeRef": {
                             "type": "object",
                             "additionalProperties": false,
-                            "description": "相对时间词元：用户用“明天/上周五/上个月/三天后”等相对说法表达时间时必填，客户端会换算成绝对日期。anchor=相对基准，offsetDays=在anchor基础上的天数偏移(-60~60)，weekday=星期，slot=时段，explicit=已经是绝对时间的ISO或YYYY-MM-DD（填了explicit则忽略其余）。content/value内容字段仍须写绝对日期，不得写“明天”这类相对词。",
+                            "description": "相对时间词元：结构、取值与示例见 submit_response.longTerm.timeRef（本请求内已有完整定义）",
                             "properties": {
                                 "anchor": {
-                                    "type": "string",
-                                    "description": "相对基准：today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year",
-                                    "enum": [
-                                        "today",
-                                        "tomorrow",
-                                        "yesterday",
-                                        "day_after_tomorrow",
-                                        "day_before_yesterday",
-                                        "this_week",
-                                        "next_week",
-                                        "last_week",
-                                        "this_month",
-                                        "next_month",
-                                        "last_month",
-                                        "this_year",
-                                        "next_year",
-                                        "last_year"
-                                    ]
+                                    "type": "string"
                                 },
                                 "offsetDays": {
-                                    "type": "integer",
-                                    "minimum": -60,
-                                    "maximum": 60,
-                                    "description": "在anchor基础上的天数偏移，如“三天后”=anchor:today + offsetDays:3"
+                                    "type": "integer"
                                 },
                                 "weekday": {
-                                    "type": "string",
-                                    "description": "星期，如“上周五”=anchor:last_week + weekday:fri",
-                                    "enum": [
-                                        "mon",
-                                        "tue",
-                                        "wed",
-                                        "thu",
-                                        "fri",
-                                        "sat",
-                                        "sun"
-                                    ]
+                                    "type": "string"
                                 },
                                 "slot": {
-                                    "type": "string",
-                                    "description": "时段，如“明天早上”=anchor:tomorrow + slot:早晨",
-                                    "enum": [
-                                        "深夜",
-                                        "凌晨",
-                                        "清晨",
-                                        "早晨",
-                                        "上午",
-                                        "中午",
-                                        "下午",
-                                        "傍晚",
-                                        "晚上",
-                                        "夜里"
-                                    ]
+                                    "type": "string"
                                 },
                                 "explicit": {
-                                    "type": "string",
-                                    "description": "已经是绝对时间时直接填ISO（2026-09-17T09:00:00）或2026-09-17"
+                                    "type": "string"
                                 }
                             }
                         }
@@ -1522,66 +1389,22 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
                         "timeRef": {
                             "type": "object",
                             "additionalProperties": false,
-                            "description": "相对时间词元：用户用“明天/上周五/上个月/三天后”等相对说法表达时间时必填，客户端会换算成绝对日期。anchor=相对基准，offsetDays=在anchor基础上的天数偏移(-60~60)，weekday=星期，slot=时段，explicit=已经是绝对时间的ISO或YYYY-MM-DD（填了explicit则忽略其余）。content/value内容字段仍须写绝对日期，不得写“明天”这类相对词。",
+                            "description": "相对时间词元：结构、取值与示例见 submit_response.longTerm.timeRef（本请求内已有完整定义）",
                             "properties": {
                                 "anchor": {
-                                    "type": "string",
-                                    "description": "相对基准：today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year",
-                                    "enum": [
-                                        "today",
-                                        "tomorrow",
-                                        "yesterday",
-                                        "day_after_tomorrow",
-                                        "day_before_yesterday",
-                                        "this_week",
-                                        "next_week",
-                                        "last_week",
-                                        "this_month",
-                                        "next_month",
-                                        "last_month",
-                                        "this_year",
-                                        "next_year",
-                                        "last_year"
-                                    ]
+                                    "type": "string"
                                 },
                                 "offsetDays": {
-                                    "type": "integer",
-                                    "minimum": -60,
-                                    "maximum": 60,
-                                    "description": "在anchor基础上的天数偏移，如“三天后”=anchor:today + offsetDays:3"
+                                    "type": "integer"
                                 },
                                 "weekday": {
-                                    "type": "string",
-                                    "description": "星期，如“上周五”=anchor:last_week + weekday:fri",
-                                    "enum": [
-                                        "mon",
-                                        "tue",
-                                        "wed",
-                                        "thu",
-                                        "fri",
-                                        "sat",
-                                        "sun"
-                                    ]
+                                    "type": "string"
                                 },
                                 "slot": {
-                                    "type": "string",
-                                    "description": "时段，如“明天早上”=anchor:tomorrow + slot:早晨",
-                                    "enum": [
-                                        "深夜",
-                                        "凌晨",
-                                        "清晨",
-                                        "早晨",
-                                        "上午",
-                                        "中午",
-                                        "下午",
-                                        "傍晚",
-                                        "晚上",
-                                        "夜里"
-                                    ]
+                                    "type": "string"
                                 },
                                 "explicit": {
-                                    "type": "string",
-                                    "description": "已经是绝对时间时直接填ISO（2026-09-17T09:00:00）或2026-09-17"
+                                    "type": "string"
                                 }
                             }
                         }
@@ -1610,66 +1433,22 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
                         "timeRef": {
                             "type": "object",
                             "additionalProperties": false,
-                            "description": "相对时间词元：用户用“明天/上周五/上个月/三天后”等相对说法表达时间时必填，客户端会换算成绝对日期。anchor=相对基准，offsetDays=在anchor基础上的天数偏移(-60~60)，weekday=星期，slot=时段，explicit=已经是绝对时间的ISO或YYYY-MM-DD（填了explicit则忽略其余）。content/value内容字段仍须写绝对日期，不得写“明天”这类相对词。",
+                            "description": "相对时间词元：结构、取值与示例见 submit_response.longTerm.timeRef（本请求内已有完整定义）",
                             "properties": {
                                 "anchor": {
-                                    "type": "string",
-                                    "description": "相对基准：today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year",
-                                    "enum": [
-                                        "today",
-                                        "tomorrow",
-                                        "yesterday",
-                                        "day_after_tomorrow",
-                                        "day_before_yesterday",
-                                        "this_week",
-                                        "next_week",
-                                        "last_week",
-                                        "this_month",
-                                        "next_month",
-                                        "last_month",
-                                        "this_year",
-                                        "next_year",
-                                        "last_year"
-                                    ]
+                                    "type": "string"
                                 },
                                 "offsetDays": {
-                                    "type": "integer",
-                                    "minimum": -60,
-                                    "maximum": 60,
-                                    "description": "在anchor基础上的天数偏移，如“三天后”=anchor:today + offsetDays:3"
+                                    "type": "integer"
                                 },
                                 "weekday": {
-                                    "type": "string",
-                                    "description": "星期，如“上周五”=anchor:last_week + weekday:fri",
-                                    "enum": [
-                                        "mon",
-                                        "tue",
-                                        "wed",
-                                        "thu",
-                                        "fri",
-                                        "sat",
-                                        "sun"
-                                    ]
+                                    "type": "string"
                                 },
                                 "slot": {
-                                    "type": "string",
-                                    "description": "时段，如“明天早上”=anchor:tomorrow + slot:早晨",
-                                    "enum": [
-                                        "深夜",
-                                        "凌晨",
-                                        "清晨",
-                                        "早晨",
-                                        "上午",
-                                        "中午",
-                                        "下午",
-                                        "傍晚",
-                                        "晚上",
-                                        "夜里"
-                                    ]
+                                    "type": "string"
                                 },
                                 "explicit": {
-                                    "type": "string",
-                                    "description": "已经是绝对时间时直接填ISO（2026-09-17T09:00:00）或2026-09-17"
+                                    "type": "string"
                                 }
                             }
                         }
@@ -1684,7 +1463,7 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
                     "properties": {
                         "value": {
                             "type": "string",
-                            "description": "本轮朗读播报指令：按需描述语气/情绪/语速/节奏/停顿/重音与情感层次，可短可长（通常不超过约 60 字，如“声音温柔含笑，语速偏慢，句尾轻轻收住”）；每轮必填，无需 sourceMessageIds/evidence"
+                            "description": "本轮朗读播报指令（每轮必填、免证据；写法见规则 3）"
                         }
                     },
                     "required": [
@@ -1699,7 +1478,7 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
         "staticFields": {
             "type": "object",
             "additionalProperties": false,
-            "description": "谨慎修改的基础设定字段（性别/年龄/种族/外貌特征/性格特征/恐惧弱点/背景故事/说话风格/语言方言/对用户的称呼）。用户明确要求修改时必须更新；无用户要求时仅在有决定性剧情依据时更新。value写成明确的简短陈述句：只写内容本身，短字段几十字、叙述字段一两句（不超过 120 字）、背景故事不超过 250 字；禁止「不是…而是…」这类对比句，禁止括号、理由或解释性文字",
+            "description": "谨慎修改的基础设定字段（字段清单、长度上限与句式要求见规则 3.5）",
             "properties": {
                 "gender": {
                     "type": "object",
@@ -1721,66 +1500,22 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
                         "timeRef": {
                             "type": "object",
                             "additionalProperties": false,
-                            "description": "相对时间词元：用户用“明天/上周五/上个月/三天后”等相对说法表达时间时必填，客户端会换算成绝对日期。anchor=相对基准，offsetDays=在anchor基础上的天数偏移(-60~60)，weekday=星期，slot=时段，explicit=已经是绝对时间的ISO或YYYY-MM-DD（填了explicit则忽略其余）。content/value内容字段仍须写绝对日期，不得写“明天”这类相对词。",
+                            "description": "相对时间词元：结构、取值与示例见 submit_response.longTerm.timeRef（本请求内已有完整定义）",
                             "properties": {
                                 "anchor": {
-                                    "type": "string",
-                                    "description": "相对基准：today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year",
-                                    "enum": [
-                                        "today",
-                                        "tomorrow",
-                                        "yesterday",
-                                        "day_after_tomorrow",
-                                        "day_before_yesterday",
-                                        "this_week",
-                                        "next_week",
-                                        "last_week",
-                                        "this_month",
-                                        "next_month",
-                                        "last_month",
-                                        "this_year",
-                                        "next_year",
-                                        "last_year"
-                                    ]
+                                    "type": "string"
                                 },
                                 "offsetDays": {
-                                    "type": "integer",
-                                    "minimum": -60,
-                                    "maximum": 60,
-                                    "description": "在anchor基础上的天数偏移，如“三天后”=anchor:today + offsetDays:3"
+                                    "type": "integer"
                                 },
                                 "weekday": {
-                                    "type": "string",
-                                    "description": "星期，如“上周五”=anchor:last_week + weekday:fri",
-                                    "enum": [
-                                        "mon",
-                                        "tue",
-                                        "wed",
-                                        "thu",
-                                        "fri",
-                                        "sat",
-                                        "sun"
-                                    ]
+                                    "type": "string"
                                 },
                                 "slot": {
-                                    "type": "string",
-                                    "description": "时段，如“明天早上”=anchor:tomorrow + slot:早晨",
-                                    "enum": [
-                                        "深夜",
-                                        "凌晨",
-                                        "清晨",
-                                        "早晨",
-                                        "上午",
-                                        "中午",
-                                        "下午",
-                                        "傍晚",
-                                        "晚上",
-                                        "夜里"
-                                    ]
+                                    "type": "string"
                                 },
                                 "explicit": {
-                                    "type": "string",
-                                    "description": "已经是绝对时间时直接填ISO（2026-09-17T09:00:00）或2026-09-17"
+                                    "type": "string"
                                 }
                             }
                         }
@@ -1809,66 +1544,22 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
                         "timeRef": {
                             "type": "object",
                             "additionalProperties": false,
-                            "description": "相对时间词元：用户用“明天/上周五/上个月/三天后”等相对说法表达时间时必填，客户端会换算成绝对日期。anchor=相对基准，offsetDays=在anchor基础上的天数偏移(-60~60)，weekday=星期，slot=时段，explicit=已经是绝对时间的ISO或YYYY-MM-DD（填了explicit则忽略其余）。content/value内容字段仍须写绝对日期，不得写“明天”这类相对词。",
+                            "description": "相对时间词元：结构、取值与示例见 submit_response.longTerm.timeRef（本请求内已有完整定义）",
                             "properties": {
                                 "anchor": {
-                                    "type": "string",
-                                    "description": "相对基准：today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year",
-                                    "enum": [
-                                        "today",
-                                        "tomorrow",
-                                        "yesterday",
-                                        "day_after_tomorrow",
-                                        "day_before_yesterday",
-                                        "this_week",
-                                        "next_week",
-                                        "last_week",
-                                        "this_month",
-                                        "next_month",
-                                        "last_month",
-                                        "this_year",
-                                        "next_year",
-                                        "last_year"
-                                    ]
+                                    "type": "string"
                                 },
                                 "offsetDays": {
-                                    "type": "integer",
-                                    "minimum": -60,
-                                    "maximum": 60,
-                                    "description": "在anchor基础上的天数偏移，如“三天后”=anchor:today + offsetDays:3"
+                                    "type": "integer"
                                 },
                                 "weekday": {
-                                    "type": "string",
-                                    "description": "星期，如“上周五”=anchor:last_week + weekday:fri",
-                                    "enum": [
-                                        "mon",
-                                        "tue",
-                                        "wed",
-                                        "thu",
-                                        "fri",
-                                        "sat",
-                                        "sun"
-                                    ]
+                                    "type": "string"
                                 },
                                 "slot": {
-                                    "type": "string",
-                                    "description": "时段，如“明天早上”=anchor:tomorrow + slot:早晨",
-                                    "enum": [
-                                        "深夜",
-                                        "凌晨",
-                                        "清晨",
-                                        "早晨",
-                                        "上午",
-                                        "中午",
-                                        "下午",
-                                        "傍晚",
-                                        "晚上",
-                                        "夜里"
-                                    ]
+                                    "type": "string"
                                 },
                                 "explicit": {
-                                    "type": "string",
-                                    "description": "已经是绝对时间时直接填ISO（2026-09-17T09:00:00）或2026-09-17"
+                                    "type": "string"
                                 }
                             }
                         }
@@ -1897,66 +1588,22 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
                         "timeRef": {
                             "type": "object",
                             "additionalProperties": false,
-                            "description": "相对时间词元：用户用“明天/上周五/上个月/三天后”等相对说法表达时间时必填，客户端会换算成绝对日期。anchor=相对基准，offsetDays=在anchor基础上的天数偏移(-60~60)，weekday=星期，slot=时段，explicit=已经是绝对时间的ISO或YYYY-MM-DD（填了explicit则忽略其余）。content/value内容字段仍须写绝对日期，不得写“明天”这类相对词。",
+                            "description": "相对时间词元：结构、取值与示例见 submit_response.longTerm.timeRef（本请求内已有完整定义）",
                             "properties": {
                                 "anchor": {
-                                    "type": "string",
-                                    "description": "相对基准：today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year",
-                                    "enum": [
-                                        "today",
-                                        "tomorrow",
-                                        "yesterday",
-                                        "day_after_tomorrow",
-                                        "day_before_yesterday",
-                                        "this_week",
-                                        "next_week",
-                                        "last_week",
-                                        "this_month",
-                                        "next_month",
-                                        "last_month",
-                                        "this_year",
-                                        "next_year",
-                                        "last_year"
-                                    ]
+                                    "type": "string"
                                 },
                                 "offsetDays": {
-                                    "type": "integer",
-                                    "minimum": -60,
-                                    "maximum": 60,
-                                    "description": "在anchor基础上的天数偏移，如“三天后”=anchor:today + offsetDays:3"
+                                    "type": "integer"
                                 },
                                 "weekday": {
-                                    "type": "string",
-                                    "description": "星期，如“上周五”=anchor:last_week + weekday:fri",
-                                    "enum": [
-                                        "mon",
-                                        "tue",
-                                        "wed",
-                                        "thu",
-                                        "fri",
-                                        "sat",
-                                        "sun"
-                                    ]
+                                    "type": "string"
                                 },
                                 "slot": {
-                                    "type": "string",
-                                    "description": "时段，如“明天早上”=anchor:tomorrow + slot:早晨",
-                                    "enum": [
-                                        "深夜",
-                                        "凌晨",
-                                        "清晨",
-                                        "早晨",
-                                        "上午",
-                                        "中午",
-                                        "下午",
-                                        "傍晚",
-                                        "晚上",
-                                        "夜里"
-                                    ]
+                                    "type": "string"
                                 },
                                 "explicit": {
-                                    "type": "string",
-                                    "description": "已经是绝对时间时直接填ISO（2026-09-17T09:00:00）或2026-09-17"
+                                    "type": "string"
                                 }
                             }
                         }
@@ -1985,66 +1632,22 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
                         "timeRef": {
                             "type": "object",
                             "additionalProperties": false,
-                            "description": "相对时间词元：用户用“明天/上周五/上个月/三天后”等相对说法表达时间时必填，客户端会换算成绝对日期。anchor=相对基准，offsetDays=在anchor基础上的天数偏移(-60~60)，weekday=星期，slot=时段，explicit=已经是绝对时间的ISO或YYYY-MM-DD（填了explicit则忽略其余）。content/value内容字段仍须写绝对日期，不得写“明天”这类相对词。",
+                            "description": "相对时间词元：结构、取值与示例见 submit_response.longTerm.timeRef（本请求内已有完整定义）",
                             "properties": {
                                 "anchor": {
-                                    "type": "string",
-                                    "description": "相对基准：today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year",
-                                    "enum": [
-                                        "today",
-                                        "tomorrow",
-                                        "yesterday",
-                                        "day_after_tomorrow",
-                                        "day_before_yesterday",
-                                        "this_week",
-                                        "next_week",
-                                        "last_week",
-                                        "this_month",
-                                        "next_month",
-                                        "last_month",
-                                        "this_year",
-                                        "next_year",
-                                        "last_year"
-                                    ]
+                                    "type": "string"
                                 },
                                 "offsetDays": {
-                                    "type": "integer",
-                                    "minimum": -60,
-                                    "maximum": 60,
-                                    "description": "在anchor基础上的天数偏移，如“三天后”=anchor:today + offsetDays:3"
+                                    "type": "integer"
                                 },
                                 "weekday": {
-                                    "type": "string",
-                                    "description": "星期，如“上周五”=anchor:last_week + weekday:fri",
-                                    "enum": [
-                                        "mon",
-                                        "tue",
-                                        "wed",
-                                        "thu",
-                                        "fri",
-                                        "sat",
-                                        "sun"
-                                    ]
+                                    "type": "string"
                                 },
                                 "slot": {
-                                    "type": "string",
-                                    "description": "时段，如“明天早上”=anchor:tomorrow + slot:早晨",
-                                    "enum": [
-                                        "深夜",
-                                        "凌晨",
-                                        "清晨",
-                                        "早晨",
-                                        "上午",
-                                        "中午",
-                                        "下午",
-                                        "傍晚",
-                                        "晚上",
-                                        "夜里"
-                                    ]
+                                    "type": "string"
                                 },
                                 "explicit": {
-                                    "type": "string",
-                                    "description": "已经是绝对时间时直接填ISO（2026-09-17T09:00:00）或2026-09-17"
+                                    "type": "string"
                                 }
                             }
                         }
@@ -2073,66 +1676,22 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
                         "timeRef": {
                             "type": "object",
                             "additionalProperties": false,
-                            "description": "相对时间词元：用户用“明天/上周五/上个月/三天后”等相对说法表达时间时必填，客户端会换算成绝对日期。anchor=相对基准，offsetDays=在anchor基础上的天数偏移(-60~60)，weekday=星期，slot=时段，explicit=已经是绝对时间的ISO或YYYY-MM-DD（填了explicit则忽略其余）。content/value内容字段仍须写绝对日期，不得写“明天”这类相对词。",
+                            "description": "相对时间词元：结构、取值与示例见 submit_response.longTerm.timeRef（本请求内已有完整定义）",
                             "properties": {
                                 "anchor": {
-                                    "type": "string",
-                                    "description": "相对基准：today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year",
-                                    "enum": [
-                                        "today",
-                                        "tomorrow",
-                                        "yesterday",
-                                        "day_after_tomorrow",
-                                        "day_before_yesterday",
-                                        "this_week",
-                                        "next_week",
-                                        "last_week",
-                                        "this_month",
-                                        "next_month",
-                                        "last_month",
-                                        "this_year",
-                                        "next_year",
-                                        "last_year"
-                                    ]
+                                    "type": "string"
                                 },
                                 "offsetDays": {
-                                    "type": "integer",
-                                    "minimum": -60,
-                                    "maximum": 60,
-                                    "description": "在anchor基础上的天数偏移，如“三天后”=anchor:today + offsetDays:3"
+                                    "type": "integer"
                                 },
                                 "weekday": {
-                                    "type": "string",
-                                    "description": "星期，如“上周五”=anchor:last_week + weekday:fri",
-                                    "enum": [
-                                        "mon",
-                                        "tue",
-                                        "wed",
-                                        "thu",
-                                        "fri",
-                                        "sat",
-                                        "sun"
-                                    ]
+                                    "type": "string"
                                 },
                                 "slot": {
-                                    "type": "string",
-                                    "description": "时段，如“明天早上”=anchor:tomorrow + slot:早晨",
-                                    "enum": [
-                                        "深夜",
-                                        "凌晨",
-                                        "清晨",
-                                        "早晨",
-                                        "上午",
-                                        "中午",
-                                        "下午",
-                                        "傍晚",
-                                        "晚上",
-                                        "夜里"
-                                    ]
+                                    "type": "string"
                                 },
                                 "explicit": {
-                                    "type": "string",
-                                    "description": "已经是绝对时间时直接填ISO（2026-09-17T09:00:00）或2026-09-17"
+                                    "type": "string"
                                 }
                             }
                         }
@@ -2161,66 +1720,22 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
                         "timeRef": {
                             "type": "object",
                             "additionalProperties": false,
-                            "description": "相对时间词元：用户用“明天/上周五/上个月/三天后”等相对说法表达时间时必填，客户端会换算成绝对日期。anchor=相对基准，offsetDays=在anchor基础上的天数偏移(-60~60)，weekday=星期，slot=时段，explicit=已经是绝对时间的ISO或YYYY-MM-DD（填了explicit则忽略其余）。content/value内容字段仍须写绝对日期，不得写“明天”这类相对词。",
+                            "description": "相对时间词元：结构、取值与示例见 submit_response.longTerm.timeRef（本请求内已有完整定义）",
                             "properties": {
                                 "anchor": {
-                                    "type": "string",
-                                    "description": "相对基准：today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year",
-                                    "enum": [
-                                        "today",
-                                        "tomorrow",
-                                        "yesterday",
-                                        "day_after_tomorrow",
-                                        "day_before_yesterday",
-                                        "this_week",
-                                        "next_week",
-                                        "last_week",
-                                        "this_month",
-                                        "next_month",
-                                        "last_month",
-                                        "this_year",
-                                        "next_year",
-                                        "last_year"
-                                    ]
+                                    "type": "string"
                                 },
                                 "offsetDays": {
-                                    "type": "integer",
-                                    "minimum": -60,
-                                    "maximum": 60,
-                                    "description": "在anchor基础上的天数偏移，如“三天后”=anchor:today + offsetDays:3"
+                                    "type": "integer"
                                 },
                                 "weekday": {
-                                    "type": "string",
-                                    "description": "星期，如“上周五”=anchor:last_week + weekday:fri",
-                                    "enum": [
-                                        "mon",
-                                        "tue",
-                                        "wed",
-                                        "thu",
-                                        "fri",
-                                        "sat",
-                                        "sun"
-                                    ]
+                                    "type": "string"
                                 },
                                 "slot": {
-                                    "type": "string",
-                                    "description": "时段，如“明天早上”=anchor:tomorrow + slot:早晨",
-                                    "enum": [
-                                        "深夜",
-                                        "凌晨",
-                                        "清晨",
-                                        "早晨",
-                                        "上午",
-                                        "中午",
-                                        "下午",
-                                        "傍晚",
-                                        "晚上",
-                                        "夜里"
-                                    ]
+                                    "type": "string"
                                 },
                                 "explicit": {
-                                    "type": "string",
-                                    "description": "已经是绝对时间时直接填ISO（2026-09-17T09:00:00）或2026-09-17"
+                                    "type": "string"
                                 }
                             }
                         }
@@ -2249,66 +1764,22 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
                         "timeRef": {
                             "type": "object",
                             "additionalProperties": false,
-                            "description": "相对时间词元：用户用“明天/上周五/上个月/三天后”等相对说法表达时间时必填，客户端会换算成绝对日期。anchor=相对基准，offsetDays=在anchor基础上的天数偏移(-60~60)，weekday=星期，slot=时段，explicit=已经是绝对时间的ISO或YYYY-MM-DD（填了explicit则忽略其余）。content/value内容字段仍须写绝对日期，不得写“明天”这类相对词。",
+                            "description": "相对时间词元：结构、取值与示例见 submit_response.longTerm.timeRef（本请求内已有完整定义）",
                             "properties": {
                                 "anchor": {
-                                    "type": "string",
-                                    "description": "相对基准：today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year",
-                                    "enum": [
-                                        "today",
-                                        "tomorrow",
-                                        "yesterday",
-                                        "day_after_tomorrow",
-                                        "day_before_yesterday",
-                                        "this_week",
-                                        "next_week",
-                                        "last_week",
-                                        "this_month",
-                                        "next_month",
-                                        "last_month",
-                                        "this_year",
-                                        "next_year",
-                                        "last_year"
-                                    ]
+                                    "type": "string"
                                 },
                                 "offsetDays": {
-                                    "type": "integer",
-                                    "minimum": -60,
-                                    "maximum": 60,
-                                    "description": "在anchor基础上的天数偏移，如“三天后”=anchor:today + offsetDays:3"
+                                    "type": "integer"
                                 },
                                 "weekday": {
-                                    "type": "string",
-                                    "description": "星期，如“上周五”=anchor:last_week + weekday:fri",
-                                    "enum": [
-                                        "mon",
-                                        "tue",
-                                        "wed",
-                                        "thu",
-                                        "fri",
-                                        "sat",
-                                        "sun"
-                                    ]
+                                    "type": "string"
                                 },
                                 "slot": {
-                                    "type": "string",
-                                    "description": "时段，如“明天早上”=anchor:tomorrow + slot:早晨",
-                                    "enum": [
-                                        "深夜",
-                                        "凌晨",
-                                        "清晨",
-                                        "早晨",
-                                        "上午",
-                                        "中午",
-                                        "下午",
-                                        "傍晚",
-                                        "晚上",
-                                        "夜里"
-                                    ]
+                                    "type": "string"
                                 },
                                 "explicit": {
-                                    "type": "string",
-                                    "description": "已经是绝对时间时直接填ISO（2026-09-17T09:00:00）或2026-09-17"
+                                    "type": "string"
                                 }
                             }
                         }
@@ -2337,66 +1808,22 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
                         "timeRef": {
                             "type": "object",
                             "additionalProperties": false,
-                            "description": "相对时间词元：用户用“明天/上周五/上个月/三天后”等相对说法表达时间时必填，客户端会换算成绝对日期。anchor=相对基准，offsetDays=在anchor基础上的天数偏移(-60~60)，weekday=星期，slot=时段，explicit=已经是绝对时间的ISO或YYYY-MM-DD（填了explicit则忽略其余）。content/value内容字段仍须写绝对日期，不得写“明天”这类相对词。",
+                            "description": "相对时间词元：结构、取值与示例见 submit_response.longTerm.timeRef（本请求内已有完整定义）",
                             "properties": {
                                 "anchor": {
-                                    "type": "string",
-                                    "description": "相对基准：today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year",
-                                    "enum": [
-                                        "today",
-                                        "tomorrow",
-                                        "yesterday",
-                                        "day_after_tomorrow",
-                                        "day_before_yesterday",
-                                        "this_week",
-                                        "next_week",
-                                        "last_week",
-                                        "this_month",
-                                        "next_month",
-                                        "last_month",
-                                        "this_year",
-                                        "next_year",
-                                        "last_year"
-                                    ]
+                                    "type": "string"
                                 },
                                 "offsetDays": {
-                                    "type": "integer",
-                                    "minimum": -60,
-                                    "maximum": 60,
-                                    "description": "在anchor基础上的天数偏移，如“三天后”=anchor:today + offsetDays:3"
+                                    "type": "integer"
                                 },
                                 "weekday": {
-                                    "type": "string",
-                                    "description": "星期，如“上周五”=anchor:last_week + weekday:fri",
-                                    "enum": [
-                                        "mon",
-                                        "tue",
-                                        "wed",
-                                        "thu",
-                                        "fri",
-                                        "sat",
-                                        "sun"
-                                    ]
+                                    "type": "string"
                                 },
                                 "slot": {
-                                    "type": "string",
-                                    "description": "时段，如“明天早上”=anchor:tomorrow + slot:早晨",
-                                    "enum": [
-                                        "深夜",
-                                        "凌晨",
-                                        "清晨",
-                                        "早晨",
-                                        "上午",
-                                        "中午",
-                                        "下午",
-                                        "傍晚",
-                                        "晚上",
-                                        "夜里"
-                                    ]
+                                    "type": "string"
                                 },
                                 "explicit": {
-                                    "type": "string",
-                                    "description": "已经是绝对时间时直接填ISO（2026-09-17T09:00:00）或2026-09-17"
+                                    "type": "string"
                                 }
                             }
                         }
@@ -2425,66 +1852,22 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
                         "timeRef": {
                             "type": "object",
                             "additionalProperties": false,
-                            "description": "相对时间词元：用户用“明天/上周五/上个月/三天后”等相对说法表达时间时必填，客户端会换算成绝对日期。anchor=相对基准，offsetDays=在anchor基础上的天数偏移(-60~60)，weekday=星期，slot=时段，explicit=已经是绝对时间的ISO或YYYY-MM-DD（填了explicit则忽略其余）。content/value内容字段仍须写绝对日期，不得写“明天”这类相对词。",
+                            "description": "相对时间词元：结构、取值与示例见 submit_response.longTerm.timeRef（本请求内已有完整定义）",
                             "properties": {
                                 "anchor": {
-                                    "type": "string",
-                                    "description": "相对基准：today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year",
-                                    "enum": [
-                                        "today",
-                                        "tomorrow",
-                                        "yesterday",
-                                        "day_after_tomorrow",
-                                        "day_before_yesterday",
-                                        "this_week",
-                                        "next_week",
-                                        "last_week",
-                                        "this_month",
-                                        "next_month",
-                                        "last_month",
-                                        "this_year",
-                                        "next_year",
-                                        "last_year"
-                                    ]
+                                    "type": "string"
                                 },
                                 "offsetDays": {
-                                    "type": "integer",
-                                    "minimum": -60,
-                                    "maximum": 60,
-                                    "description": "在anchor基础上的天数偏移，如“三天后”=anchor:today + offsetDays:3"
+                                    "type": "integer"
                                 },
                                 "weekday": {
-                                    "type": "string",
-                                    "description": "星期，如“上周五”=anchor:last_week + weekday:fri",
-                                    "enum": [
-                                        "mon",
-                                        "tue",
-                                        "wed",
-                                        "thu",
-                                        "fri",
-                                        "sat",
-                                        "sun"
-                                    ]
+                                    "type": "string"
                                 },
                                 "slot": {
-                                    "type": "string",
-                                    "description": "时段，如“明天早上”=anchor:tomorrow + slot:早晨",
-                                    "enum": [
-                                        "深夜",
-                                        "凌晨",
-                                        "清晨",
-                                        "早晨",
-                                        "上午",
-                                        "中午",
-                                        "下午",
-                                        "傍晚",
-                                        "晚上",
-                                        "夜里"
-                                    ]
+                                    "type": "string"
                                 },
                                 "explicit": {
-                                    "type": "string",
-                                    "description": "已经是绝对时间时直接填ISO（2026-09-17T09:00:00）或2026-09-17"
+                                    "type": "string"
                                 }
                             }
                         }
@@ -2513,66 +1896,22 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
                         "timeRef": {
                             "type": "object",
                             "additionalProperties": false,
-                            "description": "相对时间词元：用户用“明天/上周五/上个月/三天后”等相对说法表达时间时必填，客户端会换算成绝对日期。anchor=相对基准，offsetDays=在anchor基础上的天数偏移(-60~60)，weekday=星期，slot=时段，explicit=已经是绝对时间的ISO或YYYY-MM-DD（填了explicit则忽略其余）。content/value内容字段仍须写绝对日期，不得写“明天”这类相对词。",
+                            "description": "相对时间词元：结构、取值与示例见 submit_response.longTerm.timeRef（本请求内已有完整定义）",
                             "properties": {
                                 "anchor": {
-                                    "type": "string",
-                                    "description": "相对基准：today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year",
-                                    "enum": [
-                                        "today",
-                                        "tomorrow",
-                                        "yesterday",
-                                        "day_after_tomorrow",
-                                        "day_before_yesterday",
-                                        "this_week",
-                                        "next_week",
-                                        "last_week",
-                                        "this_month",
-                                        "next_month",
-                                        "last_month",
-                                        "this_year",
-                                        "next_year",
-                                        "last_year"
-                                    ]
+                                    "type": "string"
                                 },
                                 "offsetDays": {
-                                    "type": "integer",
-                                    "minimum": -60,
-                                    "maximum": 60,
-                                    "description": "在anchor基础上的天数偏移，如“三天后”=anchor:today + offsetDays:3"
+                                    "type": "integer"
                                 },
                                 "weekday": {
-                                    "type": "string",
-                                    "description": "星期，如“上周五”=anchor:last_week + weekday:fri",
-                                    "enum": [
-                                        "mon",
-                                        "tue",
-                                        "wed",
-                                        "thu",
-                                        "fri",
-                                        "sat",
-                                        "sun"
-                                    ]
+                                    "type": "string"
                                 },
                                 "slot": {
-                                    "type": "string",
-                                    "description": "时段，如“明天早上”=anchor:tomorrow + slot:早晨",
-                                    "enum": [
-                                        "深夜",
-                                        "凌晨",
-                                        "清晨",
-                                        "早晨",
-                                        "上午",
-                                        "中午",
-                                        "下午",
-                                        "傍晚",
-                                        "晚上",
-                                        "夜里"
-                                    ]
+                                    "type": "string"
                                 },
                                 "explicit": {
-                                    "type": "string",
-                                    "description": "已经是绝对时间时直接填ISO（2026-09-17T09:00:00）或2026-09-17"
+                                    "type": "string"
                                 }
                             }
                         }
@@ -2617,66 +1956,22 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
                                     "timeRef": {
                                         "type": "object",
                                         "additionalProperties": false,
-                                        "description": "相对时间词元：用户用“明天/上周五/上个月/三天后”等相对说法表达时间时必填，客户端会换算成绝对日期。anchor=相对基准，offsetDays=在anchor基础上的天数偏移(-60~60)，weekday=星期，slot=时段，explicit=已经是绝对时间的ISO或YYYY-MM-DD（填了explicit则忽略其余）。content/value内容字段仍须写绝对日期，不得写“明天”这类相对词。",
+                                        "description": "相对时间词元：结构、取值与示例见 submit_response.longTerm.timeRef（本请求内已有完整定义）",
                                         "properties": {
                                             "anchor": {
-                                                "type": "string",
-                                                "description": "相对基准：today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year",
-                                                "enum": [
-                                                    "today",
-                                                    "tomorrow",
-                                                    "yesterday",
-                                                    "day_after_tomorrow",
-                                                    "day_before_yesterday",
-                                                    "this_week",
-                                                    "next_week",
-                                                    "last_week",
-                                                    "this_month",
-                                                    "next_month",
-                                                    "last_month",
-                                                    "this_year",
-                                                    "next_year",
-                                                    "last_year"
-                                                ]
+                                                "type": "string"
                                             },
                                             "offsetDays": {
-                                                "type": "integer",
-                                                "minimum": -60,
-                                                "maximum": 60,
-                                                "description": "在anchor基础上的天数偏移，如“三天后”=anchor:today + offsetDays:3"
+                                                "type": "integer"
                                             },
                                             "weekday": {
-                                                "type": "string",
-                                                "description": "星期，如“上周五”=anchor:last_week + weekday:fri",
-                                                "enum": [
-                                                    "mon",
-                                                    "tue",
-                                                    "wed",
-                                                    "thu",
-                                                    "fri",
-                                                    "sat",
-                                                    "sun"
-                                                ]
+                                                "type": "string"
                                             },
                                             "slot": {
-                                                "type": "string",
-                                                "description": "时段，如“明天早上”=anchor:tomorrow + slot:早晨",
-                                                "enum": [
-                                                    "深夜",
-                                                    "凌晨",
-                                                    "清晨",
-                                                    "早晨",
-                                                    "上午",
-                                                    "中午",
-                                                    "下午",
-                                                    "傍晚",
-                                                    "晚上",
-                                                    "夜里"
-                                                ]
+                                                "type": "string"
                                             },
                                             "explicit": {
-                                                "type": "string",
-                                                "description": "已经是绝对时间时直接填ISO（2026-09-17T09:00:00）或2026-09-17"
+                                                "type": "string"
                                             }
                                         }
                                     }
@@ -2705,66 +2000,22 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
                                     "timeRef": {
                                         "type": "object",
                                         "additionalProperties": false,
-                                        "description": "相对时间词元：用户用“明天/上周五/上个月/三天后”等相对说法表达时间时必填，客户端会换算成绝对日期。anchor=相对基准，offsetDays=在anchor基础上的天数偏移(-60~60)，weekday=星期，slot=时段，explicit=已经是绝对时间的ISO或YYYY-MM-DD（填了explicit则忽略其余）。content/value内容字段仍须写绝对日期，不得写“明天”这类相对词。",
+                                        "description": "相对时间词元：结构、取值与示例见 submit_response.longTerm.timeRef（本请求内已有完整定义）",
                                         "properties": {
                                             "anchor": {
-                                                "type": "string",
-                                                "description": "相对基准：today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year",
-                                                "enum": [
-                                                    "today",
-                                                    "tomorrow",
-                                                    "yesterday",
-                                                    "day_after_tomorrow",
-                                                    "day_before_yesterday",
-                                                    "this_week",
-                                                    "next_week",
-                                                    "last_week",
-                                                    "this_month",
-                                                    "next_month",
-                                                    "last_month",
-                                                    "this_year",
-                                                    "next_year",
-                                                    "last_year"
-                                                ]
+                                                "type": "string"
                                             },
                                             "offsetDays": {
-                                                "type": "integer",
-                                                "minimum": -60,
-                                                "maximum": 60,
-                                                "description": "在anchor基础上的天数偏移，如“三天后”=anchor:today + offsetDays:3"
+                                                "type": "integer"
                                             },
                                             "weekday": {
-                                                "type": "string",
-                                                "description": "星期，如“上周五”=anchor:last_week + weekday:fri",
-                                                "enum": [
-                                                    "mon",
-                                                    "tue",
-                                                    "wed",
-                                                    "thu",
-                                                    "fri",
-                                                    "sat",
-                                                    "sun"
-                                                ]
+                                                "type": "string"
                                             },
                                             "slot": {
-                                                "type": "string",
-                                                "description": "时段，如“明天早上”=anchor:tomorrow + slot:早晨",
-                                                "enum": [
-                                                    "深夜",
-                                                    "凌晨",
-                                                    "清晨",
-                                                    "早晨",
-                                                    "上午",
-                                                    "中午",
-                                                    "下午",
-                                                    "傍晚",
-                                                    "晚上",
-                                                    "夜里"
-                                                ]
+                                                "type": "string"
                                             },
                                             "explicit": {
-                                                "type": "string",
-                                                "description": "已经是绝对时间时直接填ISO（2026-09-17T09:00:00）或2026-09-17"
+                                                "type": "string"
                                             }
                                         }
                                     }
@@ -2793,66 +2044,22 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
                                     "timeRef": {
                                         "type": "object",
                                         "additionalProperties": false,
-                                        "description": "相对时间词元：用户用“明天/上周五/上个月/三天后”等相对说法表达时间时必填，客户端会换算成绝对日期。anchor=相对基准，offsetDays=在anchor基础上的天数偏移(-60~60)，weekday=星期，slot=时段，explicit=已经是绝对时间的ISO或YYYY-MM-DD（填了explicit则忽略其余）。content/value内容字段仍须写绝对日期，不得写“明天”这类相对词。",
+                                        "description": "相对时间词元：结构、取值与示例见 submit_response.longTerm.timeRef（本请求内已有完整定义）",
                                         "properties": {
                                             "anchor": {
-                                                "type": "string",
-                                                "description": "相对基准：today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year",
-                                                "enum": [
-                                                    "today",
-                                                    "tomorrow",
-                                                    "yesterday",
-                                                    "day_after_tomorrow",
-                                                    "day_before_yesterday",
-                                                    "this_week",
-                                                    "next_week",
-                                                    "last_week",
-                                                    "this_month",
-                                                    "next_month",
-                                                    "last_month",
-                                                    "this_year",
-                                                    "next_year",
-                                                    "last_year"
-                                                ]
+                                                "type": "string"
                                             },
                                             "offsetDays": {
-                                                "type": "integer",
-                                                "minimum": -60,
-                                                "maximum": 60,
-                                                "description": "在anchor基础上的天数偏移，如“三天后”=anchor:today + offsetDays:3"
+                                                "type": "integer"
                                             },
                                             "weekday": {
-                                                "type": "string",
-                                                "description": "星期，如“上周五”=anchor:last_week + weekday:fri",
-                                                "enum": [
-                                                    "mon",
-                                                    "tue",
-                                                    "wed",
-                                                    "thu",
-                                                    "fri",
-                                                    "sat",
-                                                    "sun"
-                                                ]
+                                                "type": "string"
                                             },
                                             "slot": {
-                                                "type": "string",
-                                                "description": "时段，如“明天早上”=anchor:tomorrow + slot:早晨",
-                                                "enum": [
-                                                    "深夜",
-                                                    "凌晨",
-                                                    "清晨",
-                                                    "早晨",
-                                                    "上午",
-                                                    "中午",
-                                                    "下午",
-                                                    "傍晚",
-                                                    "晚上",
-                                                    "夜里"
-                                                ]
+                                                "type": "string"
                                             },
                                             "explicit": {
-                                                "type": "string",
-                                                "description": "已经是绝对时间时直接填ISO（2026-09-17T09:00:00）或2026-09-17"
+                                                "type": "string"
                                             }
                                         }
                                     }
@@ -2881,66 +2088,22 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
                                     "timeRef": {
                                         "type": "object",
                                         "additionalProperties": false,
-                                        "description": "相对时间词元：用户用“明天/上周五/上个月/三天后”等相对说法表达时间时必填，客户端会换算成绝对日期。anchor=相对基准，offsetDays=在anchor基础上的天数偏移(-60~60)，weekday=星期，slot=时段，explicit=已经是绝对时间的ISO或YYYY-MM-DD（填了explicit则忽略其余）。content/value内容字段仍须写绝对日期，不得写“明天”这类相对词。",
+                                        "description": "相对时间词元：结构、取值与示例见 submit_response.longTerm.timeRef（本请求内已有完整定义）",
                                         "properties": {
                                             "anchor": {
-                                                "type": "string",
-                                                "description": "相对基准：today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year",
-                                                "enum": [
-                                                    "today",
-                                                    "tomorrow",
-                                                    "yesterday",
-                                                    "day_after_tomorrow",
-                                                    "day_before_yesterday",
-                                                    "this_week",
-                                                    "next_week",
-                                                    "last_week",
-                                                    "this_month",
-                                                    "next_month",
-                                                    "last_month",
-                                                    "this_year",
-                                                    "next_year",
-                                                    "last_year"
-                                                ]
+                                                "type": "string"
                                             },
                                             "offsetDays": {
-                                                "type": "integer",
-                                                "minimum": -60,
-                                                "maximum": 60,
-                                                "description": "在anchor基础上的天数偏移，如“三天后”=anchor:today + offsetDays:3"
+                                                "type": "integer"
                                             },
                                             "weekday": {
-                                                "type": "string",
-                                                "description": "星期，如“上周五”=anchor:last_week + weekday:fri",
-                                                "enum": [
-                                                    "mon",
-                                                    "tue",
-                                                    "wed",
-                                                    "thu",
-                                                    "fri",
-                                                    "sat",
-                                                    "sun"
-                                                ]
+                                                "type": "string"
                                             },
                                             "slot": {
-                                                "type": "string",
-                                                "description": "时段，如“明天早上”=anchor:tomorrow + slot:早晨",
-                                                "enum": [
-                                                    "深夜",
-                                                    "凌晨",
-                                                    "清晨",
-                                                    "早晨",
-                                                    "上午",
-                                                    "中午",
-                                                    "下午",
-                                                    "傍晚",
-                                                    "晚上",
-                                                    "夜里"
-                                                ]
+                                                "type": "string"
                                             },
                                             "explicit": {
-                                                "type": "string",
-                                                "description": "已经是绝对时间时直接填ISO（2026-09-17T09:00:00）或2026-09-17"
+                                                "type": "string"
                                             }
                                         }
                                     }
@@ -2969,66 +2132,22 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
                                     "timeRef": {
                                         "type": "object",
                                         "additionalProperties": false,
-                                        "description": "相对时间词元：用户用“明天/上周五/上个月/三天后”等相对说法表达时间时必填，客户端会换算成绝对日期。anchor=相对基准，offsetDays=在anchor基础上的天数偏移(-60~60)，weekday=星期，slot=时段，explicit=已经是绝对时间的ISO或YYYY-MM-DD（填了explicit则忽略其余）。content/value内容字段仍须写绝对日期，不得写“明天”这类相对词。",
+                                        "description": "相对时间词元：结构、取值与示例见 submit_response.longTerm.timeRef（本请求内已有完整定义）",
                                         "properties": {
                                             "anchor": {
-                                                "type": "string",
-                                                "description": "相对基准：today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year",
-                                                "enum": [
-                                                    "today",
-                                                    "tomorrow",
-                                                    "yesterday",
-                                                    "day_after_tomorrow",
-                                                    "day_before_yesterday",
-                                                    "this_week",
-                                                    "next_week",
-                                                    "last_week",
-                                                    "this_month",
-                                                    "next_month",
-                                                    "last_month",
-                                                    "this_year",
-                                                    "next_year",
-                                                    "last_year"
-                                                ]
+                                                "type": "string"
                                             },
                                             "offsetDays": {
-                                                "type": "integer",
-                                                "minimum": -60,
-                                                "maximum": 60,
-                                                "description": "在anchor基础上的天数偏移，如“三天后”=anchor:today + offsetDays:3"
+                                                "type": "integer"
                                             },
                                             "weekday": {
-                                                "type": "string",
-                                                "description": "星期，如“上周五”=anchor:last_week + weekday:fri",
-                                                "enum": [
-                                                    "mon",
-                                                    "tue",
-                                                    "wed",
-                                                    "thu",
-                                                    "fri",
-                                                    "sat",
-                                                    "sun"
-                                                ]
+                                                "type": "string"
                                             },
                                             "slot": {
-                                                "type": "string",
-                                                "description": "时段，如“明天早上”=anchor:tomorrow + slot:早晨",
-                                                "enum": [
-                                                    "深夜",
-                                                    "凌晨",
-                                                    "清晨",
-                                                    "早晨",
-                                                    "上午",
-                                                    "中午",
-                                                    "下午",
-                                                    "傍晚",
-                                                    "晚上",
-                                                    "夜里"
-                                                ]
+                                                "type": "string"
                                             },
                                             "explicit": {
-                                                "type": "string",
-                                                "description": "已经是绝对时间时直接填ISO（2026-09-17T09:00:00）或2026-09-17"
+                                                "type": "string"
                                             }
                                         }
                                     }
@@ -3043,7 +2162,7 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
                                 "properties": {
                                     "value": {
                                         "type": "string",
-                                        "description": "本轮朗读播报指令：按需描述语气/情绪/语速/节奏/停顿/重音与情感层次，可短可长（通常不超过约 60 字，如“声音温柔含笑，语速偏慢，句尾轻轻收住”）；每轮必填，无需 sourceMessageIds/evidence"
+                                        "description": "本轮朗读播报指令（每轮必填、免证据；写法见规则 3）"
                                     }
                                 },
                                 "required": [
@@ -3114,6 +2233,10 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
     ]
 }
 ```
+
+### A-1b 单角色版的差异（`isGroup = false`）
+
+单角色请求用裁剪版（schema 11,978 字，比群组版少 3,426 字）：整块删掉 `memberDynamicState`（连带它内嵌的 5 份字段结构）、`longTerm[].memberName`；`promisor` / `promisee` 的取值从「user（用户）/character（角色自己）/relationship（双方）/群组成员名」收成前三项。其余完全一致。
 
 ### A-2 其余 19 个工具
 
@@ -3391,7 +2514,7 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
         },
         "value": {
             "type": "string",
-            "description": "字段值：写成明确的简短陈述句（只表达一件事；短字段几十字、叙述字段一两句、背景故事不超过 250 字）；禁止「不是…而是…」这类对比句；禁止括号注释、理由、解释性文字；涉及日期写绝对日期"
+            "description": "字段值：写成明确的简短陈述句（只表达一件事；长度上限见规则 3.5）；禁止「不是…而是…」这类对比句；禁止括号注释、理由、解释性文字；涉及日期写绝对日期"
         },
         "sourceMessageIds": {
             "type": "array",
@@ -3407,66 +2530,22 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
         "timeRef": {
             "type": "object",
             "additionalProperties": false,
-            "description": "相对时间词元：用户用“明天/上周五/上个月/三天后”等相对说法表达时间时必填，客户端会换算成绝对日期。anchor=相对基准，offsetDays=在anchor基础上的天数偏移(-60~60)，weekday=星期，slot=时段，explicit=已经是绝对时间的ISO或YYYY-MM-DD（填了explicit则忽略其余）。content/value内容字段仍须写绝对日期，不得写“明天”这类相对词。",
+            "description": "相对时间词元：结构、取值与示例见 submit_response.longTerm.timeRef（本请求内已有完整定义）",
             "properties": {
                 "anchor": {
-                    "type": "string",
-                    "description": "相对基准：today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year",
-                    "enum": [
-                        "today",
-                        "tomorrow",
-                        "yesterday",
-                        "day_after_tomorrow",
-                        "day_before_yesterday",
-                        "this_week",
-                        "next_week",
-                        "last_week",
-                        "this_month",
-                        "next_month",
-                        "last_month",
-                        "this_year",
-                        "next_year",
-                        "last_year"
-                    ]
+                    "type": "string"
                 },
                 "offsetDays": {
-                    "type": "integer",
-                    "minimum": -60,
-                    "maximum": 60,
-                    "description": "在anchor基础上的天数偏移，如“三天后”=anchor:today + offsetDays:3"
+                    "type": "integer"
                 },
                 "weekday": {
-                    "type": "string",
-                    "description": "星期，如“上周五”=anchor:last_week + weekday:fri",
-                    "enum": [
-                        "mon",
-                        "tue",
-                        "wed",
-                        "thu",
-                        "fri",
-                        "sat",
-                        "sun"
-                    ]
+                    "type": "string"
                 },
                 "slot": {
-                    "type": "string",
-                    "description": "时段，如“明天早上”=anchor:tomorrow + slot:早晨",
-                    "enum": [
-                        "深夜",
-                        "凌晨",
-                        "清晨",
-                        "早晨",
-                        "上午",
-                        "中午",
-                        "下午",
-                        "傍晚",
-                        "晚上",
-                        "夜里"
-                    ]
+                    "type": "string"
                 },
                 "explicit": {
-                    "type": "string",
-                    "description": "已经是绝对时间时直接填ISO（2026-09-17T09:00:00）或2026-09-17"
+                    "type": "string"
                 }
             }
         }
@@ -3607,66 +2686,22 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
         "timeRef": {
             "type": "object",
             "additionalProperties": false,
-            "description": "相对时间词元：用户用“明天/上周五/上个月/三天后”等相对说法表达时间时必填，客户端会换算成绝对日期。anchor=相对基准，offsetDays=在anchor基础上的天数偏移(-60~60)，weekday=星期，slot=时段，explicit=已经是绝对时间的ISO或YYYY-MM-DD（填了explicit则忽略其余）。content/value内容字段仍须写绝对日期，不得写“明天”这类相对词。",
+            "description": "相对时间词元：结构、取值与示例见 submit_response.longTerm.timeRef（本请求内已有完整定义）",
             "properties": {
                 "anchor": {
-                    "type": "string",
-                    "description": "相对基准：today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year",
-                    "enum": [
-                        "today",
-                        "tomorrow",
-                        "yesterday",
-                        "day_after_tomorrow",
-                        "day_before_yesterday",
-                        "this_week",
-                        "next_week",
-                        "last_week",
-                        "this_month",
-                        "next_month",
-                        "last_month",
-                        "this_year",
-                        "next_year",
-                        "last_year"
-                    ]
+                    "type": "string"
                 },
                 "offsetDays": {
-                    "type": "integer",
-                    "minimum": -60,
-                    "maximum": 60,
-                    "description": "在anchor基础上的天数偏移，如“三天后”=anchor:today + offsetDays:3"
+                    "type": "integer"
                 },
                 "weekday": {
-                    "type": "string",
-                    "description": "星期，如“上周五”=anchor:last_week + weekday:fri",
-                    "enum": [
-                        "mon",
-                        "tue",
-                        "wed",
-                        "thu",
-                        "fri",
-                        "sat",
-                        "sun"
-                    ]
+                    "type": "string"
                 },
                 "slot": {
-                    "type": "string",
-                    "description": "时段，如“明天早上”=anchor:tomorrow + slot:早晨",
-                    "enum": [
-                        "深夜",
-                        "凌晨",
-                        "清晨",
-                        "早晨",
-                        "上午",
-                        "中午",
-                        "下午",
-                        "傍晚",
-                        "晚上",
-                        "夜里"
-                    ]
+                    "type": "string"
                 },
                 "explicit": {
-                    "type": "string",
-                    "description": "已经是绝对时间时直接填ISO（2026-09-17T09:00:00）或2026-09-17"
+                    "type": "string"
                 }
             }
         },
@@ -3702,9 +2737,6 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
     "properties": {
         "tag": {
             "type": "string",
-            "enum": [
-                "开心"
-            ],
             "description": "表情包标签"
         }
     },
@@ -3878,8 +2910,6 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
     "additionalProperties": false
 }
 ```
-
-
 ## 附录 B 工具结果的固定文案（逐字，属于 `input`）
 
 工具结果作为 `function_call_output` 回传模型：成功是各工具自己拼的 `{"ok":true,…}`；**失败 / 拒收是固定文案**，作为 `{"ok":false,"reason":"…"}` 的 `reason` 值。共 33 条；`<…>` 是运行时插值。

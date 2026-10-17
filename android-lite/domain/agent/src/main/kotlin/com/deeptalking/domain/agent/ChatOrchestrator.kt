@@ -164,7 +164,7 @@ class ChatOrchestrator(
         }
 
         val autoTools = tools.definitions(context)
-        val submitTool = SubmitResponseTool().definition
+        val submitTool = SubmitResponseTool().definitionFor(context)
         val instructionsHash = fnv1a(instructions)
         val toolsHash = fnv1a(
             autoTools.joinToString("\n") { "${it.name}|${it.description}|${it.parametersJson}|${it.strict}" },

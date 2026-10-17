@@ -40,5 +40,13 @@ interface AgentTool {
     /** Tools can opt in/out based on the current character or app state. */
     fun isEnabled(context: AgentContext): Boolean = true
 
+    /**
+     * Context-dependent definition. Defaults to the static [definition]; override it
+     * when the schema itself must shrink with the context (`send_sticker`'s tag enum,
+     * `submit_response`'s group-only blocks) so single-character requests stop paying
+     * for text they cannot use.
+     */
+    fun definitionFor(context: AgentContext): ToolDefinition = definition
+
     suspend fun execute(call: ToolCall, context: AgentContext): AgentToolResult
 }

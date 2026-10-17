@@ -35,7 +35,7 @@ class UpdateCharacterFieldTool : AgentTool {
 
     override val definition = ToolDefinition(
         name = "update_character_field",
-        description = "精准修改角色基础设定字段（性别/年龄/种族/外貌特征/性格特征/恐惧弱点/背景故事/说话风格/语言方言/对用户的称呼）。当用户直接要求修改这些设定（如\"把我职业改成教师\"\"我现在是学生了\"\"你性格应该更冷酷些\"\"别叫我用户，叫我明明\"）时，必须调用本工具立即生效；value一律写成**明确的简短陈述句**：只写内容本身、一个字段一件事，短字段几十字、外貌/性格/恐惧弱点/说话风格一两句（不超过 120 字）、背景故事不超过 250 字；**禁止「不是…而是…」这类对比句**（会被拒收，请直接写陈述句，如性格\"性格冷静克制，遇事沉稳。\"）；禁止括号注释、理由、整句说明或解释性文字；\"对用户的称呼\"只填一个简短称呼词、不带任何解释。群组实体不维护基础设定字段（世界观并入群组描述），成员的个人字段请在该成员卡片上修改。不要在submit_response的staticFields里重复提交本工具已改的字段。",
+        description = "精准修改角色基础设定字段（性别/年龄/种族/外貌特征/性格特征/恐惧弱点/背景故事/说话风格/语言方言/对用户的称呼）。当用户直接要求修改这些设定（如\"把我职业改成教师\"\"我现在是学生了\"\"你性格应该更冷酷些\"\"别叫我用户，叫我明明\"）时，必须调用本工具立即生效；value一律写成**明确的简短陈述句**：只写内容本身、一个字段一件事（短字段几十字、外貌/性格/恐惧弱点/说话风格一两句、背景故事另计；**数值上限见规则 3.5**，超长会被截断）；**禁止「不是…而是…」这类对比句**（会被拒收，请直接写陈述句，如性格\"性格冷静克制，遇事沉稳。\"）；禁止括号注释、理由、整句说明或解释性文字；\"对用户的称呼\"只填一个简短称呼词、不带任何解释。群组实体不维护基础设定字段（世界观并入群组描述），成员的个人字段请在该成员卡片上修改。不要在submit_response的staticFields里重复提交本工具已改的字段。",
         parametersJson = buildJsonObject {
             put("type", "object")
             put("additionalProperties", false)
@@ -45,13 +45,13 @@ class UpdateCharacterFieldTool : AgentTool {
                     put("enum", buildJsonArray { STATIC_PROFILE_FIELDS.forEach { add(it.first) } })
                     put("description", "要修改的字段")
                 })
-                put("value", buildJsonObject { put("type", "string"); put("description", "字段值：写成明确的简短陈述句（只表达一件事；短字段几十字、叙述字段一两句、背景故事不超过 250 字）；禁止「不是…而是…」这类对比句；禁止括号注释、理由、解释性文字；涉及日期写绝对日期") })
+                put("value", buildJsonObject { put("type", "string"); put("description", "字段值：写成明确的简短陈述句（只表达一件事；长度上限见规则 3.5）；禁止「不是…而是…」这类对比句；禁止括号注释、理由、解释性文字；涉及日期写绝对日期") })
                 put("sourceMessageIds", buildJsonObject {
                     put("type", "array"); put("items", buildJsonObject { put("type", "string") })
                     put("description", "引用用户消息ID（用户原话所在消息）")
                 })
                 put("evidence", buildJsonObject { put("type", "string"); put("description", "逐字摘录用户要求修改的原话") })
-                put("timeRef", timeRefSchema())
+                put("timeRef", timeRefPointerSchema())
             })
             put("required", buildJsonArray { add("field"); add("value"); add("sourceMessageIds"); add("evidence") })
         }.toString(),
