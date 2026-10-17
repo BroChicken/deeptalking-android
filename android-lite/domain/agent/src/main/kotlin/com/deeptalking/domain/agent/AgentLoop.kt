@@ -380,8 +380,10 @@ internal fun toolActivityHint(name: String): String = when (name) {
     "upsert_lorebook_entry" -> "已更新世界书…"
     "web_search" -> "正在搜索…"
     "web_fetch" -> "正在读取网页…"
-    "hot_topics" -> "正在看热榜…"
-    "social_search" -> "正在搜社区…"
+    "search_video" -> "正在搜B站视频…"
+    "search_music" -> "正在搜歌…"
+    "search_posts" -> "正在搜虎扑帖子…"
+    "baidu_hot", "toutiao_hot", "douyin_hot", "zhihu_hot" -> "正在看热榜…"
     "send_sticker" -> "正在挑表情…"
     else -> "正在处理…"
 }

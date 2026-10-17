@@ -383,9 +383,13 @@ private const val RULE_9_5 =
  * guards it against drifting again. (`send_sticker` is only registered when the
  * character has stickers; `submit_response` is the terminal call and is described
  * separately by [OUTPUT_FORMAT].)
+ *
+ * The web tools follow the **one tool = one platform** rule, so the list names each
+ * platform's own tool instead of one tool with a `platform` parameter: the model never
+ * has to remember an implicit mapping like `netease` = music.
  */
 internal const val RULE_A =
-    "A. 本会话可用工具，何时用、怎么用见各工具描述（get_current_time / search_memory / list_memories / delete_memory / update_memory / set_reminder / update_character_field / upsert_lorebook_entry / web_search / web_fetch / hot_topics / social_search / send_sticker / ask_user）。原则：回忆过往用 search_memory，检索不到再 list_memories 盘点；联网类：查资料用 web_search、读指定链接用 web_fetch、问当下热点热榜用 hot_topics（百度/头条/抖音/知乎）、在虎扑/网易云音乐/B站上找帖子歌或视频用 social_search——这几类都免登录，失败或没搜到就直说不确定，不要编造；**用户提到某个具体日期/某天发生的事（如“九号晚上”“三号”“上周五”“那天记不记得”）时，用 search_memory 的 date/timeRef 按日期召回那天的原始对话与记忆，不要只凭摘要回忆**；记忆过期/重复/被用户纠正时先定位再用 delete_memory 或 update_memory 处理，用户明确否认或纠正时必须用 update_memory 带原话改正，不要只靠删除；待办只在**用户自己明确提出或同意**时用 set_reminder 记录（附 sourceMessageIds + evidence），你要求用户做或你叮嘱的事不记；工具结果属系统内部上下文，仅供理解，自然融入 reply，不得向用户透露检索过程或工具名，但工具返回的图片本身可直接展示。**断言前先核对**：说“第一次/从来没/总是/每次/以前也…”这类关于过去、次数或习惯的话之前，先用 search_memory 确认；查不到依据就别断言，改说不确定或反问用户，不要编造。"
+    "A. 本会话可用工具，何时用、怎么用见各工具描述（get_current_time / search_memory / list_memories / delete_memory / update_memory / set_reminder / update_character_field / upsert_lorebook_entry / web_search / web_fetch / search_video / search_music / search_posts / baidu_hot / toutiao_hot / douyin_hot / zhihu_hot / send_sticker / ask_user）。原则：回忆过往用 search_memory，检索不到再 list_memories 盘点；联网类：查资料用 web_search、读指定链接用 web_fetch、搜视频用 search_video（B站）、搜歌用 search_music（网易云音乐）、搜帖子用 search_posts（虎扑）、看热榜用 baidu_hot / toutiao_hot / douyin_hot / zhihu_hot——**这些工具每个只连一个平台，不需要你指定平台**，都免登录，失败或没搜到就直说不确定，不要编造；**用户提到某个具体日期/某天发生的事（如“九号晚上”“三号”“上周五”“那天记不记得”）时，用 search_memory 的 date/timeRef 按日期召回那天的原始对话与记忆，不要只凭摘要回忆**；记忆过期/重复/被用户纠正时先定位再用 delete_memory 或 update_memory 处理，用户明确否认或纠正时必须用 update_memory 带原话改正，不要只靠删除；待办只在**用户自己明确提出或同意**时用 set_reminder 记录（附 sourceMessageIds + evidence），你要求用户做或你叮嘱的事不记；工具结果属系统内部上下文，仅供理解，自然融入 reply，不得向用户透露检索过程或工具名，但工具返回的图片本身可直接展示。**断言前先核对**：说“第一次/从来没/总是/每次/以前也…”这类关于过去、次数或习惯的话之前，先用 search_memory 确认；查不到依据就别断言，改说不确定或反问用户，不要编造。"
 
 private const val GROUP_RULE_10 =
     "10. 当前是群组对话：只能由已列出的成员发言（一人或多人）。reply 中用户可见回复必须用每人独立一行的“成员名：内容”格式（台词不加任何引号或符号），动作按第 2 条写进全角括号，例如“张三：（看了一眼纸）这件事我先说说我的看法。\n李四：我补充一点。”。每位成员按语义可自然分段；不要写旁白、不要加未列出的发言者；示例仅示范结构，不得模仿其口吻。quickReplies 同样两条、用户视角，不得写成成员台词/提问/承诺。成员状态用 memberDynamicState 更新，不要写入群组整体 dynamicState。"
@@ -878,7 +882,7 @@ suspend fun buildVolatileContext(
         context += "【角色主动开场（系统触发，不是用户陈述）】用户此刻正停留在与你的对话里但暂时没有说话。请角色主动发起一次开场：自然地打招呼或问候，或提起最近一次共同经历、一件待跟进的事项、一个角色此刻想聊的话题。开场要贴合角色性格、自然不突兀；不要问\"你想聊什么\"\"怎么不说话\"之类把话题推回给用户的话；不要把\"系统触发\"这件事说给用户听。\n\n"
     }
     if (hotTopicTurn) {
-        context += "【本轮热榜话题（系统触发，不是用户陈述）】先调用 hot_topics 查一次热榜（平台任选：zhihu 话题性最强、建议优先，baidu/toutiao/douyin 更偏社会新闻），从结果里挑**一条**与角色人设、与你们的共同兴趣最合得来、能自然引入的话题。把它带进这一轮：本轮若是主动开场就围绕它起个头，若是回应对方就在合适时自然引到它。只挑一条，不要罗列榜单、不要复读热度数字，也不要提\"热搜/热榜/系统/工具\"这类词。若对方此刻在说严肃、紧急或伤心的事，就正常回应，不必强行提话题。工具没取到内容（ok:false）就按平常方式回应，不得编造话题。\n\n"
+        context += "【本轮热榜话题（系统触发，不是用户陈述）】先调用一个热榜工具查一次热榜（zhihu_hot 话题性最强、建议优先；baidu_hot / toutiao_hot / douyin_hot 更偏社会新闻），从结果里挑**一条**与角色人设、与你们的共同兴趣最合得来、能自然引入的话题。把它带进这一轮：本轮若是主动开场就围绕它起个头，若是回应对方就在合适时自然引到它。只挑一条，不要罗列榜单、不要复读热度数字，也不要提\"热搜/热榜/系统/工具\"这类词。若对方此刻在说严肃、紧急或伤心的事，就正常回应，不必强行提话题。工具没取到内容（ok:false）就按平常方式回应，不得编造话题。\n\n"
     }
     return context
 }

@@ -1,9 +1,15 @@
 package com.deeptalking.core.network
 
 /**
- * Web access used by the agent's web_search / web_fetch / hot_topics /
- * social_search tools. Every method returns the same JSON-string shape the
- * legacy tools returned so the model sees a stable contract.
+ * Web access used by the agent's web_search / web_fetch tools and by the
+ * **one tool per platform** search tools (search_video=B站, search_music=网易云,
+ * search_posts=虎扑, baidu_hot/toutiao_hot/douyin_hot/zhihu_hot). Every method returns
+ * the same JSON-string shape the legacy tools returned so the model sees a stable
+ * contract.
+ *
+ * The platform dispatch (`hotBoard` / `searchSocial`) stays here as **defense in
+ * depth**: the agent tools bind a fixed platform constant, and this layer still
+ * validates it instead of trusting the caller.
  *
  * Every source here is reachable **without an account** — no login cookie, no
  * API key. Platforms that require a signed-in session (weibo, xiaohongshu,

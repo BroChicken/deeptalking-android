@@ -85,17 +85,29 @@ BackgroundTasks.scheduleTurn  后台串行维护：文风校对、快速回应�
 | `ask_user` | 向用户提出澄清问题 | `AskUserTool` |
 | `update_character_field` | 精准修改基础设定字段（说话风格、称呼等） | `UpdateCharacterFieldTool` |
 | `upsert_lorebook_entry` | 写入/更新世界书条目（世界层设定唯一入口，保护人工维护条目） | `UpsertLorebookEntryTool` |
-| `web_fetch` | 抓网页正文 / 图片 / B站视频（url 或 keyword）；虎扑帖子链接、网易云歌曲链接有专门解析 | `WebFetchTool` → `HttpWebContentProvider` |
+| `web_fetch` | 读取链接（网页正文 / 图片 / 站内专门解析）；虎扑帖子、网易云歌曲、B站视频链接各有专门解析。**只读链接、不做关键词搜索** | `WebFetchTool` → `HttpWebContentProvider` |
 | `update_memory` | 按 ID 修正记忆（用户纠正时用） | `UpdateMemoryTool` |
 | `send_sticker` | 发表情包（**仅当角色有贴图时注册**，schema 内联该角色的标签枚举） | `SendStickerTool` |
-| `web_search` | 联网搜索（必应 RSS，`limit` 可调 1–20） | `WebSearchTool` |
-| `hot_topics` | 国内平台热榜（百度 / 头条 / 抖音 / 知乎，全部免账号） | `HotTopicsTool` |
-| `social_search` | 国内社区检索（虎扑 / 网易云 / B站，全部免账号） | `SocialSearchTool` |
+| `web_search` | 通用联网搜索（必应 RSS，`limit` 可调 1–20） | `WebSearchTool` |
+| `search_video` | 按关键词搜 **B站** 视频（免账号） | `SocialSearchTool(platform=bilibili)` |
+| `search_music` | 按关键词搜 **网易云音乐** 歌曲（免账号，返回歌曲 id 可用 `web_fetch` 看热评） | `SocialSearchTool(platform=netease)` |
+| `search_posts` | 按关键词搜 **虎扑** 帖子（免账号） | `SocialSearchTool(platform=hupu)` |
+| `baidu_hot` | **百度**热搜（免账号） | `HotBoardTool(platform=baidu)` |
+| `toutiao_hot` | **今日头条**热榜（免账号） | `HotBoardTool(platform=toutiao)` |
+| `douyin_hot` | **抖音**热榜（免账号） | `HotBoardTool(platform=douyin)` |
+| `zhihu_hot` | **知乎**热榜（免账号） | `HotBoardTool(platform=zhihu)` |
 | `submit_response` | 结构化收尾（见下） | `SubmitResponseTool` |
 
 每个工具就是一段 JSON Schema 描述（name + description + parameters），模型据此决定何时调用。
 **工具描述是"何时用哪个工具"的权威依据**，system 提示词的规则 A 只留一句导引。
 新增工具 = 新增 `AgentTool` 实现 + 在 `defaultTools` 注册，`AgentLoop` 不变。
+
+**一个工具只连一个平台**（搜索类）：平台是工具身份的一部分，不再通过 `platform` 参数让模型去挑——
+`search_video`/`search_music`/`search_posts` 与四个 `*_hot` 都是同一个类按固定平台常量实例化
+（`SocialSearchTool` / `HotBoardTool`），因此不存在"选错平台"这一步，也不必让模型记住
+`netease` 才是音乐这类隐式映射。代价是工具条数变多（工具 schema 属于请求前缀，一次性的
+`toolsHash` 变化 = 每个角色一次破缓存）。`SocialToolsTest` 有回归护栏：这些工具的 schema
+里不得再出现 `platform` 参数。
 
 ### 3. 工具实现（agent 的手）
 
@@ -146,7 +158,7 @@ BackgroundTasks.scheduleTurn  后台串行维护：文风校对、快速回应�
 | `submit-retry` | 阶段二兜底仍未拿到合法 `submit_response` | retry-submit | 正在重新整理 |
 | `empty` | 无可用正文 | regenerate / fail | 有额度 → `正在重新生成（第2次）…`；否则提示失败并保留用户消息 |
 
-工具提示（`AgentLoop.toolActivityHint`）：`get_current_time`→`正在确认时间…`、`search_memory`→`正在回忆…`、`list_memories`→`正在整理记忆…`、`delete_memory`→`正在清理记忆…`、`set_reminder`→`已记下，正在回应…`、`update_character_field`→`已按你的要求调整设定…`、`upsert_lorebook_entry`→`已更新世界书…`、`web_search`→`正在搜索…`、`web_fetch`→`正在读取网页…`、`hot_topics`→`正在看热榜…`、`social_search`→`正在搜社区…`、`send_sticker`→`正在挑表情…`，未知工具回退 `正在处理…`。
+工具提示（`AgentLoop.toolActivityHint`）：`get_current_time`→`正在确认时间…`、`search_memory`→`正在回忆…`、`list_memories`→`正在整理记忆…`、`delete_memory`→`正在清理记忆…`、`set_reminder`→`已记下，正在回应…`、`update_character_field`→`已按你的要求调整设定…`、`upsert_lorebook_entry`→`已更新世界书…`、`web_search`→`正在搜索…`、`web_fetch`→`正在读取网页…`、`search_video`→`正在搜B站视频…`、`search_music`→`正在搜歌…`、`search_posts`→`正在搜虎扑帖子…`、`baidu_hot`/`toutiao_hot`/`douyin_hot`/`zhihu_hot`→`正在看热榜…`、`send_sticker`→`正在挑表情…`，未知工具回退 `正在处理…`。
 
 > 主提示词的 0/7/8 与【输出格式】都要求"以结构化方式收尾"（调用 `submit_response` 或输出单个 JSON 对象）且 `quickReplies` 恒为两条用户视角短句；但**客户端不把 `quickReplies` 当收尾门槛**——散文/缺 quickReplies 的收尾一律直接采用。
 
@@ -195,7 +207,7 @@ BackgroundTasks.scheduleTurn  后台串行维护：文风校对、快速回应�
 
 ### 注入与衰减
 
-- `buildVolatileContext(character, query, memory, now, proactiveTurn, hotTopicTurn, recentAssistantReplies)` — 把最相关的记忆与本轮动态上下文注入本轮 prompt（只注入 `AppLimits.Agent.TOOL_MEMORY_INJECT_LIMIT = 5` 条长期记忆，其余提示模型用 `search_memory` 检索）。**没有任何区块预算**：这是主对话请求体，所有块整块注入（只保留"每条条目"级别的兜底上限，靠提示词的软限制让它尽量不触发）。区块顺序按"越靠后越近"排列：可选话题库 → 角色当前状态 → 待跟进承诺 → 世界书 → 群成员私人记忆 → 用户最新纠正 → 互动节奏 → 场景概要 → 长期召回 + 取用说明/主体约定 → 时间基准 → 消息时间元数据 → 风格尾块 + 本轮指令。**最末尾两条系统触发的本轮指令**：`proactiveTurn`（主动开场）与 `hotTopicTurn`（热榜开场，见 `HotTopicPolicy`：每角色每逻辑日掷一次、10%、每天 1 次/每周 2 次；命中时要求先调 `hot_topics` 再挑一条话题带入）。两条都只加在 volatile 上下文尾部，**不进 system prompt**，所以不会打乱缓存前缀。`metadata` 回传本轮真正注入的召回 ID 与世界书条目，供主线在回复落盘后精确清除 `pendingRecall` 与累计 `mentions`。检索查询经 `buildMemoryQuery()` 扩展：用户明显指代前文时附加最近对话，避免短指代召回不到正确记忆。
+- `buildVolatileContext(character, query, memory, now, proactiveTurn, hotTopicTurn, recentAssistantReplies)` — 把最相关的记忆与本轮动态上下文注入本轮 prompt（只注入 `AppLimits.Agent.TOOL_MEMORY_INJECT_LIMIT = 5` 条长期记忆，其余提示模型用 `search_memory` 检索）。**没有任何区块预算**：这是主对话请求体，所有块整块注入（只保留"每条条目"级别的兜底上限，靠提示词的软限制让它尽量不触发）。区块顺序按"越靠后越近"排列：可选话题库 → 角色当前状态 → 待跟进承诺 → 世界书 → 群成员私人记忆 → 用户最新纠正 → 互动节奏 → 场景概要 → 长期召回 + 取用说明/主体约定 → 时间基准 → 消息时间元数据 → 风格尾块 + 本轮指令。**最末尾两条系统触发的本轮指令**：`proactiveTurn`（主动开场）与 `hotTopicTurn`（热榜开场，见 `HotTopicPolicy`：每角色每逻辑日掷一次、10%、每天 1 次/每周 2 次；命中时要求先调一个热榜工具——`zhihu_hot` 优先——再挑一条话题带入）。两条都只加在 volatile 上下文尾部，**不进 system prompt**，所以不会打乱缓存前缀。`metadata` 回传本轮真正注入的召回 ID 与世界书条目，供主线在回复落盘后精确清除 `pendingRecall` 与累计 `mentions`。检索查询经 `buildMemoryQuery()` 扩展：用户明显指代前文时附加最近对话，避免短指代召回不到正确记忆。
 - `MemoryPolicy.applyMemoryDecay()`：按时间衰减 events/promises 的重要性与状态。
 - `MemoryPolicy.computeEffectiveImportance()`：`(importance + learnedBonus) × decay`（0-10 封顶）。
 

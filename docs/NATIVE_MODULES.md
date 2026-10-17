@@ -34,7 +34,7 @@ DeepTalking 是原生 Android 应用（Kotlin + Jetpack Compose 多模块），�
 
 - 端侧推理（`:engine:ondevice`）：调用方只依赖接口，新增模型 = 新增实现 + 在 `NativeCore` 注册。`LlmBackend` 由 `:core:network` 的 `ResponsesLlmBackend` 实现（远程）；`TtsBackend` 由 `:engine:cosyvoice` 的 `CosyVoiceController.backend` 实现（端侧 CosyVoice3）；`EmbeddingBackend/AsrBackend` 暂为 `null`。
 - 朗读播放（`:engine:ondevice` 的 `TtsSpeaker`）：呼叫做朗读者只依赖此接口，具体引擎由 `AppConfig.ttsBackend` 决定——`ondevice` 走 `:engine:cosyvoice` 的 `CosyVoiceController`，`remote` 走 `:engine:remote-tts` 的 `RemoteTtsSpeaker`。唯一的分派点是 `NativeCore.ttsSpeaker(config)`（同时把 `ttsSpeed` 写进引擎），上层与 UI 都不按后端分支。远程失败**不自动回落**端侧（按设计），由已有的「朗读失败」提示暴露。
-- Agent 工具（`:domain:agent`）：实现 `AgentTool` 接口并在 `defaultTools()` 注册即可，`AgentLoop` 不变。**新增工具时必须同步系统提示词里那份"本会话可用工具"清单**（`prompts/Prompts.kt` 的 `RULE_A`）——清单漏列会让模型以为自己没有该能力（历史上有两个写入类工具就漏了）；`PromptToolListTest` 会断言清单覆盖全部已注册工具。**联网类工具**共四个：`web_search`（必应 RSS，`limit` 可调 1–20）、`web_fetch`（网页/图片/B站视频；虎扑帖子链接与网易云歌曲链接有专门路由）、`hot_topics`（百度/头条/抖音/知乎热榜）、`social_search`（虎扑帖子 / 网易云歌曲 / B站视频）。四个都**不需要账号**（不存 cookie、不需要 key）。
+- Agent 工具（`:domain:agent`）：实现 `AgentTool` 接口并在 `defaultTools()` 注册即可，`AgentLoop` 不变。**新增工具时必须同步系统提示词里那份"本会话可用工具"清单**（`prompts/Prompts.kt` 的 `RULE_A`）——清单漏列会让模型以为自己没有该能力（历史上有两个写入类工具就漏了）；`PromptToolListTest` 会断言清单覆盖全部已注册工具。**联网类工具遵循"一个工具一个平台"**：`web_search`（必应 RSS，`limit` 可调 1–20）、`web_fetch`（只读链接：网页/图片 + 虎扑帖子、网易云歌曲、B站视频的专门解析）、`search_video`（B站视频）、`search_music`（网易云歌曲）、`search_posts`（虎扑帖子）、`baidu_hot` / `toutiao_hot` / `douyin_hot` / `zhihu_hot`（四家热榜各一个工具）。平台是**工具身份的一部分**，不再有 `platform` 参数让模型挑（`SocialSearchTool` / `HotBoardTool` 按固定平台常量实例化）。都**不需要账号**（不存 cookie、不需要 key）。
 - 记忆（`:domain:memory`）：上层依赖 `MemoryService` 接口。
 
 ## 界面与交互
@@ -43,7 +43,7 @@ DeepTalking 是原生 Android 应用（Kotlin + Jetpack Compose 多模块），�
 - 应用骨架：顶部 header（hamburger 42dp + 头像 32 + 名称/身份 + 主题菜单 + 版本徽标，高 64dp，随状态栏 inset）+ 左侧抽屉侧栏 **258dp**（**角色 / 设置** 两标签）+ 主聊天区。缓存条 / 活动状态为 header 右下角小胶囊。
 - 消息区：`max-width 56rem` 居中；气泡 `max-width min(84%,560)`、内距 `12px 14px`、圆角 12 + 尾角 4、无阴影、字号 15、行高 1.68；AI 头像 30dp 圆角方块（用户消息无头像）；typing 三点；消息 meta 行（时间 + 30dp 圆形操作按钮）。
 - 角色**主动开口**：面板空闲 **60s** 自动触发（随应用可见性暂停/重置），非手动按钮；编辑重发/重新生成会**丢弃后续分支及相关记忆**。
-- **热榜开场**（小概率事件，`HotTopicPolicy` + `AppViewModel.armHotTopicTurn`）：每个角色**每个逻辑日（凌晨 2 点换日）只在当天第一个要发请求的回合掷一次骰子**，命中率 10%，上限**每天 1 次、每周 2 次**（自然周，每角色独立）。命中则本轮在 volatile 上下文尾部多一条指令：先调 `hot_topics` 查热榜，挑一条与人设合得来的话题自然带入（可叠加在主动开口上）；搜不到就按平常方式回应、不得编造。计数存 DataStore 键 `deeptalking_hot_topic_v1`（JSON：角色id → `{rolledDay, weekStart, weekCount, total}`），**不进 Room、不进备份导出**，所以不牵动 `LegacyMapper`/`BackupService`。
+- **热榜开场**（小概率事件，`HotTopicPolicy` + `AppViewModel.armHotTopicTurn`）：每个角色**每个逻辑日（凌晨 2 点换日）只在当天第一个要发请求的回合掷一次骰子**，命中率 10%，上限**每天 1 次、每周 2 次**（自然周，每角色独立）。命中则本轮在 volatile 上下文尾部多一条指令：先调一个热榜工具（`zhihu_hot` 优先）查热榜，挑一条与人设合得来的话题自然带入（可叠加在主动开口上）；搜不到就按平常方式回应、不得编造。计数存 DataStore 键 `deeptalking_hot_topic_v1`（JSON：角色id → `{rolledDay, weekStart, weekCount, total}`），**不进 Room、不进备份导出**，所以不牵动 `LegacyMapper`/`BackupService`。
 - 世界书条目受 `enabled` 控制：禁用的条目不参与注入（`LorebookMatcher.select` 过滤），与「常驻」互不影响。
 - 多模态：用户图片在请求装配时由 `LlmRequest.imageResolver` 解析为 `data:` URL，`buildResponsesInput` 生成 `input_text` + `input_image(detail:auto)` 内容数组。用户主动发送的**贴图**在该轮请求副本中提升为图片一并送入模型（落盘仍保留 `Kind.Sticker` 供渲染）；`web_fetch`/B站封面/Microlink 主图等工具结果若为 `input_text`/`input_image` 数组，则原样作为 `function_call_output` 数组下发（模型可直接看图，而非 JSON 字符串）。
 - 表情包：新增后由视觉模型从 `STICKER_TAGS` 词表自动打标签（`NativeCore.tagSticker`；都不贴切时允许 1~6 字中文短词，未分类时才写）；`send_sticker` 按标签精确匹配，失败再按子串双向兜底，schema 内联该角色的标签枚举。

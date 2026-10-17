@@ -24,7 +24,7 @@ class HotTopicPromptTest {
         val character = Character(id = "c1", name = "小雨")
 
         val plain = buildVolatileContext(character = character, query = "在吗", memory = memory, now = now)
-        assertFalse(plain.contains("hot_topics"))
+        assertFalse(plain.contains("zhihu_hot"))
         assertFalse(plain.contains("本轮热榜话题"))
 
         val hot = buildVolatileContext(
@@ -35,7 +35,7 @@ class HotTopicPromptTest {
             hotTopicTurn = true,
         )
         assertTrue(hot.contains("【本轮热榜话题"))
-        assertTrue(hot.contains("hot_topics"))
+        assertTrue(hot.contains("zhihu_hot"))
         assertTrue(hot.contains("只挑一条"))
         assertTrue(hot.contains("不得编造话题"))
         // 指令加在整段上下文的最后（时间基准/节奏骨架之后），平常轮完全没有这条。
