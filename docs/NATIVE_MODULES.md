@@ -104,7 +104,8 @@ DeepTalking 是原生 Android 应用（Kotlin + Jetpack Compose 多模块），�
 powershell -File tools/native-verify.ps1    # 全量自检：静态检查 + 编译 + 全部单测
 powershell -File tools/native-test.ps1      # 仅单测
 powershell -File tools/native-build.ps1     # debug
-powershell -File tools/native-build.ps1 -Release   # 需 keystore 环境变量
+powershell -File tools/native-build.ps1 -Release            # 签名 release（需 keystore 环境变量）
+powershell -File tools/native-build.ps1 -Release -Publish   # 本地出包 + 上传 GitHub Release
 powershell -File tools/native-version.ps1 [-BumpPatch]
 ```
 
@@ -115,4 +116,6 @@ powershell -File tools/native-version.ps1 [-BumpPatch]
 
 ## CI
 
-CI（`.github/workflows/build-lite-apk.yml`）在 `android-lite/**` 变化时编译 + 跑与本地自检相同的全部单测，再用固定 release keystore 构建签名的 release APK 并发布。包名、签名与数据迁移链的稳定是覆盖升级的兼容要求。
+CI（`.github/workflows/verify-lite.yml`）在 `android-lite/**` 变化时只做**编译 + 与本地自检相同的全部单测**，作为门禁；它**不构建、不发布**任何包（因此 CI 里没有 keystore，也不可能覆盖已发布的 APK）。
+
+**出包在本地**：`tools/native-build.ps1 -Release -Publish` 用本机 keystore 签名构建 release APK、归档到 `apk/DeepTalking-lite-v<版本>.apk`，再用 `gh` 把这个**本地包**创建/覆盖上传到 GitHub Release（tag `v<版本>`）。这样 Release 上的包永远就是本地验过的那个。包名、签名与数据迁移链的稳定是覆盖升级的兼容要求。

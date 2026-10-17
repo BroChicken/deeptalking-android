@@ -1,0 +1,37 @@
+name: Verify Android Lite
+
+# Compile + unit tests only, as a gate on every push that touches the app.
+#
+# The signed release APK is built and published from the local machine instead:
+#   powershell -File tools/native-build.ps1 -Release -Publish
+# That way CI needs no keystore, cannot overwrite a published APK, and the Release
+# always carries the exact build that was verified locally.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, cloud-main]
+    paths:
+      - 'android-lite/**'
+      - '.github/workflows/verify-lite.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Compile every module
+        working-directory: android-lite
+        run: gradle :app:assembleDebug --stacktrace
+      - name: Unit tests
+        working-directory: android-lite
+        run: |
+          gradle :engine:ondevice:test :engine:audio:testDebugUnitTest :engine:cosyvoice:testDebugUnitTest :engine:remote-tts:testDebugUnitTest :domain:agent:test :core:network:test :domain:memory:test :core:data:testDebugUnitTest :core:model:test :feature:richtext:testDebugUnitTest --stacktrace

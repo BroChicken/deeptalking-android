@@ -11,7 +11,7 @@ Android SDK automatically (see `native/env.ps1`).
 | `native/env.ps1` | Dot-sourced by the others; resolves JAVA_HOME / ANDROID_SDK_ROOT / gradle. |
 | `native-verify.ps1` | Compile all modules + run the full unit-test suite. Pre-commit gate. |
 | `native-test.ps1` | Run just the unit-test tasks and print a pass/fail summary. |
-| `native-build.ps1` | `assembleDebug` (default) or `-Release`. |
+| `native-build.ps1` | `assembleDebug` (default), `-Release` (signed), `-Release -Publish` (also archives to `apk/` and uploads that exact APK to the GitHub Release). |
 | `native-version.ps1` | Print / bump `versionName` + `versionCode` in `app/build.gradle.kts`. |
 | `pull-apk.ps1` | Download the latest released APK via the GitHub CLI. |
 
@@ -33,4 +33,6 @@ Unit tests live in each module under `src/test/`, run with `native-test.ps1`:
 - `:core:data` — legacy import / mapper.
 - `:feature:richtext` — markdown renderer.
 
-CI runs `native-verify.ps1` equivalent tasks before building the release APK.
+CI runs the same compile + unit-test tasks as `native-verify.ps1` and stops there: the
+signed release APK is built and published from the local machine with
+`native-build.ps1 -Release -Publish`.

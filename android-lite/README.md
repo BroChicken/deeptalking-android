@@ -40,4 +40,4 @@ git commit && git push                                    # 推送触发 CI 出�
 
 ## CI 与覆盖升级
 
-`.github/workflows/build-lite-apk.yml` 在 `android-lite/**` 变化时编译、跑全部单测，并用固定 release keystore 构建签名 APK 发布。`applicationId`、签名与旧数据导入链的稳定是覆盖安装的前提（旧版数据需先在旧版导出 JSON，再在原生「导入备份」导入）。
+`.github/workflows/verify-lite.yml` 在 `android-lite/**` 变化时编译、跑全部单测（**只当门禁，不出包**）。签名 release APK 由本机出：`tools/native-build.ps1 -Release -Publish`（本机签名构建 + 归档 `apk/` + 上传 GitHub Release）。`applicationId`、签名与旧数据导入链的稳定是覆盖安装的前提（旧版数据需先在旧版导出 JSON，再在原生「导入备份」导入）。

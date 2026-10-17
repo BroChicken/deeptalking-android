@@ -23,11 +23,15 @@
 ## 3. 版本号与推送规则
 - `android-lite/app/build.gradle.kts` 中 `versionName` 为 `X.Y.Z`，`versionCode` 单调递增。
 - **默认：改完只做本地提交** —— 不升版本、不推送、不出包。改完跑 `tools/native-verify.ps1`，本地 `git commit` 即止，停下等用户指示。
-- **只有用户明确说"推版本"（或"推送 / 出包"）时**才升版本并推送，一次做完：
+- **只有用户明确说"推版本"（或"推送 / 出包"）时**才升版本并出包，一次做完：
   1. `powershell -File tools/native-version.ps1 -BumpPatch`（Z+1、`versionCode`+1）；
   2. `powershell -File tools/native-verify.ps1` 全绿；
-  3. 提交版本改动并 `git push` —— 推送即触发 CI 构建签名 release APK 并发布 GitHub Release。
-- **版本号没变就不要推送**：CI 用 `versionName` 当标签，同名 Release 已存在时会 `gh release upload --clobber` 覆盖已发布的 APK。
+  3. **本地出包并发布**：`powershell -File tools/native-build.ps1 -Release -Publish`
+     —— 本机 keystore 签名构建 release APK，归档 `apk/DeepTalking-lite-v<版本>.apk`，
+     再用 `gh` 把**这个本地包**创建/覆盖上传到 GitHub Release（tag `v<版本>`）；
+  4. 提交版本改动并 `git push`。
+  CI（`.github/workflows/verify-lite.yml`）只跑「编译 + 单测」当门禁，**不出包、不发布**。
+- **版本号没变就不要出包**：Release 用 `versionName` 当标签，同名 Release 已存在时 `-Publish` 会 `--clobber` 覆盖已发布的 APK（等于把同版本的包换掉）。
 - 升 X 或 Y 由用户决定，**若我认为需要升 X 或 Y，必须先询问用户**。
 - 应用内版本号由 BuildConfig/`versionName` 提供，不要另设手写常量。
 
@@ -43,6 +47,6 @@
    - 新增工具/记忆/解析/迁移逻辑时必须同步补测试。
 2. 端侧接口新增实现时，在 `:engine:ondevice` 或对应模块补一个"假后端可插拔"测试。
 3. `docs/`（尤其 `docs/AGENT_ARCHITECTURE.md`、`docs/NATIVE_MODULES.md`）已同步更新。
-4. 发布前跑 `powershell -File tools/native-build.ps1 -Release`（需 keystore 环境变量）确认签名打包成功。
+4. 出包即 `powershell -File tools/native-build.ps1 -Release -Publish`（需 keystore 环境变量 + `gh` 已登录）：本机签名打包、归档到 `apk/`，并把该包上传到 GitHub Release。
 
-`tools/` 只保留原生侧脚本：`native-verify.ps1`（全量自检）、`native-test.ps1`（单测）、`native-build.ps1`（打包）、`native-version.ps1`（版本号）、`pull-apk.ps1`（拉取发布包）、`build-cosyvoice-android.ps1`（重建 CosyVoice 原生库），以及 `tools/native/`（环境解析）。另有一个 PC 侧远程朗读启动器 `run-cosyvoice-server.bat`（只是包装 `tools/.work/cosyvoice-server/run-server.ps1`，见 `docs/REMOTE_TTS.md`）。旧 WebView 构建/测试脚本与 JS↔Kotlin 差分 oracle（`tools/diff/`）均已删除。
+`tools/` 只保留原生侧脚本：`native-verify.ps1`（全量自检）、`native-test.ps1`（单测）、`native-build.ps1`（打包；`-Release -Publish` = 本地出包并上传 GitHub Release）、`native-version.ps1`（版本号）、`pull-apk.ps1`（拉取发布包）、`build-cosyvoice-android.ps1`（重建 CosyVoice 原生库），以及 `tools/native/`（环境解析）。另有一个 PC 侧远程朗读启动器 `run-cosyvoice-server.bat`（只是包装 `tools/.work/cosyvoice-server/run-server.ps1`，见 `docs/REMOTE_TTS.md`）。旧 WebView 构建/测试脚本与 JS↔Kotlin 差分 oracle（`tools/diff/`）均已删除。
