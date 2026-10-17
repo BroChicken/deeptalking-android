@@ -1,32 +1,17 @@
-# 各调用发送内容一览
+# 发给模型的三部分：instructions / input / tools
 
-> **这份文档干什么用**：看清每一次外发调用**到底给模型发了什么**——用来判断「提示词是不是太长、注意力被稀释在哪一块」。
-> 正文是**地图**（顺序 / 字数 / 重复位置），**逐字原文全部在附录 A**，两边用 ID 对上。
+> **范围**：只记录**模型真正读到的文本**——`instructions`（system prompt）、`input`（消息序列与其中所有注入块）、`tools`（工具定义）。**不含** HTTP 传输、请求体字段、超时、联网抓取、语音合成（不在这个文档的用途里）。
 >
-> **怎么查**：ID 可直接检索（`grep A-3.1`、`grep RULE_5`）。`RULE_*` = 主对话规则常量名；`A-*` = 附录逐字原文；`§n` = 正文小节。
+> **用途**：调整**结构**与**提示词措辞**。所以能改的文本都整段逐字放在对应位置（§1–§3、§4 各节）；只有占 34k 字的 `parameters` JSON Schema 收进附录 A。
 >
-> **三条约定**
-> 1. 传输格式逐字给出：URL 规则 / Header / 请求体 JSON 键名与取值来源。
-> 2. **发给模型的固定文案全部逐字收录**（system 提示词、规则条、拼装语句、返回 schema、工具定义、工具返回的固定文案）。源码里的 `\n` 在请求里是真实换行（正文按真实换行排版），`${'$'}` 渲染为 `$`，`${常量}` 已展开为实际值。
-> 3. **只有运行时数据用 `<…>` 占位**（用户消息、历史、角色设定值、记忆条目、世界书内容、转录文本、工具返回的真实数据）。
+> **约定**：`<…>` 是运行时数据（用户消息、历史、角色设定值、记忆条目、世界书内容、转录文本）；其余都是实际发出去的文本——源码里的 `\n` 即真实换行，`${'$'}` 渲染为 `$`。源码是唯一权威。
 >
-> **权威**：源码。改动任一调用的参数 / 提示词 / 工具清单 / 拼装顺序时必须同步本文，并更新 §0.2 的实测字数。
+> **怎么查**：`RULE_*` / `HARD_*` / `OUTPUT_FORMAT` = §1 里的规则常量名；`TOOL-*` = §3；`§4.n` = 其它调用。
 
-**代码位置速查**：传输层 `core/network/ResponsesLlmBackend.kt`；请求体 DTO `core/network/ResponsesDto.kt`；主对话提示词 `domain/agent/prompts/Prompts.kt`；主循环 `domain/agent/AgentLoop.kt`；后台调用 `domain/agent/background/BackgroundTasks.kt`；建卡 / 补全 `app/.../NativeCore.kt` + `feature/characters/CharacterParity.kt`；远程朗读 `engine/remote-tts/`；联网抓取 `core/network/HttpWebContentProvider.kt`。
+## 0. 总览
 
----
+### 0.1 体量（实测，字符）
 
-## 0. 速查
-
-### 0.1 目录
-
-- **§0.2 体量总览（实测）** · §0.3 主对话读到的顺序 · §0.4 精炼索引：同一约束出现在哪几处 · §0.5 全部调用总表
-- §1 LLM 传输层 · §2 主对话 AUTO · §3 主对话 SUBMIT · §4 后台 / 辅助调用共性
-- §5 记忆抽取 · §6 记忆分析 · §7 场景概要 · §8 世界书整理 · §9 世界书退回重写 · §10 世界书重建 · §11 散文轮转结构化 · §12 补全静态字段 · §13 补全群成员字段 · §14 世界观迁移 · §15 字段重排 · §16 文风校对 · §17 快速回应修补 · §18 建卡 / 补全（App 层）
-- §19 远程语音合成 · §20 联网抓取 · §21 其他外发调用 · §22 关键常量索引
-- **附录 A 逐字原文**：A-1 主对话 system prompt · A-2 volatile 尾块 · A-3 工具定义 · A-4 后台 / 辅助提示词 · A-5 工具返回固定文案
-
-### 0.2 体量总览（实测，单位：字符）
 
 | 块 | 字数 | 性质 |
 |---|---|---|
@@ -46,159 +31,63 @@
 
 **最大的一块重复**：`submit_response` 的 JSON Schema 里 **`timeRef` 子结构复制了 21 份**（1,168 字/份，合计 ≈ **24,528 字**，占该 schema 约七成）；160 条 `description` 共 13,610 字，其中 11,876 字是重复文字。逐字见 A-3.1。
 
-### 0.3 主对话：模型实际读到的顺序
+
+### 0.2 三部分的结构与顺序
+
+**我们不控制、也观测不到**：服务端把三个字段拼成一段有序提示的确切位置（惯例是 instructions + 工具定义在对话之前）。所以这里只写两件**源码可验证**的事：
 
 ```
-instructions（缓存前缀）：
-  1  【交互规则】                  6,163 字   → A-1.1（群组再追加 604 字 → A-1.2）
-  2  【角色设定（固定，不随对话变化）】 ≤8,000 字（运行时角色数据）
-  3  【硬性约束与语气锁定】          827 字   → A-1.3
-input（顺序即模型读到的顺序）：
-  4  【近期摘要记忆…】              无字符预算（约 40 条 × 120 字）
-  5  历史对话                      最多 60 条（用户 ≤2,000 / 助手 ≤1,200）
-  6  本轮用户消息
-  7  【系统提供的本轮上下文…】+ volatile 各块（最坏 ~18,000 字）→ A-2
-tools（缓存前缀）：20 个工具定义      47,636 字   → A-3
+① 我们发出去三个字段
+   instructions ← §1（规则 6,163 + 角色设定 ≤8,000 + 硬性约束 827）   稳定：改提示词/换角色才变
+   tools        ← §3（20 个工具定义 47,636）                          稳定：改工具/换角色才变
+   input        ← §2（每轮都在变，顺序由我们拼，见 ②）
+
+② input 内部顺序 ← 本文唯一能断言的"读到的顺序"
+   1 【近期摘要记忆…】              无字符预算（≈40 条 × 120 字）
+   2 历史对话                      最多 60 条（用户 ≤2,000 / 助手 ≤1,200）
+   3 本轮用户消息
+   4 【系统提供的本轮上下文…】+ volatile 各块（最坏 ~18,000 字）
+
+③ 缓存断点（用 config 的 cacheStats / prompt_cache_hit_tokens 验证）
+   命中：稳定前缀（instructions + tools + 摘要块 + 到上一轮为止的历史）
+   每轮实付：上一轮的回复 + 本轮用户消息 + volatile 尾块
 ```
 
-### 0.4 精炼索引：同一约束出现在哪几处
+### 0.3 精炼索引：同一约束出现在哪几处
+
+这张表就是「精炼」的工作清单：同一件事被写了几遍，去重时按行删除即可。
+
 
 这张表就是「精炼」的工作清单：同一件事被写了几遍，去重时按行删除即可。
 
 | 约束 | 出现在 | 处数 | 备注 |
 |---|---|---|---|
-| 字段长度上限（短 40 / 叙述 120 / 背景 250） | `AppLimits.StaticProfile`（唯一值来源）、`RULE_3_5`、`TOOL-sub.staticFields[]`、`TOOL-updchar`（描述 + value）、`AUX-§12`、`AUX-§13`、`AUX-§18.4` | 7 | 数值只有一处权威，其余是复述 |
-| 语气锁定（口癖 / 称呼必须出现） | `HARD_2_5`、`RULE_2`、`RULE_3_9`、`A-2.2` 声音契约、`A-2.3` 群聊锁定 | 5 | 同一件事从三个角度写了 5 遍 |
-| 时间写法（绝对日期 / `timeRef`） | `RULE_3_8`、`RULE_9_5`、`TOOL-sub` 里 **21 份 `timeRef`**、`AUX-§5`、`AUX-§6`、`AUX-§7`、`AUX-§12` | 7 + 21 | **最大的重复源** |
-| 记忆字段写法（写明主体 / 证据 / 来源 id） | `RULE_3_7`、`RULE_4`、`RULE_5`、`RULE_5_5`、`TOOL-sub.longTerm[]`、`AUX-§5`、`AUX-§6` | 7 | |
-| 引号与引用保护 | `RULE_2④`、`TOOL-sub.reply`、`AUX-§16`（critique ⑤） | 3 | 有确定性兜底（`keepsProtectedContent`） |
-| `quickReplies` 两条 + 用户视角 | `RULE_7`、`TOOL-sub.quickReplies`、`AUX-§17`、`A-2.2` 快速回应提醒 | 4 | 有客户端校验闭环 |
-| 世界书条目写法（一条一件事、300–400 字） | `AppLimits.Lorebook`、`AUX-§8`、`AUX-§9`、`AUX-§10`、`AUX-§14`、`AUX-§18.1`（两处） | 7 | |
-| 动作一律全角括号、单拍短、≤¼ | `RULE_2`、`TOOL-sub.reply`、`AUX-§11` | 3 | |
+| 字段长度上限（短 40 / 叙述 120 / 背景 250） | `AppLimits.StaticProfile`（唯一值来源）、`RULE_3_5`、`TOOL-sub.staticFields[]`、`TOOL-updchar`（描述 + value）、`§4.8`、`§4.9`、`§4.14.4` | 7 | 数值只有一处权威，其余是复述 |
+| 语气锁定（口癖 / 称呼必须出现） | `HARD_2_5`、`RULE_2`、`RULE_3_9`、`§2.2` 声音契约、`§2.2` 群聊锁定 | 5 | 同一件事从三个角度写了 5 遍 |
+| 时间写法（绝对日期 / `timeRef`） | `RULE_3_8`、`RULE_9_5`、`TOOL-sub` 里 **21 份 `timeRef`**、`§4.1`、`§4.2`、`§4.3`、`§4.8` | 7 + 21 | **最大的重复源** |
+| 记忆字段写法（写明主体 / 证据 / 来源 id） | `RULE_3_7`、`RULE_4`、`RULE_5`、`RULE_5_5`、`TOOL-sub.longTerm[]`、`§4.1`、`§4.2` | 7 | |
+| 引号与引用保护 | `RULE_2④`、`TOOL-sub.reply`、`§4.12`（critique ⑤） | 3 | 有确定性兜底（`keepsProtectedContent`） |
+| `quickReplies` 两条 + 用户视角 | `RULE_7`、`TOOL-sub.quickReplies`、`§4.13`、`§2.3` 快速回应提醒 | 4 | 有客户端校验闭环 |
+| 世界书条目写法（一条一件事、300–400 字） | `AppLimits.Lorebook`、`§4.4`、`§4.5`、`§4.6`、`§4.10`、`§4.14.1`（两处） | 7 | |
+| 动作一律全角括号、单拍短、≤¼ | `RULE_2`、`TOOL-sub.reply`、`§4.7` | 3 | |
 
-### 0.5 全部调用总表
 
-| § | 调用 | 入口（触发时机） | taskType | system 来源 | 期望输出 |
-|---|---|---|---|---|---|
-| §2 | 主对话 · AUTO | 每轮用户发言 / 主动开场 | — | `buildSystemPrompt` | JSON 正文或 `submit_response` |
-| §3 | 主对话 · SUBMIT | AUTO 没拿到正文时的兜底 | — | 同上（同一 `instructions`） | 强制 `submit_response` |
-| §5 | 即时对话 → 短期事件 | 每轮；`instant` 到 60 整窗折叠 | `extraction` | `EXTRACTION_SYSTEM` | JSON 数组 |
-| §6 | 短期事件 → 长期记忆 | 每 N 轮 / 清理 | `analysis` | `ANALYSIS_SYSTEM` | JSON 对象 |
-| §7 | 场景概要 | 场景切换 / 跨 SPAN 且有 ≥6 条 | `scene` | `SCENE_SYSTEM` | 纯文本 |
-| §8 | 世界书整理 | 每轮（折叠出新摘要后） | `lorebook` | `LOREBOOK_SYSTEM` | JSON 对象 |
-| §9 | 世界书超长退回重写 | 上一步有条目 >400 字 | `lorebook` | `LOREBOOK_SYSTEM` | JSON 对象 |
-| §10 | 世界书超长条目重建 | 用户手动一次性迁移 | `lorebook` | `LOREBOOK_REBUILD_SYSTEM` | JSON 对象 |
-| §11 | 散文回复 → 结构化记忆 | 本轮回复是散文 | `auxiliary` | `PROSE_SYSTEM` + 角色设定 | 标准 JSON |
-| §12 | 补全空的基础设定字段 | 启动维护 / 手动 | `auxiliary` | `FILL_SYSTEM` | JSON 对象 |
-| §13 | 补全群成员字段 | 启动维护 / 手动 | `auxiliary` | `FILL_SYSTEM` | JSON 对象 |
-| §14 | 世界观迁移（背景 → 世界书） | 一次性迁移 | `auxiliary` | `LOREBOOK_SYSTEM` | JSON 对象 |
-| §15 | 字段结构重排 | 一次性迁移 | `auxiliary` | `FILL_SYSTEM` | JSON 对象 |
-| §16 | 文风校对 | 检测到文风违规时 | `auxiliary` | `CRITIQUE_SYSTEM` | `{"reply":…}` |
-| §17 | 快速回应修补 | 每轮（开关开且不足两条/不过校验） | `auxiliary` | 动态（用户视角） | `{"quickReplies":[…]}` |
-| §18.1 | 建卡 / 群组升级 `quickGenerate` | 用户触发 | `auxiliary` | `QUICK_GEN_INSTRUCTIONS` | 角色/群组 JSON |
-| §18.2 | 头像 emoji `requestEmojiAvatar` | 建卡后 / 手动 | `auxiliary` | 单行 | 一个 emoji |
-| §18.3 | 表情包打标签 `tagSticker` | 添加表情包时 | `auxiliary` | 单段 | 一个短词 |
-| §18.4 | 群成员字段补全 `fillMemberFields` | 手动 | `auxiliary` | `FILL_MEMBER_INSTRUCTIONS` | 成员字段 JSON |
-| §19 | 远程语音合成 | 点朗读 / 自动朗读 | — | — | PCM 音频流 |
-| §20 | 联网抓取（搜索/热榜/社区/网页） | 工具调用 | — | — | JSON 或 `input_text`+`input_image` |
+**第二类：情境不匹配**（内容本身没错，但对当前实体用不上——单角色请求里仍会带上）
 
-## 1. LLM 传输层（所有 LLM 调用共用）
-
-### 1.1 端点
-
-`POST {responsesEndpoint}/responses`
-
-`responsesEndpoint(baseUrl, platform)`（`ResponsesLlmBackend.kt:486-492`）：去掉结尾 `/chat/completions` → 去掉结尾 `/v1`（平台 `keepV1InResponses=true`，如 `opencode`，保留 `/v1`）→ 追加 `/responses`。
-
-默认 `apiBaseUrl = "https://api.deepseek.com/v1"` → `https://api.deepseek.com/responses`。
-
-### 1.2 Header
-
-| Header | 值 |
-|---|---|
-| `Content-Type` | `application/json` |
-| `User-Agent` | `DeepTalking-Lite/<BuildConfig.VERSION_NAME>`（app 注入；默认 `DeepTalking-Lite`） |
-| `Authorization` | `Bearer <apiKey>`；key 为空**直接抛错不发请求**（`未配置API Key，请在设置中填写`） |
-| `x-opencode-session` | **仅** `apiPlatform == "opencode"`：`sessionId ?: "deeptalking-general"`（缺这个 header 网关返回 400 MissingSessionID） |
-| `Accept` | **仅流式**：`text/event-stream` |
-
-### 1.3 请求体（`ResponsesRequest`，字段名即 JSON 键）
-
-```json
-{
-  "model": "<AppConfig.modelName，默认 deepseek-flash>",
-  "instructions": "<system prompt；无则省略>",
-  "input": [ /* 见 1.4 */ ],
-  "tools": [
-    { "type": "function", "name": "…", "description": "…", "parameters": { }, "strict": false }
-  ],
-  "tool_choice": "auto",
-  "temperature": 0.8,
-  "max_output_tokens": 8192,
-  "stream": true,
-  "reasoning": { "effort": "medium" }
-}
-```
-
-- `tool_choice` 三种形态：`"auto"` / `"none"` / `{"type":"function","name":"…"}`。
-- `reasoning.effort` 白名单 `none|low|medium|high|max`，越界回落 `medium`。
-- `signature`：`temperature` 由 `normalizeTemperature(config.temperature)` 夹到 `[0,2]`；`encodeDefaults = true` 意味着即使是默认值也会出现在体里（`stream`/`strict` 等）。
-
-### 1.4 `input` 数组的元素形态（异构）
-
-| 形态 | 结构 |
-|---|---|
-| 普通消息 | `{"role":"user|assistant|system","content":"文本"}` |
-| 含图消息 | `{"role":"user","content":[{"type":"input_text","text":"…"},{"type":"input_image","image_url":"data:…","detail":"auto"}]}` |
-| 工具调用 | `{"type":"function_call","call_id":"…","name":"…","arguments":"<JSON 字符串>"}` |
-| 工具结果 | `{"type":"function_call_output","call_id":"…","output":"字符串 或 [input_text/input_image 部件]"}` |
-| 思考项重放 | `{"type":"reasoning","id":"…","status":"…","content":[{"type":"reasoning_text","text":"…"}],"summary":[…]}` |
-
-规则：`Role.Tool` **绝不**作为 `{role:"tool"}` 发出；assistant 带 `toolName` 的消息会先把该消息的 reasoning 项逐个展开、再发 `function_call`；工具结果若是 `[{type:"input_text"|"input_image"|"input_file"}, …]` 数组则原样下发（模型能直接看图），否则按字符串下发。
-
-### 1.5 超时
-
-| 场景 | callTimeout | readTimeout |
+| 位置 | 内容 | 量 |
 |---|---|---|
-| 主对话（非流式） | 180 s | 180 s |
-| 主对话（流式） | 180 s | 60 s（空闲即断；每来一个事件重置） |
-| 辅助调用（`auxiliary=true`） | 90 s（`AppLimits.Api.AUXILIARY_TIMEOUT_MS`） | 90 s |
+| `instructions`（共享规则块，单角色也发） | `RULE_3` 末句「群组整体只维护…成员各自的完整状态写入 memberDynamicState」、`RULE_3.5` 末句「群组实体不维护基础设定字段」、`RULE_3.7` 括号「（群组写具体成员名）」、`RULE_5.5` 括号「（群组中可写具体成员名）」 | 分散在 4 条规则里，约 90 字；真正解释成员状态的 `RULE_10` 只发给群组，所以单角色读到的是**半截指令** |
+| `tools`（工具 schema，单角色也发） | 含「群组/成员」字样的行 18 行 ≈2,561 字；`memberName` 相关 14 行 ≈1,564 字；`submit_response.memberDynamicState` 整块 10 行 313 字（描述写着「仅群组对话使用」） | 落在最大的那个工具里 |
 
-### 1.6 响应解析
+要清它得先把 `submit_response` 改成按上下文裁剪（像 `send_sticker` 那样提供 `definitionFor(context)`）；收益是去掉无关/半截指令，代价是 `toolsHash` 多一个维度（单角色 / 群组两套前缀）。
 
-- 正文 = `output[]` 中 `type=="message"` 的 `content[]` 里 `type=="output_text"` 的 `text` 拼接。
-- 工具调用 = `output[]` 中 `type=="function_call"` → `{call_id,name,arguments}`。
-- 用量缓存：`prompt_cache_hit_tokens` 存在时优先，否则 `input_tokens_details.cached_tokens`。
-- `error` 非空 → 抛 `API 返回错误: …`；HTTP 非 2xx → 抛 `Responses API HTTP <code>: <body 前 500 字>`。
-- 前缀指纹：`instructionsHash`（system prompt）与 `toolsHash`（启用工具的 `name|description|parametersJson|strict` 拼接）用 `fnv1a` 计算，用于缓存提示；**改提示词或工具清单都会让每个角色破一次前缀缓存**。
+## 1. `instructions`（主对话 system prompt）
 
----
+### 1.1 结构：每条规则的字数与要点
 
-## 2. 主对话请求 · AUTO 阶段
-
-**调用点**：`ChatOrchestrator.run` 组装 → `AgentLoop.run` 内 `builder.build(...)`（`AgentLoop.kt:92`）。**触发**：每次用户发言、主动开场轮、热榜开场轮。
-
-```json
-{
-  "model": "<config.modelName>",
-  "instructions": "<buildSystemPrompt(...)>",
-  "input": [ /* 见 2.3 */ ],
-  "tools": [ /* 见 2.5，全部启用的工具 */ ],
-  "tool_choice": "auto",
-  "temperature": 0.8,
-  "max_output_tokens": 8192,
-  "stream": true,
-  "reasoning": { "effort": "<config.reasoningEffort，默认 medium>" }
-}
-```
-
-（`stream`/`temperature`/`reasoningEffort` 取自 `AppConfig`，默认 `stream=true`、`temperature=0.8`、`reasoningEffort="medium"`、`apiPlatform="deepseek"`、`modelName="deepseek-flash"`。）
-
-### 2.1 `instructions`（system prompt）结构与字数
 
 拼装顺序（`buildSystemPrompt`）：① 交互规则 → ②（仅群组）规则 10/11/12 → ③ 角色设定段 → ④ 硬性约束与语气锁定段。① 段内每条一行，各段之间空行。
 
-**① 交互规则（共 6,163 字）**——逐字见 **A-1.1**
 
 | 常量 | 一句话要点 | 字数 |
 |---|---|---|
@@ -223,624 +112,16 @@ tools（缓存前缀）：20 个工具定义      47,636 字   → A-3
 | `RULE_9_5` | 相对时间 `timeRef`（anchor / offsetDays / weekday / slot / explicit）；时段只有十个 | 214 |
 | `RULE_A` | 本会话可用工具清单 + 使用原则（一工具一平台、断言前先 `search_memory`） | 1,012 |
 
-**② 群组实体在规则 A 之后额外追加 604 字**（规则 10/11/12：发言格式 / 记忆归属 / 三层设定）——逐字见 **A-1.2**
 
-**③ 角色设定段 + 硬性约束与语气锁定段**——逐字见 **A-1.3**
 
 | 段内块 | 字数 | 说明 |
 |---|---|---|
 | `【角色设定（固定，不随对话变化）】` | ≤8,000（运行时） | `buildRoleContext(character, staticOnly = true)`：单角色 `名称:` + 各静态字段 `标签: 值`（`background` 截 800、其余 600）；群组为 `群组名称/群组前提/场景/互动规则` + `成员:`（每人整段 ≤900） |
 | `【硬性约束与语气锁定（最高优先级，冲突时以这里为准）】` | 827 | `HARD_0_5`（只扮演角色本人）+ `HARD_2_5`（语气锁定）+ `OUTPUT_FORMAT`（收尾格式） |
 
-说明：规则 `3.` 的正文由 `RULE_3_PREFIX` + 字段清单 + `RULE_3_SUFFIX` 拼成（清单见 A-1.1）。`staticOnly = true` 所以**不注入**动态状态；`staticOnly = false`（散文整理等辅助调用）单角色/群组/成员会各追加 `当前状态:` 或 `群组当前状态（全员共用）:` 一行。
+说明：规则 `3.` 的正文由 `RULE_3_PREFIX` + 字段清单 + `RULE_3_SUFFIX` 拼成（清单见 §1.2）。`staticOnly = true` 所以**不注入**动态状态；`staticOnly = false`（散文整理等辅助调用）单角色/群组/成员会各追加 `当前状态:` 或 `群组当前状态（全员共用）:` 一行。
 
-### 2.2 `input` 组装顺序
-
-```
-[0] 近期摘要记忆块（User 消息，可省略）      ← buildShortTermBlock(character)
-[1..n] mapHistory(history).takeLast(60)      ← 历史，最多 60 条
-[n+1] 本轮用户消息（若历史最后一条不是 User）  ← 原文 userText
-[last] 本轮系统上下文（User 消息，volatile 尾部）
-```
-
-- **历史映射**（`mapHistory`）：过滤 `rejected`；用户消息 `trimText 2000` 且贴图附件 `Kind.Sticker → Kind.Image`；助手消息 `trimText 1200` 后包成 `{"reply":"…"}`（含 JSON 转义），空则丢弃；其它角色原样。
-- **近期摘要块**（`buildShortTermBlock`，逐字模板；整窗无字符预算，头部写明条数）：
-
-```
-【近期摘要记忆（刚发生的事，按时间从早到晚，共 <条数> 条；更早的事用 search_memory 按日期或关键词召回）】
-[<日期|日期未知>] <摘要内容>
-[<日期|日期未知>] <摘要内容>
-```
-
-- **系统上下文消息**（逐字模板；`<volatile>` = 下一节的全部区块）：
-
-```
-【系统提供的本轮上下文，仅供角色理解，不代表用户陈述】
-<volatile>
-```
-
-### 2.3 volatile 尾部（系统上下文消息内）分块顺序
-
-| # | 标题 | 条件 | 上限 |
-|---|---|---|---|
-| 1 | `【可选话题库（仅在需要时自然引出，不要生硬报菜名）】` | 有话题候选 | 最多 5 条；来源 `trimText 200` |
-| 2 | `【角色当前状态，可随对话变化】` | 恒有 | 每字段 `trimText 200`；群成员 `trimText 220` |
-| 3 | `【待跟进承诺】` | 有承诺 | 最多 3 条；key 80 / value 260 |
-| 4 | `【世界书·常驻前提…】` / `【世界书·相关条目…】` | 有条目 | 每条 `trimText 400`；最多 6 条 |
-| 5 | `【<成员名>的私人记忆，仅该成员知道】` | 群组且有 | 每条 `trimText 1200`；每成员 ≤2 条 |
-| 6 | `【用户最新纠正（优先于旧记忆…）】` | 有纠正 | `takeLast(2)`；`trimText 200` |
-| 7 | `【互动节奏】距上次回复已过 …` | 间隔 ≥6h | — |
-| 8 | `【场景概要（较早情节的压缩记录…）】` | 有场景 | `takeLast(2)` |
-| 9 | `【本轮主动召回的相关长期记忆】` + `【记忆取用说明】` + `【记忆主体约定】` | 恒有 | 召回 5 条；key 120 / value 1200 |
-| 10 | `【时间基准】`（本地时间/时区/ISO/逻辑日） | 恒有 | — |
-| 11 | `【消息时间元数据，仅供内部推理】` | 恒有 | 最近 14 条：`id \| role \| timestamp` |
-| 12 | 风格尾块 `tail` | 各子块各自条件 | 见下 |
-| 13 | `【角色主动开场（系统触发，不是用户陈述）】` | 主动轮 | — |
-| 14 | `【本轮热榜话题（系统触发，不是用户陈述）】` | 热榜轮 | — |
-
-**区块逐字模板**（按上表顺序；实际只在满足条件时才出现，区块之间空一行）：
-
-> 逐字原文见 **A-2.1**（volatile 完整模板，780 字）。
-
-说明：
-
-- 世界书块由 `buildLorebookInjection` 拼成：常驻条目进第一段、关键词命中进第二段，末行固定为「以上为设定资料…」；正文为空的条目改输出 `条目名：（正文为空，待补充；条目ID: <id>；关键词: a、b）`（无名字则省略名字部分），并追加「标注「正文为空，待补充」的条目…」那一句。
-- 记忆块若一条都没召回到，正文行替换为字面 `无相关长期记忆`。
-- `<主体标签>` 来自 `actorLabel`：用户的称呼（空则 `对方`）/ 角色名（空则 `角色本人`）/ `你们` / `背景`。
-
-**尾块 `<tail>`（紧跟"消息时间元数据"之后，逐字模板）**：
-
-> 逐字原文见 **A-2.2**（尾块 tail 模板，636 字）。
-
-尾块内每个子块都有条件：`【结尾多样性】` 有近期收尾才出；`【本轮节奏骨架…】` 恒出（从下面第 2.3.4 节的 10 条模板里随机取一条）；`【本轮冷场】` 与 `【本轮话题切换】` 二选一（`COLD_FIELD_PATTERNS` 命中前者，否则话题切换时后者）；两条 `（内部提醒）` 各自有问题才出；`【语气回顾…】` 每 `STYLE_GUARD.reviewEveryTurns = 3` 轮出一次；声音契约单角色用上表模板、群组用下面的群聊变体（摘要 `anchorStyleChars = 300`、示例最多 `anchorSamples = 3` 条各 `trimText 80`）。
-
-**群聊声音契约（逐字模板，替代上面的 `【本轮声音契约…】` 块）**：
-
-> 逐字原文见 **A-2.3**（群聊声音契约模板，224 字）。
-
-**两个系统触发的本轮指令（逐字，追加在尾块之后）**：
-
-> 逐字原文见 **A-2.4**（两个系统触发的本轮指令，445 字）。
-
-### 2.3.1 提醒里会插入的标签（逐字）
-
-| 键 | 标签文本（插入 `【上一轮需要纠正…】` / `【语气回顾…】`） |
-|---|---|
-| `metaTalk` | 出现元话术（如"好的我改成/我会这样说话/收到，我调整"）——应直接演出，不要说明自己在调整 |
-| `speaksForUser` | 替用户写了台词或行动——用户的话只能由用户自己说 |
-| `cliche` | 出现陈词滥调（如"心湖泛起涟漪""勾起嘴角""空气中弥漫着"） |
-| `reusedImagery` | 复用了近期用过的比喻、意象或收尾方式 |
-| `toneDrift` | 没有体现设定的说话风格（口癖/句尾/称呼），或句长过于整齐缺少起伏 |
-| `recitedLore` | 复述了世界书或设定条目本身，应当只在需要时自然引用 |
-
-| 键 | 标签文本（插入 `【上一轮快速回应（内部提醒）】`） |
-|---|---|
-| `missing` | 没有给出两条可用短句 |
-| `placeholder` | 把示例占位文字（如"短句一/短句二"）当成了真内容 |
-| `action` | 带了括号动作或旁白（快速回应只写用户会打的字） |
-| `mirrored` | 复述或镜像了角色刚说过的话 |
-| `characterName` | 出现了角色自己的名字，像是在用角色口吻说话 |
-| `tooLong` | 单条过长，不像用户随手打的一句话 |
-
-### 2.3.2 节奏骨架模板（`NARRATIVE_PATTERNS`，逐字 10 条，每轮随机取一条）
-
-| 骨架名 | 说明（拼进"建议本轮按…组织内容："之后） |
-|---|---|
-| 动作/描写 → 对白 → 动作/描写 | 先一两句场景、动作或情绪描写，再说 1-2 句台词，最后回到动作或环境收束。 |
-| 短句开场 → 描写 → 对白 | 先用一个很短的句子或独字反应（如“……嗯。”）开场，接一两句描写或心理，再落到 1-2 句台词。 |
-| 对白 → 描写 → 短句收尾 | 先直接说 1-2 句台词，中间穿插动作或环境描写，最后用一句很短的话或一个小动作收住。 |
-| 描写 → 短句 → 描写 | 以描写起手，中间插一句短促的台词或动作，再回到描写或环境。 |
-| 短句 → 描写 → 短句 | 首尾都用很短的句子，中间用一段描写承上启下，整体节奏偏顿挫。 |
-| 描写 → 对白 → 短句 | 先铺一小段描写或动作，再说 1-2 句台词，最后用一个短促的动作或半句话收住。 |
-| 对白 → 描写 → 对白 | 台词与描写交替：一句台词、一段描写、再一句台词，像真实对话里的停顿与反应。 |
-| 短句 → 描写 → 较长描写 | 先用短句点出反应，再用两段递进的描写展开当下的状态与氛围，但不做总结拔高。 |
-| 描写 → 对白 → 描写 → 对白 | 描写与台词两组交替推进，信息密度较高，但每句都要短，不要写成大段独白。 |
-| 对白 → 描写 → 描写 | 先给台词，再用两段描写承接（动作、表情、环境），收尾留在描写上，不要加总结句。 |
-
-**volatile 无区块预算**，只有上表每条目的的兜底上限。
-
-### 2.4 多轮工具循环
-
-每执行一个信息类工具后追加两条消息（下轮请求里序列化成 3 个 item）：
-
-```
-assistant 消息 { content:"", toolCallId, toolName, toolArguments, reasoningJson }  →  reasoning item(s) + function_call item
-Role.Tool 消息 { content: 工具结果 JSON, toolCallId }                              →  function_call_output item
-```
-
-上限：`MAX_TOOL_ROUNDS = 5`、`MAX_TOOL_CALLS = 12`（`AppLimits.Agent`）。达到上限时：有累计正文就直接采用；没有就转 SUBMIT。
-
-### 2.5 `tools`：20 个工具定义
-
-注册顺序即发送顺序；`strict` 只有 `submit_response` 是 `true`，其余 `false`；`send_sticker` **仅当角色有贴图**才注册（schema 内联该角色标签枚举）。
-
-| 工具 | 作用 | 字数 |
-|---|---|---|
-| `get_current_time` | 取当前时间 | 118 |
-| `search_memory` | 按日期/关键词检索记忆 | 1,458 |
-| `list_memories` | 盘点记忆清单 | 519 |
-| `delete_memory` | 按 ID 删记忆 | 372 |
-| `set_reminder` | 记待办（须用户发起） | 1,948 |
-| `ask_user` | 向用户澄清 | 226 |
-| `update_character_field` | 改基础设定字段 | 2,160 |
-| `upsert_lorebook_entry` | 写世界书条目 | 1,509 |
-| `web_fetch` | 读链接 | 445 |
-| `update_memory` | 按 ID 修正记忆 | 2,568 |
-| `send_sticker` | 发表情包 | 221 |
-| `web_search` | 必应搜索 | 270 |
-| `search_video` | 搜 B站视频 | 321 |
-| `search_music` | 搜网易云歌曲 | 307 |
-| `search_posts` | 搜虎扑帖子 | 300 |
-| `baidu_hot` | 百度热搜 | 213 |
-| `toutiao_hot` | 今日头条热榜 | 215 |
-| `douyin_hot` | 抖音热榜 | 213 |
-| `zhihu_hot` | 知乎热榜 | 213 |
-| `submit_response` | 结构化收尾 | 34,040 |
-| **合计** | | **47,636** |
-
-逐字定义（`name` / `description` / `parameters` / `strict`）见 **A-3**：`submit_response` 单独在 **A-3.1**，其余 19 个在 **A-3.2**。
-
-### 2.6 工具结果的固定文案
-
-工具结果作为 `function_call_output` 回传模型：成功是各工具自己拼的 `{"ok":true,…}`；**失败 / 拒收是固定文案**（`errorJson(...)`），作为 `{"ok":false,"reason":"…"}` 的 `reason` 值。共 33 条，逐字见 **A-5**。
-
-工具注册表兜底（`ToolRegistry.execute`）：未知工具 → `未知工具: <name>`；未启用 → `工具不可用: <name>`；抛异常 → `工具执行异常: <message>`（不中断整轮）。
-
-### 2.7 期望输出与解析
-
-`submit_response` 工具调用、或合法 JSON、或**散文**都直接采用（散文即终稿）。
-
----
-
-## 3. 主对话请求 · SUBMIT 阶段
-
-同一 `instructions`，只改三项：
-
-| 字段 | AUTO | SUBMIT |
-|---|---|---|
-| `tools` | 全部启用工具 | 只有 `submit_response` |
-| `tool_choice` | `"auto"` | `{"type":"function","name":"submit_response"}` |
-| `reasoning.effort` | `config.reasoningEffort` | `"none"` |
-
-**触发**：AUTO 没产出可用正文时（先补一个 reasoning 消息再转）；SUBMIT 给一次重试，仍空则最多再试两次空回合，最后返回空结果。
-
----
-
-## 4. 后台 / 辅助调用（共性）
-
-所有后台任务（第 5–18 节）走同一个模板（`BackgroundTasks.kt:1929-1940`）：
-
-```json
-{
-  "model": "<BackgroundTasks.model，默认 deepseek-flash>",
-  "instructions": "<各调用自己的 system>",
-  "input": [ { "role": "user", "content": "<各调用拼装的 user>" } ],
-  "tool_choice": "auto",
-  "temperature": 0.8,
-  "max_output_tokens": 8192,
-  "stream": false,
-  "reasoning": { "effort": "none" }
-}
-```
-
-- `temperature = normalizeTemperature(config.temperature)`；`max_output_tokens = AppLimits.Api.AUXILIARY_MAX_OUTPUT_TOKENS = 8192`；`stream=false`；`auxiliary=true`（因此用 90 s 预算）；`sessionId = deeptalking-<charId>`（无 id 时 `deeptalking-general`）；`tools` 空。
-- **失败策略**：瞬时错误（网络/超时/429/5xx）按 `ApiRetry` 重试；永久失败记录原因并返回空文本（各调用按空结果回退）。**没有 `tools`**，所以辅助调用只发一次、不进入工具循环。
-
----
-
-## 5. 即时对话 → 短期事件（`extraction`）
-
-- **触发**：每轮；`instant` 达高水位 60 时整窗折叠；或超长窗迁移（`migrateOversizedWindow`）。
-- **taskType**：`extraction`。
-- **system（逐字）**：
-
-```
-你是一个信息提取助手。只返回JSON数组，不要其他文字。
-```
-
-- **user 拼装顺序**：`EXTRACTION_PROMPT_HEAD` → 模式子句 → `EXTRACTION_PROMPT_TAIL` → 已有短期事件 JSON → `\n对话内容:\n` → 对话 JSON。
-
-  1. 模式子句：普通 `返回JSON数组，最多十五个元素。`；迁移 `不限事件数量，尽可能完整覆盖本批全部消息。`
-  2. 已有短期事件 JSON：`[{eventTime,participants,location,content}]`，来自 `shortTerm` 按 `eventTime` 倒序 `take 20`，每条 `content = trimText 240`。
-  3. 对话 JSON：`[{id,role,content,timestamp}]`，`role` 小写、`content = trimText 600`；普通模式=当前 `instant` 全窗，迁移模式=`instant.take(60)`。
-- **期望输出**：`[{"content":"…","eventTime":"ISO","participants":["用户","角色名"],"location":"…"}]`；解析用宽松 JSON，普通的 `take(15)`，空即失败。
-
-`EXTRACTION_PROMPT_HEAD`（逐字）：
-
-> 逐字原文见 **A-4.1**（§5 · `EXTRACTION_PROMPT_HEAD`，792 字）。
-
-`EXTRACTION_PROMPT_TAIL`（逐字，末尾换行后接已有事件 JSON）：
-
-```
-返回JSON数组：[{"content":"一段完整的事件流程摘要","eventTime":"ISO时间","participants":["用户","角色名"],"location":"地点或未说明"}]。
-已有短期事件（不要重复，只在需要延续或更新时合并进去）:
-```
-
----
-
-## 6. 短期事件 → 长期记忆（`analysis`）
-
-- **触发**：累计够一批（`SHORT_TERM - TRIM_FLOOR = 20`）时每 N 轮；清理时可手动排空。
-- **taskType**：`analysis`。
-- **system（逐字）**：
-
-```
-你是一个记忆分析助手。只返回JSON，不要其他文字。
-```
-
-- **user 拼装顺序**：`ANALYSIS_PROMPT_HEAD` → 条目 JSON → `ANALYSIS_PROMPT_TAIL`。
-  1. 条目 JSON：`[{id,content,sourceMessageIds,eventTime,participants,location,userEvidence,analyzed}]`。`batch` = 未分析的前 40 条（`analyzed=false`），`context` = 最近 20 条已分析条目（`analyzed=true`，只用于连贯）。
-- **期望输出**：`{"status":"ok","analyzedShortTermIds":[…],"longTerm":[{category,subject,key,value,tags,importance,sourceShortTermIds,sourceMessageIds,evidence,eventTime,participants,location,status,dueAt,arcOf,arcStage}]}`；解析失败则走 `AnalysisSalvage` 的确定性抢救。
-
-`ANALYSIS_PROMPT_HEAD`（逐字）：
-
-> 逐字原文见 **A-4.2**（§6 · `ANALYSIS_PROMPT_HEAD`，1437 字）。
-
-`ANALYSIS_PROMPT_TAIL`（逐字）：
-
-> 逐字原文见 **A-4.3**（§6 · `ANALYSIS_PROMPT_TAIL`，731 字）。
-
----
-
-## 7. 场景概要（`scene`）
-
-- **触发**：场景键（地点）变化、或场景跨度超过 `SPAN=12` 且消息 ≥ `MIN_MESSAGES=6`。
-- **taskType**：`scene`。**system（逐字）**：
-
-```
-你是对话记录整理助手。只输出场景摘要正文，不要任何额外文字。
-```
-
-- **user**：`SCENE_PROMPT` + 转录文本。转录 = 场景起点之后的 `instant` 取 `takeLast(20)`，每行 `[序号] 用户|角色名: trimText(content,500)`。
-- **期望输出**：纯文本摘要（无 JSON）；长度 <8 视为失败，落盘 `trimText 2000`。
-
-`SCENE_PROMPT`（逐字）：
-
-> 逐字原文见 **A-4.4**（§7 · `SCENE_PROMPT`，289 字）。
-
----
-
-## 8. 世界书整理（`lorebook`）
-
-- **触发**：每轮（折叠出新摘要后）/ 清理时排空。
-- **taskType**：`lorebook`。**system（逐字）**：
-
-```
-你是世界书整理助手。只返回 JSON，不要任何额外文字。
-```
-
-- **user 拼装顺序**：`LOREBOOK_PROMPT_HEAD` → 现有条目清单（或字面 `（空）`）→ `LOREBOOK_PROMPT_TAIL` → `（角色名：<名>）：` → 事件摘要行。
-
-  1. 现有条目清单每行：`- 名称｜关键词: a、b` + `｜常驻` + `｜内容: …` 或 `｜内容（略，本轮不要更新此条）`。完整内容只给**最近更新的 12 条**且总字符 ≤ 6000（`LOREBOOK_EXISTING_FULL_ENTRIES` / `LOREBOOK_EXISTING_FULL_CHARS`）。
-  2. 事件摘要行：`[<shortTermId>] trimText(content,600)`。
-- **期望输出**：`{"entries":[{"name","keywords","content","alwaysActive","sourceShortTermIds"}]}`；`take(3)`，`sourceShortTermIds` 必须都在本批摘要 id 内；超 400 字的条目转入第 9 节重写。
-
-`LOREBOOK_PROMPT_HEAD`（逐字）：
-
-> 逐字原文见 **A-4.5**（§8 · `LOREBOOK_PROMPT_HEAD`，826 字）。
-
-`LOREBOOK_PROMPT_TAIL`（逐字）：
-
-```
-
-事件摘要
-```
-
----
-
-## 9. 世界书超长条目的退回重写（`lorebook`）
-
-- **触发**：第 8 节有条目 >400 字时**同一函数内**追加一轮。
-- **system**：同 `LOREBOOK_SYSTEM`。
-- **user 拼装**：`LOREBOOK_FIX_PROMPT` → 被退回条目逐行 `- name: X｜keywords: a、b｜sourceShortTermIds: s1、s2｜content: …`（原文回显，不截断）。
-- **期望输出**：同 `{"entries":[…]}`；只接受原名单里、content 非空且 ≤400 字、来源 id 合法的条目，其余丢弃（原超长条目不落盘）。
-
-`LOREBOOK_FIX_PROMPT`（逐字，末尾换行后接退回条目）：
-
-> 逐字原文见 **A-4.6**（§9 · `LOREBOOK_FIX_PROMPT`，315 字）。
-
----
-
-## 10. 世界书超长条目重建（一次性迁移）
-
-- **触发**：用户手动对某角色执行"重建超长世界书条目"，每条一次调用。
-- **taskType**：`lorebook`。**system（逐字）**：
-
-```
-你是世界书整理助手。只返回 JSON，不要任何额外文字。
-```
-
-- **user 拼装**：`LOREBOOK_REBUILD_PROMPT` → `\n\n（角色名：<名>）\n原条目：\n名称：…\n关键词：…|（无）\n常驻：true|false\n内容：\n<原条目全文>`
-- **期望输出**：`{"entries":[…]}`；`take(3)`，名称 `take 60`，content 必须 ≤400 字（否则整次失败、保留原条目），keywords `take 8`；首条沿用原 id。
-
-`LOREBOOK_REBUILD_PROMPT`（逐字）：
-
-> 逐字原文见 **A-4.7**（§10 · `LOREBOOK_REBUILD_PROMPT`，490 字）。
-
----
-
-## 11. 散文回复 → 结构化记忆（`auxiliary`）
-
-- **触发**：本轮回复是散文（非结构化 JSON），后台补成标准 JSON 并落记忆。
-- **taskType**：默认 `auxiliary`（未显式传）。
-- **system**：`PROSE_SYSTEM` + `\n\n【角色设定】\n` + `buildRoleContext(character, false)`。
-- **user 拼装**（逐字骨架）：
-
-```
-【系统提供的本轮上下文，仅供理解，不是用户陈述】
-<volatileContext（同 2.3）>
-
-用户消息: <用户原文> （消息id: <id>）
-
-角色回复（散文，整理到reply字段）：
-<散文原文>
-```
-
-- **期望输出**：与主对话一致的标准 JSON（`reply` 一字不改、`quickReplies` 两条、`shortTerm`/`longTerm`/`dynamicState`/`staticFields`/`memberDynamicState`/`promiseUpdates`）；来源 id 只接受本轮用户消息 id 与助手消息 id。
-
-`PROSE_SYSTEM`（逐字）：
-
-> 逐字原文见 **A-4.8**（§11 · `PROSE_SYSTEM`，1352 字）。
-
----
-
-## 12. 补全空的基础设定字段（`auxiliary`）
-
-- **触发**：启动维护 / 手动；有缺失字段且未在冷却期（成功后 24h，失败按 5→30 分钟指数退避）。
-- **taskType**：默认 `auxiliary`。**system（逐字）**：
-
-```
-你是角色卡补全助手。只返回JSON。
-```
-
-- **user 拼装**（逐字骨架，`labels` = `中文标签(key)`、`existing` = 已有字段 `"key":"value"` 且 value `trimText 300`）：
-
-> 逐字原文见 **A-4.9**（§12 补全空的基础设定字段 · user 拼装，183 字）。
-
-  - 补 `speakingStyle` 时插入逐字规则：`speakingStyle 必须写成“整体调性描述；示例：<台词1> / <台词2> / <台词3>”：三条示例台词必须是该角色真的会说的口语短句，要体现口头禅、句尾助词、标点习惯与对用户的称呼，三条之间差异明显（能看出是同一个人、但场景不同）；**禁止换行，三条之间只能用 " / " 分隔**，整个字段不超过 200 字。`
-  - 补 `userAddress` 时插入逐字规则：`“对用户的称呼”(userAddress) 只填一个简短称呼词（如“明明”“老公”），不带任何解释。`
-- **期望输出**：`{"<字段英文名>":"内容"}`；每个字段再走 `cleanFieldValue`（长度/句式收敛，见 `AppLimits.StaticProfile`：短字段 40 / 叙述字段 120 / 背景 250 字）与 `normalizeUserAddress`。
-
----
-
-## 13. 补全群成员字段（`auxiliary`）
-
-- **触发**：启动维护 / 手动；每次最多 3 名成员。**sessionId 用群组 id**。
-- **system**：同 `FILL_SYSTEM`。
-- **user 拼装**（逐字骨架）：
-
-> 逐字原文见 **A-4.10**（§13 补全群成员字段 · user 拼装，283 字）。
-
-- **期望输出 / 解析**：同第 12 节。
-
----
-
-## 14. 世界观迁移：背景 → 世界书（一次性）
-
-- **触发**：用户手动迁移（已有 `lorebookMigratedAt` 或源文本 <40 字则跳过）。
-- **system**：`LOREBOOK_SYSTEM`。
-- **user 拼装**（逐字骨架，`trimmed` = 群组 `description` / 单角色 `background`）：
-
-> 逐字原文见 **A-4.11**（§14 世界观迁移：背景 → 世界书 · user 拼装，481 字）。
-
-- **期望输出**：`{"entries":[…6 条…]}`，可选 `trimmedSource`（只在更短时采纳，落盘 `trimText 1200`（群组）/`800`（单角色））。
-
----
-
-## 15. 字段结构重排（一次性）
-
-- **触发**：用户手动迁移（已在 `fieldsMigrationVersion == "1.2.0"` 则跳过）。
-- **system**：`FILL_SYSTEM`。
-- **user 拼装**（逐字骨架 + 现有内容 JSON）：
-
-> 逐字原文见 **A-4.12**（§15 字段结构重排 · user 拼装，347 字）。
-
-- **期望输出**：`{"dynamicState":{…},"background":"…"}`；动态字段 `trimText 700`、单角色 background `800`、群组 description `1200`。
-
-> 注：`「价值观」「关键过往」两个字段已删除`，旧数据由 `core:data/RetiredStaticFields` 在**读取时**并入性格/背景（旧备份由 `LegacyMapper` 合并），不经过本调用。
-
----
-
-## 16. 文风校对（`auxiliary`）
-
-- **触发**：`detectStyleViolations` 命中且 `AppConfig.styleCritique` 开启。
-- **taskType**：默认 `auxiliary`。**system（逐字）**：
-
-```
-你是文风校对助手。只返回JSON。
-```
-
-- **user 拼装**（逐字骨架，`rules` = 每条 `- <违规中文标签>`）：
-
-> 逐字原文见 **A-4.13**（§16 文风校对 · user 拼装，269 字）。
-
-- **期望输出**：`{"reply":"…"}`。
-- **确定性回退**（任何一条不满足就保留原文）：非空、有变化、长度 ≤ `critiqueMaxChars`(1600)、长度比在 `[0.5, 2.0]`、且 `keepsProtectedContent`（引用段落逐字未变、世界书条目名/角色名/成员名/称呼未丢失）。
-
----
-
-## 17. 快速回应修补（`auxiliary`）
-
-- **触发**：每轮（开关开；当前 `quickReplies` 不足两条或不过视角校验）。
-- **taskType**：默认 `auxiliary`。**system**（动态，逐字）：
-
-```
-你就是这位用户本人，正在手机上和<charName>聊天。只输出用户此刻最可能打出的两句话，不要扮演<charName>，不要写旁白或动作，不要解释。
-```
-
-- **user 拼装**（逐字骨架）：
-
-> 逐字原文见 **A-4.14**（§17 快速回应修补 · user 拼装，282 字）。
-
-- **期望输出**：`{"quickReplies":[…]}`；解析不足 2 条或仍不过校验 → 回退 `["嗯","继续"]`。
-
----
-
-## 18. App 层建卡 / 补全调用
-
-### 18.1 建卡与群组升级（`quickGenerate`）
-
-**system（逐字）**：
-
-```
-你是角色设计助手。严格按用户在消息里给出的 JSON 结构返回，只输出 JSON，不要任何解释、旁白或代码块标记。
-不得使用陈词滥调的人设模板；世界层设定一律写进 lorebook，不要写进角色个人背景。
-```
-
-**参数**：`temperature = 1.0`、`max_output_tokens = 1200`、`reasoning.effort = "none"`、`sessionId = "deeptalking-general"`、`auxiliary = true`、无工具。**input** 只有一条用户消息 = 调用方给的 prompt：
-
-- **建角色卡**（`CharacterParity.buildQuickGeneratePrompt(desc, isGroup=false)`）：
-  `CHARACTER_PROMPT_PREFIX` + `CHARACTER_QUALITY_RULE` + `SPEAKING_STYLE_SAMPLES_RULE` + `LOREBOOK_CONTENT_RULE` + `\n描述: ` + 用户描述。
-  前缀（逐字）：
-> 逐字原文见 **A-4.15**（§18.1 建卡与群组升级 · 前缀，461 字）。
-
-- **建群组卡**（`isGroup=true`）：`GROUP_PROMPT_PREFIX` + 同样三条规则 + `\n描述: ` + 描述。前缀（逐字）：
-> 逐字原文见 **A-4.16**（§18.1 · `GROUP_PROMPT_PREFIX`，995 字）。
-
-- 三条共用规则（逐字）：
-  - `CHARACTER_QUALITY_RULE`：
-    ```
-    人设质量要求：①不得使用陈词滥调的名字或模板化人设（如“艾尔德里亚”式的套路奇幻名、“高冷大小姐”“温柔邻家女孩”这类通用模板）；②personality 写具体的行为倾向（遇到事情会怎么做、在意什么），不要堆砌形容词；③background 只写 3-5 条会影响当下互动的要点，不要写编年史。
-    ```
-  - `SPEAKING_STYLE_SAMPLES_RULE`：同第 12 节的同名规则文本。
-  - `LOREBOOK_CONTENT_RULE`：
-    ```
-    lorebook 每条 content 精炼、一条只讲一件事，**目标 300 字以内**（硬上限 400 字，超过会被丢掉）。
-    ```
-- **群组升级**（`AppViewModel.upgradeToGroup`，同一 `quickGenerate`）：prompt 顺序为「升级说明 + 返回 JSON 骨架（`groupInfo` / `lorebook` / `additionalMembers` 全字段空串）+ lorebook 与成员补充要求 + `CHARACTER_QUALITY_RULE` + `SPEAKING_STYLE_SAMPLES_RULE` + `\n原角色（禁止重复输出）:\n<原角色 JSON>` + `\n近期对话:\n<最近 20 条，各 take 1000>`」。原角色 JSON 键顺序：`name, avatar, gender, age, race, appearance, personality, fears, background, speakingStyle, language, userAddress`。
-- **解析**：`CharacterParity.parseGeneratedDraft`（提取第一个 `{…}`）；lorebook 条目超 400 字**丢弃不截断**，条数 ≤200、keywords ≤8、名称 `take 60`。
-
-### 18.2 头像 emoji（`requestEmojiAvatar`）
-
-**system（逐字）**：
-
-```
-你是角色头像助手。只输出一个最能代表该角色的 emoji 字符，不要任何文字、标点或解释。
-```
-
-**参数**：`temperature = 1.2`、`max_output_tokens = 16`、`effort = "none"`、`sessionId = "deeptalking-general"`、`auxiliary = true`。**input** = 一条用户消息，内容 = 描述（`[name, appearance, personality]` 非空项用 `，` 连接；空则 `一个神秘角色`）。**输出**：第一个 emoji 码点（扫描 emoji 码区）。
-
-### 18.3 表情包打标签（`tagSticker`）
-
-**system（逐字，`STICKER_TAGS` 内联）**：
-
-```
-你是表情包分类助手。看这张表情包或图片，从下列标签中选一个最贴切的：开心、大笑、难过、委屈、生气、无语、惊讶、疑惑、害羞、得意、爱意、亲亲、抱抱、加油、点赞、拒绝、睡觉、干杯。若都不贴切，就给出一个 1 到 6 字的中文短词。只输出这一个词，不要标点、解释或其它文字。
-```
-
-**参数**：`temperature = 0.2`、`max_output_tokens = 8`、`effort = "none"`、`auxiliary = true`。**input** = 一条用户消息：文本 `给这张图打一个短词标签。` + 图片附件（经 `imageResolver` 变成 `input_image`）。**输出**：去标点后 `take 6`。
-
-### 18.4 群成员字段补全（`fillMemberFields`，NativeCore 版）
-
-**system（逐字）**：
-
-> 逐字原文见 **A-4.17**（§18.4 群成员字段补全 · system，469 字）。
-
-**参数**：`temperature = 0.8`、`max_output_tokens = 800`、`effort = "none"`、`auxiliary = true`。**input** = 一条用户消息，顺序拼装 `群组信息:`(JSON `name, avatar, description, scene, interactionRules`) + `群组其他成员:`(JSON `name, personality, speakingStyle, roleInGroup`) + `待补全成员:`(JSON `name, avatar, gender, age, race, appearance, personality, fears, background, speakingStyle, language, userAddress, roleInGroup, dynamicState{六字段}`) + `用户补充:` + hint + `SPEAKING_STYLE_SAMPLES_RULE`。**输出**：只填**空**字段的 JSON。
-
----
-
-## 19. 远程语音合成（`POST {base}/v1/audio/speech`）
-
-**端点**：`speechUrl(base) = base.trimEnd('/') + "/v1/audio/speech"`，`base = config.normalizedBaseUrl`。
-
-**Header**：
-
-| Header | 值 |
-|---|---|
-| `Accept` | `audio/L16` |
-| `User-Agent` | `DeepTalking-Lite/<version>` |
-| `Authorization` | `Bearer <token>`，**仅当**配置了访问口令（自动去掉用户粘贴的 `Bearer ` 前缀） |
-| `Content-Type` | `application/json; charset=utf-8` |
-
-**请求体**（字段顺序即下）：
-
-```json
-{
-  "model": "cosyvoice-3",
-  "voice": "alloy",
-  "input": "<朗读文本（extractSpeechText 后的纯台词）>",
-  "response_format": "pcm",
-  "stream": false,
-  "speed": 1.0,
-  "instructions": "<本轮 currentTone，空则省略>",
-  "chunk_tokens": 28,
-  "temperature": 1.0,
-  "top_k": 25,
-  "top_p": 0.8,
-  "win_size": 10,
-  "tau_r": 0.1,
-  "min_token_text_ratio": 2.0,
-  "max_token_text_ratio": 20.0
-}
-```
-
-- `speed` 夹到 `[0.5, 2.0]`；`instructions` 即角色当前语气（群聊按发言人分段，每段用该成员的 `currentTone`）。响应体是 PCM16 裸流，按 8192 字节读取切块。
-- 超时：连接 4 s、读空闲 60 s、**无总超时**。
-- 同模块其他端点：探测 `GET {base}/v1/models` → `/healthz` → `/ping`；状态 `GET {base}/status`（取 `sample_rate`）；音色列表 API 模式 `GET {base}/healthz` 的 `voices`、WebUI 模式 `GET {base}/speaker`；上传参考音色 `POST {base}/v1/voices?name=<URL编码>`（body 为 gguf 原始字节，`Content-Type: application/octet-stream`）。
-
----
-
-## 20. 联网抓取（工具触发的 HTTP）
-
-所有请求走 `HttpWebContentProvider`（读超时 20 s；DoH DNS 可开）。`BROWSER_UA` = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36`，仅在下表标注处发送。
-
-| 工具 | 方法 + URL | 特殊 Header | 超时 | 返回 |
-|---|---|---|---|---|
-| `web_search` | GET `https://www.bing.com/search?format=rss&q=<query 截断 200>` | — | 15 s | `{"ok":true,"query","results":[{"title","url","description"}]}`（title ≤160、desc ≤400） |
-| `search_video` | GET `https://api.bilibili.com/x/web-interface/search/all/v2?keyword=<q>&page=1` | `Referer: https://www.bilibili.com/` | 15 s | `{"ok":true,"platform":"bilibili","keyword","count","results":[{"bvid","title","author","play","duration","url","cover"}]}` |
-| `web_fetch`（B站链接） | GET `…/x/web-interface/view?bvid=<id>`（`b23.tv` 先解析短链） | Referer bilibili | 15 s | 视频详情（+ 有封面时包成 `input_text`+`input_image`） |
-| `baidu_hot` | GET `https://top.baidu.com/api/board?platform=wise&tab=realtime` | `User-Agent: BROWSER_UA` | 15 s | `{"ok":true,"platform":"baidu","count","items":[{"title","url","hot"}]}` |
-| `toutiao_hot` | GET `https://www.toutiao.com/hot-event/hot-board/?origin=toutiao_pc` | BROWSER_UA + `Referer: https://www.toutiao.com/` | 15 s | 同上 items |
-| `douyin_hot` | GET `https://www.iesdouyin.com/web/api/v2/hotsearch/billboard/word/` | BROWSER_UA | 15 s | 同上 items |
-| `zhihu_hot` | GET `https://api.zhihu.com/topstory/hot-lists/total?limit=50` | BROWSER_UA + `Referer: https://www.zhihu.com/hot` | 15 s | 同上 items（问题链接改写为 `https://www.zhihu.com/question/<id>`） |
-| `search_music` | GET `https://music.163.com/api/search/get?s=<q>&type=1&limit=<n>` | BROWSER_UA + `Referer: https://music.163.com/` | 15 s | `{"ok":true,"platform":"netease","keyword","count","results":[{"id","name","artists","album"?,"url"}],"note":"要听热评可用 web_fetch 打开该歌曲链接"}` |
-| `search_posts` | GET `https://bbs.hupu.com/search?q=<q>` | BROWSER_UA | 20 s | `{"ok":true,"platform":"hupu","keyword","count","results":[{"title","url","meta"?}]}` |
-| `web_fetch`（虎扑帖子） | GET `https://bbs.hupu.com/<tid>.html` | BROWSER_UA | 20 s | 帖子正文（≤3000）+ 回帖（每条 ≤400）+ 图片 |
-| `web_fetch`（网易云歌曲） | GET `https://music.163.com/api/song/detail/?ids=[<id>]` + `…/api/v1/resource/comments/R_SO_4_<id>?limit=20&offset=0` | BROWSER_UA + Referer netease | 15 s | 歌曲信息 + 热评（每条 ≤300） |
-| `web_fetch`（通用网页） | GET 目标 URL | — | 20 s | 正文 ≥80 字 → `{"ok":true,"url","content"(≤6000)}`；图片响应 → `input_text`+`input_image` |
-| `web_fetch`（摘要兜底） | GET `https://api.microlink.io/?url=<目标>` | — | 12 s | `{"ok":true,"via":"microlink","url","title","description"(≤600),"publisher","author","date","image"}`（有图则包成部件数组） |
-
-**上限**：`MAX_SEARCH_RESULTS=20`、`MAX_HOT_TOPICS=30`、`MAX_SOCIAL_RESULTS=20`、`NETEASE_COMMENT_LIMIT=20`。所有失败都降级为 `{"ok":false,…,"reason":…}`，不抛异常。
-
----
-
-## 21. 其他外发调用
-
-| 用途 | 方法 + URL | 说明 |
-|---|---|---|
-| DoH DNS | POST `https://dns.alidns.com/dns-query` 或 `https://doh.pub/dns-query` | body 为 RFC 8484 线格式查询，`Accept: application/dns-message`；DoH 主机名用固定引导 IP 解析，避免被劫持；结果缓存 5 分钟，失败回落系统 DNS |
-| CosyVoice3 模型下载 | GET `https://modelscope.cn/models/Lourdle/Fun-CosyVoice3-0.5B-2512-GGUF/resolve/master/…` | 三个文件（主 gguf 629 MB、speech_tokenizer、campplus）；`User-Agent: DeepTalking-Lite/1.5`（硬编码）；连接 30 s / 读 60 s |
-| API 连接自检 | GET `{base}/` + POST `{responsesEndpoint}` | 探测请求体固定为 `{"model":…,"input":[{"role":"user","content":"hi"}],"max_output_tokens":50,"stream":false,"reasoning":{"effort":"none"}}` |
-
-> 没有更新检查、也没有第三方头像/表情包服务：头像由第 18.2 的 LLM 调用产生，表情包标签由第 18.3 的视觉调用产生。
-
----
-
-## 22. 关键常量索引
-
-| 常量 | 值 | 位置 |
-|---|---|---|
-| `AppLimits.Api.AUXILIARY_TIMEOUT_MS` | 90000 | `core/common/AppLimits.kt` |
-| `AppLimits.Api.AUXILIARY_MAX_OUTPUT_TOKENS` | 8192 | 同上 |
-| `AppLimits.Agent.MAX_TOOL_ROUNDS` / `MAX_TOOL_CALLS` / `TOOL_MEMORY_INJECT_LIMIT` | 5 / 12 / 5 | 同上 |
-| `AppLimits.Memory.INSTANT` / `SHORT_TERM` / `INSTANT_TRIM_FLOOR` | 60 / 40 / 20 | 同上 |
-| `AppLimits.StaticProfile.SHORT_CHARS` / `PROSE_CHARS` / `BACKGROUND_CHARS` | 40 / 120 / 250 | 同上 |
-| `AppLimits.Lorebook.CONTENT_CHARS` / `ENTRIES` / `INJECT_ENTRIES` | 400 / 200 / 6 | 同上 |
-| 主对话超时 / 流式空闲 / 辅助超时 | 180 s / 60 s / 90 s | `core/network/ResponsesLlmBackend.kt` |
-| `STYLE_GUARD.critiqueMaxChars` / 长度比 | 1600 / 0.5–2.0 | `domain/agent/background/StyleGuard.kt` |
-
----
-
-# 附录 A：逐字原文
-
-> 附录里每一块都是**请求里实际发出去的文字**（运行时的用户消息 / 记忆 / 设定值等用 `<…>` 占位）。每块标注实测字数，方便判断「砍哪块最划算」。
-
-## A-1 主对话 system prompt（`Prompts.buildSystemPrompt`）
-
-### A-1.1 ① 交互规则（所有实体；含规则优先级阶梯与规则 0–A）
-
-字数：**5,990**
+### 1.2 ① 交互规则（共 6,163 字）（逐字）
 
 ```
 【交互规则】
@@ -866,9 +147,7 @@ Role.Tool 消息 { content: 工具结果 JSON, toolCallId }                     
 A. 本会话可用工具，何时用、怎么用见各工具描述（get_current_time / search_memory / list_memories / delete_memory / update_memory / set_reminder / update_character_field / upsert_lorebook_entry / web_search / web_fetch / search_video / search_music / search_posts / baidu_hot / toutiao_hot / douyin_hot / zhihu_hot / send_sticker / ask_user）。原则：回忆过往用 search_memory，检索不到再 list_memories 盘点；联网类：查资料用 web_search、读指定链接用 web_fetch、搜视频用 search_video（B站）、搜歌用 search_music（网易云音乐）、搜帖子用 search_posts（虎扑）、看热榜用 baidu_hot / toutiao_hot / douyin_hot / zhihu_hot——**这些工具每个只连一个平台，不需要你指定平台**，都免登录，失败或没搜到就直说不确定，不要编造；**用户提到某个具体日期/某天发生的事（如“九号晚上”“三号”“上周五”“那天记不记得”）时，用 search_memory 的 date/timeRef 按日期召回那天的原始对话与记忆，不要只凭摘要回忆**；记忆过期/重复/被用户纠正时先定位再用 delete_memory 或 update_memory 处理，用户明确否认或纠正时必须用 update_memory 带原话改正，不要只靠删除；待办只在**用户自己明确提出或同意**时用 set_reminder 记录（附 sourceMessageIds + evidence），你要求用户做或你叮嘱的事不记；工具结果属系统内部上下文，仅供理解，自然融入 reply，不得向用户透露检索过程或工具名，但工具返回的图片本身可直接展示。**断言前先核对**：说“第一次/从来没/总是/每次/以前也…”这类关于过去、次数或习惯的话之前，先用 search_memory 确认；查不到依据就别断言，改说不确定或反问用户，不要编造。
 ```
 
-### A-1.2 ② 群组实体追加（规则 10 / 11 / 12）
-
-字数：**604**
+### 1.3 ② 群组实体在规则 A 之后额外追加 604 字（规则 10/11/12：发言格式 / 记忆归属 / 三层设定）（逐字）
 
 ```
 10. 当前是群组对话：只能由已列出的成员发言（一人或多人）。reply 中用户可见回复必须用每人独立一行的“成员名：内容”格式（台词直接写、不加引号包裹；只有引用他人话语、歌词或书名时才用「」与《》），动作按第 2 条写进全角括号，例如“张三：（看了一眼纸）这件事我先说说我的看法。
@@ -877,9 +156,7 @@ A. 本会话可用工具，何时用、怎么用见各工具描述（get_current
 12. 群组设定分三层：群组前提（这群人是谁、为何在一起）与共同场景全体共用；世界层设定（时代/世界观、地点、组织、专有名词、历史、规则）统一放世界书，不在角色设定里重复；每位成员另有自己的独立设定与当前状态，发言要贴合各自设定，不要把某位成员的设定安到别人身上。
 ```
 
-### A-1.3 ③ 角色设定段 + 硬性约束与语气锁定段（含 0.5 / 2.5 / 输出格式）
-
-字数：**827**
+### 1.4 ③ 角色设定段 + 硬性约束与语气锁定段（逐字）
 
 ```
 
@@ -892,13 +169,57 @@ A. 本会话可用工具，何时用、怎么用见各工具描述（get_current
 【输出格式】收尾只能二选一：①调用 submit_response（reply 写进 reply 字段）；②直接输出单个 JSON 对象（以{开头、以}结尾，reply 为第一个字段，全文不得有 JSON 以外文字）。都不许在结构化内容外写说明/思考/旁白，也不得用 Markdown 代码块；**即使本轮调用过其他工具，也必须以上述方式收尾**；reply 里的英文引号必须转义写 \"、换行写 \n（**引用话语/歌词/书名请优先用「」《》等中文符号，可以完全避开转义**）；quickReplies 恒为两条用户视角的短句。
 ```
 
-## A-2 volatile 尾块（`Prompts.buildVolatileContext`）
 
-各块的出现条件与上限见正文 §2.3。
+## 2. `input`（主对话）
 
-### A-2.1 volatile 完整模板（按序；运行时数据用占位符）
+### 2.1 组装顺序（顺序即模型读到的顺序）
 
-字数：**780**
+
+```
+[0] 近期摘要记忆块（User 消息，可省略）      ← buildShortTermBlock(character)
+[1..n] mapHistory(history).takeLast(60)      ← 历史，最多 60 条
+[n+1] 本轮用户消息（若历史最后一条不是 User）  ← 原文 userText
+[last] 本轮系统上下文（User 消息，volatile 尾部）
+```
+
+- **历史映射**（`mapHistory`）：过滤 `rejected`；用户消息 `trimText 2000` 且贴图附件 `Kind.Sticker → Kind.Image`；助手消息 `trimText 1200` 后包成 `{"reply":"…"}`（含 JSON 转义），空则丢弃；其它角色原样。
+- **近期摘要块**（`buildShortTermBlock`，逐字模板；整窗无字符预算，头部写明条数）：
+
+```
+【近期摘要记忆（刚发生的事，按时间从早到晚，共 <条数> 条；更早的事用 search_memory 按日期或关键词召回）】
+[<日期|日期未知>] <摘要内容>
+[<日期|日期未知>] <摘要内容>
+```
+
+- **系统上下文消息**（逐字模板；`<volatile>` = 下一节的全部区块）：
+
+```
+【系统提供的本轮上下文，仅供角色理解，不代表用户陈述】
+<volatile>
+```
+
+
+### 2.2 volatile 尾块（系统上下文消息内）
+
+
+| # | 标题 | 条件 | 上限 |
+|---|---|---|---|
+| 1 | `【可选话题库（仅在需要时自然引出，不要生硬报菜名）】` | 有话题候选 | 最多 5 条；来源 `trimText 200` |
+| 2 | `【角色当前状态，可随对话变化】` | 恒有 | 每字段 `trimText 200`；群成员 `trimText 220` |
+| 3 | `【待跟进承诺】` | 有承诺 | 最多 3 条；key 80 / value 260 |
+| 4 | `【世界书·常驻前提…】` / `【世界书·相关条目…】` | 有条目 | 每条 `trimText 400`；最多 6 条 |
+| 5 | `【<成员名>的私人记忆，仅该成员知道】` | 群组且有 | 每条 `trimText 1200`；每成员 ≤2 条 |
+| 6 | `【用户最新纠正（优先于旧记忆…）】` | 有纠正 | `takeLast(2)`；`trimText 200` |
+| 7 | `【互动节奏】距上次回复已过 …` | 间隔 ≥6h | — |
+| 8 | `【场景概要（较早情节的压缩记录…）】` | 有场景 | `takeLast(2)` |
+| 9 | `【本轮主动召回的相关长期记忆】` + `【记忆取用说明】` + `【记忆主体约定】` | 恒有 | 召回 5 条；key 120 / value 1200 |
+| 10 | `【时间基准】`（本地时间/时区/ISO/逻辑日） | 恒有 | — |
+| 11 | `【消息时间元数据，仅供内部推理】` | 恒有 | 最近 14 条：`id \| role \| timestamp` |
+| 12 | 风格尾块 `tail` | 各子块各自条件 | 见下 |
+| 13 | `【角色主动开场（系统触发，不是用户陈述）】` | 主动轮 | — |
+| 14 | `【本轮热榜话题（系统触发，不是用户陈述）】` | 热榜轮 | — |
+
+**区块逐字模板**（按上表顺序；实际只在满足条件时才出现，区块之间空一行）：
 
 ```
 【可选话题库（仅在需要时自然引出，不要生硬报菜名）】
@@ -945,9 +266,14 @@ ISO时间: <iso>
 <消息id> | <user|assistant|tool|system> | <时间戳>
 ```
 
-### A-2.2 尾块 tail 模板
 
-字数：**636**
+说明：
+
+- 世界书块由 `buildLorebookInjection` 拼成：常驻条目进第一段、关键词命中进第二段，末行固定为「以上为设定资料…」；正文为空的条目改输出 `条目名：（正文为空，待补充；条目ID: <id>；关键词: a、b）`（无名字则省略名字部分），并追加「标注「正文为空，待补充」的条目…」那一句。
+- 记忆块若一条都没召回到，正文行替换为字面 `无相关长期记忆`。
+- `<主体标签>` 来自 `actorLabel`：用户的称呼（空则 `对方`）/ 角色名（空则 `角色本人`）/ `你们` / `背景`。
+
+**尾块 `<tail>`（紧跟"消息时间元数据"之后，逐字模板）**：
 
 ```
 【结尾多样性】不要重复最近的收尾：<上一轮收尾>
@@ -967,9 +293,10 @@ ISO时间: <iso>
 本轮必须：用你自己的口吻说话；至少自然带出你的口头禅、句尾助词、称呼共 2 处，并保持你的标点习惯；**禁止通用书面语与默认 AI 助手腔，不得把语气中和成标准普通话**；不复述设定、不解释自己在怎么做；不替用户说话或行动；收尾不与上一轮雷同。
 ```
 
-### A-2.3 群聊声音契约模板
 
-字数：**224**
+尾块内每个子块都有条件：`【结尾多样性】` 有近期收尾才出；`【本轮节奏骨架…】` 恒出（从下面第 2.3.4 节的 10 条模板里随机取一条）；`【本轮冷场】` 与 `【本轮话题切换】` 二选一（`COLD_FIELD_PATTERNS` 命中前者，否则话题切换时后者）；两条 `（内部提醒）` 各自有问题才出；`【语气回顾…】` 每 `STYLE_GUARD.reviewEveryTurns = 3` 轮出一次；声音契约单角色用上表模板、群组用下面的群聊变体（摘要 `anchorStyleChars = 300`、示例最多 `anchorSamples = 3` 条各 `trimText 80`）。
+
+**群聊声音契约（逐字模板，替代上面的 `【本轮声音契约…】` 块）**：
 
 ```
 【群聊声音锁定（离生成最近，优先级高于一切风格偏好）】
@@ -981,9 +308,8 @@ ISO时间: <iso>
 该成员本轮台词必须体现以上口头禅、句尾助词与称呼，且与其他成员明显不同。
 ```
 
-### A-2.4 两个系统触发的本轮指令
 
-字数：**445**
+**两个系统触发的本轮指令（逐字，追加在尾块之后）**：
 
 ```
 【角色主动开场（系统触发，不是用户陈述）】用户此刻正停留在与你的对话里但暂时没有说话。请角色主动发起一次开场：自然地打招呼或问候，或提起最近一次共同经历、一件待跟进的事项、一个角色此刻想聊的话题。开场要贴合角色性格、自然不突兀；不要问"你想聊什么""怎么不说话"之类把话题推回给用户的话；不要把"系统触发"这件事说给用户听。
@@ -991,24 +317,759 @@ ISO时间: <iso>
 【本轮热榜话题（系统触发，不是用户陈述）】先调用一个热榜工具查一次热榜（zhihu_hot 话题性最强、建议优先；baidu_hot / toutiao_hot / douyin_hot 更偏社会新闻），从结果里挑**一条**与角色人设、与你们的共同兴趣最合得来、能自然引入的话题。把它带进这一轮：本轮若是主动开场就围绕它起个头，若是回应对方就在合适时自然引到它。只挑一条，不要罗列榜单、不要复读热度数字，也不要提"热搜/热榜/系统/工具"这类词。若对方此刻在说严肃、紧急或伤心的事，就正常回应，不必强行提话题。工具没取到内容（ok:false）就按平常方式回应，不得编造话题。
 ```
 
-## A-3 工具定义（`tools[]` 逐字）
 
-用带贴图的示例角色实跑 `defaultTools()` 导出，与请求里字节一致。`parameters` 是 JSON Schema 原文（发送时紧凑单行，这里缩进只为可读）。
 
-### A-3.1 `submit_response`（34,040 字，占工具总量 71%）
+### 2.3 提醒里会插入的标签
 
-**它为什么这么大**：这一个 schema 里 `timeRef` 子结构被复制了 **21 份**（每份 1,168 字，合计 ≈ **24,528 字**，约占 schema 的七成），且所有副本逐字相同——只保留一份、其余换成一句短指向，即可无损省下 ≈ **23,360 字**；此外 160 条 `description` 共 13,610 字，其中 11,876 字是重复文字。这是「提示词太长」里最集中、也最容易无损砍掉的一块。
 
+| 键 | 标签文本（插入 `【上一轮需要纠正…】` / `【语气回顾…】`） |
+|---|---|
+| `metaTalk` | 出现元话术（如"好的我改成/我会这样说话/收到，我调整"）——应直接演出，不要说明自己在调整 |
+| `speaksForUser` | 替用户写了台词或行动——用户的话只能由用户自己说 |
+| `cliche` | 出现陈词滥调（如"心湖泛起涟漪""勾起嘴角""空气中弥漫着"） |
+| `reusedImagery` | 复用了近期用过的比喻、意象或收尾方式 |
+| `toneDrift` | 没有体现设定的说话风格（口癖/句尾/称呼），或句长过于整齐缺少起伏 |
+| `recitedLore` | 复述了世界书或设定条目本身，应当只在需要时自然引用 |
+
+| 键 | 标签文本（插入 `【上一轮快速回应（内部提醒）】`） |
+|---|---|
+| `missing` | 没有给出两条可用短句 |
+| `placeholder` | 把示例占位文字（如"短句一/短句二"）当成了真内容 |
+| `action` | 带了括号动作或旁白（快速回应只写用户会打的字） |
+| `mirrored` | 复述或镜像了角色刚说过的话 |
+| `characterName` | 出现了角色自己的名字，像是在用角色口吻说话 |
+| `tooLong` | 单条过长，不像用户随手打的一句话 |
+
+
+### 2.4 节奏骨架模板（10 条，每轮随机取一条）
+
+
+| 骨架名 | 说明（拼进"建议本轮按…组织内容："之后） |
+|---|---|
+| 动作/描写 → 对白 → 动作/描写 | 先一两句场景、动作或情绪描写，再说 1-2 句台词，最后回到动作或环境收束。 |
+| 短句开场 → 描写 → 对白 | 先用一个很短的句子或独字反应（如“……嗯。”）开场，接一两句描写或心理，再落到 1-2 句台词。 |
+| 对白 → 描写 → 短句收尾 | 先直接说 1-2 句台词，中间穿插动作或环境描写，最后用一句很短的话或一个小动作收住。 |
+| 描写 → 短句 → 描写 | 以描写起手，中间插一句短促的台词或动作，再回到描写或环境。 |
+| 短句 → 描写 → 短句 | 首尾都用很短的句子，中间用一段描写承上启下，整体节奏偏顿挫。 |
+| 描写 → 对白 → 短句 | 先铺一小段描写或动作，再说 1-2 句台词，最后用一个短促的动作或半句话收住。 |
+| 对白 → 描写 → 对白 | 台词与描写交替：一句台词、一段描写、再一句台词，像真实对话里的停顿与反应。 |
+| 短句 → 描写 → 较长描写 | 先用短句点出反应，再用两段递进的描写展开当下的状态与氛围，但不做总结拔高。 |
+| 描写 → 对白 → 描写 → 对白 | 描写与台词两组交替推进，信息密度较高，但每句都要短，不要写成大段独白。 |
+| 对白 → 描写 → 描写 | 先给台词，再用两段描写承接（动作、表情、环境），收尾留在描写上，不要加总结句。 |
+
+**volatile 无区块预算**，只有上表每条目的的兜底上限。
+
+
+### 2.5 工具调用往返（`function_call` / `function_call_output` 属于 input）
+
+
+每执行一个信息类工具后追加两条消息（下轮请求里序列化成 3 个 item）：
+
+```
+assistant 消息 { content:"", toolCallId, toolName, toolArguments, reasoningJson }  →  reasoning item(s) + function_call item
+Role.Tool 消息 { content: 工具结果 JSON, toolCallId }                              →  function_call_output item
+```
+
+上限：`MAX_TOOL_ROUNDS = 5`、`MAX_TOOL_CALLS = 12`（`AppLimits.Agent`）。达到上限时：有累计正文就直接采用；没有就转 SUBMIT。
+
+
+### 2.6 工具结果的固定文案（属于 input）
+
+
+工具结果作为 `function_call_output` 回传模型：成功是各工具自己拼的 `{"ok":true,…}`；**失败 / 拒收是固定文案**（`errorJson(...)`），作为 `{"ok":false,"reason":"…"}` 的 `reason` 值。共 33 条，逐字见 **附录 B**。
+
+工具注册表兜底（`ToolRegistry.execute`）：未知工具 → `未知工具: <name>`；未启用 → `工具不可用: <name>`；抛异常 → `工具执行异常: <message>`（不中断整轮）。
+
+
+## 3. `tools`（主对话）
+
+### 3.1 清单（20 个，字数 = description + schema）
+
+
+注册顺序即发送顺序；`strict` 只有 `submit_response` 是 `true`，其余 `false`；`send_sticker` **仅当角色有贴图**才注册（schema 内联该角色标签枚举）。
+
+| 工具 | 作用 | 字数 |
+|---|---|---|
+| `get_current_time` | 取当前时间 | 118 |
+| `search_memory` | 按日期/关键词检索记忆 | 1,458 |
+| `list_memories` | 盘点记忆清单 | 519 |
+| `delete_memory` | 按 ID 删记忆 | 372 |
+| `set_reminder` | 记待办（须用户发起） | 1,948 |
+| `ask_user` | 向用户澄清 | 226 |
+| `update_character_field` | 改基础设定字段 | 2,160 |
+| `upsert_lorebook_entry` | 写世界书条目 | 1,509 |
+| `web_fetch` | 读链接 | 445 |
+| `update_memory` | 按 ID 修正记忆 | 2,568 |
+| `send_sticker` | 发表情包 | 221 |
+| `web_search` | 必应搜索 | 270 |
+| `search_video` | 搜 B站视频 | 321 |
+| `search_music` | 搜网易云歌曲 | 307 |
+| `search_posts` | 搜虎扑帖子 | 300 |
+| `baidu_hot` | 百度热搜 | 213 |
+| `toutiao_hot` | 今日头条热榜 | 215 |
+| `douyin_hot` | 抖音热榜 | 213 |
+| `zhihu_hot` | 知乎热榜 | 213 |
+| `submit_response` | 结构化收尾 | 34,040 |
+| **合计** | | **47,636** |
+
+### 3.2 工具 description（逐字——要改的就是这些；`parameters` schema 见附录 A）
+
+#### `submit_response`
 
 `strict`: `true`
-
-`description`（逐字）：
 
 ```
 结束本轮回复：提交用户可见的回复正文与全部记忆更新。每轮对话结束时必须且只能调用一次此工具（推荐用它收尾，而不是在正文里手写 JSON）；回复正文写入 reply 字段。
 ```
 
-`parameters`（逐字 JSON）：
+#### `get_current_time`
+
+`strict`: `false`
+
+```
+获取当前本地时间与日期（含时区、星期、ISO时间）。用于回答"现在几点/几号/星期几/距离某个时间多久"等问题。
+```
+
+#### `search_memory`
+
+`strict`: `false`
+
+```
+检索记忆库。两种用法：①**按日期召回**——用户问起某个具体日期/某天发生的事时（如“九号晚上”“三号”“上周五”“那天记不记得”），用 date 或 timeRef 按日期召回，会返回那天的**原始对话**、当天摘要与当天长期记忆，比凭摘要回忆更准确；date 写 YYYY-MM-DD，请依据系统给的时间基准把用户的口语日期换算成绝对日期，相对说法（昨天/上周五/三天前）改用 timeRef。②**按关键词检索**——回忆过往约定、用户喜好与习惯、共同经历、关系事实，或**刚滑出近期摘要窗口的事**时用 query；返回 results（长期记忆）与 shortTerm（短期摘要，id 以 short_ 开头，可直接交给 update_memory / delete_memory 修正）。query/date/timeRef 至少给一个。默认检索全员共享记忆；群组对话中若想检索某位成员的私人记忆，可传入 memberName（该成员自己的记忆，如"张三"。注意：若该成员的私人记忆里没有，也可能是共享记忆，必要时可再不带 memberName 检索一次）。
+```
+
+#### `list_memories`
+
+`strict`: `false`
+
+```
+盘点指定分类的长期记忆清单（不含内容详情），用于主动发现过期、重复或错误的记忆。分类：userProfile（用户信息）、relationship（关系）、events（共同事件）、promises（约定）、habits（习惯）。可选按关键词过滤。返回每条记忆的ID、分类、关键词与更新时间。群组对话中可传 memberName 盘点某位成员的私人记忆。
+```
+
+#### `delete_memory`
+
+`strict`: `false`
+
+```
+删除一条记忆（长期或短期，按ID）。仅用于：内容已被明确推翻或已过时失效、重复记录、或用户明确否认/纠正过的错误记忆。删除前建议先用 list_memories 或 search_memory 确认目标ID。ID 以 short_ 开头的是短期记忆（删除后不会再被整理进长期记忆）。群组对话中删除某位成员私人记忆时传入对应 memberName。
+```
+
+#### `set_reminder`
+
+`strict`: `false`
+
+```
+记录“需要用户参与”的待办/约定，且**必须由用户自己明确提出或同意**（如用户说“我明天要交报告”“记得提醒我买药”）。调用时必须附用户原话：sourceMessageIds 填用户消息ID、evidence 逐字摘录用户原话。角色要求用户去做的事、角色的建议或叮嘱，一律不得用本工具记录——应先自然征询用户，等用户自己答应后再记。到时间可在对话中温和提起。群组对话中若要记入某位成员的私人记忆可传 memberName。
+```
+
+#### `ask_user`
+
+`strict`: `false`
+
+```
+当记忆缺失、用户表述含糊或无法可靠推断某件关键事实时，向用户提出一个简短澄清问题，避免凭空编造。仅在确实需要澄清且追问不显得突兀时使用；不要滥用，也不要用它代替正常的角色回复。
+```
+
+#### `update_character_field`
+
+`strict`: `false`
+
+```
+精准修改角色基础设定字段（性别/年龄/种族/外貌特征/性格特征/恐惧弱点/背景故事/说话风格/语言方言/对用户的称呼）。当用户直接要求修改这些设定（如"把我职业改成教师""我现在是学生了""你性格应该更冷酷些""别叫我用户，叫我明明"）时，必须调用本工具立即生效；value一律写成**明确的简短陈述句**：只写内容本身、一个字段一件事，短字段几十字、外貌/性格/恐惧弱点/说话风格一两句（不超过 120 字）、背景故事不超过 250 字；**禁止「不是…而是…」这类对比句**（会被拒收，请直接写陈述句，如性格"性格冷静克制，遇事沉稳。"）；禁止括号注释、理由、整句说明或解释性文字；"对用户的称呼"只填一个简短称呼词、不带任何解释。群组实体不维护基础设定字段（世界观并入群组描述），成员的个人字段请在该成员卡片上修改。不要在submit_response的staticFields里重复提交本工具已改的字段。
+```
+
+#### `upsert_lorebook_entry`
+
+`strict`: `false`
+
+```
+写入/更新世界书条目——世界层设定的唯一去处（时代与世界观、地点、组织、专有名词、历史、规则、背景事实）。**同一件事物只能有一条**：先对照现有条目，凡名称相近、关键词相同或内容重叠的都算同一条，必须用它的 entryId/name 更新合并，绝不新建近似条目；当你用 entryId/name 明确指定要更新的条目时，content 会**替换**该条目原有内容，因此更新时要写全该条目应有的完整内容（不要只写增量，否则会丢信息）；**内容要精炼，一条只讲一件事，目标 300 字以内（硬上限 400 字，超了会被拒绝，要求你精简后重写）**；未指定 id/name 而由系统按相似度命中时，同样会用你这次写的完整内容**替换**该条目。只在近期对话里已经出现/确立、且**会反复复用**的这类设定，或用户补充修正了这类设定时才使用；一次性的小事、可从上下文直接看出的细节不要写。**用户手写条目（origin=user）受保护，不得覆盖或改写**；若现有用户条目已覆盖同一设定，不要重复写入。keywords 写剧情里可能出现的称呼（命中才注入；没给关键词时系统会用条目名当触发词）；只有确实需要每轮生效的世界前提/规则才把 alwaysActive 设为 true（常驻条目数量有限，不要滥用）。必须给出 sourceMessageIds 与 evidence 证明该设定已在对话中出现（本轮新编、尚未落库的内容不要写，等它出现在消息里再由整理任务沉淀）；拿不出依据就不要写。
+```
+
+#### `web_fetch`
+
+`strict`: `false`
+
+```
+读取一个链接的内容。① 用户给出链接、需要读网页正文时传 url（只传上下文里真实存在的 http(s) 链接，禁止自行编造或拼接 URL）；② 链接是图片（jpg/png/gif/webp 等）时会把图片取回以便你直接查看；③ 链接是虎扑帖子或网易云歌曲时，会直接返回帖子正文+回帖、歌曲信息+热评；B站视频链接会返回标题、UP主、播放数据、简介与封面图。若网页直连失败或正文为空，会自动改用摘要服务取回标题、描述与主图。**本工具只读链接；想按关键词搜视频/歌曲/帖子请用 search_video / search_music / search_posts。**
+```
+
+#### `update_memory`
+
+`strict`: `false`
+
+```
+修正一条已存在的记忆（长期或短期，按ID）。仅当用户明确否认或纠正某条记忆时使用，例如"那件事是我做的不是你做的""记反了""我不是那个意思"。必须先调用 search_memory 或 list_memories 找到目标ID，再用用户纠正的原话作为 evidence。ID 以 short_ 开头的是**短期记忆**（只支持 value 与 eventTime）：改正后会重新排到队尾，等待下一轮被整理进长期记忆。其他 ID 是长期记忆，可改 subject（主体：user=用户 / character=角色自己 / relationship=双方 / world=背景设定）、value（内容，必须写明主体）、key、importance、promisor/promisee（约定的承诺方/受约方）。不要用它新建记忆（新建请用 longTerm 字段或 set_reminder）。
+```
+
+#### `send_sticker`
+
+`strict`: `false`
+
+```
+给用户发一个表情包（贴图）。tag 必须从这些可用标签中选择其一：开心。当你想用表情包/贴图表达情绪时使用；贴图会作为你的下一条消息单独发出，不需要再用文字描述它。
+```
+
+#### `web_search`
+
+`strict`: `false`
+
+```
+搜索实时网页资料，返回实际取得的标题、链接和摘要。失败或无结果时不得编造搜索结果；可请用户提供链接后用 web_fetch 读取。
+```
+
+#### `search_video`
+
+`strict`: `false`
+
+```
+在B站（哔哩哔哩） 按关键词检索公开内容（免登录）。用户想找某个视频、某个UP主的视频时使用。返回标题与链接；视频链接可用 web_fetch 打开看标题、UP主、播放数据、简介与封面图。 失败或无结果时不得编造结果。
+```
+
+#### `search_music`
+
+`strict`: `false`
+
+```
+在网易云音乐 按关键词检索公开内容（免登录）。用户想找某首歌、某个歌手的歌时使用。返回歌名、歌手与歌曲 id/链接；歌曲链接可用 web_fetch 打开看热评。 失败或无结果时不得编造结果。
+```
+
+#### `search_posts`
+
+`strict`: `false`
+
+```
+在虎扑 按关键词检索公开内容（免登录）。用户想找虎扑上的帖子、看大家怎么聊时使用。返回标题与链接；帖子链接可用 web_fetch 读正文与回帖。 失败或无结果时不得编造结果。
+```
+
+#### `baidu_hot`
+
+`strict`: `false`
+
+```
+获取百度热搜（免登录）。用户想了解当下热点、最近流行的梗或话题时使用；返回按热度排序的标题（部分平台带链接与热度）。失败或无结果时不得编造榜单内容。
+```
+
+#### `toutiao_hot`
+
+`strict`: `false`
+
+```
+获取今日头条热榜（免登录）。用户想了解当下热点、最近流行的梗或话题时使用；返回按热度排序的标题（部分平台带链接与热度）。失败或无结果时不得编造榜单内容。
+```
+
+#### `douyin_hot`
+
+`strict`: `false`
+
+```
+获取抖音热榜（免登录）。用户想了解当下热点、最近流行的梗或话题时使用；返回按热度排序的标题（部分平台带链接与热度）。失败或无结果时不得编造榜单内容。
+```
+
+#### `zhihu_hot`
+
+`strict`: `false`
+
+```
+获取知乎热榜（免登录）。用户想了解当下热点、最近流行的梗或话题时使用；返回按热度排序的标题（部分平台带链接与热度）。失败或无结果时不得编造榜单内容。
+```
+
+> `parameters`（每个工具的 JSON Schema，共 10048 字）见 **附录 A**。
+
+
+
+### 3.3 SUBMIT 阶段的差异
+
+
+同一 `instructions`，只改三项：
+
+| 字段 | AUTO | SUBMIT |
+|---|---|---|
+| `tools` | 全部启用工具 | 只有 `submit_response` |
+| `tool_choice` | `"auto"` | `{"type":"function","name":"submit_response"}` |
+| `reasoning.effort` | `config.reasoningEffort` | `"none"` |
+
+**触发**：AUTO 没产出可用正文时（先补一个 reasoning 消息再转）；SUBMIT 给一次重试，仍空则最多再试两次空回合，最后返回空结果。
+
+---
+
+
+## 4. 其它调用：各自发给模型的 instructions + input
+
+> 每个调用都是**一条 user 消息 + 自己的 system**，都没有 `tools`。触发条件、参数与期望输出见各节；逐字文本就在节内（可直接改）。
+
+| § | 调用 | 入口（触发时机） | taskType | system 来源 | 期望输出 |
+|---|---|---|---|---|---|
+| 4.1 | 即时对话 → 短期事件 | 每轮；`instant` 到 60 整窗折叠 | `extraction` | `EXTRACTION_SYSTEM` | JSON 数组 |
+| 4.2 | 短期事件 → 长期记忆 | 每 N 轮 / 清理 | `analysis` | `ANALYSIS_SYSTEM` | JSON 对象 |
+| 4.3 | 场景概要 | 场景切换 / 跨 SPAN 且有 ≥6 条 | `scene` | `SCENE_SYSTEM` | 纯文本 |
+| 4.4 | 世界书整理 | 每轮（折叠出新摘要后） | `lorebook` | `LOREBOOK_SYSTEM` | JSON 对象 |
+| 4.5 | 世界书超长退回重写 | 上一步有条目 >400 字 | `lorebook` | `LOREBOOK_SYSTEM` | JSON 对象 |
+| 4.6 | 世界书超长条目重建 | 用户手动一次性迁移 | `lorebook` | `LOREBOOK_REBUILD_SYSTEM` | JSON 对象 |
+| 4.7 | 散文回复 → 结构化记忆 | 本轮回复是散文 | `auxiliary` | `PROSE_SYSTEM` + 角色设定 | 标准 JSON |
+| 4.8 | 补全空的基础设定字段 | 启动维护 / 手动 | `auxiliary` | `FILL_SYSTEM` | JSON 对象 |
+| 4.9 | 补全群成员字段 | 启动维护 / 手动 | `auxiliary` | `FILL_SYSTEM` | JSON 对象 |
+| 4.10 | 世界观迁移（背景 → 世界书） | 一次性迁移 | `auxiliary` | `LOREBOOK_SYSTEM` | JSON 对象 |
+| 4.11 | 字段结构重排 | 一次性迁移 | `auxiliary` | `FILL_SYSTEM` | JSON 对象 |
+| 4.12 | 文风校对 | 检测到文风违规时 | `auxiliary` | `CRITIQUE_SYSTEM` | `{"reply":…}` |
+| 4.13 | 快速回应修补 | 每轮（开关开且不足两条/不过校验） | `auxiliary` | 动态（用户视角） | `{"quickReplies":[…]}` |
+| 4.14.1 | 建卡 / 群组升级 `quickGenerate` | 用户触发 | `auxiliary` | `QUICK_GEN_INSTRUCTIONS` | 角色/群组 JSON |
+| 4.14.2 | 头像 emoji `requestEmojiAvatar` | 建卡后 / 手动 | `auxiliary` | 单行 | 一个 emoji |
+| 4.14.3 | 表情包打标签 `tagSticker` | 添加表情包时 | `auxiliary` | 单段 | 一个短词 |
+| 4.14.4 | 群成员字段补全 `fillMemberFields` | 手动 | `auxiliary` | `FILL_MEMBER_INSTRUCTIONS` | 成员字段 JSON |
+
+## 4.1 即时对话 → 短期事件（`extraction`）
+
+- **触发**：每轮；`instant` 达高水位 60 时整窗折叠；或超长窗迁移（`migrateOversizedWindow`）。
+- **taskType**：`extraction`。
+- **system（逐字）**：
+
+```
+你是一个信息提取助手。只返回JSON数组，不要其他文字。
+```
+
+- **user 拼装顺序**：`EXTRACTION_PROMPT_HEAD` → 模式子句 → `EXTRACTION_PROMPT_TAIL` → 已有短期事件 JSON → `\n对话内容:\n` → 对话 JSON。
+
+  1. 模式子句：普通 `返回JSON数组，最多十五个元素。`；迁移 `不限事件数量，尽可能完整覆盖本批全部消息。`
+  2. 已有短期事件 JSON：`[{eventTime,participants,location,content}]`，来自 `shortTerm` 按 `eventTime` 倒序 `take 20`，每条 `content = trimText 240`。
+  3. 对话 JSON：`[{id,role,content,timestamp}]`，`role` 小写、`content = trimText 600`；普通模式=当前 `instant` 全窗，迁移模式=`instant.take(60)`。
+- **期望输出**：`[{"content":"…","eventTime":"ISO","participants":["用户","角色名"],"location":"…"}]`；解析用宽松 JSON，普通的 `take(15)`，空即失败。
+
+`EXTRACTION_PROMPT_HEAD`（逐字）：
+
+```
+把下面这段即时对话整体压缩为事件流程摘要，覆盖整段对话、不要遗漏内容。事件按“日期+时段”划分：时段只有深夜、凌晨、清晨、早晨、上午、中午、下午、傍晚、晚上、夜里十种，且一天从02:00起算（00:00-02:00算前一天的深夜）；同一天同一时段的多个事情视为同一事件，按时间线集中叙述（如“2026-08-01 下午在家先…晚上…”）。同一时段也可能有不同事件，按事实或持续话题区分，不得把无关事件强行合并；同一事件内用时间线连接各阶段，保留仍然有效的关键细节、结果与未决事项。**只保留会影响后续剧情的内容**：谁做了什么、学到或决定了什么，地点/物品/伤势/关系的变化，新的发现或线索，以及仍未解决的目标、承诺、威胁与期限；一次性的寒暄、当下的情绪起伏、闲聊过程一律不记。**每条content不超过120字**，用平实的叙述句写成，禁止文学化描写、比喻、形容词铺陈与对白原文。eventTime写该事件的真实ISO时间，participants为参与人列表，location写地点（没有明确地点写“未说明”）。若本次某事件是“已有短期事件”中某事件的延续或更新，不要另起一条：把它并进对应事件（沿用同一事件的时间与地点），并在输出里直接给出合并后的完整摘要，旧摘要中**仍然有效**的信息（未过期的约定、未解决的事、仍然成立的关系与状态）必须原样保留，只丢弃已经过时或已被推翻的部分。content按时间和因果顺序书写，不要逐字摘录。content必须写明是谁做的：涉及用户写“用户”，涉及角色写角色名（群组写具体成员名），双方共同的事写清各自做了什么，禁止使用“我、你、TA、他、她”这类指代不清的代词。content中禁止使用“今天、昨天、明天、今晚、刚刚、刚才、现在、最近、这几天”等相对时间词，一律使用具体日期（如“8月1日下午”）或事件本身描述。不要输出任何消息ID。
+```
+
+
+`EXTRACTION_PROMPT_TAIL`（逐字，末尾换行后接已有事件 JSON）：
+
+```
+返回JSON数组：[{"content":"一段完整的事件流程摘要","eventTime":"ISO时间","participants":["用户","角色名"],"location":"地点或未说明"}]。
+已有短期事件（不要重复，只在需要延续或更新时合并进去）:
+```
+
+---
+
+## 4.2 短期事件 → 长期记忆（`analysis`）
+
+- **触发**：累计够一批（`SHORT_TERM - TRIM_FLOOR = 20`）时每 N 轮；清理时可手动排空。
+- **taskType**：`analysis`。
+- **system（逐字）**：
+
+```
+你是一个记忆分析助手。只返回JSON，不要其他文字。
+```
+
+- **user 拼装顺序**：`ANALYSIS_PROMPT_HEAD` → 条目 JSON → `ANALYSIS_PROMPT_TAIL`。
+  1. 条目 JSON：`[{id,content,sourceMessageIds,eventTime,participants,location,userEvidence,analyzed}]`。`batch` = 未分析的前 40 条（`analyzed=false`），`context` = 最近 20 条已分析条目（`analyzed=true`，只用于连贯）。
+- **期望输出**：`{"status":"ok","analyzedShortTermIds":[…],"longTerm":[{category,subject,key,value,tags,importance,sourceShortTermIds,sourceMessageIds,evidence,eventTime,participants,location,status,dueAt,arcOf,arcStage}]}`；解析失败则走 `AnalysisSalvage` 的确定性抢救。
+
+`ANALYSIS_PROMPT_HEAD`（逐字）：
+
+```
+分析以下带短期ID、来源消息ID、userEvidence及时间/人物/地点三要素的事件流程摘要，提取未来仍有价值的稳定事实。输入中每条条目带 analyzed 标记：**只为 analyzed=false 的条目产出长期记忆**；analyzed=true 的是前一轮已整理过的上下文，只用于保持情节连贯（可据此合并或修正），不得为它们重复产出条目，也不要在 analyzedShortTermIds 中返回它们。**价值判据**：只有能跨轮复用、会影响后续对话或关系、或用户明确表达过的信息才记（长期偏好、重要人物与关系、承诺与约定、反复出现的习惯、持续的情节线）；一次性的寒暄客套、当下的情绪起伏、可以随口重说的闲聊、纯场景描写一律不记。**证据不足宁可不记**，不要为了产出而脑补或推演。必须检查全部 analyzed=false 的条目，并在analyzedShortTermIds中原样返回它们的短期ID；不得遗漏、增加或重复。**每条 value 不超过200字，arc 叙事摘要不超过300字**，写成平实叙述，不堆砌形容词。合并重复或冲突条目；事件、承诺保留必要日期；普通寒暄不要进入长期记忆。每条长期记忆必须在sourceShortTermIds中列出它实际使用的短期条目id；每个列出的短期条目都必须至少贡献一个sourceMessageIds中的消息ID，否则不要列出该短期ID。sourceMessageIds只选择直接支持该事实的消息，不要复制短期条目的全部来源；userProfile和habits只能选择用户消息。evidence只能逐字引用被选择消息对应的userEvidence.text，不能引用摘要或改写。没有可引用的userEvidence时不要输出该条。events按“日期+时段+事实主题”区分：同一天同一时段（深夜/凌晨/清晨/早晨/上午/中午/下午/傍晚/晚上/夜里，一天从02:00起算）的短期事件合并为一条长期事件，同一时段的独立事实不得互相覆盖，key须标明稳定事实主题；合并时eventTime取最早的ISO时间，participants取并集，location取最新（无明确地点写“未说明”）。剧情弧线：若若干短期事件属于同一持续情节或话题线（同一人物线、同一持续事件、同一反复出现的话题），除按时间合并外，还应在其中一条事件条目上标注arcOf（该情节的持续话题或人物线名称，稳定可复用）与arcStage（只能是起始/发展/转折/现状之一，按情节推进阶段标注），arcOf命名一旦确定就保持稳定——同一情节线不得每轮改名或另起新名，续写时沿用已有名称；并将value整合成按时间顺序、带情绪起伏的叙事摘要；同一arcOf只允许一条带弧线标注的条目，其余同线条目按普通事件输出。无论是否提取出长期记忆，成功完成分析都必须返回status:"ok"；没有长期价值时仍需返回完整analyzedShortTermIds和空longTerm。
+分类规则：userProfile/habits仅限用户事实，subject=user；relationship仅限双方关系，subject=relationship；events只记录用户陈述或共同事件；promises只记录用户明确承诺或双方明确约定。promises在此处只能新建为active；完成或取消由主对话的promiseUpdates按承诺ID处理。存在明确期限才填写dueAt。
+条目:
+```
+
+
+`ANALYSIS_PROMPT_TAIL`（逐字）：
+
+```
+
+返回JSON格式:
+{"status":"ok","analyzedShortTermIds":["全部 analyzed=false 的 short_id"],"longTerm": [{"category": "...", "subject": "user|relationship|world", "key": "稳定且可复用的标识", "value": "...", "tags": [...], "importance": 1-10, "sourceShortTermIds":["short_id"], "sourceMessageIds": ["msg_id"], "evidence": "被选择用户消息中的逐字原话", "eventTime": "ISO时间", "participants":["参与者"],"location":"地点或未说明","status": "active", "dueAt": "ISO时间", "arcOf": "可选，持续情节线名称", "arcStage": "可选，起始/发展/转折/现状"}]}
+category可选: userProfile, relationship, events, promises, habits。value同样必须写明主体：涉及用户写“用户”，涉及角色写角色名（群组写具体成员名），禁止“我/你/TA”这类指代不清的代词。key与value中的时间一律写绝对日期（YYYY-MM-DD 或 YYYY-MM-DD 时段），禁止“明天/明晚/上周/上个月/三天后”这类相对时间词。这里只提取用户的约定（promises 的 promisor=user、promisor与promisee只能是 user 或 character）；角色单方承诺由主对话记录，不在此处提取。
+```
+
+
+---
+
+## 4.3 场景概要（`scene`）
+
+- **触发**：场景键（地点）变化、或场景跨度超过 `SPAN=12` 且消息 ≥ `MIN_MESSAGES=6`。
+- **taskType**：`scene`。**system（逐字）**：
+
+```
+你是对话记录整理助手。只输出场景摘要正文，不要任何额外文字。
+```
+
+- **user**：`SCENE_PROMPT` + 转录文本。转录 = 场景起点之后的 `instant` 取 `takeLast(20)`，每行 `[序号] 用户|角色名: trimText(content,500)`。
+- **期望输出**：纯文本摘要（无 JSON）；长度 <8 视为失败，落盘 `trimText 2000`。
+
+`SCENE_PROMPT`（逐字）：
+
+```
+把下面这段已经告一段落的情节压缩成 1-2 段、不超过 300 字的「场景记忆」，供之后长期参考。
+只保留会影响后续剧情的要点：谁做了什么、学到或决定了什么；地点、物品、伤势、关系的变化；新的发现或线索；仍未解决的目标、承诺、威胁或期限。
+要求：①写明主体（涉及用户写“用户”，涉及角色写角色名），禁止“我/你/TA”这类指代不清的代词；②时间写绝对日期（YYYY-MM-DD 或 YYYY-MM-DD 时段），禁止“今天/昨天/刚才”这类相对时间词；③不要引用对白原句、不要加标题或 markdown、不要文学化描写；④不得编造原文没有的事实；⑤直接输出摘要正文，不要任何前后缀或解释。
+
+对话内容：
+```
+
+
+---
+
+## 4.4 世界书整理（`lorebook`）
+
+- **触发**：每轮（折叠出新摘要后）/ 清理时排空。
+- **taskType**：`lorebook`。**system（逐字）**：
+
+```
+你是世界书整理助手。只返回 JSON，不要任何额外文字。
+```
+
+- **user 拼装顺序**：`LOREBOOK_PROMPT_HEAD` → 现有条目清单（或字面 `（空）`）→ `LOREBOOK_PROMPT_TAIL` → `（角色名：<名>）：` → 事件摘要行。
+
+  1. 现有条目清单每行：`- 名称｜关键词: a、b` + `｜常驻` + `｜内容: …` 或 `｜内容（略，本轮不要更新此条）`。完整内容只给**最近更新的 12 条**且总字符 ≤ 6000（`LOREBOOK_EXISTING_FULL_ENTRIES` / `LOREBOOK_EXISTING_FULL_CHARS`）。
+  2. 事件摘要行：`[<shortTermId>] trimText(content,600)`。
+- **期望输出**：`{"entries":[{"name","keywords","content","alwaysActive","sourceShortTermIds"}]}`；`take(3)`，`sourceShortTermIds` 必须都在本批摘要 id 内；超 400 字的条目转入第 9 节重写。
+
+`LOREBOOK_PROMPT_HEAD`（逐字）：
+
+```
+下面是一段角色扮演对话里已经发生的事件摘要，以及现有的世界书条目清单。
+请找出其中**已经出现、值得日后复用**的世界层设定（时代/世界观、地点、组织、专有名词、历史、规则、背景事实），整理成世界书条目。
+要求：①只写已经出现或已被明确说出的内容，禁止推测、扩写或发明新设定；②**同一件事物只能有一条**：对照现有条目的名称、关键词与内容，凡与已有条目讲的是同一件事（名称相近、关键词相同、内容重叠），必须复用它的名字、用你这次总结的内容**整条替换**它，绝不新建近似条目；同理，本批不同摘要里指向同一件事的也只输出一条；③只沉淀会反复复用的世界层设定，一次性的小事、可从上下文直接看出的细节不要单独立条；④每条 content 只写该条目本身的信息，不写理由、解释或出处，**一条只讲一件事**；**长度目标 300 字以内**、**硬上限 400 字**（超过 400 字的条目会被退回重写，宁短勿长）；⑤更新一条已有条目时，把它下面给出的**完整原有内容**与你掌握的新事实**重新总结成一条**：仍然有效的信息必须原样保留，重复的、过时的、与本条主题无关的内容删掉，允许比原来短——**只写增量会丢掉原有信息**；⑥清单里标注「内容（略）」的条目本轮不要更新（你看不到它的完整内容）；⑦keywords 写剧情里可能出现的称呼，不超过 8 个；若这条是世界前提/规则这类需要每轮生效的设定，把 alwaysActive 设为 true，否则一律 false；⑧最多 3 条；没有值得沉淀的就返回空数组。
+只返回 JSON：{"entries":[{"name":"条目名","keywords":["触发词"],"content":"设定内容","alwaysActive":false,"sourceShortTermIds":["上面的摘要ID"]}]}。sourceShortTermIds 必须是上面出现过的摘要ID，至少要有一个；没有可引用ID的条目不要返回。
+
+现有条目清单：
+```
+
+
+`LOREBOOK_PROMPT_TAIL`（逐字）：
+
+```
+
+事件摘要
+```
+
+---
+
+## 4.5 世界书超长条目的退回重写（`lorebook`）
+
+- **触发**：第 8 节有条目 >400 字时**同一函数内**追加一轮。
+- **system**：同 `LOREBOOK_SYSTEM`。
+- **user 拼装**：`LOREBOOK_FIX_PROMPT` → 被退回条目逐行 `- name: X｜keywords: a、b｜sourceShortTermIds: s1、s2｜content: …`（原文回显，不截断）。
+- **期望输出**：同 `{"entries":[…]}`；只接受原名单里、content 非空且 ≤400 字、来源 id 合法的条目，其余丢弃（原超长条目不落盘）。
+
+`LOREBOOK_FIX_PROMPT`（逐字，末尾换行后接退回条目）：
+
+```
+下面这些世界书条目**超过了 400 字的硬上限**被退回，请把每一条**重新写一遍**：
+要求：①压缩到 **300 字以内**，仍然有效的关键信息（专有名词、人名、地点、日期、已确定的事实）必须保留，只删重复、修饰和可从上下文推出的细节；②**一条只讲一件事**，名称保持不变；③sourceShortTermIds 原样照抄，不要新增或改动；④不得编造原文没有的内容。
+只返回 JSON：{"entries":[{"name":"条目名","keywords":["触发词"],"content":"压缩后的设定内容","alwaysActive":false,"sourceShortTermIds":["摘要ID"]}]}
+
+被退回的条目：
+```
+
+
+---
+
+## 4.6 世界书超长条目重建（一次性迁移）
+
+- **触发**：用户手动对某角色执行"重建超长世界书条目"，每条一次调用。
+- **taskType**：`lorebook`。**system（逐字）**：
+
+```
+你是世界书整理助手。只返回 JSON，不要任何额外文字。
+```
+
+- **user 拼装**：`LOREBOOK_REBUILD_PROMPT` → `\n\n（角色名：<名>）\n原条目：\n名称：…\n关键词：…|（无）\n常驻：true|false\n内容：\n<原条目全文>`
+- **期望输出**：`{"entries":[…]}`；`take(3)`，名称 `take 60`，content 必须 ≤400 字（否则整次失败、保留原条目），keywords `take 8`；首条沿用原 id。
+
+`LOREBOOK_REBUILD_PROMPT`（逐字）：
+
+```
+下面是一条已经积累得过长、把好几件不同的事混在一起的世界书条目。请把它**重新整理**成 1~3 条各自只讲一件事的条目。
+要求：①只使用原文里已有的信息，**禁止新增、推测或扩写任何设定**；②按主题拆分：读起来是不同话题的内容必须拆成不同条目，同一话题的合并成一条；③删掉重复的说法、已经过时或彼此矛盾的旧信息和与条目主题无关的内容；④每条的 content 都要写成完整、精炼的句子，**目标 300 字以内、硬性不超过 400 字**（超了这次重写会被丢弃、原条目原样保留），只写该条目本身的信息，不写理由或出处；⑤沿用原文的专有名词写法，条目名简洁（不超过 20 字）；⑥keywords 写剧情里可能出现的称呼，不超过 8 个，不要写泛词；⑦只有确实是世界前提/规则这类需要每轮生效的才把 alwaysActive 设为 true，其余一律 false；⑧原文里**仍然有效的信息要尽量保留**，不要因为压缩而丢事实。
+只返回 JSON：{"entries":[{"name":"条目名","keywords":["触发词"],"content":"设定内容","alwaysActive":false}]}
+```
+
+
+---
+
+## 4.7 散文回复 → 结构化记忆（`auxiliary`）
+
+- **触发**：本轮回复是散文（非结构化 JSON），后台补成标准 JSON 并落记忆。
+- **taskType**：默认 `auxiliary`（未显式传）。
+- **system**：`PROSE_SYSTEM` + `\n\n【角色设定】\n` + `buildRoleContext(character, false)`。
+- **user 拼装**（逐字骨架）：
+
+```
+【系统提供的本轮上下文，仅供理解，不是用户陈述】
+<volatileContext（同 2.3）>
+
+用户消息: <用户原文> （消息id: <id>）
+
+角色回复（散文，整理到reply字段）：
+<散文原文>
+```
+
+- **期望输出**：与主对话一致的标准 JSON（`reply` 一字不改、`quickReplies` 两条、`shortTerm`/`longTerm`/`dynamicState`/`staticFields`/`memberDynamicState`/`promiseUpdates`）；来源 id 只接受本轮用户消息 id 与助手消息 id。
+
+`PROSE_SYSTEM`（逐字）：
+
+```
+你是「对话记录整理助手」。下面是一次角色扮演交互（用户消息 + 角色回复），请整理成与主对话一致的标准 JSON，包含全部字段：{"reply":"角色回复原文（一字不改）","quickReplies":["用户下一句1","用户下一句2"],"shortTerm":[{"content":"从交互提取的本轮事件摘要，写明谁做了什么","sourceMessageIds":["<用户消息id>"]}],"longTerm":[{"category":"userProfile|relationship|events|promises|habits","subject":"user|relationship|world","key":"稳定标识","value":"用户的具体事实（写明主体）","tags":[],"importance":1-10,"sourceMessageIds":["<用户消息id>"],"evidence":"用户原话","promisor":"可选，约定的承诺方 user|character","promisee":"可选，约定的受约方 user|character"}],"dynamicState":{"currentSituation":{"value":"当前处境","sourceMessageIds":["current_response"],"evidence":"回复中引原句"},"currentMood":{"value":"当前情绪","sourceMessageIds":["current_response"],"evidence":"概括回复原句"},"currentGoal":{"value":"当前目标","sourceMessageIds":["current_response"],"evidence":"回复中引原句"}},"staticFields":{},"memberDynamicState":[],"promiseUpdates":[]}。规则：reply必须一字不改保留角色回复原文；quickReplies必须恰好两条用户可直接发送给角色的短句；所有记忆只能从这次交互中明确提取，不得凭空编造；dynamicState来源用current_response、evidence引用回复原句；shortTerm和longTerm的sourceMessageIds引用用户消息id；用户未明确陈述或表现的内容不要写入；无合格记忆返回空数组。记忆字段（shortTerm的content、longTerm的key与value）必须写明主体：涉及用户写“用户”，涉及角色写角色名，禁止“我/你/TA”这类指代不清的代词；时间一律写绝对日期（YYYY-MM-DD 或 YYYY-MM-DD 时段），禁止“明天/明晚/上周/上个月/三天后”这类相对时间词，用户用相对时间说法时改用timeRef（anchor/offsetDays/weekday/slot/explicit）。dynamicState与staticFields的值以段落式的陈述句书写（自然完整陈述句，简短段落），禁止括号注释或理由。只返回JSON对象，不要其他任何文字。
+```
+
+
+---
+
+## 4.8 补全空的基础设定字段（`auxiliary`）
+
+- **触发**：启动维护 / 手动；有缺失字段且未在冷却期（成功后 24h，失败按 5→30 分钟指数退避）。
+- **taskType**：默认 `auxiliary`。**system（逐字）**：
+
+```
+你是角色卡补全助手。只返回JSON。
+```
+
+- **user 拼装**（逐字骨架，`labels` = `中文标签(key)`、`existing` = 已有字段 `"key":"value"` 且 value `trimText 300`）：
+
+```
+请只补全下列【当前为空】的字段：<labels>。
+要求：只补空字段，绝不修改或覆盖已有设定（已有设定是绝对权威，不得改写、润色或替换）；只根据已知信息合理补写，没有把握的字段直接省略；不要编造与已有设定冲突的内容。<speakingStyle 示例规则><userAddress 规则>
+已有设定:
+{<existing>}
+只返回JSON对象，键为字段英文名，值为补写内容。
+```
+
+
+  - 补 `speakingStyle` 时插入逐字规则：`speakingStyle 必须写成“整体调性描述；示例：<台词1> / <台词2> / <台词3>”：三条示例台词必须是该角色真的会说的口语短句，要体现口头禅、句尾助词、标点习惯与对用户的称呼，三条之间差异明显（能看出是同一个人、但场景不同）；**禁止换行，三条之间只能用 " / " 分隔**，整个字段不超过 200 字。`
+  - 补 `userAddress` 时插入逐字规则：`“对用户的称呼”(userAddress) 只填一个简短称呼词（如“明明”“老公”），不带任何解释。`
+- **期望输出**：`{"<字段英文名>":"内容"}`；每个字段再走 `cleanFieldValue`（长度/句式收敛，见 `AppLimits.StaticProfile`：短字段 40 / 叙述字段 120 / 背景 250 字）与 `normalizeUserAddress`。
+
+---
+
+## 4.9 补全群成员字段（`auxiliary`）
+
+- **触发**：启动维护 / 手动；每次最多 3 名成员。**sessionId 用群组 id**。
+- **system**：同 `FILL_SYSTEM`。
+- **user 拼装**（逐字骨架）：
+
+```
+所属群组：<群组名>（<description 前 200 字>）
+群内其他成员：<名：personality 前 60 字；…|（无）>
+请只补全该成员下列【当前为空】的字段：<labels>。
+要求：只补空字段，绝不修改或覆盖已有设定（已有设定是绝对权威，不得改写、润色或替换）；只根据已知信息合理补写，没有把握的字段直接省略；不要编造与已有设定冲突的内容。<speakingStyle 示例规则><该成员的说话方式必须与群内其他成员显著不同（看台词就能分辨是谁）。><userAddress 规则>
+已有设定:
+{<existing>}
+只返回JSON对象，键为字段英文名，值为补写内容。
+```
+
+
+- **期望输出 / 解析**：同第 12 节。
+
+---
+
+## 4.10 世界观迁移：背景 → 世界书（一次性）
+
+- **触发**：用户手动迁移（已有 `lorebookMigratedAt` 或源文本 <40 字则跳过）。
+- **system**：`LOREBOOK_SYSTEM`。
+- **user 拼装**（逐字骨架，`trimmed` = 群组 `description` / 单角色 `background`）：
+
+```
+下面是一个<群组前提|角色的个人背景>文本，其中可能混有世界观类内容（时代/世界观、地点、组织、专有名词、历史、规则）。
+请把其中的**世界层设定**整理成世界书条目；只整理原文已有的信息，禁止编造或扩写；角色/群组本人的性格、经历、关系不要抽成条目。
+每条给出 name（条目名）、keywords（剧情里可能出现的称呼）、content（该条目本身的信息，不要理由与解释）、alwaysActive（世界前提/规则这类需要每轮生效的设 true，其余 false）。最多 6 条；没有世界层内容就返回空数组。
+<可选：另外请给出精简后的原文：删掉已经抽成条目的世界观内容，只保留角色/群组本人相关的部分，其他内容一字不改；没有可精简的就原样返回。>
+只返回 JSON：{"entries":[{"name":"","keywords":[],"content":"","alwaysActive":false}]<可选 ,"trimmedSource":"">}。
+
+现有世界书条目：<已有条目 JSON|（空）>
+
+<群组前提|个人背景>：
+<trimText(trimmed, 2000)>
+```
+
+
+- **期望输出**：`{"entries":[…6 条…]}`，可选 `trimmedSource`（只在更短时采纳，落盘 `trimText 1200`（群组）/`800`（单角色））。
+
+---
+
+## 4.11 字段结构重排（一次性）
+
+- **触发**：用户手动迁移（已在 `fieldsMigrationVersion == "1.2.0"` 则跳过）。
+- **system**：`FILL_SYSTEM`。
+- **user 拼装**（逐字骨架 + 现有内容 JSON）：
+
+```
+下面是一个角色/成员的当前字段文本。请把它整理成新版字段结构：
+动态状态字段只能是：currentSituation、currentLocation、currentMood、currentOccupation、currentGoal、currentTone；静态设定只保留 background（仅单角色）。
+要求：①按语义归入最贴切字段，消除重复；②时间写绝对日期；③只整理已有信息，不编造；④写成自然完整的陈述句。
+只返回JSON对象：{"dynamicState":{...},"background":"..."}。
+现有内容（JSON）：
+{"name":…,"entityType":"group|character","dynamicState":{六个字段},"background":…}
+```
+
+
+- **期望输出**：`{"dynamicState":{…},"background":"…"}`；动态字段 `trimText 700`、单角色 background `800`、群组 description `1200`。
+
+> 注：`「价值观」「关键过往」两个字段已删除`，旧数据由 `core:data/RetiredStaticFields` 在**读取时**并入性格/背景（旧备份由 `LegacyMapper` 合并），不经过本调用。
+
+---
+
+## 4.12 文风校对（`auxiliary`）
+
+- **触发**：`detectStyleViolations` 命中且 `AppConfig.styleCritique` 开启。
+- **taskType**：默认 `auxiliary`。**system（逐字）**：
+
+```
+你是文风校对助手。只返回JSON。
+```
+
+- **user 拼装**（逐字骨架，`rules` = 每条 `- <违规中文标签>`）：
+
+```
+下面是一段角色扮演回复，以及它违反的文风规则清单。请修订文风。
+硬性要求：①只改文风，绝不改动情节、事实、对话含义与人物关系；②保持大体长度与段落数；③不要新增情节要素、不要加解释或旁白；④不得复述规则本身；⑤**被「」『』《》〈〉或引号包裹的内容是引用（别人的话、歌词、诗句、书名/作品名），以及世界书条目名、角色/成员名、对用户的称呼，都必须原样保留、逐字不变**——改写、删减、换序任何一处都会导致整次修订被丢弃。
+违反的规则：
+<rules>
+
+只返回 JSON：{"reply":"修订后的正文"}，换行写 \n，双引号写 \"。
+
+原文：
+<原文>
+```
+
+
+- **期望输出**：`{"reply":"…"}`。
+- **确定性回退**（任何一条不满足就保留原文）：非空、有变化、长度 ≤ `critiqueMaxChars`(1600)、长度比在 `[0.5, 2.0]`、且 `keepsProtectedContent`（引用段落逐字未变、世界书条目名/角色名/成员名/称呼未丢失）。
+
+---
+
+## 4.13 快速回应修补（`auxiliary`）
+
+- **触发**：每轮（开关开；当前 `quickReplies` 不足两条或不过视角校验）。
+- **taskType**：默认 `auxiliary`。**system**（动态，逐字）：
+
+```
+你就是这位用户本人，正在手机上和<charName>聊天。只输出用户此刻最可能打出的两句话，不要扮演<charName>，不要写旁白或动作，不要解释。
+```
+
+- **user 拼装**（逐字骨架）：
+
+```
+【用户最近说过的话，仅用于参考语气，不要照抄】   ← 仅当最近有 >1 条用户消息
+<最近 2 条用户消息，各 trimText 80>
+
+<charName>刚对你说：
+<trimText(reply, 800)>
+
+请写出你（用户<，对方平时叫你“<称呼>”>）此刻最可能发给他的两句话：
+①每句都是用户可以原样发送的消息，是"我"（用户自己）的立场、感受、提问或要求；
+②不得是<charName>会说的话，不得是把<charName>刚说的话换个人称复述一遍；
+③每条不超过 40 字，不用括号动作、不用 Markdown。
+只返回 JSON：{"quickReplies":["句子一","句子二"]}
+```
+
+
+- **期望输出**：`{"quickReplies":[…]}`；解析不足 2 条或仍不过校验 → 回退 `["嗯","继续"]`。
+
+---
+
+## 4.14 App 层建卡 / 补全调用
+
+#### 4.14.1 建卡与群组升级（`quickGenerate`）
+
+**system（逐字）**：
+
+```
+你是角色设计助手。严格按用户在消息里给出的 JSON 结构返回，只输出 JSON，不要任何解释、旁白或代码块标记。
+不得使用陈词滥调的人设模板；世界层设定一律写进 lorebook，不要写进角色个人背景。
+```
+
+**参数**：`temperature = 1.0`、`max_output_tokens = 1200`、`reasoning.effort = "none"`、`sessionId = "deeptalking-general"`、`auxiliary = true`、无工具。**input** 只有一条用户消息 = 调用方给的 prompt：
+
+- **建角色卡**（`CharacterParity.buildQuickGeneratePrompt(desc, isGroup=false)`）：
+  `CHARACTER_PROMPT_PREFIX` + `CHARACTER_QUALITY_RULE` + `SPEAKING_STYLE_SAMPLES_RULE` + `LOREBOOK_CONTENT_RULE` + `\n描述: ` + 用户描述。
+  前缀（逐字）：
+```
+根据以下描述，生成一个角色设定。返回JSON格式，包含这些字段: entityType, name, avatar(emoji), gender, age, race, appearance, personality, fears, background(角色个人经历，不要写世界观), speakingStyle, language, userAddress(角色对用户的称呼，只填一个短称呼词), dynamicState(对象，包含 currentSituation、currentLocation、currentMood、currentOccupation、currentGoal、currentTone), lorebook(数组，2-4 条世界层设定条目，每条 {"name":"条目名","keywords":["触发词"],"content":"命中后注入的世界层设定","alwaysActive":false})。**世界层设定（时代/世界观、地点、组织、专有名词、历史、规则）一律写进 lorebook，不要写进 background。**
+```
+
+
+- **建群组卡**（`isGroup=true`）：`GROUP_PROMPT_PREFIX` + 同样三条规则 + `\n描述: ` + 描述。前缀（逐字）：
+```
+根据以下描述生成一个角色群组。只返回JSON：{"entityType":"group","groupInfo":{"name":"群组名","avatar":"emoji","description":"群组前提（这群人是谁、为什么在一起，1-2 句；不要写世界观/时代/地点/组织等世界层设定）","scene":"场景","interactionRules":"成员互动规则"},"lorebook":[{"name":"条目名（地点/组织/专有名词/规则等）","keywords":["触发词"],"content":"命中后注入的世界层设定","alwaysActive":false}],"members":[{"name":"成员名","avatar":"emoji","gender":"性别","age":"年龄","race":"种族","appearance":"外貌","personality":"性格","fears":"恐惧或弱点","background":"背景","speakingStyle":"说话风格","language":"语言","userAddress":"该成员对用户的称呼（一个短称呼词）","roleInGroup":"群内定位","dynamicState":{"currentSituation":"当前处境","currentLocation":"当前位置","currentMood":"当前情绪","currentOccupation":"当前职业/身份","currentGoal":"当前目标","currentTone":"当前语气（供朗读的播报指令，可短可长，通常约60字内）"}}]}。群组的 description/scene 是全体成员共用的前提，必须填写；**世界层设定（时代/世界观、地点、组织、专有名词、历史、规则）一律写进 lorebook（2-4 条），绝不能塞进 description 或成员的 background**；lorebook 条目要能被日后复用，keywords 写剧情里可能出现的称呼（常驻内容把 alwaysActive 设为 true），content 只写该条目本身的信息。至少生成两名成员；每名成员必须尽可能填满所有字段，不能只返回名称和性格；成员之间的说话方式必须显著不同（看台词就能分辨是谁）。
+```
+
+
+- 三条共用规则（逐字）：
+  - `CHARACTER_QUALITY_RULE`：
+    ```
+    人设质量要求：①不得使用陈词滥调的名字或模板化人设（如“艾尔德里亚”式的套路奇幻名、“高冷大小姐”“温柔邻家女孩”这类通用模板）；②personality 写具体的行为倾向（遇到事情会怎么做、在意什么），不要堆砌形容词；③background 只写 3-5 条会影响当下互动的要点，不要写编年史。
+    ```
+  - `SPEAKING_STYLE_SAMPLES_RULE`：同第 12 节的同名规则文本。
+  - `LOREBOOK_CONTENT_RULE`：
+    ```
+    lorebook 每条 content 精炼、一条只讲一件事，**目标 300 字以内**（硬上限 400 字，超过会被丢掉）。
+    ```
+- **群组升级**（`AppViewModel.upgradeToGroup`，同一 `quickGenerate`）：prompt 顺序为「升级说明 + 返回 JSON 骨架（`groupInfo` / `lorebook` / `additionalMembers` 全字段空串）+ lorebook 与成员补充要求 + `CHARACTER_QUALITY_RULE` + `SPEAKING_STYLE_SAMPLES_RULE` + `\n原角色（禁止重复输出）:\n<原角色 JSON>` + `\n近期对话:\n<最近 20 条，各 take 1000>`」。原角色 JSON 键顺序：`name, avatar, gender, age, race, appearance, personality, fears, background, speakingStyle, language, userAddress`。
+- **解析**：`CharacterParity.parseGeneratedDraft`（提取第一个 `{…}`）；lorebook 条目超 400 字**丢弃不截断**，条数 ≤200、keywords ≤8、名称 `take 60`。
+
+#### 4.14.2 头像 emoji（`requestEmojiAvatar`）
+
+**system（逐字）**：
+
+```
+你是角色头像助手。只输出一个最能代表该角色的 emoji 字符，不要任何文字、标点或解释。
+```
+
+**参数**：`temperature = 1.2`、`max_output_tokens = 16`、`effort = "none"`、`sessionId = "deeptalking-general"`、`auxiliary = true`。**input** = 一条用户消息，内容 = 描述（`[name, appearance, personality]` 非空项用 `，` 连接；空则 `一个神秘角色`）。**输出**：第一个 emoji 码点（扫描 emoji 码区）。
+
+#### 4.14.3 表情包打标签（`tagSticker`）
+
+**system（逐字，`STICKER_TAGS` 内联）**：
+
+```
+你是表情包分类助手。看这张表情包或图片，从下列标签中选一个最贴切的：开心、大笑、难过、委屈、生气、无语、惊讶、疑惑、害羞、得意、爱意、亲亲、抱抱、加油、点赞、拒绝、睡觉、干杯。若都不贴切，就给出一个 1 到 6 字的中文短词。只输出这一个词，不要标点、解释或其它文字。
+```
+
+**参数**：`temperature = 0.2`、`max_output_tokens = 8`、`effort = "none"`、`auxiliary = true`。**input** = 一条用户消息：文本 `给这张图打一个短词标签。` + 图片附件（经 `imageResolver` 变成 `input_image`）。**输出**：去标点后 `take 6`。
+
+#### 4.14.4 群成员字段补全（`fillMemberFields`，NativeCore 版）
+
+**system（逐字）**：
+
+```
+你是角色卡补全助手。只返回 JSON。
+只能根据群组设定、现有角色卡和用户的一句话补全空字段，不能覆盖或编造与已有字段冲突的信息。
+已有字段是绝对权威，任何情况下不得改写、润色或替换。
+返回字段：name, avatar, gender, age, race, appearance, personality, fears,
+background, speakingStyle, language, userAddress, roleInGroup,
+dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccupation, currentGoal, currentTone)。
+只给出有把握的字段，没有把握就省略。成员的说话方式必须与群内其他成员显著不同。
+每个字段都要精炼：短字段几十字内（性别/年龄/种族/语言/称呼），外貌/性格/恐惧弱点/说话风格一两句、不超过 120 字，背景故事不超过 250 字；
+一律写成明确的简短陈述句，禁止“不是…而是…”这类对比句，禁止括号注释、理由与解释性文字。
+```
+
+
+**参数**：`temperature = 0.8`、`max_output_tokens = 800`、`effort = "none"`、`auxiliary = true`。**input** = 一条用户消息，顺序拼装 `群组信息:`(JSON `name, avatar, description, scene, interactionRules`) + `群组其他成员:`(JSON `name, personality, speakingStyle, roleInGroup`) + `待补全成员:`(JSON `name, avatar, gender, age, race, appearance, personality, fears, background, speakingStyle, language, userAddress, roleInGroup, dynamicState{六字段}`) + `用户补充:` + hint + `SPEAKING_STYLE_SAMPLES_RULE`。**输出**：只填**空**字段的 JSON。
+
+---
+
+
+## 5. 上限索引（提示词 / 注入相关）
+
+| 常量 | 值 | 位置 |
+|---|---|---|
+| `AppLimits.Api.AUXILIARY_MAX_OUTPUT_TOKENS` | 8192 | 同上 |
+| `AppLimits.Agent.MAX_TOOL_ROUNDS` / `MAX_TOOL_CALLS` / `TOOL_MEMORY_INJECT_LIMIT` | 5 / 12 / 5 | 同上 |
+| `AppLimits.Memory.INSTANT` / `SHORT_TERM` / `INSTANT_TRIM_FLOOR` | 60 / 40 / 20 | 同上 |
+| `AppLimits.StaticProfile.SHORT_CHARS` / `PROSE_CHARS` / `BACKGROUND_CHARS` | 40 / 120 / 250 | 同上 |
+| `AppLimits.Lorebook.CONTENT_CHARS` / `ENTRIES` / `INJECT_ENTRIES` | 400 / 200 / 6 | 同上 |
+| `STYLE_GUARD.critiqueMaxChars` / 长度比 | 1600 / 0.5–2.0 | `domain/agent/background/StyleGuard.kt` |
+
+---
+
+## 附录 A 各工具的 `parameters`（JSON Schema，逐字）
+
+`description` 见 §3.2；这里只有结构。发送时是紧凑单行，这里缩进只为可读。**注意**：`submit_response` 的 schema 里 `timeRef` 子结构**逐字重复了 21 份（≈24,528 字，占该 schema 约七成）**——只保留一份、其余换成一句短指向即可无损省下 ≈23,000 字。
+
+### A-1 `submit_response`
 
 ```json
 {
@@ -3054,21 +3115,9 @@ ISO时间: <iso>
 }
 ```
 
-
-
-### A-3.2 其余 19 个工具
+### A-2 其余 19 个工具
 
 #### `get_current_time`
-
-`strict`: `false`
-
-`description`（逐字）：
-
-```
-获取当前本地时间与日期（含时区、星期、ISO时间）。用于回答"现在几点/几号/星期几/距离某个时间多久"等问题。
-```
-
-`parameters`（逐字 JSON）：
 
 ```json
 {
@@ -3078,18 +3127,7 @@ ISO时间: <iso>
 }
 ```
 
-
 #### `search_memory`
-
-`strict`: `false`
-
-`description`（逐字）：
-
-```
-检索记忆库。两种用法：①**按日期召回**——用户问起某个具体日期/某天发生的事时（如“九号晚上”“三号”“上周五”“那天记不记得”），用 date 或 timeRef 按日期召回，会返回那天的**原始对话**、当天摘要与当天长期记忆，比凭摘要回忆更准确；date 写 YYYY-MM-DD，请依据系统给的时间基准把用户的口语日期换算成绝对日期，相对说法（昨天/上周五/三天前）改用 timeRef。②**按关键词检索**——回忆过往约定、用户喜好与习惯、共同经历、关系事实，或**刚滑出近期摘要窗口的事**时用 query；返回 results（长期记忆）与 shortTerm（短期摘要，id 以 short_ 开头，可直接交给 update_memory / delete_memory 修正）。query/date/timeRef 至少给一个。默认检索全员共享记忆；群组对话中若想检索某位成员的私人记忆，可传入 memberName（该成员自己的记忆，如"张三"。注意：若该成员的私人记忆里没有，也可能是共享记忆，必要时可再不带 memberName 检索一次）。
-```
-
-`parameters`（逐字 JSON）：
 
 ```json
 {
@@ -3143,18 +3181,7 @@ ISO时间: <iso>
 }
 ```
 
-
 #### `list_memories`
-
-`strict`: `false`
-
-`description`（逐字）：
-
-```
-盘点指定分类的长期记忆清单（不含内容详情），用于主动发现过期、重复或错误的记忆。分类：userProfile（用户信息）、relationship（关系）、events（共同事件）、promises（约定）、habits（习惯）。可选按关键词过滤。返回每条记忆的ID、分类、关键词与更新时间。群组对话中可传 memberName 盘点某位成员的私人记忆。
-```
-
-`parameters`（逐字 JSON）：
 
 ```json
 {
@@ -3189,18 +3216,7 @@ ISO时间: <iso>
 }
 ```
 
-
 #### `delete_memory`
-
-`strict`: `false`
-
-`description`（逐字）：
-
-```
-删除一条记忆（长期或短期，按ID）。仅用于：内容已被明确推翻或已过时失效、重复记录、或用户明确否认/纠正过的错误记忆。删除前建议先用 list_memories 或 search_memory 确认目标ID。ID 以 short_ 开头的是短期记忆（删除后不会再被整理进长期记忆）。群组对话中删除某位成员私人记忆时传入对应 memberName。
-```
-
-`parameters`（逐字 JSON）：
 
 ```json
 {
@@ -3222,18 +3238,7 @@ ISO时间: <iso>
 }
 ```
 
-
 #### `set_reminder`
-
-`strict`: `false`
-
-`description`（逐字）：
-
-```
-记录“需要用户参与”的待办/约定，且**必须由用户自己明确提出或同意**（如用户说“我明天要交报告”“记得提醒我买药”）。调用时必须附用户原话：sourceMessageIds 填用户消息ID、evidence 逐字摘录用户原话。角色要求用户去做的事、角色的建议或叮嘱，一律不得用本工具记录——应先自然征询用户，等用户自己答应后再记。到时间可在对话中温和提起。群组对话中若要记入某位成员的私人记忆可传 memberName。
-```
-
-`parameters`（逐字 JSON）：
 
 ```json
 {
@@ -3343,18 +3348,7 @@ ISO时间: <iso>
 }
 ```
 
-
 #### `ask_user`
-
-`strict`: `false`
-
-`description`（逐字）：
-
-```
-当记忆缺失、用户表述含糊或无法可靠推断某件关键事实时，向用户提出一个简短澄清问题，避免凭空编造。仅在确实需要澄清且追问不显得突兀时使用；不要滥用，也不要用它代替正常的角色回复。
-```
-
-`parameters`（逐字 JSON）：
 
 ```json
 {
@@ -3372,18 +3366,7 @@ ISO时间: <iso>
 }
 ```
 
-
 #### `update_character_field`
-
-`strict`: `false`
-
-`description`（逐字）：
-
-```
-精准修改角色基础设定字段（性别/年龄/种族/外貌特征/性格特征/恐惧弱点/背景故事/说话风格/语言方言/对用户的称呼）。当用户直接要求修改这些设定（如"把我职业改成教师""我现在是学生了""你性格应该更冷酷些""别叫我用户，叫我明明"）时，必须调用本工具立即生效；value一律写成**明确的简短陈述句**：只写内容本身、一个字段一件事，短字段几十字、外貌/性格/恐惧弱点/说话风格一两句（不超过 120 字）、背景故事不超过 250 字；**禁止「不是…而是…」这类对比句**（会被拒收，请直接写陈述句，如性格"性格冷静克制，遇事沉稳。"）；禁止括号注释、理由、整句说明或解释性文字；"对用户的称呼"只填一个简短称呼词、不带任何解释。群组实体不维护基础设定字段（世界观并入群组描述），成员的个人字段请在该成员卡片上修改。不要在submit_response的staticFields里重复提交本工具已改的字段。
-```
-
-`parameters`（逐字 JSON）：
 
 ```json
 {
@@ -3497,18 +3480,7 @@ ISO时间: <iso>
 }
 ```
 
-
 #### `upsert_lorebook_entry`
-
-`strict`: `false`
-
-`description`（逐字）：
-
-```
-写入/更新世界书条目——世界层设定的唯一去处（时代与世界观、地点、组织、专有名词、历史、规则、背景事实）。**同一件事物只能有一条**：先对照现有条目，凡名称相近、关键词相同或内容重叠的都算同一条，必须用它的 entryId/name 更新合并，绝不新建近似条目；当你用 entryId/name 明确指定要更新的条目时，content 会**替换**该条目原有内容，因此更新时要写全该条目应有的完整内容（不要只写增量，否则会丢信息）；**内容要精炼，一条只讲一件事，目标 300 字以内（硬上限 400 字，超了会被拒绝，要求你精简后重写）**；未指定 id/name 而由系统按相似度命中时，同样会用你这次写的完整内容**替换**该条目。只在近期对话里已经出现/确立、且**会反复复用**的这类设定，或用户补充修正了这类设定时才使用；一次性的小事、可从上下文直接看出的细节不要写。**用户手写条目（origin=user）受保护，不得覆盖或改写**；若现有用户条目已覆盖同一设定，不要重复写入。keywords 写剧情里可能出现的称呼（命中才注入；没给关键词时系统会用条目名当触发词）；只有确实需要每轮生效的世界前提/规则才把 alwaysActive 设为 true（常驻条目数量有限，不要滥用）。必须给出 sourceMessageIds 与 evidence 证明该设定已在对话中出现（本轮新编、尚未落库的内容不要写，等它出现在消息里再由整理任务沉淀）；拿不出依据就不要写。
-```
-
-`parameters`（逐字 JSON）：
 
 ```json
 {
@@ -3563,18 +3535,7 @@ ISO时间: <iso>
 }
 ```
 
-
 #### `web_fetch`
-
-`strict`: `false`
-
-`description`（逐字）：
-
-```
-读取一个链接的内容。① 用户给出链接、需要读网页正文时传 url（只传上下文里真实存在的 http(s) 链接，禁止自行编造或拼接 URL）；② 链接是图片（jpg/png/gif/webp 等）时会把图片取回以便你直接查看；③ 链接是虎扑帖子或网易云歌曲时，会直接返回帖子正文+回帖、歌曲信息+热评；B站视频链接会返回标题、UP主、播放数据、简介与封面图。若网页直连失败或正文为空，会自动改用摘要服务取回标题、描述与主图。**本工具只读链接；想按关键词搜视频/歌曲/帖子请用 search_video / search_music / search_posts。**
-```
-
-`parameters`（逐字 JSON）：
 
 ```json
 {
@@ -3592,18 +3553,7 @@ ISO时间: <iso>
 }
 ```
 
-
 #### `update_memory`
-
-`strict`: `false`
-
-`description`（逐字）：
-
-```
-修正一条已存在的记忆（长期或短期，按ID）。仅当用户明确否认或纠正某条记忆时使用，例如"那件事是我做的不是你做的""记反了""我不是那个意思"。必须先调用 search_memory 或 list_memories 找到目标ID，再用用户纠正的原话作为 evidence。ID 以 short_ 开头的是**短期记忆**（只支持 value 与 eventTime）：改正后会重新排到队尾，等待下一轮被整理进长期记忆。其他 ID 是长期记忆，可改 subject（主体：user=用户 / character=角色自己 / relationship=双方 / world=背景设定）、value（内容，必须写明主体）、key、importance、promisor/promisee（约定的承诺方/受约方）。不要用它新建记忆（新建请用 longTerm 字段或 set_reminder）。
-```
-
-`parameters`（逐字 JSON）：
 
 ```json
 {
@@ -3744,18 +3694,7 @@ ISO时间: <iso>
 }
 ```
 
-
 #### `send_sticker`
-
-`strict`: `false`
-
-`description`（逐字）：
-
-```
-给用户发一个表情包（贴图）。tag 必须从这些可用标签中选择其一：开心。当你想用表情包/贴图表达情绪时使用；贴图会作为你的下一条消息单独发出，不需要再用文字描述它。
-```
-
-`parameters`（逐字 JSON）：
 
 ```json
 {
@@ -3776,18 +3715,7 @@ ISO时间: <iso>
 }
 ```
 
-
 #### `web_search`
-
-`strict`: `false`
-
-`description`（逐字）：
-
-```
-搜索实时网页资料，返回实际取得的标题、链接和摘要。失败或无结果时不得编造搜索结果；可请用户提供链接后用 web_fetch 读取。
-```
-
-`parameters`（逐字 JSON）：
 
 ```json
 {
@@ -3811,18 +3739,7 @@ ISO时间: <iso>
 }
 ```
 
-
 #### `search_video`
-
-`strict`: `false`
-
-`description`（逐字）：
-
-```
-在B站（哔哩哔哩） 按关键词检索公开内容（免登录）。用户想找某个视频、某个UP主的视频时使用。返回标题与链接；视频链接可用 web_fetch 打开看标题、UP主、播放数据、简介与封面图。 失败或无结果时不得编造结果。
-```
-
-`parameters`（逐字 JSON）：
 
 ```json
 {
@@ -3845,20 +3762,9 @@ ISO时间: <iso>
     "additionalProperties": false
 }
 ```
-
 
 #### `search_music`
 
-`strict`: `false`
-
-`description`（逐字）：
-
-```
-在网易云音乐 按关键词检索公开内容（免登录）。用户想找某首歌、某个歌手的歌时使用。返回歌名、歌手与歌曲 id/链接；歌曲链接可用 web_fetch 打开看热评。 失败或无结果时不得编造结果。
-```
-
-`parameters`（逐字 JSON）：
-
 ```json
 {
     "type": "object",
@@ -3880,20 +3786,9 @@ ISO时间: <iso>
     "additionalProperties": false
 }
 ```
-
 
 #### `search_posts`
 
-`strict`: `false`
-
-`description`（逐字）：
-
-```
-在虎扑 按关键词检索公开内容（免登录）。用户想找虎扑上的帖子、看大家怎么聊时使用。返回标题与链接；帖子链接可用 web_fetch 读正文与回帖。 失败或无结果时不得编造结果。
-```
-
-`parameters`（逐字 JSON）：
-
 ```json
 {
     "type": "object",
@@ -3916,18 +3811,7 @@ ISO时间: <iso>
 }
 ```
 
-
 #### `baidu_hot`
-
-`strict`: `false`
-
-`description`（逐字）：
-
-```
-获取百度热搜（免登录）。用户想了解当下热点、最近流行的梗或话题时使用；返回按热度排序的标题（部分平台带链接与热度）。失败或无结果时不得编造榜单内容。
-```
-
-`parameters`（逐字 JSON）：
 
 ```json
 {
@@ -3943,20 +3827,9 @@ ISO时间: <iso>
     "additionalProperties": false
 }
 ```
-
 
 #### `toutiao_hot`
 
-`strict`: `false`
-
-`description`（逐字）：
-
-```
-获取今日头条热榜（免登录）。用户想了解当下热点、最近流行的梗或话题时使用；返回按热度排序的标题（部分平台带链接与热度）。失败或无结果时不得编造榜单内容。
-```
-
-`parameters`（逐字 JSON）：
-
 ```json
 {
     "type": "object",
@@ -3971,20 +3844,9 @@ ISO时间: <iso>
     "additionalProperties": false
 }
 ```
-
 
 #### `douyin_hot`
 
-`strict`: `false`
-
-`description`（逐字）：
-
-```
-获取抖音热榜（免登录）。用户想了解当下热点、最近流行的梗或话题时使用；返回按热度排序的标题（部分平台带链接与热度）。失败或无结果时不得编造榜单内容。
-```
-
-`parameters`（逐字 JSON）：
-
 ```json
 {
     "type": "object",
@@ -3999,20 +3861,9 @@ ISO时间: <iso>
     "additionalProperties": false
 }
 ```
-
 
 #### `zhihu_hot`
 
-`strict`: `false`
-
-`description`（逐字）：
-
-```
-获取知乎热榜（免登录）。用户想了解当下热点、最近流行的梗或话题时使用；返回按热度排序的标题（部分平台带链接与热度）。失败或无结果时不得编造榜单内容。
-```
-
-`parameters`（逐字 JSON）：
-
 ```json
 {
     "type": "object",
@@ -4029,219 +3880,9 @@ ISO时间: <iso>
 ```
 
 
-## A-4 后台 / 辅助调用提示词（逐字）
+## 附录 B 工具结果的固定文案（逐字，属于 `input`）
 
-按正文 §5–§18 的顺序排列；触发条件、参数、拼装顺序与回退见对应小节。
-
-### A-4.1 §5 · `EXTRACTION_PROMPT_HEAD`
-
-字数：**792**
-
-```
-把下面这段即时对话整体压缩为事件流程摘要，覆盖整段对话、不要遗漏内容。事件按“日期+时段”划分：时段只有深夜、凌晨、清晨、早晨、上午、中午、下午、傍晚、晚上、夜里十种，且一天从02:00起算（00:00-02:00算前一天的深夜）；同一天同一时段的多个事情视为同一事件，按时间线集中叙述（如“2026-08-01 下午在家先…晚上…”）。同一时段也可能有不同事件，按事实或持续话题区分，不得把无关事件强行合并；同一事件内用时间线连接各阶段，保留仍然有效的关键细节、结果与未决事项。**只保留会影响后续剧情的内容**：谁做了什么、学到或决定了什么，地点/物品/伤势/关系的变化，新的发现或线索，以及仍未解决的目标、承诺、威胁与期限；一次性的寒暄、当下的情绪起伏、闲聊过程一律不记。**每条content不超过120字**，用平实的叙述句写成，禁止文学化描写、比喻、形容词铺陈与对白原文。eventTime写该事件的真实ISO时间，participants为参与人列表，location写地点（没有明确地点写“未说明”）。若本次某事件是“已有短期事件”中某事件的延续或更新，不要另起一条：把它并进对应事件（沿用同一事件的时间与地点），并在输出里直接给出合并后的完整摘要，旧摘要中**仍然有效**的信息（未过期的约定、未解决的事、仍然成立的关系与状态）必须原样保留，只丢弃已经过时或已被推翻的部分。content按时间和因果顺序书写，不要逐字摘录。content必须写明是谁做的：涉及用户写“用户”，涉及角色写角色名（群组写具体成员名），双方共同的事写清各自做了什么，禁止使用“我、你、TA、他、她”这类指代不清的代词。content中禁止使用“今天、昨天、明天、今晚、刚刚、刚才、现在、最近、这几天”等相对时间词，一律使用具体日期（如“8月1日下午”）或事件本身描述。不要输出任何消息ID。
-```
-
-### A-4.2 §6 · `ANALYSIS_PROMPT_HEAD`
-
-字数：**1,437**
-
-```
-分析以下带短期ID、来源消息ID、userEvidence及时间/人物/地点三要素的事件流程摘要，提取未来仍有价值的稳定事实。输入中每条条目带 analyzed 标记：**只为 analyzed=false 的条目产出长期记忆**；analyzed=true 的是前一轮已整理过的上下文，只用于保持情节连贯（可据此合并或修正），不得为它们重复产出条目，也不要在 analyzedShortTermIds 中返回它们。**价值判据**：只有能跨轮复用、会影响后续对话或关系、或用户明确表达过的信息才记（长期偏好、重要人物与关系、承诺与约定、反复出现的习惯、持续的情节线）；一次性的寒暄客套、当下的情绪起伏、可以随口重说的闲聊、纯场景描写一律不记。**证据不足宁可不记**，不要为了产出而脑补或推演。必须检查全部 analyzed=false 的条目，并在analyzedShortTermIds中原样返回它们的短期ID；不得遗漏、增加或重复。**每条 value 不超过200字，arc 叙事摘要不超过300字**，写成平实叙述，不堆砌形容词。合并重复或冲突条目；事件、承诺保留必要日期；普通寒暄不要进入长期记忆。每条长期记忆必须在sourceShortTermIds中列出它实际使用的短期条目id；每个列出的短期条目都必须至少贡献一个sourceMessageIds中的消息ID，否则不要列出该短期ID。sourceMessageIds只选择直接支持该事实的消息，不要复制短期条目的全部来源；userProfile和habits只能选择用户消息。evidence只能逐字引用被选择消息对应的userEvidence.text，不能引用摘要或改写。没有可引用的userEvidence时不要输出该条。events按“日期+时段+事实主题”区分：同一天同一时段（深夜/凌晨/清晨/早晨/上午/中午/下午/傍晚/晚上/夜里，一天从02:00起算）的短期事件合并为一条长期事件，同一时段的独立事实不得互相覆盖，key须标明稳定事实主题；合并时eventTime取最早的ISO时间，participants取并集，location取最新（无明确地点写“未说明”）。剧情弧线：若若干短期事件属于同一持续情节或话题线（同一人物线、同一持续事件、同一反复出现的话题），除按时间合并外，还应在其中一条事件条目上标注arcOf（该情节的持续话题或人物线名称，稳定可复用）与arcStage（只能是起始/发展/转折/现状之一，按情节推进阶段标注），arcOf命名一旦确定就保持稳定——同一情节线不得每轮改名或另起新名，续写时沿用已有名称；并将value整合成按时间顺序、带情绪起伏的叙事摘要；同一arcOf只允许一条带弧线标注的条目，其余同线条目按普通事件输出。无论是否提取出长期记忆，成功完成分析都必须返回status:"ok"；没有长期价值时仍需返回完整analyzedShortTermIds和空longTerm。
-分类规则：userProfile/habits仅限用户事实，subject=user；relationship仅限双方关系，subject=relationship；events只记录用户陈述或共同事件；promises只记录用户明确承诺或双方明确约定。promises在此处只能新建为active；完成或取消由主对话的promiseUpdates按承诺ID处理。存在明确期限才填写dueAt。
-条目:
-```
-
-### A-4.3 §6 · `ANALYSIS_PROMPT_TAIL`
-
-字数：**731**
-
-```
-
-返回JSON格式:
-{"status":"ok","analyzedShortTermIds":["全部 analyzed=false 的 short_id"],"longTerm": [{"category": "...", "subject": "user|relationship|world", "key": "稳定且可复用的标识", "value": "...", "tags": [...], "importance": 1-10, "sourceShortTermIds":["short_id"], "sourceMessageIds": ["msg_id"], "evidence": "被选择用户消息中的逐字原话", "eventTime": "ISO时间", "participants":["参与者"],"location":"地点或未说明","status": "active", "dueAt": "ISO时间", "arcOf": "可选，持续情节线名称", "arcStage": "可选，起始/发展/转折/现状"}]}
-category可选: userProfile, relationship, events, promises, habits。value同样必须写明主体：涉及用户写“用户”，涉及角色写角色名（群组写具体成员名），禁止“我/你/TA”这类指代不清的代词。key与value中的时间一律写绝对日期（YYYY-MM-DD 或 YYYY-MM-DD 时段），禁止“明天/明晚/上周/上个月/三天后”这类相对时间词。这里只提取用户的约定（promises 的 promisor=user、promisor与promisee只能是 user 或 character）；角色单方承诺由主对话记录，不在此处提取。
-```
-
-### A-4.4 §7 · `SCENE_PROMPT`
-
-字数：**289**
-
-```
-把下面这段已经告一段落的情节压缩成 1-2 段、不超过 300 字的「场景记忆」，供之后长期参考。
-只保留会影响后续剧情的要点：谁做了什么、学到或决定了什么；地点、物品、伤势、关系的变化；新的发现或线索；仍未解决的目标、承诺、威胁或期限。
-要求：①写明主体（涉及用户写“用户”，涉及角色写角色名），禁止“我/你/TA”这类指代不清的代词；②时间写绝对日期（YYYY-MM-DD 或 YYYY-MM-DD 时段），禁止“今天/昨天/刚才”这类相对时间词；③不要引用对白原句、不要加标题或 markdown、不要文学化描写；④不得编造原文没有的事实；⑤直接输出摘要正文，不要任何前后缀或解释。
-
-对话内容：
-```
-
-### A-4.5 §8 · `LOREBOOK_PROMPT_HEAD`
-
-字数：**826**
-
-```
-下面是一段角色扮演对话里已经发生的事件摘要，以及现有的世界书条目清单。
-请找出其中**已经出现、值得日后复用**的世界层设定（时代/世界观、地点、组织、专有名词、历史、规则、背景事实），整理成世界书条目。
-要求：①只写已经出现或已被明确说出的内容，禁止推测、扩写或发明新设定；②**同一件事物只能有一条**：对照现有条目的名称、关键词与内容，凡与已有条目讲的是同一件事（名称相近、关键词相同、内容重叠），必须复用它的名字、用你这次总结的内容**整条替换**它，绝不新建近似条目；同理，本批不同摘要里指向同一件事的也只输出一条；③只沉淀会反复复用的世界层设定，一次性的小事、可从上下文直接看出的细节不要单独立条；④每条 content 只写该条目本身的信息，不写理由、解释或出处，**一条只讲一件事**；**长度目标 300 字以内**、**硬上限 400 字**（超过 400 字的条目会被退回重写，宁短勿长）；⑤更新一条已有条目时，把它下面给出的**完整原有内容**与你掌握的新事实**重新总结成一条**：仍然有效的信息必须原样保留，重复的、过时的、与本条主题无关的内容删掉，允许比原来短——**只写增量会丢掉原有信息**；⑥清单里标注「内容（略）」的条目本轮不要更新（你看不到它的完整内容）；⑦keywords 写剧情里可能出现的称呼，不超过 8 个；若这条是世界前提/规则这类需要每轮生效的设定，把 alwaysActive 设为 true，否则一律 false；⑧最多 3 条；没有值得沉淀的就返回空数组。
-只返回 JSON：{"entries":[{"name":"条目名","keywords":["触发词"],"content":"设定内容","alwaysActive":false,"sourceShortTermIds":["上面的摘要ID"]}]}。sourceShortTermIds 必须是上面出现过的摘要ID，至少要有一个；没有可引用ID的条目不要返回。
-
-现有条目清单：
-```
-
-### A-4.6 §9 · `LOREBOOK_FIX_PROMPT`
-
-字数：**315**
-
-```
-下面这些世界书条目**超过了 400 字的硬上限**被退回，请把每一条**重新写一遍**：
-要求：①压缩到 **300 字以内**，仍然有效的关键信息（专有名词、人名、地点、日期、已确定的事实）必须保留，只删重复、修饰和可从上下文推出的细节；②**一条只讲一件事**，名称保持不变；③sourceShortTermIds 原样照抄，不要新增或改动；④不得编造原文没有的内容。
-只返回 JSON：{"entries":[{"name":"条目名","keywords":["触发词"],"content":"压缩后的设定内容","alwaysActive":false,"sourceShortTermIds":["摘要ID"]}]}
-
-被退回的条目：
-```
-
-### A-4.7 §10 · `LOREBOOK_REBUILD_PROMPT`
-
-字数：**490**
-
-```
-下面是一条已经积累得过长、把好几件不同的事混在一起的世界书条目。请把它**重新整理**成 1~3 条各自只讲一件事的条目。
-要求：①只使用原文里已有的信息，**禁止新增、推测或扩写任何设定**；②按主题拆分：读起来是不同话题的内容必须拆成不同条目，同一话题的合并成一条；③删掉重复的说法、已经过时或彼此矛盾的旧信息和与条目主题无关的内容；④每条的 content 都要写成完整、精炼的句子，**目标 300 字以内、硬性不超过 400 字**（超了这次重写会被丢弃、原条目原样保留），只写该条目本身的信息，不写理由或出处；⑤沿用原文的专有名词写法，条目名简洁（不超过 20 字）；⑥keywords 写剧情里可能出现的称呼，不超过 8 个，不要写泛词；⑦只有确实是世界前提/规则这类需要每轮生效的才把 alwaysActive 设为 true，其余一律 false；⑧原文里**仍然有效的信息要尽量保留**，不要因为压缩而丢事实。
-只返回 JSON：{"entries":[{"name":"条目名","keywords":["触发词"],"content":"设定内容","alwaysActive":false}]}
-```
-
-### A-4.8 §11 · `PROSE_SYSTEM`
-
-字数：**1,352**
-
-```
-你是「对话记录整理助手」。下面是一次角色扮演交互（用户消息 + 角色回复），请整理成与主对话一致的标准 JSON，包含全部字段：{"reply":"角色回复原文（一字不改）","quickReplies":["用户下一句1","用户下一句2"],"shortTerm":[{"content":"从交互提取的本轮事件摘要，写明谁做了什么","sourceMessageIds":["<用户消息id>"]}],"longTerm":[{"category":"userProfile|relationship|events|promises|habits","subject":"user|relationship|world","key":"稳定标识","value":"用户的具体事实（写明主体）","tags":[],"importance":1-10,"sourceMessageIds":["<用户消息id>"],"evidence":"用户原话","promisor":"可选，约定的承诺方 user|character","promisee":"可选，约定的受约方 user|character"}],"dynamicState":{"currentSituation":{"value":"当前处境","sourceMessageIds":["current_response"],"evidence":"回复中引原句"},"currentMood":{"value":"当前情绪","sourceMessageIds":["current_response"],"evidence":"概括回复原句"},"currentGoal":{"value":"当前目标","sourceMessageIds":["current_response"],"evidence":"回复中引原句"}},"staticFields":{},"memberDynamicState":[],"promiseUpdates":[]}。规则：reply必须一字不改保留角色回复原文；quickReplies必须恰好两条用户可直接发送给角色的短句；所有记忆只能从这次交互中明确提取，不得凭空编造；dynamicState来源用current_response、evidence引用回复原句；shortTerm和longTerm的sourceMessageIds引用用户消息id；用户未明确陈述或表现的内容不要写入；无合格记忆返回空数组。记忆字段（shortTerm的content、longTerm的key与value）必须写明主体：涉及用户写“用户”，涉及角色写角色名，禁止“我/你/TA”这类指代不清的代词；时间一律写绝对日期（YYYY-MM-DD 或 YYYY-MM-DD 时段），禁止“明天/明晚/上周/上个月/三天后”这类相对时间词，用户用相对时间说法时改用timeRef（anchor/offsetDays/weekday/slot/explicit）。dynamicState与staticFields的值以段落式的陈述句书写（自然完整陈述句，简短段落），禁止括号注释或理由。只返回JSON对象，不要其他任何文字。
-```
-
-### A-4.9 §12 补全空的基础设定字段 · user 拼装
-
-字数：**183**
-
-```
-请只补全下列【当前为空】的字段：<labels>。
-要求：只补空字段，绝不修改或覆盖已有设定（已有设定是绝对权威，不得改写、润色或替换）；只根据已知信息合理补写，没有把握的字段直接省略；不要编造与已有设定冲突的内容。<speakingStyle 示例规则><userAddress 规则>
-已有设定:
-{<existing>}
-只返回JSON对象，键为字段英文名，值为补写内容。
-```
-
-### A-4.10 §13 补全群成员字段 · user 拼装
-
-字数：**283**
-
-```
-所属群组：<群组名>（<description 前 200 字>）
-群内其他成员：<名：personality 前 60 字；…|（无）>
-请只补全该成员下列【当前为空】的字段：<labels>。
-要求：只补空字段，绝不修改或覆盖已有设定（已有设定是绝对权威，不得改写、润色或替换）；只根据已知信息合理补写，没有把握的字段直接省略；不要编造与已有设定冲突的内容。<speakingStyle 示例规则><该成员的说话方式必须与群内其他成员显著不同（看台词就能分辨是谁）。><userAddress 规则>
-已有设定:
-{<existing>}
-只返回JSON对象，键为字段英文名，值为补写内容。
-```
-
-### A-4.11 §14 世界观迁移：背景 → 世界书 · user 拼装
-
-字数：**481**
-
-```
-下面是一个<群组前提|角色的个人背景>文本，其中可能混有世界观类内容（时代/世界观、地点、组织、专有名词、历史、规则）。
-请把其中的**世界层设定**整理成世界书条目；只整理原文已有的信息，禁止编造或扩写；角色/群组本人的性格、经历、关系不要抽成条目。
-每条给出 name（条目名）、keywords（剧情里可能出现的称呼）、content（该条目本身的信息，不要理由与解释）、alwaysActive（世界前提/规则这类需要每轮生效的设 true，其余 false）。最多 6 条；没有世界层内容就返回空数组。
-<可选：另外请给出精简后的原文：删掉已经抽成条目的世界观内容，只保留角色/群组本人相关的部分，其他内容一字不改；没有可精简的就原样返回。>
-只返回 JSON：{"entries":[{"name":"","keywords":[],"content":"","alwaysActive":false}]<可选 ,"trimmedSource":"">}。
-
-现有世界书条目：<已有条目 JSON|（空）>
-
-<群组前提|个人背景>：
-<trimText(trimmed, 2000)>
-```
-
-### A-4.12 §15 字段结构重排 · user 拼装
-
-字数：**347**
-
-```
-下面是一个角色/成员的当前字段文本。请把它整理成新版字段结构：
-动态状态字段只能是：currentSituation、currentLocation、currentMood、currentOccupation、currentGoal、currentTone；静态设定只保留 background（仅单角色）。
-要求：①按语义归入最贴切字段，消除重复；②时间写绝对日期；③只整理已有信息，不编造；④写成自然完整的陈述句。
-只返回JSON对象：{"dynamicState":{...},"background":"..."}。
-现有内容（JSON）：
-{"name":…,"entityType":"group|character","dynamicState":{六个字段},"background":…}
-```
-
-### A-4.13 §16 文风校对 · user 拼装
-
-字数：**269**
-
-```
-下面是一段角色扮演回复，以及它违反的文风规则清单。请修订文风。
-硬性要求：①只改文风，绝不改动情节、事实、对话含义与人物关系；②保持大体长度与段落数；③不要新增情节要素、不要加解释或旁白；④不得复述规则本身；⑤**被「」『』《》〈〉或引号包裹的内容是引用（别人的话、歌词、诗句、书名/作品名），以及世界书条目名、角色/成员名、对用户的称呼，都必须原样保留、逐字不变**——改写、删减、换序任何一处都会导致整次修订被丢弃。
-违反的规则：
-<rules>
-
-只返回 JSON：{"reply":"修订后的正文"}，换行写 \n，双引号写 \"。
-
-原文：
-<原文>
-```
-
-### A-4.14 §17 快速回应修补 · user 拼装
-
-字数：**282**
-
-```
-【用户最近说过的话，仅用于参考语气，不要照抄】   ← 仅当最近有 >1 条用户消息
-<最近 2 条用户消息，各 trimText 80>
-
-<charName>刚对你说：
-<trimText(reply, 800)>
-
-请写出你（用户<，对方平时叫你“<称呼>”>）此刻最可能发给他的两句话：
-①每句都是用户可以原样发送的消息，是"我"（用户自己）的立场、感受、提问或要求；
-②不得是<charName>会说的话，不得是把<charName>刚说的话换个人称复述一遍；
-③每条不超过 40 字，不用括号动作、不用 Markdown。
-只返回 JSON：{"quickReplies":["句子一","句子二"]}
-```
-
-### A-4.15 §18.1 建卡与群组升级 · 前缀
-
-字数：**461**
-
-```
-根据以下描述，生成一个角色设定。返回JSON格式，包含这些字段: entityType, name, avatar(emoji), gender, age, race, appearance, personality, fears, background(角色个人经历，不要写世界观), speakingStyle, language, userAddress(角色对用户的称呼，只填一个短称呼词), dynamicState(对象，包含 currentSituation、currentLocation、currentMood、currentOccupation、currentGoal、currentTone), lorebook(数组，2-4 条世界层设定条目，每条 {"name":"条目名","keywords":["触发词"],"content":"命中后注入的世界层设定","alwaysActive":false})。**世界层设定（时代/世界观、地点、组织、专有名词、历史、规则）一律写进 lorebook，不要写进 background。**
-```
-
-### A-4.16 §18.1 · `GROUP_PROMPT_PREFIX`
-
-字数：**995**
-
-```
-根据以下描述生成一个角色群组。只返回JSON：{"entityType":"group","groupInfo":{"name":"群组名","avatar":"emoji","description":"群组前提（这群人是谁、为什么在一起，1-2 句；不要写世界观/时代/地点/组织等世界层设定）","scene":"场景","interactionRules":"成员互动规则"},"lorebook":[{"name":"条目名（地点/组织/专有名词/规则等）","keywords":["触发词"],"content":"命中后注入的世界层设定","alwaysActive":false}],"members":[{"name":"成员名","avatar":"emoji","gender":"性别","age":"年龄","race":"种族","appearance":"外貌","personality":"性格","fears":"恐惧或弱点","background":"背景","speakingStyle":"说话风格","language":"语言","userAddress":"该成员对用户的称呼（一个短称呼词）","roleInGroup":"群内定位","dynamicState":{"currentSituation":"当前处境","currentLocation":"当前位置","currentMood":"当前情绪","currentOccupation":"当前职业/身份","currentGoal":"当前目标","currentTone":"当前语气（供朗读的播报指令，可短可长，通常约60字内）"}}]}。群组的 description/scene 是全体成员共用的前提，必须填写；**世界层设定（时代/世界观、地点、组织、专有名词、历史、规则）一律写进 lorebook（2-4 条），绝不能塞进 description 或成员的 background**；lorebook 条目要能被日后复用，keywords 写剧情里可能出现的称呼（常驻内容把 alwaysActive 设为 true），content 只写该条目本身的信息。至少生成两名成员；每名成员必须尽可能填满所有字段，不能只返回名称和性格；成员之间的说话方式必须显著不同（看台词就能分辨是谁）。
-```
-
-### A-4.17 §18.4 群成员字段补全 · system
-
-字数：**469**
-
-```
-你是角色卡补全助手。只返回 JSON。
-只能根据群组设定、现有角色卡和用户的一句话补全空字段，不能覆盖或编造与已有字段冲突的信息。
-已有字段是绝对权威，任何情况下不得改写、润色或替换。
-返回字段：name, avatar, gender, age, race, appearance, personality, fears,
-background, speakingStyle, language, userAddress, roleInGroup,
-dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccupation, currentGoal, currentTone)。
-只给出有把握的字段，没有把握就省略。成员的说话方式必须与群内其他成员显著不同。
-每个字段都要精炼：短字段几十字内（性别/年龄/种族/语言/称呼），外貌/性格/恐惧弱点/说话风格一两句、不超过 120 字，背景故事不超过 250 字；
-一律写成明确的简短陈述句，禁止“不是…而是…”这类对比句，禁止括号注释、理由与解释性文字。
-```
-
-## A-5 工具返回的固定文案（逐字）
-
-共 33 条；`<…>` 是运行时插值。
+工具结果作为 `function_call_output` 回传模型：成功是各工具自己拼的 `{"ok":true,…}`；**失败 / 拒收是固定文案**，作为 `{"ok":false,"reason":"…"}` 的 `reason` 值。共 33 条；`<…>` 是运行时插值。
 
 | 工具（源码） | 固定文案（逐字） |
 |---|---|
