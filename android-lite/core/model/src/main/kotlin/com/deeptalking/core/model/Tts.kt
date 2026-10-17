@@ -8,6 +8,14 @@ private val LINK_MD = Regex("""\[([^\]]+)\]\([^)]*\)""")
 private val CODE_SPAN = Regex("""`([^`]*)`""")
 private val UNDERSCORE_EMPHASIS = Regex("""(?<![A-Za-z0-9])_([^_]+)_(?![A-Za-z0-9])""")
 private val BRACKET_ASIDE = Regex("""【[^】]*】""")
+
+/**
+ * 中文引用/书名符号：`「」『』《》〈〉`。
+ *
+ * 回复里允许用它们标注**引用**（别人的话、歌词、诗句、书名），但朗读时只需念出被引用的
+ * 文字本身——保留这些记号会让 TTS 多念一个无关的括号音（`【】`/Markdown 早就这样处理了）。
+ */
+private val CJK_QUOTE_MARKERS = Regex("""[「」『』《》〈〉]""")
 private val HEADING = Regex("""^#{1,6}\s*""")
 private val QUOTE = Regex("""^>\s?""")
 private val BULLET = Regex("""^[-*+]\s+""")
@@ -31,6 +39,7 @@ fun extractSpeechText(source: String): String {
     s = UNDERSCORE_EMPHASIS.replace(s, "$1")
     s = s.replace("*", "")
     s = BRACKET_ASIDE.replace(s, " ")
+    s = CJK_QUOTE_MARKERS.replace(s, "")
     s = stripParentheticals(s)
     val cleaned = s.lines().map { line ->
         line.trim()

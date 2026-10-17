@@ -356,7 +356,7 @@ tools: AUTO 阶段全部工具 / SUBMIT 阶段只有 submit_response
 | — | 优先级阶梯（规则块首行）：`0／0.5 与【输出格式】= 硬性契约 > 2.5／2.6 > 角色设定 > 风格偏好` |
 | `0` | （最高优先级）本轮必须以结构化方式收尾，二选一：调用 `submit_response` 工具（推荐）或直接输出单个 JSON 对象；不得在结构化内容之外写说明/旁白 |
 | `1` | 保持角色身份连续；先用已提供的记忆；"系统提供的本轮上下文"不是用户的话 |
-| `2` | reply 正文写法（像日常说话）：**不设下限**、只设 **≤250 字上限**防大段空话；分段/行内样式限制；**动作/表情/心理/旁白一律写全角括号、单拍短、不堆叠、总量 ≤ ¼、不复述对白情绪**；**台词不加任何引号或符号包裹**；去重（禁重复近期整句/句式/意象/固定动作/收尾） |
+| `2` | reply 正文写法（像日常说话）：**不设下限**、只设 **≤250 字上限**防大段空话；分段/行内样式限制；**动作/表情/心理/旁白一律写全角括号、单拍短、不堆叠、总量 ≤ ¼、不复述对白情绪**；**自己说的话直接写、不加引号包裹；只有引用他人话语/歌词/诗句/书名或专有名词原文时才用符号（引号用「」、书名用《》、逐字照抄），并避免英文直引号（JSON 需转义）**；去重（禁重复近期整句/句式/意象/固定动作/收尾） |
 | `2.6` | **表演质量（真人感）**：show-don't-tell、句长节奏起伏、对白优先、回避陈词滥调与复用比喻、删掉不推进内容的句子、人物性格稳定 |
 | `3` | 人格/背景锁定 + `dynamicState` 更新与溯源规则（时间写法见 `3.8`） |
 | `3.5` | 谨慎修改基础设定：用户直接要求 → `update_character_field`；无要求时仅"决定性不可逆转折"才改 |
@@ -400,7 +400,7 @@ tools: AUTO 阶段全部工具 / SUBMIT 阶段只有 submit_response
   `metaTalk`（元话术）／`speaksForUser`（替用户说话）／`cliche`（陈词滥调表）／`reusedImagery`（复用近期意象）／`toneDrift`（声明的口癖缺失或句长过于整齐）／`recitedLore`（复述世界书条目）。
 - **内部提醒**（不展示给用户）：违规标签随消息持久化（`message.styleViolations`），下一轮由 `StyleGuard.buildStyleCorrectionReminder()` 在 volatile 尾部点名纠正。
 - **每 N 轮语气回顾** `StyleGuard.buildStyleReview()`：`reviewEveryTurns`（3）轮一次，汇总近期违规并重申语气契约。
-- **critique 调用** `BackgroundTasks`（只改文风、不改剧情）：命中违规且 `AppConfig.styleCritique` 开启时追加一次修订请求；解析失败或长度比例异常一律**回退原文**；修订后重新检测并以剩余违规为准。
+- **critique 调用** `BackgroundTasks`（只改文风、不改剧情）：命中违规且 `AppConfig.styleCritique` 开启时追加一次修订请求；解析失败或长度比例异常一律**回退原文**；**引用保护**（确定性兜底，`StyleGuard.keepsProtectedContent`）：把 `「」『』《》〈〉` 与英文/弯引号包起来的引用段落、以及世界书条目名/角色名/成员名/对用户的称呼逐一比对，**只要有一处被改写、增删或换序就整体回退原文**（不做局部修补——那会留下半截被改写的引用）；修订后重新检测并以剩余违规为准。
 
 ### 快速回应视角（quickReplies）
 
@@ -433,7 +433,7 @@ tools: AUTO 阶段全部工具 / SUBMIT 阶段只有 submit_response
 | 即时→短期摘要 `analyzeShortTermBatch`（抽取） | `BackgroundTasks` | **整窗折叠**：`instant` 满 60 触发，输入是**整个窗口**；按"日期+时段"合并；**只保留影响后续剧情的内容**；**每条 ≤120 字**；禁止文学化与对白原文。**不要求模型点名消息 id**：原话证据由客户端按同一"日期+时段"从窗口里采；重复靠提示词注入**已有短期事件**来压 |
 | 短期→长期 `analyzeShortTermBatch`（分析） | `BackgroundTasks` | **整窗折叠**：`shortTerm` 满 40 触发，输入是**整个窗口**（低水位留下的 20 条只作上下文）；**价值判据**（可跨轮复用/影响后续/用户明确表达）才记，**证据不足宁可不记**；`arcOf` 命名一旦确定保持稳定；**取证链锚在短期条目上**；**每条 value ≤200 字、arc 叙事 ≤300 字** |
 | 场景概要 `summarizeScene` | `BackgroundTasks` | 1-2 段 ≤300 字，只含剧情要点，不引对白、不编造、写绝对日期 |
-| 文风校对（critique） | `BackgroundTasks` | **只改文风、不改剧情**；不得复述规则；只返回 `{"reply":"…"}`；空结果或长度比例异常一律回退原文 |
+| 文风校对（critique） | `BackgroundTasks` | **只改文风、不改剧情**；不得复述规则；只返回 `{"reply":"…"}`；空结果或长度比例异常一律回退原文；**引用段落（「」『』《》〈〉/引号）与世界书条目名/角色名/成员名/称呼被改动也整体回退** |
 | 快速回应换位生成 `repairQuickReplies` | `BackgroundTasks` | 身份是**用户本人**；只输出 `{"quickReplies":[...]}`；结果再过一遍 `detectQuickReplyIssues`，不通过就放弃（回退兜底） |
 | 散文轮记忆整理 `extractProseTurnMemory` | `BackgroundTasks` | 复用"对话记录整理助手"把散文轮补成结构化记忆；**后台执行**、不改写已显示正文、还原已注入召回 |
 | 其他 | emoji 头像（`NativeCore.requestEmojiAvatar`）、散文转 JSON（`convertProseToJson`）、字段重排（`remapFields`）、贴图标签（`NativeCore.tagSticker`） | 低价值路径，未做经验对齐 |
@@ -453,7 +453,7 @@ tools: AUTO 阶段全部工具 / SUBMIT 阶段只有 submit_response
 - **时间精度**：`TimeUtils.resolveTimeRef` 保留带时区/时分的 explicit ISO，仅"日期或时段"表达才落整点/时段起点。记忆衰减/排序的时间基准逐级回退（`lastRecalled` → `updatedAt` → `createdAt`），不可解析时不短路更新的时间戳、也不被当成 1970 年。
 - **联网工具超时**：`HttpWebContentProvider` 给 B站 API、短链解析、Microlink、网页直连统一设超时，避免任意外部请求卡死工具循环。
 - **请求失败也留痕**：chat 轮失败、辅助调用失败都会写 `RequestMetric`（`status='failed'`，原因在 `phase`）；`authorizationHeader` 在 API Key 缺失时提前抛清晰错误，不发出 `Bearer undefined` 请求。
-- **文风校对可回退**：critique 在任何异常（解析失败、空结果、长度比例异常）下都返回原文。
+- **文风校对可回退**：critique 在任何异常（解析失败、空结果、长度比例异常）下都返回原文；**引用/专有名词被改动也整体回退**（`StyleGuard.keepsProtectedContent`，逐字比对引用段落与条目名/角色名/称呼）。
 - **快速回应后台补齐可回退**：换位生成失败（或结果仍不过校验）时退回兜底短句；回来太晚（已被下一轮覆盖）直接丢弃，不会覆盖新一轮。
 - **后台任务串行**：后台队列把"散文轮记忆整理""快速回应补写"等串成一条链，避免交错写同一份角色状态；都不阻塞正文显示。
 - **散文即终稿不再重写**：阶段一拿到散文就直接采用，`convertProseToJson` 只在后台补记忆，不会把用户已看到的正文换成"整理"后的版本。

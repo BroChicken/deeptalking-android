@@ -6,6 +6,7 @@ import com.deeptalking.core.model.GroupMember
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.StaticProfile
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -198,5 +199,37 @@ class StyleGuardTest {
         )
         assertTrue(buildGroupVoiceContract(group).isEmpty())
         assertTrue(buildGroupVoiceContract(character).isEmpty())
+    }
+
+    // ------------------------------------------------ 引用/专有名词保护（文风修订）
+
+    @Test
+    fun quotedSpansPicksEveryQuoteFlavour() {
+        val text = "他发来「月亮代表我的心」，我回《夜曲》，还抄了句“晚安”，外加 'ok'。"
+        assertEquals(
+            listOf("「月亮代表我的心」", "《夜曲》", "“晚安”", "'ok'"),
+            quotedSpans(text),
+        )
+        assertTrue(quotedSpans(null).isEmpty())
+    }
+
+    @Test
+    fun critiqueIsRejectedWhenAQuotedPassageChanges() {
+        val original = "她说「你别熬夜」，我没接话。"
+        // 引用被改写 → 整体回退
+        assertFalse(keepsProtectedContent(original, "她说「你不要熬夜」，我没接话。", emptyList()))
+        // 引用被删掉 → 回退
+        assertFalse(keepsProtectedContent(original, "她说我要早点睡，我没接话。", emptyList()))
+        // 引用原样保留（其余文风可改）→ 通过
+        assertTrue(keepsProtectedContent(original, "她只说了句「你别熬夜」。我没接话。", emptyList()))
+    }
+
+    @Test
+    fun critiqueIsRejectedWhenAProtectedNameDisappears() {
+        val original = "小雨把《夜曲》放给阿岩听。"
+        assertTrue(keepsProtectedContent(original, "小雨把《夜曲》放给阿岩听。", listOf("小雨", "阿岩")))
+        assertFalse(keepsProtectedContent(original, "她把《夜曲》放给他听。", listOf("小雨", "阿岩")))
+        // 原文里没有的名字不参与判定。
+        assertTrue(keepsProtectedContent(original, "她把《夜曲》放给阿岩听。", listOf("林晚")))
     }
 }

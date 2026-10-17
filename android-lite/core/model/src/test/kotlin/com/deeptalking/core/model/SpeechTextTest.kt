@@ -38,6 +38,13 @@ class SpeechTextTest {
     }
 
     @Test
+    fun stripsChineseQuoteAndTitleMarkersButKeepsTheQuotedWords() {
+        // 引用/书名符号只在文本里当记号，朗读时念被引用的文字本身。
+        assertEquals("他发来月亮代表我的心，我回夜曲。", extractSpeechText("他发来「月亮代表我的心」，我回《夜曲》。"))
+        assertEquals("唔知道了", extractSpeechText("『唔』〈知道了〉"))
+    }
+
+    @Test
     fun keepsLinkLabel() {
         assertEquals("点这里", extractSpeechText("[点这里](https://example.com)"))
     }

@@ -1673,7 +1673,8 @@ class BackgroundTasks(
     ): String {
         val rules = violations.joinToString("\n") { "- " + (STYLE_VIOLATION_LABELS[it] ?: it) }
         val prompt = "下面是一段角色扮演回复，以及它违反的文风规则清单。请修订文风。\n" +
-            "硬性要求：①只改文风，绝不改动情节、事实、对话含义与人物关系；②保持大体长度与段落数；③不要新增情节要素、不要加解释或旁白；④不得复述规则本身。\n" +
+            "硬性要求：①只改文风，绝不改动情节、事实、对话含义与人物关系；②保持大体长度与段落数；③不要新增情节要素、不要加解释或旁白；④不得复述规则本身；" +
+            "⑤**被「」『』《》〈〉或引号包裹的内容是引用（别人的话、歌词、诗句、书名/作品名），以及世界书条目名、角色/成员名、对用户的称呼，都必须原样保留、逐字不变**——改写、删减、换序任何一处都会导致整次修订被丢弃。\n" +
             "违反的规则：\n" + rules + "\n\n" +
             "只返回 JSON：{\"reply\":\"修订后的正文\"}，换行写 \\n，双引号写 \\\"。\n\n原文：\n" + original
         val raw = complete(CRITIQUE_SYSTEM, prompt, sessionId = sessionIdFor(character))
@@ -1684,8 +1685,24 @@ class BackgroundTasks(
         if (revised.length > STYLE_GUARD.critiqueMaxChars) return original
         if (revised.length < original.length * STYLE_GUARD.critiqueMinRatio) return original
         if (revised.length > original.length * STYLE_GUARD.critiqueMaxRatio) return original
+        // 引用与专有名词是"内容"：修订稿动了它们就整体回退（确定性兜底，不靠模型自觉）。
+        if (!keepsProtectedContent(original, revised, protectedStyleNames(character))) return original
         return revised
     }
+
+    /**
+     * 文风修订必须原样保留的名字：角色名、群成员名、世界书条目名（含成员各自的）、
+     * 以及对用户的称呼。
+     */
+    private fun protectedStyleNames(character: Character): List<String> = buildList {
+        add(character.name)
+        add(character.staticProfile.userAddress)
+        character.lorebook.forEach { add(it.name) }
+        character.members.forEach { member ->
+            add(member.name)
+            member.lorebook.forEach { add(it.name) }
+        }
+    }.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
 
     suspend fun repairQuickReplies(
         character: Character,

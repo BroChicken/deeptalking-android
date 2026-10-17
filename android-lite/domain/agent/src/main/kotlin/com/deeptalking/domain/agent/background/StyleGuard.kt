@@ -338,3 +338,36 @@ fun detectStyleViolations(reply: String?, character: Character?, prevReplies: Li
 
     return hits.distinct()
 }
+
+// ---------------------------------------------------------------------------
+// 引用保护（文风修订不得改动"内容"）
+// ---------------------------------------------------------------------------
+
+/**
+ * 「引用的话语」的各种包裹符：中文直角引号、书名号，以及英文/弯引号。
+ *
+ * 为什么单独抽出来：文风修订（`critiqueStyle`）只该动**风格**，而引用段落、歌词、
+ * 书名、专有名词是**内容**——它们被改写就等于篡改了别人的原话或作品名。这里提供
+ * 确定性的比对依据，而不是只靠一句"请保留引用"的提示词。
+ */
+private val PROTECTED_SPANS = Regex(
+    "「[^」]*」|『[^』]*』|《[^》]*》|〈[^〉]*〉|“[^”]*”|‘[^’]*’|\"[^\"]*\"|'[^']*'",
+)
+
+/** 按出现顺序取出 [text] 里所有被引号/书名号包裹的引用段落。 */
+fun quotedSpans(text: String?): List<String> =
+    PROTECTED_SPANS.findAll(text.orEmpty()).map { it.value }.toList()
+
+/**
+ * 修订稿是否**完整保留了**原文里的引用段落与受保护的专有名词。
+ *
+ * 任一引用段落被改写、增删或换序，或某个专有名词（世界书条目名、角色/成员名、
+ * 对用户的称呼）在原文里出现却在修订稿里消失，都判为不合格 —— 调用方据此
+ * **整体回退**到原文（不做局部修补：局部修补会留下半截被改写的引用）。
+ */
+fun keepsProtectedContent(original: String, revised: String, protectedNames: List<String>): Boolean {
+    if (quotedSpans(original) != quotedSpans(revised)) return false
+    return protectedNames
+        .filter { it.isNotBlank() }
+        .all { name -> !original.contains(name) || revised.contains(name) }
+}
