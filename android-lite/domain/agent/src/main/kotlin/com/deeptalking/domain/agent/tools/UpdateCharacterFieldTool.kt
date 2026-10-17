@@ -6,6 +6,7 @@ import com.deeptalking.domain.agent.AgentToolResult
 import com.deeptalking.domain.agent.prompts.STATIC_PROFILE_FIELDS
 import com.deeptalking.domain.agent.prompts.staticFieldLabel
 import com.deeptalking.domain.agent.prompts.withStaticField
+import com.deeptalking.core.model.StaticFieldRules
 import com.deeptalking.domain.memory.hasStaticEditIntent
 import com.deeptalking.domain.memory.hasValidUserEvidence
 import com.deeptalking.domain.memory.parseRelativeText
@@ -34,7 +35,7 @@ class UpdateCharacterFieldTool : AgentTool {
 
     override val definition = ToolDefinition(
         name = "update_character_field",
-        description = "精准修改角色基础设定字段（性别/年龄/种族/外貌特征/性格特征/价值观/恐惧弱点/背景故事/关键过往/说话风格/语言方言/对用户的称呼）。当用户直接要求修改这些设定（如\"把我职业改成教师\"\"我现在是学生了\"\"你性格应该更冷酷些\"\"别叫我用户，叫我明明\"）时，必须调用本工具立即生效；value一律以段落式的陈述句书写（用自然、完整的陈述句写成简短段落，如性格\"性格冷静克制，遇事沉稳。\"），禁止括号注释、理由、整句说明或解释性文字；\"对用户的称呼\"只填一个简短称呼词、不带任何解释。群组实体不维护基础设定字段（世界观并入群组描述），成员的个人字段请在该成员卡片上修改。不要在submit_response的staticFields里重复提交本工具已改的字段。",
+        description = "精准修改角色基础设定字段（性别/年龄/种族/外貌特征/性格特征/恐惧弱点/背景故事/说话风格/语言方言/对用户的称呼）。当用户直接要求修改这些设定（如\"把我职业改成教师\"\"我现在是学生了\"\"你性格应该更冷酷些\"\"别叫我用户，叫我明明\"）时，必须调用本工具立即生效；value一律写成**明确的简短陈述句**：只写内容本身、一个字段一件事，短字段几十字、外貌/性格/恐惧弱点/说话风格一两句（不超过 120 字）、背景故事不超过 250 字；**禁止「不是…而是…」这类对比句**（会被拒收，请直接写陈述句，如性格\"性格冷静克制，遇事沉稳。\"）；禁止括号注释、理由、整句说明或解释性文字；\"对用户的称呼\"只填一个简短称呼词、不带任何解释。群组实体不维护基础设定字段（世界观并入群组描述），成员的个人字段请在该成员卡片上修改。不要在submit_response的staticFields里重复提交本工具已改的字段。",
         parametersJson = buildJsonObject {
             put("type", "object")
             put("additionalProperties", false)
@@ -44,7 +45,7 @@ class UpdateCharacterFieldTool : AgentTool {
                     put("enum", buildJsonArray { STATIC_PROFILE_FIELDS.forEach { add(it.first) } })
                     put("description", "要修改的字段")
                 })
-                put("value", buildJsonObject { put("type", "string"); put("description", "字段值：以段落式的陈述句书写（自然、完整的陈述句，简短段落）；禁止括号注释、理由、解释性文字；涉及日期写绝对日期") })
+                put("value", buildJsonObject { put("type", "string"); put("description", "字段值：写成明确的简短陈述句（只表达一件事；短字段几十字、叙述字段一两句、背景故事不超过 250 字）；禁止「不是…而是…」这类对比句；禁止括号注释、理由、解释性文字；涉及日期写绝对日期") })
                 put("sourceMessageIds", buildJsonObject {
                     put("type", "array"); put("items", buildJsonObject { put("type", "string") })
                     put("description", "引用用户消息ID（用户原话所在消息）")
@@ -71,7 +72,13 @@ class UpdateCharacterFieldTool : AgentTool {
         val nowZoned = ZonedDateTime.now()
         val resolved = resolveTimeRef(ToolArgs.timeRef(args, "timeRef"), nowZoned)
         val base = resolved?.iso?.let { parseZoned(it) } ?: nowZoned
-        val value = MemoryToolSupport.cleanFieldValue(field, parseRelativeText(ToolArgs.string(args, "value"), base))
+        val rawValue = ToolArgs.string(args, "value")
+        StaticFieldRules.contrastReason(field, rawValue)?.let { reason ->
+            return AgentToolResult(
+                errorJson("value 不能是$reason：请改写成明确的简短陈述句、只表达这一件事，例如「性格冷静克制，遇事沉稳。」"),
+            )
+        }
+        val value = MemoryToolSupport.cleanFieldValue(field, parseRelativeText(rawValue, base))
         if (value.isEmpty()) return AgentToolResult(errorJson("value 为空或全部为说明性文字，请只提供内容本身"))
 
         val sourceIds = ToolArgs.strings(args, "sourceMessageIds").map { it.trim() }.filter { it.isNotEmpty() }

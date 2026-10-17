@@ -49,10 +49,8 @@ internal val STATIC_PROFILE_FIELDS: List<Pair<String, String>> = listOf(
     "race" to "种族",
     "appearance" to "外貌特征",
     "personality" to "性格特征",
-    "values" to "价值观",
     "fears" to "恐惧/弱点",
     "background" to "个人背景",
-    "keyEvents" to "关键过往（里程碑）",
     "speakingStyle" to "说话风格",
     "language" to "语言/方言",
     "userAddress" to "对用户的称呼",
@@ -83,10 +81,8 @@ internal fun staticProfileValue(profile: StaticProfile, key: String): String = w
     "race" -> profile.race
     "appearance" -> profile.appearance
     "personality" -> profile.personality
-    "values" -> profile.values
     "fears" -> profile.fears
     "background" -> profile.background
-    "keyEvents" -> profile.keyEvents
     "speakingStyle" -> profile.speakingStyle
     "language" -> profile.language
     "userAddress" -> profile.userAddress
@@ -99,10 +95,8 @@ internal fun withStaticField(profile: StaticProfile, key: String, value: String)
     "race" -> profile.copy(race = value)
     "appearance" -> profile.copy(appearance = value)
     "personality" -> profile.copy(personality = value)
-    "values" -> profile.copy(values = value)
     "fears" -> profile.copy(fears = value)
     "background" -> profile.copy(background = value)
-    "keyEvents" -> profile.copy(keyEvents = value)
     "speakingStyle" -> profile.copy(speakingStyle = value)
     "language" -> profile.copy(language = value)
     "userAddress" -> profile.copy(userAddress = value)
@@ -270,7 +264,7 @@ internal fun buildMemberContext(member: GroupMember, staticOnly: Boolean): Strin
     }
     lines += "- " + trimText(member.name, 100) + roleSuffix
     STATIC_PROFILE_FIELDS.forEach { (key, label) ->
-        val value = trimText(staticProfileValue(member.staticProfile, key), if (key == "background" || key == "keyEvents") 600 else 400)
+        val value = trimText(staticProfileValue(member.staticProfile, key), if (key == "background") 600 else 400)
         if (value.isNotEmpty()) lines += "  $label: " + maskUserWord(member, value)
     }
     if (!staticOnly) {
@@ -305,7 +299,7 @@ internal fun buildRoleContext(character: Character, staticOnly: Boolean): String
     val lines = mutableListOf<String>()
     lines += "名称: " + trimText(character.name, 100)
     STATIC_PROFILE_FIELDS.forEach { (key, label) ->
-        val value = trimText(staticProfileValue(character.staticProfile, key), if (key == "background" || key == "keyEvents") 800 else 600)
+        val value = trimText(staticProfileValue(character.staticProfile, key), if (key == "background") 800 else 600)
         if (value.isNotEmpty()) lines += "$label: " + maskUserWord(character, value)
     }
     return trimText(lines.joinToString("\n"), AppLimits.Prompt.ROLE_CHARS)
@@ -337,7 +331,7 @@ private const val RULE_3_SUFFIX =
     "。用户信息引用真实用户消息ID并逐字摘录原话；角色在本轮可见回复中明确表现或说出的状态用sourceMessageIds:[\"current_response\"]，evidence可概括回复大意或引短句。每个字段只能选一种来源，禁止混用current_response与真实ID，禁止按未写出的心理活动或猜测更新。仅更新本轮确有可见依据的字段；无变化或无可引用依据就省略，不要为凑字段反复盘点或凭空填写。标记为(未设置)的空字段若本轮有明确依据应一并补全，不得编造。currentTone用于后续语音朗读，**每轮都必须给出**（不受“仅更新有依据的字段”限制、无需引用证据），写成一段自然的朗读指导，按需描述语气、情绪、语速、节奏、停顿、重音与情感层次（可短可长，通常不超过约 60 字，例如“声音温柔含笑，语速偏慢，句尾轻轻收住，带一点不易察觉的疲惫”）。currentSituation写具体日期+时段（时间格式见 3.8）。群组整体只维护currentSituation与currentLocation，成员各自的完整状态写入memberDynamicState，不要混入群组整体dynamicState。"
 
 private const val RULE_3_5 =
-    "3.5 谨慎修改基础设定（性别/年龄/种族/外貌/性格/价值观/恐惧弱点/背景/关键过往/说话风格/语言方言/对用户的称呼）。①用户直接要求改时：调用 update_character_field 精准改用户点名的字段，只改提到的、不连带改动；②无用户直接要求时：仅剧情决定性、不可逆转折且证据明确才可通过 staticFields 改，禁止凭情绪/猜测/轻微剧情改；③世界层设定（时代/地点/组织/专有名词/历史/规则）不进基础设定，用 upsert_lorebook_entry 写入世界书。字段 value 写法、世界观条目规则、用户手写条目保护、\"xx字段已修改\"提示等详见对应工具描述。群组实体不维护基础设定字段。"
+    "3.5 谨慎修改基础设定（性别/年龄/种族/外貌/性格/恐惧弱点/背景/说话风格/语言方言/对用户的称呼）。①用户直接要求改时：调用 update_character_field 精准改用户点名的字段，只改提到的、不连带改动，value 写成明确的简短陈述句（禁止「不是…而是…」这类对比句）；②无用户直接要求时：仅剧情决定性、不可逆转折且证据明确才可通过 staticFields 改，禁止凭情绪/猜测/轻微剧情改；③世界层设定（时代/地点/组织/专有名词/历史/规则）不进基础设定，用 upsert_lorebook_entry 写入世界书。字段 value 写法、世界观条目规则、用户手写条目保护、\"xx字段已修改\"提示等详见对应工具描述。群组实体不维护基础设定字段。"
 
 private const val RULE_3_6 =
     "3.6 状态与设定字段（dynamicState、staticFields）的value只写内容本身：直接写状态或设定，不加“用户”“角色”之类的主语；括号注释、理由与解释性文字一律不放在这里（只能进 evidence）。"

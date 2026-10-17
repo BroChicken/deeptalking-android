@@ -70,10 +70,8 @@ private val STATIC_FIELDS = listOf(
     "race" to "种族",
     "appearance" to "外貌特征",
     "personality" to "性格特征",
-    "values" to "价值观",
     "fears" to "恐惧/弱点",
     "background" to "个人背景",
-    "keyEvents" to "关键过往（里程碑）",
     "speakingStyle" to "说话风格",
     "language" to "语言/方言",
     "userAddress" to "对用户的称呼",
@@ -946,10 +944,8 @@ private fun staticValue(profile: StaticProfile, key: String): String = when (key
     "race" -> profile.race
     "appearance" -> profile.appearance
     "personality" -> profile.personality
-    "values" -> profile.values
     "fears" -> profile.fears
     "background" -> profile.background
-    "keyEvents" -> profile.keyEvents
     "speakingStyle" -> profile.speakingStyle
     "language" -> profile.language
     "userAddress" -> profile.userAddress
@@ -962,10 +958,8 @@ private fun withStatic(profile: StaticProfile, key: String, value: String): Stat
     "race" -> profile.copy(race = value)
     "appearance" -> profile.copy(appearance = value)
     "personality" -> profile.copy(personality = value)
-    "values" -> profile.copy(values = value)
     "fears" -> profile.copy(fears = value)
     "background" -> profile.copy(background = value)
-    "keyEvents" -> profile.copy(keyEvents = value)
     "speakingStyle" -> profile.copy(speakingStyle = value)
     "language" -> profile.copy(language = value)
     "userAddress" -> profile.copy(userAddress = value)

@@ -1082,10 +1082,8 @@ class NativeCore(context: Context) {
             put("race", member.staticProfile.race)
             put("appearance", member.staticProfile.appearance)
             put("personality", member.staticProfile.personality)
-            put("values", member.staticProfile.values)
             put("fears", member.staticProfile.fears)
             put("background", member.staticProfile.background)
-            put("keyEvents", member.staticProfile.keyEvents)
             put("speakingStyle", member.staticProfile.speakingStyle)
             put("language", member.staticProfile.language)
             put("userAddress", member.staticProfile.userAddress)
@@ -1236,10 +1234,12 @@ class NativeCore(context: Context) {
             你是角色卡补全助手。只返回 JSON。
             只能根据群组设定、现有角色卡和用户的一句话补全空字段，不能覆盖或编造与已有字段冲突的信息。
             已有字段是绝对权威，任何情况下不得改写、润色或替换。
-            返回字段：name, avatar, gender, age, race, appearance, personality, values, fears,
-            background, keyEvents, speakingStyle, language, userAddress, roleInGroup,
+            返回字段：name, avatar, gender, age, race, appearance, personality, fears,
+            background, speakingStyle, language, userAddress, roleInGroup,
             dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccupation, currentGoal, currentTone)。
             只给出有把握的字段，没有把握就省略。成员的说话方式必须与群内其他成员显著不同。
+            每个字段都要精炼：短字段几十字内（性别/年龄/种族/语言/称呼），外貌/性格/恐惧弱点/说话风格一两句、不超过 120 字，背景故事不超过 250 字；
+            一律写成明确的简短陈述句，禁止“不是…而是…”这类对比句，禁止括号注释、理由与解释性文字。
         """.trimIndent()
     }
 }

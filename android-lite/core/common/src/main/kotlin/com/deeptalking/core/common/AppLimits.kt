@@ -113,6 +113,34 @@ object AppLimits {
         const val MEMBER_CHARS = 900
     }
 
+    /**
+     * 基础设定字段的长度上限。设定要**精炼**：一个字段一件事，写成明确的简短陈述句。
+     *
+     * 写入路径（`cleanFieldValue`）按这里硬截断，所以模型自己改字段时也不会把设定
+     * 越写越长（信息量大的背景故事单独放宽）。`limitFor` 只覆盖基础设定字段；动态状态
+     * 等其它字段仍走各自原有的上限。
+     */
+    object StaticProfile {
+        /** 短字段：性别/年龄/种族/语言/对用户的称呼（群成员另有"群内定位"）。 */
+        const val SHORT_CHARS = 40
+
+        /** 叙述字段：外貌特征/性格特征/恐惧弱点/说话风格。 */
+        const val PROSE_CHARS = 120
+
+        /** 背景故事：信息量最大，单独放宽，但同样要求只写人物经历本身。 */
+        const val BACKGROUND_CHARS = 250
+
+        private val SHORT_KEYS = setOf("gender", "age", "race", "language", "userAddress", "roleInGroup")
+
+        /** 该静态字段的写入上限（非静态字段返回 null，交由调用方用自己的上限）。 */
+        fun limitFor(key: String): Int? = when (key) {
+            "background" -> BACKGROUND_CHARS
+            in SHORT_KEYS -> SHORT_CHARS
+            "appearance", "personality", "fears", "speakingStyle" -> PROSE_CHARS
+            else -> null
+        }
+    }
+
     object Lorebook {
         const val ENTRIES = 200
         const val KEYWORDS_PER_ENTRY = 8

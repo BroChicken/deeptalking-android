@@ -32,7 +32,7 @@ class CharacterParityTest {
               ],
               "members": [
                 {"name": "阿黎", "avatar": "🐱", "gender": "女", "age": "19", "race": "人类", "appearance": "银发",
-                 "personality": "冷静", "values": "守护", "fears": "黑暗", "background": "孤儿", "keyEvents": "觉醒",
+                 "personality": "冷静", "fears": "黑暗", "background": "孤儿",
                  "speakingStyle": "简短", "language": "通用语", "userAddress": "队长", "roleInGroup": "领队",
                  "dynamicState": {"currentSituation": "露营", "currentMood": "平静"}},
                 {"name": "阿岩", "personality": "热血", "roleInGroup": "前锋"}

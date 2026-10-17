@@ -59,7 +59,10 @@ class CharacterRepository(
     suspend fun delete(id: String) = dao.delete(id)
 
     private fun decode(entity: CharacterEntity): Character? =
-        runCatching { AppJson.decodeFromString<Character>(entity.payload) }.getOrNull()
+        runCatching {
+            // 旧行里的「价值观」「关键过往」在读取时并入性格/背景（见 RetiredStaticFields）。
+            AppJson.decodeFromString<Character>(RetiredStaticFields.foldPayload(entity.payload))
+        }.getOrNull()
             ?: run {
                 val reporter = onCorruptRow
                 if (reporter != null && reportedCorrupt.add((entity.id + "\u0000" + entity.payload).hashCode())) {

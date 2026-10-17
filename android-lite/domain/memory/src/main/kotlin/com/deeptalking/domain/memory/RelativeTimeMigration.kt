@@ -30,8 +30,8 @@ object RelativeTimeMigration {
     const val TIME_PARSE_VERSION = 1
 
     private val STATIC_PROFILE_KEYS: List<String> = listOf(
-        "gender", "age", "race", "appearance", "personality", "values",
-        "fears", "background", "keyEvents", "speakingStyle", "language", "userAddress",
+        "gender", "age", "race", "appearance", "personality",
+        "fears", "background", "speakingStyle", "language", "userAddress",
     )
 
     fun convert(character: Character, now: ZonedDateTime = ZonedDateTime.now()): Character {
@@ -131,10 +131,8 @@ object RelativeTimeMigration {
         "race" -> profile.race
         "appearance" -> profile.appearance
         "personality" -> profile.personality
-        "values" -> profile.values
         "fears" -> profile.fears
         "background" -> profile.background
-        "keyEvents" -> profile.keyEvents
         "speakingStyle" -> profile.speakingStyle
         "language" -> profile.language
         "userAddress" -> profile.userAddress
@@ -147,10 +145,8 @@ object RelativeTimeMigration {
         "race" -> copy(race = value)
         "appearance" -> copy(appearance = value)
         "personality" -> copy(personality = value)
-        "values" -> copy(values = value)
         "fears" -> copy(fears = value)
         "background" -> copy(background = value)
-        "keyEvents" -> copy(keyEvents = value)
         "speakingStyle" -> copy(speakingStyle = value)
         "language" -> copy(language = value)
         "userAddress" -> copy(userAddress = value)

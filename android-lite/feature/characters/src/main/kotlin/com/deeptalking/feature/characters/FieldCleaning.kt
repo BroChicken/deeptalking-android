@@ -1,5 +1,6 @@
 package com.deeptalking.feature.characters
 
+import com.deeptalking.core.model.StaticFieldRules
 import java.time.LocalDate
 import java.time.ZoneId
 import java.time.ZonedDateTime
@@ -18,8 +19,8 @@ object FieldCleaning {
     private const val DAY_START_HOUR = 2
 
     private val STATIC_FIELD_KEYS = listOf(
-        "gender", "age", "race", "appearance", "personality", "values", "fears",
-        "background", "keyEvents", "speakingStyle", "language", "userAddress",
+        "gender", "age", "race", "appearance", "personality", "fears",
+        "background", "speakingStyle", "language", "userAddress",
     )
 
     private val DYNAMIC_FIELD_KEYS = listOf(
@@ -28,8 +29,8 @@ object FieldCleaning {
     )
 
     private val STATIC_FIELD_LABELS = listOf(
-        "性别", "年龄", "种族", "外貌特征", "性格特征", "价值观", "恐惧/弱点",
-        "个人背景", "关键过往（里程碑）", "说话风格", "语言/方言", "对用户的称呼",
+        "性别", "年龄", "种族", "外貌特征", "性格特征", "恐惧/弱点",
+        "个人背景", "说话风格", "语言/方言", "对用户的称呼",
     )
 
     private val DYNAMIC_FIELD_LABELS = listOf(
@@ -202,6 +203,7 @@ object FieldCleaning {
     /** Port of legacy `cleanFieldValue` (`src/js/memory/time.js`). */
     fun cleanFieldValue(key: String, value: String?): String {
         var text = value.orEmpty()
+        if (StaticFieldRules.contrastReason(key, text) != null) return ""
 
         val prefixMatch = Regex("^\\s*[^：:\\n]{1,24}[：:]\\s*").find(text)
         if (prefixMatch != null) {
@@ -220,7 +222,8 @@ object FieldCleaning {
             text = text.replace(Regex("[，,。；;、\\s]+$"), "")
         }
 
-        return trimText(text.replace(Regex("\\s+"), " ").trim(), 700)
+        val cleaned = trimText(text.replace(Regex("\\s+"), " ").trim(), 700)
+        return StaticFieldRules.clamp(key, cleaned)
     }
 
     private fun isMetaParenthetical(inner: String): Boolean =

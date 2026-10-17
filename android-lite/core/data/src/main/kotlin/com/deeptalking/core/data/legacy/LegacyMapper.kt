@@ -390,15 +390,33 @@ private fun mapStaticProfile(
         age = read({ it.age }, basic?.age),
         race = read({ it.race }, basic?.race),
         appearance = read({ it.appearance }, basic?.appearance),
-        personality = read({ it.personality }, basic?.personality),
-        values = read({ it.values }, basic?.values),
+        // 「价值观」并入「性格特征」、「关键过往」并入「背景故事」：这两个字段已从
+        // StaticProfile 移除（与幸存字段重叠），旧备份导入时不能把人设丢掉。
+        personality = foldLegacyField(
+            read({ it.personality }, basic?.personality),
+            read({ it.values }, basic?.values),
+        ),
         fears = read({ it.fears }, basic?.fears),
-        background = if (background.isBlank()) worldView else background,
-        keyEvents = read({ it.keyEvents }, basic?.keyEvents),
+        background = foldLegacyField(
+            if (background.isBlank()) worldView else background,
+            read({ it.keyEvents }, basic?.keyEvents),
+        ),
         speakingStyle = read({ it.speakingStyle }, basic?.speakingStyle),
         language = read({ it.language }, basic?.language),
         userAddress = normalizeUserAddress(read({ it.userAddress }, basic?.userAddress)),
     )
+}
+
+/** 并入退休字段：已包含就不重复，否则用「；」接在后面。 */
+private fun foldLegacyField(kept: String, retired: String?): String {
+    val a = kept.trim()
+    val b = retired.orEmpty().trim()
+    return when {
+        b.isEmpty() -> a
+        a.isEmpty() -> b
+        a.contains(b) -> a
+        else -> "$a；$b"
+    }
 }
 
 private fun mapDynamicState(dto: LegacyCharacter): DynamicState {

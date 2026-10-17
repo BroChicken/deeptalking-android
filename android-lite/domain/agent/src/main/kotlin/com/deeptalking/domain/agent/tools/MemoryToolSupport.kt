@@ -3,6 +3,7 @@ package com.deeptalking.domain.agent.tools
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.GroupMember
 import com.deeptalking.core.model.MemorySubject
+import com.deeptalking.core.model.StaticFieldRules
 import com.deeptalking.domain.agent.prompts.DYNAMIC_STATE_FIELDS
 import com.deeptalking.domain.agent.prompts.STATIC_PROFILE_FIELDS
 import com.deeptalking.domain.agent.prompts.TimeContext
@@ -122,9 +123,15 @@ internal object MemoryToolSupport {
     /**
      * Port of `cleanFieldValue`: strips a leading field-name prefix, removes only
      * meta parentheticals and, for short-fact fields, explanatory sentences.
+     *
+     * On top of the legacy behaviour, basic-profile fields are held to
+     * [StaticFieldRules]: a contrastive sentence ("不是 A 而是 B") is **rejected**
+     * (returns empty, so the tool can ask the model for a plain statement) and an
+     * over-long value is clamped to the per-field cap.
      */
     fun cleanFieldValue(key: String, value: String?): String {
         var text = value.orEmpty()
+        if (StaticFieldRules.contrastReason(key, text) != null) return ""
         val prefixMatch = Regex("^\\s*[^：:\\n]{1,24}[：:]\\s*").find(text)
         if (prefixMatch != null) {
             val prefix = prefixMatch.value.replace(Regex("[：:]"), "").trim()
@@ -139,7 +146,8 @@ internal object MemoryToolSupport {
             text = splitFieldSentences(text).filter { !isExplanatorySentence(it) }.joinToString("")
             text = text.replace(Regex("[，,。；;、\\s]+$"), "")
         }
-        return trimText(text.replace(Regex("\\s+"), " ").trim(), 700)
+        val cleaned = trimText(text.replace(Regex("\\s+"), " ").trim(), 700)
+        return StaticFieldRules.clamp(key, cleaned)
     }
 
     private fun isMetaParenthetical(inner: String): Boolean =

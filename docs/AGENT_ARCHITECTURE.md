@@ -228,6 +228,17 @@ BackgroundTasks.scheduleTurn  后台串行维护：文风校对、快速回应�
 
 **证据与时间精度**：`MemoryEvidence.evidenceMatchesSummary()` 要求证据与实际回复有 ≥2 个双字片段重叠（≥35%），不"满 8 字即采信"；`applyStaticFields` 与 `update_character_field` 都额外要求 `hasStaticEditIntent()`（用户原话提到该字段且是修改意图）。`TimeUtils.resolveTimeRef` 对带时分秒的 explicit ISO 原样保留（含时区偏移），只给"仅日期有理"的结果补时段起点。
 
+### 基础设定字段（10 字段）
+
+`Prompts.STATIC_PROFILE_FIELDS`（`:domain:agent`）：`gender` / `age` / `race` / `appearance` / `personality` / `fears` / `background` / `speakingStyle` / `language` / `userAddress`（群成员另有 `roleInGroup`）。
+
+**只留"人本身"的设定**：原本还有「价值观」与「关键过往」两项，它们分别与「性格特征」「背景故事」重叠（后者只是前者加时间线），**已删除**——设定越少、越不易互相矛盾，注入也更省。旧页面的这两个字段由 `:core:data` 的 `RetiredStaticFields` 在**读取时并入幸存字段**（性格 ← 价值观、背景 ← 关键过往）并摘掉退休键；旧备份走 `LegacyMapper` 的同一条合并规则，所以升级不丢人设。
+
+**写作规则**（`core:model` 的 `StaticFieldRules`，两条写入路径共用——工具/`submit_response.staticFields` 与界面/建卡）：
+
+- **只写明确的简短陈述句**：禁止「不是 A 而是 B」这类对比句（`contrastReason` 命中即**拒收**，工具会回一条明确错误让模型当场改写；它不静默截断也不偷改语义）。
+- **按字段收敛**（`AppLimits.StaticProfile`）：短字段（性别/年龄/种族/语言/称呼）**40 字**、叙述字段（外貌/性格/恐惧弱点/说话风格）**120 字**、背景故事**250 字**；超长按句末标点回退截断（`clamp`）。动态状态等非基础设定字段不受这些上限约束。
+
 ### 动态状态（6 字段）
 
 `Prompts.DYNAMIC_STATE_FIELDS`（`:domain:agent`）：`currentSituation` / `currentLocation` / `currentMood` / `currentOccupation` / `currentGoal` / `currentTone`。
@@ -359,8 +370,8 @@ tools: AUTO 阶段全部工具 / SUBMIT 阶段只有 submit_response
 | `2` | reply 正文写法（像日常说话）：**不设下限**、只设 **≤250 字上限**防大段空话；分段/行内样式限制；**动作/表情/心理/旁白一律写全角括号、单拍短、不堆叠、总量 ≤ ¼、不复述对白情绪**；**自己说的话直接写、不加引号包裹；只有引用他人话语/歌词/诗句/书名或专有名词原文时才用符号（引号用「」、书名用《》、逐字照抄），并避免英文直引号（JSON 需转义）**；去重（禁重复近期整句/句式/意象/固定动作/收尾） |
 | `2.6` | **表演质量（真人感）**：show-don't-tell、句长节奏起伏、对白优先、回避陈词滥调与复用比喻、删掉不推进内容的句子、人物性格稳定 |
 | `3` | 人格/背景锁定 + `dynamicState` 更新与溯源规则（时间写法见 `3.8`） |
-| `3.5` | 谨慎修改基础设定：用户直接要求 → `update_character_field`；无要求时仅"决定性不可逆转折"才改 |
-| `3.6` | 状态/设定字段的 value 写法（只写内容本身，不加主语，解释进 evidence） |
+| `3.5` | 谨慎修改基础设定：用户直接要求 → `update_character_field`；无要求时仅"决定性不可逆转折"才改；value 写成明确的简短陈述句（禁「不是…而是…」对比句） |
+| `3.6` | 状态/设定字段的 value 写法（只写内容本身，不加主语，解释进 evidence）；**基础设定字段有硬长度上限并只写陈述句**——见「基础设定字段」一节 |
 | `3.7` | 记忆字段必须写明主体（禁止"我/你/TA"这类代词） |
 | `3.8` | 时间一律写绝对日期，相对说法填 `timeRef` |
 | `3.9` | 用户提"说话方式类"要求时，本轮 reply 直接演出、禁止元话术 |

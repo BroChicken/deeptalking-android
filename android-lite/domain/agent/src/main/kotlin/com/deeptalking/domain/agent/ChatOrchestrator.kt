@@ -371,10 +371,8 @@ class ChatOrchestrator(
         "race" -> profile.race
         "appearance" -> profile.appearance
         "personality" -> profile.personality
-        "values" -> profile.values
         "fears" -> profile.fears
         "background" -> profile.background
-        "keyEvents" -> profile.keyEvents
         "speakingStyle" -> profile.speakingStyle
         "language" -> profile.language
         "userAddress" -> profile.userAddress
