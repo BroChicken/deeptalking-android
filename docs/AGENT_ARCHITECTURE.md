@@ -1,7 +1,7 @@
 ﻿# Agent 架构文档（原生 Android）
 
 > 本文档描述 **当前实现**：原生 Android 应用的 Agent 机制（`:domain:agent` / `:domain:memory`，宿主在 `:app`）。只写最新状态，历史看 git。
-> 模块职责、依赖方向与构建流程见 [NATIVE_MODULES.md](NATIVE_MODULES.md)；解析机制链见 [PARSE_GRAPH.md](PARSE_GRAPH.md)；朗读链路见 [REMOTE_TTS.md](REMOTE_TTS.md)。
+> 模块职责、依赖方向与构建流程见 [NATIVE_MODULES.md](NATIVE_MODULES.md)；解析机制链见 [PARSE_GRAPH.md](PARSE_GRAPH.md)；朗读链路见 [REMOTE_TTS.md](REMOTE_TTS.md)；**每一次外发调用（LLM/语音/联网）的传输格式与发送内容**见 [OUTBOUND_CALLS.md](OUTBOUND_CALLS.md)。
 > 代码锚点用**模块:函数名**（行号会漂移，用 grep 函数名定位）；改动 agent 循环、工具清单、提示词、记忆系统、字段或常量时必须同步更新本文档。
 
 ## 模块锚点
