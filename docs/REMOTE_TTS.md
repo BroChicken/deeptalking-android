@@ -25,7 +25,8 @@ powershell -File tools/.work/cosyvoice-server/run-server.ps1 -Api -Backend cuda0
 ```
 
 Windows 上也可以直接双击 `tools\run-cosyvoice-server.bat`（默认就是上面这条 API+CUDA）；
-它的子命令：`webui`（WebUI 模式注册音色）、`stop`（停服）、`restart`（停掉再起，换线后地址变了就用它）、
+它的子命令：`bt`（绑蓝牙 PAN）、`hotspot`（绑手机热点，首次会记住热点 SSID）、`local`（只绑 127.0.0.1）、
+`webui`（WebUI 模式注册音色）、`stop`（停服）、`restart`（停掉再起，换线后地址变了就用它）、
 `status`（在跑吗？监听在哪个地址？该地址还有效吗）、`diag`（网卡/口令/防火墙/监听一次性报告）。
 其它参数原样转给 `run-server.ps1`（例：`... -Api -Port 9000 -Backend cpu`）。
 
@@ -34,10 +35,18 @@ Windows 上也可以直接双击 `tools\run-cosyvoice-server.bat`（默认就是
 （仅本机调试）。日志只打印口令长度，不打印口令本身。
 
 脚本做的事：自动定位 `bin/`（exe + `ggml*.dll`）、`models/`、`voices/`；缺 GGML 库直接报错；
-`-Api` 模式下把 `voices/*.gguf` **每个文件按文件名映射成一个同名音色**；监听地址由 `-Bind auto`
-决定——**只有恰好一张"活着"的 USB 共享网卡（Status=Up）时**才绑它，否则（没有 / 多于一张 / 无法确定）
-一律绑 `0.0.0.0`，因为口令已经把入口守住了；**起服后自检实际监听地址**并打印
-`PHONE -> http://<地址>:8080`（模型加载要 30–90 秒，这行会在加载完之后出现）。等价的手工命令是：
+`-Api` 模式下把 `voices/*.gguf` **每个文件按文件名映射成一个同名音色**；**起服后自检实际监听地址**
+并打印 `PHONE -> http://<地址>:8080`（模型加载要 30–90 秒，这行会在加载完之后出现）。
+
+**绑哪个地址（`-Bind auto`，默认）**：只绑**手机链路**的那一个具体地址，按「记忆的链路 → USB 共享 →
+蓝牙 PAN → SSID 匹配到的手机热点」的顺序挑；挑不出来就**等**（最多 `-WaitLinkSeconds`，默认 300 秒，
+每 10 秒报一次状态），等不到就**拒绝启动**并打印三条链路的排查步骤。**绝不静默绑 `0.0.0.0`**——
+绑具体地址时别的网络连端口开着都看不出来，详见第 6 节。链路记忆写在 `tools\tts-link.txt`
+（同样 gitignored、不含密钥），首次成功启动后自动写入（`preferred=usb|bt|hotspot`，热点另存
+`hotspot-ssid`），所以**先启动、后插线/开共享**也行：脚本会等到链路出现再绑它的当前地址。
+
+**运行中链路断了**（拔线、换口、关共享、IP 变了）：看门狗会发现绑的地址已失效，自动停服、等链路回来、
+用新地址重启（模型重载约 90 秒）。不想要这个行为用 `-NoWatchdog`。等价的手工命令是：
 
 ```powershell
 cosyvoice-server --model models\CosyVoice3-2512_Q4_K_M.gguf `
@@ -50,15 +59,29 @@ cosyvoice-server --model models\CosyVoice3-2512_Q4_K_M.gguf `
 
 两个要点：
 
-- `--host` 默认是 `127.0.0.1`，必须显式指定。**指定成 USB 共享网卡的具体地址**（而不是
-  `0.0.0.0`）时，服务只在那条点对点链路上可达：Wi-Fi/回环/VPN/虚拟网卡全部不通，
-  因此**不需要口令**（见第 6 节的安全核对）。要对外网段开放才用 `-Bind any` 并配上 `-Token`。
-- 传 `--api-key` 才会要求 `Authorization: Bearer`；不传则无鉴权，App 里口令留空。
+- `--host` 默认是 `127.0.0.1`，必须显式指定。**脚本只绑手机链路的那个具体地址，永不默认绑
+  `0.0.0.0`**：绑具体地址时，服务只在那条链路上可达，同一台电脑的 Wi-Fi/回环/VPN/虚拟网卡一律不通，
+  **别的网络里的机器扫 8080 只会得到「连不上」，连端口开着都看不出来**（见第 6 节的核对）。
+  只有显式 `-Bind any` 才会绑 `0.0.0.0`（那时口令是唯一防线）；`-Bind local` 只绑 `127.0.0.1`。
+- **口令默认必填**：脚本从 `tools\tts-token.txt` 读口令并总是传 `--api-key`，服务端要求
+  `Authorization: Bearer <口令>`，App 的「访问口令」填同一个值；只有 `-NoToken` 才无鉴权
+  （仅本机调试）。
 
-## 2. 网络：手机开 USB 网络共享
+## 2. 网络：三种链路（USB 共享 / 蓝牙网络共享 / 手机热点）
 
-手机插 USB、下拉通知栏选「USB 网络共享」（不是「仅充电」）。此时**手机是这张网的网关**，
-电脑是它的一个 DHCP 客户端，电脑会多出一张 RNDIS 网卡：
+三条链路都能用，`-Bind auto` 会自己认（认不出来就等，等不到就拒绝启动，见第 1 节）。三种都是
+**手机建网、电脑当客户端**，所以手机天然知道该扫哪个网段，App 的「查找并测试电脑」不需要你填 IP。
+
+| 链路 | 速度 | 开启难度 | 适合 |
+|---|---|---|---|
+| **USB 网络共享** | 最快（等效数十~数百 Mbps） | 最低：插线 + 手机点一下 | 日常首选 |
+| **手机热点** | 20–100 Mbps | 低：PC 连一次 SSID 即可（首次要告诉脚本热点名） | 不想插线 |
+| **蓝牙网络共享** | 名义 **3 Mbps**（PC 侧网卡 LinkSpeed 实测 3 Mbps），实际更低 | 最高：手机开共享 + PC 端手动「接入点」 | 备用：USB 口坏/线接触不良时 |
+
+### 2.1 USB 网络共享
+
+手机插 USB、下拉通知栏选「USB 网络共享」（不是「仅充电」）。**手机是这张网的网关**，电脑多出一张
+RNDIS 网卡：
 
 ```powershell
 # 找到 RNDIS 网卡及其地址（实测这台机器是 10.84.116.224/24，各厂商网段不同）
@@ -67,16 +90,45 @@ Get-NetAdapter | Where-Object { $_.InterfaceDescription -like '*NDIS*' } |
 Get-NetIPAddress -AddressFamily IPv4 | Select-Object InterfaceAlias, IPAddress, PrefixLength
 ```
 
-Windows 常把这张网卡判成「公用网络」，防火墙会默认拦住 8080 且不一定弹窗，直接加一条不依赖
-网络分类的显式规则：
+### 2.2 蓝牙网络共享（蓝牙 PAN）
+
+**关键坑：蓝牙「连着」≠ PAN 通了。** 配对后连上的是 A2DP/HFP 那类服务，网络共享要的是 **PAN 配置文件**，
+必须由 PC 主动发起一次：
+
+1. 手机：打开「蓝牙网络共享」（需要手机与 PC 已配对）；
+2. PC：运行 `control printers`（设备和打印机）→ **右键那台手机 → 连接方式 → 接入点**；
+   Windows 11 的**设置 App 里没有这个入口**，只能走控制面板；
+3. 成功后 `蓝牙网络连接` 网卡变为 `Up`，拿到手机分配的地址（实测本机 `192.168.44.175/24`，网关
+   `192.168.44.1` 就是手机）。
+
+连过一次之后 Windows 一般会记住并自动重连。也可以直接用 `tools\run-cosyvoice-server.bat bt` 启动。
+
+### 2.3 手机热点
+
+手机开热点 → PC 连到该 SSID。PC 拿到 `192.168.43.x` 之类（各厂商不同），网关就是手机。
+
+热点**必须显式告诉脚本一次**，因为「校园网/家里 Wi-Fi」和「手机热点」在系统里长得一模一样（都是
+「带默认网关的 Wi-Fi 网卡」），只有 SSID 能区分：
 
 ```powershell
-New-NetFirewallRule -DisplayName "cosyvoice-tether" -Direction Inbound -Protocol TCP `
+tools\run-cosyvoice-server.bat hotspot    # 首次：绑定热点并记住它的 SSID
+tools\run-cosyvoice-server.bat            # 之后 auto 就会自动认它
+```
+
+也可以手工把 `hotspot-ssid=<热点名>` 写进 `tools\tts-link.txt`。
+
+### 2.4 防火墙与路由
+
+Windows 常把这些网卡判成「公用网络」，防火墙会默认拦住 8080 且不一定弹窗，加一条不依赖网络分类的
+显式规则（`-OpenFirewall` 会自动做，需管理员）：
+
+```powershell
+New-NetFirewallRule -DisplayName "cosyvoice-server" -Direction Inbound -Protocol TCP `
   -LocalPort 8080 -Action Allow -Profile Any
 ```
 
-可选：USB 共享会把 PC 的默认路由抢到手机（PC 上网绕道手机流量）。`192.168.x/10.x` 网段内的
-直连访问不受影响，介意的话把该网卡 metric 调高：
+可选：这些链路会把 PC 的默认路由抢到手机（PC 上网绕道手机流量）。直连访问不受影响，介意的话把该
+网卡 metric 调高：
 
 ```powershell
 Set-NetIPInterface -InterfaceIndex <上面的 InterfaceIndex> -InterfaceMetric 9000
@@ -112,10 +164,12 @@ curl.exe -sS -o out.pcm -w "%{http_code}`n" -X POST http://<IP>:8080/v1/audio/sp
 | 高级选项 | **两端共用**的 8 个合成旋钮（见 4.1），访问口令也在里面（仅远程时显示） |
 | 上传本机音色到电脑 | 把端侧每个音色的 gguf 按同名传到服务端并注册，见第 8 节 |
 
-- **查找并测试电脑**：一个动作完成"扫本机网段找到电脑 + 验证连通性"。它先试已配置的地址，
-  再按**手机自己接口的网段**（USB 共享是手机建的网，各厂商网段不同；实测本机 `10.84.116.0/24`）
-  并发扫 `:8080`，多网段交错扫描，命中即写入地址并回填采样率/音色列表（API 模式读 `/healthz` 的
-  `voices`，WebUI 模式读 `/speaker`）。
+- **查找并测试电脑**：一个动作完成"扫本机网段找到电脑 + 验证连通性"。它先试已配置的地址，再按
+  **手机自己所有接口的网段**并发扫 `:8080`——USB 共享（`rndis0`）、蓝牙 PAN（`bnep0`）、热点 AP
+  （`wlan0`/`ap0`）都在内，所以三条链路都不需要填 IP；多网段**交错**扫描（一个慢网段不会拖住命中的
+  那个），扫描预算随在线网卡数放宽（每个网段一个 /24，总数上限 1024）。蓝牙链路往返慢，App 对
+  `bnep*` 网段用更宽的超时档（1.5s / 2.5s；普通链路仍是 0.4s / 0.9s）。命中即写入地址并回填采样率/
+  音色列表（API 模式读 `/healthz` 的 `voices`，WebUI 模式读 `/speaker`）。
 - **无 `-api-key` 时**：探针走 `/v1/models`、`/healthz`；有口令时自动带上 `Authorization: Bearer`。
 - 手机蜂窝口可能是 `10.104.37.169/**8**` 这种大网段，发现逻辑会把短于 /24 的前缀**收敛到所在 /24**，
   不会去扫 6 万个地址。
@@ -206,28 +260,43 @@ PC 端同样打前两个补丁，但 **`diffusion_steps` 保持上游的 10**（
 - **单条朗读过长会超出缓存长度**：超出的位置会被丢弃，推理继续但质量可能下降。
   默认 8192 个位置约覆盖 800+ LLM token 的回复；需要更长回复时上调 `-DitKvCacheLength`（内存随之上升）。
 
-### 暴露面核对（只会有一个套接字）
+### 暴露面核对（只有一个套接字，且只绑手机链路的地址）
 
-绑到共享网卡的具体地址后，可以这样自查（这是实测过的预期输出）：
+`-Bind auto` 绑的是手机链路的**具体地址**，不是 `0.0.0.0`，所以自查应该是：
 
 ```powershell
-# 1) 只有一条监听记录，且 LocalAddress 是共享网卡地址（不是 0.0.0.0，也没有 IPv6）
+# 1) 只有一条监听记录，LocalAddress 是手机链路地址（不是 0.0.0.0，也没有 IPv6）
 $pids = @(Get-Process cosyvoice-server).Id
 Get-NetTCPConnection -State Listen | Where-Object { $pids -contains $_.OwningProcess } |
   Select-Object LocalAddress, LocalPort
 
-# 2) 只有共享网卡地址通，其余网卡（Wi-Fi / VPN / 回环 / 虚拟网卡）都不通
-foreach ($ip in '10.84.116.224','10.127.8.138','127.0.0.1','192.168.75.1') {
+# 2) 只有手机链路地址通；同一台电脑的 Wi-Fi / 回环 / VPN / 虚拟网卡一律不通
+foreach ($ip in '<手机链路地址>','<本机 Wi-Fi 地址>','127.0.0.1','192.168.75.1') {
   curl.exe -sS --max-time 4 -o NUL -w "$ip -> %{http_code}`n" "http://$ip`:8080/healthz"
 }
 ```
 
-实测：`10.84.116.224:8080` → HTTP 200；Wi-Fi 与 VPN 地址 → 超时；回环与 VMware 虚拟网卡 → 拒绝连接。
+实测（走蓝牙 PAN，绑 `192.168.44.175`）：蓝牙地址 → 200（带口令）/ 401（不带口令）；校园网 Wi-Fi
+地址 `10.127.8.138` → **连不上**；`127.0.0.1` → 连不上（绑的是具体地址，本机自测请用 `-Bind local`）。
+**别的网络里的机器扫 8080 只会得到「连不上」，连端口是否开着都看不出来**——这就是"绑具体地址"而不是
+"绑 `0.0.0.0` 再靠防火墙"的关键区别。
+
 防火墙里只应有一条由本方案添加的规则 `Inbound / Allow / TCP 8080`（首次运行 `-OpenFirewall` 时创建；
 若发现 `Action=Block` 见第 7 节的说明）。除 8080 外的监听端口都属系统或其他软件，与本方案无关。
 
-因为"不暴露"依赖的是**绑定地址**这一层，所以：只要用 `-Bind any`（或直接给服务传 `--host 0.0.0.0`）
-起服务，就会真的对 Wi-Fi 开放——那种情况下请同时设置 `-Token`。
+只有显式 `-Bind any`（或直接给服务传 `--host 0.0.0.0`）才会真的对 Wi-Fi 开放——那种情况下口令是唯一
+防线，务必确认 `tools\tts-token.txt` 里是强口令。
+
+### 链路带宽与首音延迟
+
+音频流固定是 24 kHz / 16-bit 单声道 = **384 kbps**（约 48 KB/s），而 App 是**整段收完再播**
+（`stream=false`），所以首音延迟 ≈ 合成时间 + 传输时间：
+
+| 链路 | PC 侧速率 | 一句 5 秒音频（约 240 KB）的传输 | 体验 |
+|---|---|---|---|
+| USB 共享 | 数十~数百 Mbps | 忽略不计 | 与端侧几乎无差别 |
+| 手机热点 | 20–100 Mbps | < 0.2 秒 | 很好 |
+| 蓝牙 PAN | 名义 **3 Mbps**（网卡 LinkSpeed 实测 3 Mbps），实际吞吐更低 | 数秒 | 可用但明显慢，定位为备用链路 |
 
 ### 运行时不要留长驻
 
@@ -241,9 +310,14 @@ powershell -File tools/.work/cosyvoice-server/run-server.ps1 -Stop
 
 | 现象 | 原因 / 处理 |
 |---|---|
-| 测试连接报「无法连接」 | PC 服务没起、绑在 `127.0.0.1`（改 `--host 0.0.0.0`）、或防火墙没放行（见第 2 节的规则）。先跑 `tools\run-cosyvoice-server.bat diag` 一次性看网卡/绑定/防火墙 |
-| 换线、重插或换 USB 口后连不上（同一根线之前可以） | 服务绑的地址过期了：Windows 会给**断开**的适配器保留 IP，旧实例可能一直绑在死地址上。`run-cosyvoice-server.bat status` 里该地址会标 `STALE` → 用 `restart` 重起（或 `-Bind any`）；手机侧地址变了也可以点 App 的「自动发现」 |
-| 手机浏览器打不开 WebUI | 同上；另外确认手机是「USB 网络共享」而不是「USB 文件传输」 |
+| 测试连接报「无法连接」 | 先跑 `tools\run-cosyvoice-server.bat diag`：看有没有活链路、`auto` 会绑哪个地址、防火墙是不是 Block。服务绑在 `127.0.0.1` 时手机也连不上（那是 `-Bind local`，只给本机自测） |
+| 换线、重插或换 USB 口后连不上（同一根线之前可以） | 服务绑的地址过期了：Windows 会给**断开**的适配器保留 IP，旧实例可能一直绑在死地址上。`run-cosyvoice-server.bat status` 里该地址会标 `STALE` → `restart` 重起（运行中拔线时看门狗会自动重绑）；手机侧也可以点「自动发现」 |
+| 手机浏览器打不开 WebUI | 同上；另外确认手机开的是「USB 网络共享」而不是「USB 文件传输」 |
+| 蓝牙连着，但「蓝牙网络连接」还是 Disconnected / 手机连不上 | 蓝牙**经典链路**（A2DP/HFP）连着 ≠ PAN 通了。手机开「蓝牙网络共享」，PC 端 `control printers` → 右键手机 → 连接方式 → 接入点（Win11 设置 App 没有这个入口）；成功后该网卡变 Up 并拿到 `192.168.44.x` |
+| 蓝牙下「自动发现」扫不到电脑 | 蓝牙往返慢（名义 3 Mbps），App 对 `bnep*` 网段已用更宽的超时档；仍扫不到就手填 `diag` 打印的地址 |
+| 热点下连不上 | 确认 PC 连的是**手机热点的 SSID**（不是校园网）。热点必须显式认一次：`run-cosyvoice-server.bat hotspot`（首次，会记住 SSID），或把 `hotspot-ssid=<热点名>` 写进 `tools\tts-link.txt` |
+| 启动报「Missing ...cosyvoice-server.exe」或「并行配置不正确」 | 杀软（360 等）会把无签名的监听型 exe 隔离掉：`diag` 会直接提示 exe 缺失。到杀软隔离区恢复，并把 `tools\.work\cosyvoice-server\bin` 加入信任区，否则下次还会被吃 |
+| 先启动、后插线 | 脚本会等链路最多 5 分钟（`-WaitLinkSeconds`，默认 300 秒），出现后自动绑它的当前地址；运行中拔线/换口则由看门狗自动重绑（模型重载约 90 秒；`-NoWatchdog` 可关） |
 | 「服务器要求访问口令（HTTP 401/403）」 | `tools\tts-token.txt` 里的值、App 的「访问口令」必须完全一致（一边填一边没填也算）；改完口令要重启服务 |
 | `{"code":"model_not_found"}` | App 里「模型名」必须等于服务端的对外模型名（`--served-model-name`，缺省时是架构名如 `cosyvoice3-2512`）。`--api` 模式下 `run-server.ps1` 固定传 `cosyvoice-3`，与 App 默认值一致 |
 | 「端点不存在」/「服务器已响应但端点不匹配」 | 该端口不是 `cosyvoice-server`，或路径写错（地址只写到 `http://IP:8080`，不要带 `/v1`） |

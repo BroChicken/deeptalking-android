@@ -29,6 +29,25 @@ fun interface RemoteTtsCancellation {
 }
 
 /**
+ * Timing profile for one reachability probe.
+ *
+ * The LAN sweep tries hundreds of addresses, so it cannot afford the generous
+ * timeouts of the interactive "test connection" - but a Bluetooth PAN link is slow
+ * enough that the fast sweep timings can expire before the PC answers, which is why
+ * there is a third profile rather than just "fast" and "slow".
+ */
+enum class ProbeProfile {
+    /** Settings screen "test connection": generous timeouts. */
+    INTERACTIVE,
+
+    /** Wi-Fi / USB / Ethernet sweep: short enough to try a whole /24 quickly. */
+    SCAN,
+
+    /** Bluetooth PAN sweep (`bnep*`): ~30-100 ms RTT and 3 Mbps nominal. */
+    SLOW_SCAN,
+}
+
+/**
  * Source of 16 kHz/24 kHz PCM audio for one utterance. Implemented by
  * [RemoteTtsClient]; faked in tests so the speaker's phase/ordering logic can be
  * verified on the JVM.
@@ -118,6 +137,23 @@ class RemoteTtsClient(
         .dns(dns)
         .build()
 
+    /**
+     * Bluetooth PAN sweep probe: same shape as [scanClient], but the link's round-trip
+     * (tens of milliseconds, 3 Mbps nominal) needs more room than a Wi-Fi sweep.
+     */
+    private val slowScanClient: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(SLOW_SCAN_CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        .readTimeout(SLOW_SCAN_READ_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        .callTimeout(SLOW_SCAN_CALL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        .dispatcher(
+            Dispatcher().apply {
+                maxRequests = SCAN_CONCURRENCY
+                maxRequestsPerHost = SCAN_CONCURRENCY
+            },
+        )
+        .dns(dns)
+        .build()
+
     override fun speech(
         text: String,
         style: String?,
@@ -185,12 +221,20 @@ class RemoteTtsClient(
         }
     }
 
-    /** Fast reachability check used by the LAN sweep; never throws. */
-    fun reachable(baseUrl: String, token: String?, useScanTimeouts: Boolean = true): Boolean {
+    /** Reachability check used by the LAN sweep; never throws. */
+    fun reachable(
+        baseUrl: String,
+        token: String?,
+        profile: ProbeProfile = ProbeProfile.SCAN,
+    ): Boolean {
         val base = baseUrl.trim().trimEnd('/')
         if (base.isEmpty()) return false
         val config = RemoteTtsConfig(baseUrl = base, token = token)
-        val client = if (useScanTimeouts) scanClient else probeClient
+        val client = when (profile) {
+            ProbeProfile.INTERACTIVE -> probeClient
+            ProbeProfile.SCAN -> scanClient
+            ProbeProfile.SLOW_SCAN -> slowScanClient
+        }
         if (get(client, "$base/v1/models", config).first == 200) return true
         if (get(client, "$base/healthz", config).first == 200) return true
         return get(client, "$base/ping", config).first == 200
@@ -356,6 +400,11 @@ class RemoteTtsClient(
         const val SCAN_CONNECT_TIMEOUT_MS = 400L
         const val SCAN_READ_TIMEOUT_MS = 700L
         const val SCAN_CALL_TIMEOUT_MS = 900L
+
+        /** Bluetooth PAN sweep: the link's own round-trip is tens of milliseconds. */
+        const val SLOW_SCAN_CONNECT_TIMEOUT_MS = 1_500L
+        const val SLOW_SCAN_READ_TIMEOUT_MS = 1_500L
+        const val SLOW_SCAN_CALL_TIMEOUT_MS = 2_500L
 
         /** Parallel probes during a LAN sweep. */
         const val SCAN_CONCURRENCY = 48

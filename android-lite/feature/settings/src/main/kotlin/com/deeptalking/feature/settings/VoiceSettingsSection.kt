@@ -283,6 +283,13 @@ fun VoiceSettingsSection(
             modifier = Modifier.fillMaxWidth(),
         ) { Text(if (busy) "查找中…" else "查找并测试电脑") }
 
+        Text(
+            "USB 网络共享 / 蓝牙网络共享 / 手机热点 都支持。自动找不到时，可手填电脑地址" +
+                "（电脑上运行 run-cosyvoice-server.bat diag 会打印该地址）",
+            fontSize = 12.sp,
+            color = legacy.textMuted,
+        )
+
         OutlinedTextField(
             value = remoteUrl,
             onValueChange = onChangeRemoteUrl,

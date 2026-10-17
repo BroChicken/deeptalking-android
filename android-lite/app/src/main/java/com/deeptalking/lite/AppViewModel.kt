@@ -2081,7 +2081,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             } else {
                 ttsState.value = ttsState.value.copy(
                     busy = false,
-                    remoteStatus = "没有找到服务器。请确认电脑已启动 cosyvoice-server，且手机已开启 USB 网络共享",
+                    remoteStatus = "没有找到服务器。请确认电脑已启动 cosyvoice-server，且手机已开启 USB 网络共享、蓝牙网络共享或手机热点",
                 )
             }
             refreshTtsState(core.currentConfig())
@@ -2254,7 +2254,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 return@launch
             }
             if (cfg.ttsBackend == TTS_BACKEND_REMOTE && cfg.ttsRemoteUrl.isBlank()) {
-                eventsState.tryEmit(UiEvent("请先在设置-语音朗读中配置远程服务器地址"))
+                eventsState.tryEmit(UiEvent("请先在设置-语音朗读中配置远程服务器地址，或点「查找并测试电脑」自动发现"))
                 return@launch
             }
             if (generation != ttsGeneration) return@launch

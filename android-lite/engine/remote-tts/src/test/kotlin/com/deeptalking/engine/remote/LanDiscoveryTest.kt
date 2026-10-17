@@ -53,4 +53,29 @@ class LanDiscoveryTest {
         assertEquals("192.168.1.2", hosts.first())
         assertEquals("192.168.1.126", hosts.last())
     }
+
+    @Test
+    fun `bluetooth pan counts as a slow link`() {
+        assertTrue(LanDiscovery.isSlowLink("bnep0"))
+        assertTrue(LanDiscovery.isSlowLink("BNEP1"))
+        assertTrue(!LanDiscovery.isSlowLink("wlan0"))
+        assertTrue(!LanDiscovery.isSlowLink("rndis0"))
+        assertTrue(!LanDiscovery.isSlowLink(""))
+    }
+
+    @Test
+    fun `a subnet carries the interface name it came from`() {
+        assertEquals("bnep0", LocalSubnet("192.168.44.1", 24, "bnep0").interfaceName)
+        assertEquals("", LocalSubnet("192.168.44.1", 24).interfaceName)
+    }
+
+    @Test
+    fun `the sweep budget covers every link and stays bounded`() {
+        // One link: a full /24. Three links (USB + Bluetooth + hotspot): three of them.
+        assertEquals(254, LanDiscovery.scanBudget(1))
+        assertEquals(762, LanDiscovery.scanBudget(3))
+        // No link information at all still sweeps one /24, and the total is capped.
+        assertEquals(254, LanDiscovery.scanBudget(0))
+        assertEquals(1024, LanDiscovery.scanBudget(9))
+    }
 }

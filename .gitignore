@@ -5,8 +5,9 @@ archive/
 android-lite/keystore/*.jks
 android-lite/keystore/CREDENTIALS.txt
 **/signing.properties
-# PC 侧远程朗读服务的访问口令（tools/tts-token.txt，由 run-server.ps1 读取）
+# PC 侧远程朗读服务的访问口令与链路记忆（由 run-server.ps1 读写，本机私有）
 tools/tts-token.txt
+tools/tts-link.txt
 
 # 构建产物
 android-lite/build/

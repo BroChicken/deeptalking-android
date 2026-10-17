@@ -5,6 +5,9 @@ rem  the phone's "remote server" read-aloud engine (docs/REMOTE_TTS.md).
 rem
 rem    run-cosyvoice-server.bat            API mode, CUDA  (the phone connects here)
 rem    run-cosyvoice-server.bat webui      WebUI mode      (register / extract voices)
+rem    run-cosyvoice-server.bat bt         API mode, bound to the Bluetooth PAN link
+rem    run-cosyvoice-server.bat hotspot    API mode, bound to the phone hotspot (learns its SSID)
+rem    run-cosyvoice-server.bat local      API mode on 127.0.0.1 only (this PC, nothing exposed)
 rem    run-cosyvoice-server.bat stop       stop a running server
 rem    run-cosyvoice-server.bat restart    stop, then start again (fresh bind address)
 rem    run-cosyvoice-server.bat status     where is a running server listening?
@@ -14,12 +17,16 @@ rem  Anything else is passed straight through to the PowerShell launcher, e.g.
 rem    run-cosyvoice-server.bat -Api -Bind any -Port 9000
 rem
 rem  The access token is read from tools\tts-token.txt (git-ignored) and must be
-rem  entered in the app under "access token" as well.
+rem  entered in the app under "access token" as well. The link the launcher
+rem  remembers lives in tools\tts-link.txt (also git-ignored).
+rem
+rem  The server binds ONE phone-link address, never 0.0.0.0: a port scan from any
+rem  other network this PC is on (campus Wi-Fi, ...) cannot even tell that the port
+rem  is open. If the phone link is not up yet, the launcher waits up to 5 minutes
+rem  for it, and rebinds by itself if the link comes back on a different address.
 rem
 rem  Every other setting lives in tools/.work/cosyvoice-server/run-server.ps1
-rem  (bin/, models/, voices/ are its siblings). This file only picks the mode
-rem  and keeps the window open on failure.
-rem  Keep this file ASCII-only (Windows console codepage).
+rem  (bin/, models/, voices/ are its siblings). Keep this file ASCII-only.
 rem ============================================================
 setlocal
 cd /d "%~dp0"
@@ -39,6 +46,9 @@ if /i "%~1"=="stop"    ( %PS% -Stop & goto :done )
 if /i "%~1"=="status"  ( %PS% -Status & goto :done )
 if /i "%~1"=="diag"    ( %PS% -Diag & goto :done )
 if /i "%~1"=="webui"   ( %PS% & goto :done )
+if /i "%~1"=="bt"      ( %PS% -Api -Bind bt -OpenFirewall & goto :done )
+if /i "%~1"=="hotspot" ( %PS% -Api -Bind hotspot -OpenFirewall & goto :done )
+if /i "%~1"=="local"   ( %PS% -Api -Bind local & goto :done )
 if /i "%~1"=="restart" ( %PS% -Stop & %PS% -Api -OpenFirewall & goto :done )
 
 if not "%~1"=="" ( %PS% %* & goto :done )
@@ -53,16 +63,15 @@ if not errorlevel 1 (
   echo.
   echo     If that address says STALE above, the phone cannot reach it - run:
   echo         run-cosyvoice-server.bat restart
-  echo     If it says NOTHING, the model is probably still loading - wait a bit,
-  echo     or run "run-cosyvoice-server.bat diag" if it stays that way.
   goto :done
 )
 
 echo.
 echo Starting API mode ^(CUDA^). The model load takes ~30-90s.
-echo The address for the phone is printed as "PHONE -^> http://..." below;
-echo the access token is in tools\tts-token.txt (same value goes in the app).
-echo Press Ctrl+C in this window to stop the server.
+echo Bound to the phone link only. If that link is not up yet, the launcher waits
+echo up to 5 minutes for it (plug the cable / enable tethering / join the hotspot).
+echo The URL for the phone is printed as "PHONE -^> http://..." below; the access
+echo token is in tools\tts-token.txt. Ctrl+C in this window stops the server.
 echo.
 
 %PS% -Api -OpenFirewall
