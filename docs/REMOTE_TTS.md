@@ -45,8 +45,10 @@ Windows 上也可以直接双击 `tools\run-cosyvoice-server.bat`（默认就是
 （同样 gitignored、不含密钥），首次成功启动后自动写入（`preferred=usb|bt|hotspot`，热点另存
 `hotspot-ssid`），所以**先启动、后插线/开共享**也行：脚本会等到链路出现再绑它的当前地址。
 
-**运行中链路断了**（拔线、换口、关共享、IP 变了）：看门狗会发现绑的地址已失效，自动停服、等链路回来、
-用新地址重启（模型重载约 90 秒）。不想要这个行为用 `-NoWatchdog`。等价的手工命令是：
+**运行中链路断了**（拔线、换口、关共享、IP 变了）：看门狗发现绑的地址失效后，先给
+**`-GraceSeconds`（默认 20 秒）宽限期**——地址在宽限期内回到**同一个地址**且服务仍在监听，就**继续用原进程**
+（0 秒重载，瞬断无感）；否则才停服、等链路回来、用新地址重启（模型重载约 90 秒）。不想自动重绑用
+`-NoWatchdog`，不想等宽限期用 `-GraceSeconds 0`。等价的手工命令是：
 
 ```powershell
 cosyvoice-server --model models\CosyVoice3-2512_Q4_K_M.gguf `
@@ -319,7 +321,7 @@ powershell -File tools/.work/cosyvoice-server/run-server.ps1 -Stop
 | 蓝牙下「自动发现」扫不到电脑 | 蓝牙往返慢（名义 3 Mbps），App 对 `bnep*` 网段已用更宽的超时档；仍扫不到就手填 `diag` 打印的地址 |
 | 热点下连不上 | 确认 PC 连的是**手机热点的 SSID**（不是校园网）。热点必须显式认一次：`run-cosyvoice-server.bat hotspot`（首次，会记住 SSID），或把 `hotspot-ssid=<热点名>` 写进 `tools\tts-link.txt` |
 | 启动报「Missing ...cosyvoice-server.exe」或「并行配置不正确」 | 杀软（360 等）会把无签名的监听型 exe 隔离掉：`diag` 会直接提示 exe 缺失。到杀软隔离区恢复，并把 `tools\.work\cosyvoice-server\bin` 加入信任区，否则下次还会被吃 |
-| 先启动、后插线 | 脚本会**一直等**链路出现（`-WaitLinkSeconds`，默认 `-1` = 一直等，按 Ctrl+C 放弃；设 `0` 则立即放弃），出现后自动绑它的当前地址；运行中拔线/换口则由看门狗自动重绑（模型重载约 90 秒；`-NoWatchdog` 可关） |
+| 先启动、后插线 | 脚本会**一直等**链路出现（`-WaitLinkSeconds`，默认 `-1` = 一直等，按 Ctrl+C 放弃；设 `0` 则立即放弃），出现后自动绑它的当前地址；运行中拔线/换口由看门狗自动重绑（**同一地址 20 秒内回来就不重载**，只有地址真的变了才重载约 90 秒；`-NoWatchdog` 可关、`-GraceSeconds 0` 关宽限） |
 | 「服务器要求访问口令（HTTP 401/403）」 | `tools\tts-token.txt` 里的值、App 的「访问口令」必须完全一致（一边填一边没填也算）；改完口令要重启服务 |
 | `{"code":"model_not_found"}` | App 里「模型名」必须等于服务端的对外模型名（`--served-model-name`，缺省时是架构名如 `cosyvoice3-2512`）。`--api` 模式下 `run-server.ps1` 固定传 `cosyvoice-3`，与 App 默认值一致 |
 | 「端点不存在」/「服务器已响应但端点不匹配」 | 该端口不是 `cosyvoice-server`，或路径写错（地址只写到 `http://IP:8080`，不要带 `/v1`） |

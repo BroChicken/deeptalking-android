@@ -24,7 +24,8 @@ rem
 rem  The server binds ONE phone-link address, never 0.0.0.0: a port scan from any
 rem  other network this PC is on (campus Wi-Fi, ...) cannot even tell that the port
 rem  is open. If the phone link is not up yet the launcher waits for it (Ctrl+C gives
-rem  up), and rebinds by itself if the link comes back on a different address.
+rem  up). While it runs, a brief blip that comes back on the same address keeps the
+rem  server as it is; only a real address change makes it restart.
 rem
 rem  Every other setting lives in tools/.work/cosyvoice-server/run-server.ps1
 rem  (bin/, models/, voices/ are its siblings). Keep this file ASCII-only.
