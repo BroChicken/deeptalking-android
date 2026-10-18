@@ -143,6 +143,9 @@ fun SettingsScreen(
     onSaveTtsRemoteToken: (String?) -> Unit = {},
     onDiscoverTtsRemote: () -> Unit = {},
     onUploadTtsVoices: () -> Unit = {},
+    promiseTodos: List<PromiseTodo> = emptyList(),
+    onCompletePromise: (String) -> Unit = {},
+    onClosePromise: (String) -> Unit = {},
 ) {
     val context = LocalContext.current
     val legacy = MaterialTheme.legacy
@@ -285,6 +288,12 @@ fun SettingsScreen(
         ) { persist(edited.copy(quickReplyRepair = it)) }
 
         LegacyButton("测试提醒", modifier = Modifier.fillMaxWidth(), onClick = onTestReminder)
+
+        PromiseTodoList(
+            todos = promiseTodos,
+            onComplete = onCompletePromise,
+            onClose = onClosePromise,
+        )
 
         VoiceSettingsSection(
             enabled = ttsEnabled,

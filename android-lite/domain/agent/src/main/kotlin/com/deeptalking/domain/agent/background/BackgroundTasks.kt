@@ -24,6 +24,7 @@ import com.deeptalking.domain.agent.tools.MemoryToolSupport
 import com.deeptalking.domain.agent.prompts.DYNAMIC_STATE_FIELDS
 import com.deeptalking.domain.agent.prompts.GROUP_SHARED_DYNAMIC_FIELDS
 import com.deeptalking.domain.agent.prompts.STATIC_PROFILE_FIELDS
+import com.deeptalking.domain.agent.prompts.TimeContext
 import com.deeptalking.domain.agent.prompts.buildRoleContext
 import com.deeptalking.domain.agent.prompts.buildVolatileContext
 import com.deeptalking.domain.agent.prompts.normalizeTemperature
@@ -42,6 +43,7 @@ import com.deeptalking.domain.memory.dedupeLorebook
 import com.deeptalking.domain.memory.dedupeShortTerm
 import com.deeptalking.domain.memory.ensureMessageSequences
 import com.deeptalking.domain.memory.evidenceMatchesSource
+import com.deeptalking.domain.memory.formatAbsoluteDate
 import com.deeptalking.domain.memory.getTimeSlot
 import com.deeptalking.domain.memory.isValidAutomaticMemory
 import com.deeptalking.domain.memory.knownSources
@@ -77,6 +79,7 @@ import kotlinx.serialization.json.put
 import java.time.Instant
 import java.time.ZoneId
 import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
 import kotlin.random.Random
 
 @Serializable
@@ -105,9 +108,12 @@ internal data class AnalysisInput(
     val location: String = "",
     val userEvidence: List<SourceEvidence> = emptyList(),
     /**
-     * True when this entry was already folded into long-term memory in an earlier
-     * pass. It still rides along as context (continuity), but the model must not
-     * produce a new long-term entry for it.
+     * Whether this entry is **context-only for this pass**: the newest
+     * [AppLimits.Memory.SHORT_TERM_TRIM_FLOOR] leftovers ride along for continuity, but the
+     * pass must not produce a long-term entry for them (they will be produced when they
+     * become the batch themselves). They are *not* "already analyzed": analysis consumes by
+     * position, so nothing still in the window has been folded — calling them "已整理" is
+     * what made the model treat the freshest events as already recorded and under-record.
      */
     val analyzed: Boolean = false,
 )
@@ -677,6 +683,8 @@ class BackgroundTasks(
             .filter { it.id !in batchIds }
 
         val inputs = (batch.map { it to false } + context.map { it to true }).map { (item, isContext) ->
+            // The flag is "context-only for this pass", never "already recorded": the batch is
+            // this pass's production target, the newest leftovers are held back untouched.
             AnalysisInput(
                 id = item.id,
                 content = item.content,
@@ -891,8 +899,21 @@ class BackgroundTasks(
         )
     }
 
-    /** Compresses the messages after the scene cursor into one `scenes` summary. */
-    suspend fun summarizeScene(character: Character, sceneKey: String): Pair<TaskStatus, Character> {
+    /**
+     * Compresses the messages after the scene cursor into one `scenes` summary.
+     *
+     * The prompt demands absolute dates, so the transcript is fed **with time**: a
+     * `【时间基准】` header carries the current wall clock (rendered exactly like the injected
+     * volatile context) and every line carries the time that message actually happened
+     * (its own local clock plus the logical day + slot). A message with no usable timestamp
+     * is marked as time-unknown instead of being given an invented date — the model used to
+     * have nothing but the text, so it guessed dates that never happened.
+     */
+    suspend fun summarizeScene(
+        character: Character,
+        sceneKey: String,
+        now: Instant = Instant.now(),
+    ): Pair<TaskStatus, Character> {
         val startSequence = character.sceneState?.startSequence ?: 0
         val slice = character.instant
             .filter { !it.isLoading && it.sequence > startSequence }
@@ -900,12 +921,15 @@ class BackgroundTasks(
         if (slice.size < AppLimits.Scene.MIN_MESSAGES) return TaskStatus.Failure to character
         val speakerName = character.name.ifBlank { "角色" }
         val transcript = slice.mapIndexed { index, message ->
-            "[" + (index + 1) + "] " + (if (message.role == Role.User) "用户" else speakerName) +
+            val stamp = messageTimeStamp(message.timestamp).ifEmpty { SCENE_TIME_UNKNOWN }
+            "[" + (index + 1) + "] " + stamp + " " +
+                (if (message.role == Role.User) "用户" else speakerName) +
                 ": " + trimText(message.content, 500)
         }.joinToString("\n")
         val guard = captureGuard(character)
         onStatus("正在整理场景概要…")
-        val raw = complete(SCENE_SYSTEM, SCENE_PROMPT + transcript, sessionId = sessionIdFor(character), taskType = "scene")
+        val prompt = SCENE_PROMPT + timeBaseBlock(now) + SCENE_TRANSCRIPT_HEAD + transcript
+        val raw = complete(SCENE_SYSTEM, prompt, sessionId = sessionIdFor(character), taskType = "scene")
         if (!isGuardCurrent(guard)) return TaskStatus.Stale to character
         val summary = raw.trim()
         if (summary.length < 8) return TaskStatus.Failure to character
@@ -2057,6 +2081,34 @@ class BackgroundTasks(
         return "${day.year}年${day.monthValue}月${day.dayOfMonth}日[${getTimeSlot(zoned.toLocalTime())}]"
     }
 
+    /**
+     * One message's own time, rendered the way the injected short-term block renders it
+     * (`yyyy-MM-dd HH:mm（逻辑日 YYYY-MM-DD 时段）`): the real local wall clock *and* the
+     * logical day + slot, so a call that demands absolute dates has something to write them
+     * from. Empty when the message carries no usable timestamp — the caller marks that line
+     * as time-unknown rather than inventing a date.
+     */
+    private fun messageTimeStamp(raw: String?): String {
+        val zoned = parseZoned(raw) ?: return ""
+        val clock = zoned.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"))
+        return clock + "（逻辑日 " + formatAbsoluteDate(logicalDay(zoned)) + " " +
+            getTimeSlot(zoned.toLocalTime()) + "）"
+    }
+
+    /**
+     * The "current real date/time" header a dated background call must carry, rendered the
+     * same way as the injected volatile context (`【时间基准】`): local wall clock, zone and
+     * offset, ISO instant, plus the logical day + slot. Without it a model told to write
+     * absolute dates can only guess "now" (and it must never use it for earlier messages).
+     */
+    private fun timeBaseBlock(now: Instant): String {
+        val snapshot = TimeContext.snapshot(now)
+        return "【时间基准】\n当前本地时间: " + snapshot.local +
+            "\n时区: " + snapshot.timeZone + " (" + snapshot.offset + ")" +
+            "\nISO时间: " + snapshot.iso +
+            "\n逻辑日: " + snapshot.day + " " + snapshot.slot + "\n"
+    }
+
     private fun normalizeTimestamp(value: String?, fallback: String): String {
         if (value.isNullOrEmpty()) return fallback
         val zoned = parseZoned(value) ?: return fallback
@@ -2075,10 +2127,21 @@ class BackgroundTasks(
                 "。规则：reply必须一字不改保留角色回复原文；quickReplies必须恰好两条用户可直接发送给角色的短句；所有记忆只能从这次交互中明确提取，不得凭空编造；dynamicState来源用current_response、evidence引用回复原句；shortTerm和longTerm的sourceMessageIds引用用户消息id；用户未明确陈述或表现的内容不要写入；无合格记忆返回空数组。记忆字段（shortTerm的content、longTerm的key与value）必须写明主体：涉及用户写“用户”，涉及角色写角色名，禁止“我/你/TA”这类指代不清的代词；时间一律写绝对日期（YYYY-MM-DD 或 YYYY-MM-DD 时段），禁止“明天/明晚/上周/上个月/三天后”这类相对时间词，用户用相对时间说法时改用timeRef：anchor 取 today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year（拿不准就省略它、直接写绝对日期），offsetDays 为相对 anchor 的天数（-60~60），weekday 取 mon/tue/wed/thu/fri/sat/sun，slot 取 深夜/凌晨/清晨/早晨/上午/中午/下午/傍晚/晚上/夜里，explicit 为绝对时间（填了它则忽略其余）。日期按事件真实发生的本地日历日写：00:00-02:00 发生的事写当天日期+“凌晨”（不要归到前一天晚上），也不要用“昨晚/昨天/今晚/刚刚”这类相对说法。staticFields 的 value 长度上限：短字段 40 字、叙述字段 120 字、背景故事 250 字（超长会被截断）。dynamicState与staticFields的值以段落式的陈述句书写（自然完整陈述句，简短段落），禁止括号注释或理由。key与value涉及群组成员时写具体成员名。只返回JSON对象，不要其他任何文字。"
 
         const val SCENE_SYSTEM = "你是对话记录整理助手。只输出场景摘要正文，不要任何额外文字。"
+
+        /** Marks one transcript line whose message carries no usable timestamp (never given a date). */
+        const val SCENE_TIME_UNKNOWN = "（本条时间未知）"
+
         const val SCENE_PROMPT =
             "把下面这段已经告一段落的情节压缩成 1-2 段、不超过 300 字的「场景记忆」，供之后长期参考。\n" +
                 "只保留会影响后续剧情的要点：谁做了什么、学到或决定了什么；地点、物品、伤势、关系的变化；新的发现或线索；仍未解决的目标、承诺、威胁或期限。\n" +
-                "要求：①写明主体（涉及用户写“用户”，涉及角色写角色名），禁止“我/你/TA”这类指代不清的代词；②时间写绝对日期（YYYY-MM-DD 或 YYYY-MM-DD 时段），禁止“今天/昨天/刚才”这类相对时间词；③不要引用对白原句、不要加标题或 markdown、不要文学化描写；④不得编造原文没有的事实；⑤直接输出摘要正文，不要任何前后缀或解释。\n\n对话内容：\n"
+                "要求：①写明主体（涉及用户写“用户”，涉及角色写角色名），禁止“我/你/TA”这类指代不清的代词；" +
+                "②日期**只能依据下面给到的时间信息写**：每行对话开头的时间标注就是该条消息的发生时间，直接使用其中写明的绝对日期与时段；" +
+                "标为“" + SCENE_TIME_UNKNOWN + "”的消息没有可用时间，**不要为它编造日期**（宁可不写这条的时间）；" +
+                "禁止“今天/昨天/刚才/今晚/最近”这类相对时间词，也不得把“时间基准”里的当前时间当成更早消息的发生时间；" +
+                "③不要引用对白原句、不要加标题或 markdown、不要文学化描写；④不得编造原文没有的事实；⑤直接输出摘要正文，不要任何前后缀或解释。\n"
+
+        /** Separates the scene rules + time base from the annotated transcript. */
+        const val SCENE_TRANSCRIPT_HEAD = "\n对话内容（每行方括号后是该条消息自身的发生时间）：\n"
 
         const val LOREBOOK_SYSTEM = "你是世界书整理助手。只返回 JSON，不要任何额外文字。"
         const val LOREBOOK_PROMPT_HEAD =
@@ -2133,7 +2196,7 @@ class BackgroundTasks(
             "返回JSON数组：[{\"content\":\"一段完整的事件流程摘要\",\"eventTime\":\"ISO时间\",\"participants\":[\"用户\",\"角色名\"],\"location\":\"地点或未说明\"}]。\n已有短期事件（不要重复，只在需要延续或更新时合并进去）:\n"
 
         const val ANALYSIS_PROMPT_HEAD =
-            "分析以下带短期ID、来源消息ID、userEvidence及时间/人物/地点三要素的事件流程摘要，提取未来仍有价值的稳定事实。输入中每条条目带 analyzed 标记：**只为 analyzed=false 的条目产出长期记忆**；analyzed=true 的是前一轮已整理过的上下文，只用于保持情节连贯（可据此合并或修正），不得为它们重复产出条目，也不要在 analyzedShortTermIds 中返回它们。**价值判据**：只有能跨轮复用、会影响后续对话或关系、或用户明确表达过的信息才记（长期偏好、重要人物与关系、承诺与约定、反复出现的习惯、持续的情节线）；一次性的寒暄客套、当下的情绪起伏、可以随口重说的闲聊、纯场景描写一律不记。**证据不足宁可不记**，不要为了产出而脑补或推演。必须检查全部 analyzed=false 的条目，并在analyzedShortTermIds中原样返回它们的短期ID；不得遗漏、增加或重复。**每条 value 不超过200字，arc 叙事摘要不超过300字**，写成平实叙述，不堆砌形容词。合并重复或冲突条目；事件、承诺保留必要日期；普通寒暄不要进入长期记忆。每条长期记忆必须在sourceShortTermIds中列出它实际使用的短期条目id；每个列出的短期条目都必须至少贡献一个sourceMessageIds中的消息ID，否则不要列出该短期ID。sourceMessageIds只选择直接支持该事实的消息，不要复制短期条目的全部来源；userProfile和habits只能选择用户消息。evidence只能逐字引用被选择消息对应的userEvidence.text，不能引用摘要或改写。没有可引用的userEvidence时不要输出该条。events按“日期+时段+事实主题”区分：同一天同一时段（深夜/凌晨/清晨/早晨/上午/中午/下午/傍晚/晚上/夜里，一天从02:00起算）的短期事件合并为一条长期事件，同一时段的独立事实不得互相覆盖，key须标明稳定事实主题；合并时eventTime取最早的ISO时间，participants取并集，location取最新（无明确地点写“未说明”）。剧情弧线：若若干短期事件属于同一持续情节或话题线（同一人物线、同一持续事件、同一反复出现的话题），除按时间合并外，还应在其中一条事件条目上标注arcOf（该情节的持续话题或人物线名称，稳定可复用）与arcStage（只能是起始/发展/转折/现状之一，按情节推进阶段标注），arcOf命名一旦确定就保持稳定——同一情节线不得每轮改名或另起新名，续写时沿用已有名称；并将value整合成按时间顺序、带情绪起伏的叙事摘要；同一arcOf只允许一条带弧线标注的条目，其余同线条目按普通事件输出。无论是否提取出长期记忆，成功完成分析都必须返回status:\"ok\"；没有长期价值时仍需返回完整analyzedShortTermIds和空longTerm。\n分类规则：userProfile/habits仅限用户事实，subject=user；relationship仅限双方关系，subject=relationship；events只记录用户陈述或共同事件；promises只记录用户明确承诺或双方明确约定。promises在此处只能新建为active；完成或取消由主对话的promiseUpdates按承诺ID处理。存在明确期限才填写dueAt。\n条目:\n"
+            "分析以下带短期ID、来源消息ID、userEvidence及时间/人物/地点三要素的事件流程摘要，提取未来仍有价值的稳定事实。输入中每条条目带 analyzed 标记，它标记的是**本轮是否作为产出对象**：**只为 analyzed=false 的条目产出长期记忆**；analyzed=true 的是本轮不作为产出对象的最近上下文（它们**尚未**整理进长期记忆，只是靠近当下、留到下一轮再整理），只用于保持情节连贯、帮助合并或修正本轮条目，**不得为它们产出条目，也不要在 analyzedShortTermIds 中返回它们**；更**不得因为看到它们就认为其中的事实已经记录过**（那正是漏记的来源）。**价值判据**：只有能跨轮复用、会影响后续对话或关系、或用户明确表达过的信息才记（长期偏好、重要人物与关系、承诺与约定、反复出现的习惯、持续的情节线）；一次性的寒暄客套、当下的情绪起伏、可以随口重说的闲聊、纯场景描写一律不记。**证据不足宁可不记**，不要为了产出而脑补或推演。必须检查全部 analyzed=false 的条目，并在analyzedShortTermIds中原样返回它们的短期ID；不得遗漏、增加或重复。**每条 value 不超过200字，arc 叙事摘要不超过300字**，写成平实叙述，不堆砌形容词。合并重复或冲突条目；事件、承诺保留必要日期；普通寒暄不要进入长期记忆。每条长期记忆必须在sourceShortTermIds中列出它实际使用的短期条目id；每个列出的短期条目都必须至少贡献一个sourceMessageIds中的消息ID，否则不要列出该短期ID。sourceMessageIds只选择直接支持该事实的消息，不要复制短期条目的全部来源；userProfile和habits只能选择用户消息。evidence只能逐字引用被选择消息对应的userEvidence.text，不能引用摘要或改写。没有可引用的userEvidence时不要输出该条。events按“日期+时段+事实主题”区分：同一天同一时段（深夜/凌晨/清晨/早晨/上午/中午/下午/傍晚/晚上/夜里，一天从02:00起算）的短期事件合并为一条长期事件，同一时段的独立事实不得互相覆盖，key须标明稳定事实主题；合并时eventTime取最早的ISO时间，participants取并集，location取最新（无明确地点写“未说明”）。剧情弧线：若若干短期事件属于同一持续情节或话题线（同一人物线、同一持续事件、同一反复出现的话题），除按时间合并外，还应在其中一条事件条目上标注arcOf（该情节的持续话题或人物线名称，稳定可复用）与arcStage（只能是起始/发展/转折/现状之一，按情节推进阶段标注），arcOf命名一旦确定就保持稳定——同一情节线不得每轮改名或另起新名，续写时沿用已有名称；并将value整合成按时间顺序、带情绪起伏的叙事摘要；同一arcOf只允许一条带弧线标注的条目，其余同线条目按普通事件输出。无论是否提取出长期记忆，成功完成分析都必须返回status:\"ok\"；没有长期价值时仍需返回完整analyzedShortTermIds和空longTerm。\n分类规则：userProfile/habits仅限用户事实，subject=user；relationship仅限双方关系，subject=relationship；events只记录用户陈述或共同事件；promises只记录用户明确承诺或双方明确约定。promises在此处只能新建为active；完成或取消由主对话的promiseUpdates按承诺ID处理。存在明确期限才填写dueAt。\n条目:\n"
 
         const val ANALYSIS_PROMPT_TAIL =
             "\n\n返回JSON格式:\n{\"status\":\"ok\",\"analyzedShortTermIds\":[\"全部 analyzed=false 的 short_id\"],\"longTerm\": [{\"category\": \"...\", \"subject\": \"user|relationship|world\", \"key\": \"稳定且可复用的标识\", \"value\": \"...\", \"tags\": [...], \"importance\": 1-10, \"sourceShortTermIds\":[\"short_id\"], \"sourceMessageIds\": [\"msg_id\"], \"evidence\": \"被选择用户消息中的逐字原话\", \"eventTime\": \"ISO时间\", \"participants\":[\"参与者\"],\"location\":\"地点或未说明\",\"status\": \"active\", \"dueAt\": \"ISO时间\", \"arcOf\": \"可选，持续情节线名称\", \"arcStage\": \"可选，起始/发展/转折/现状\"}]}\ncategory可选: userProfile, relationship, events, promises, habits。value同样必须写明主体：涉及用户写“用户”，涉及角色写角色名（群组写具体成员名），禁止“我/你/TA”这类指代不清的代词。key与value中的时间一律写绝对日期（YYYY-MM-DD 或 YYYY-MM-DD 时段），禁止“明天/明晚/上周/上个月/三天后”这类相对时间词。这里只提取用户的约定（promises 的 promisor=user、promisor与promisee只能是 user 或 character）；角色单方承诺由主对话记录，不在此处提取。"

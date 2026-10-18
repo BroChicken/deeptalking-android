@@ -113,6 +113,7 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
     val lorebookRebuild by vm.lorebookRebuild.collectAsState()
     val lorebookRetryPrompt by vm.lorebookRetryPrompt.collectAsState()
     val tts by vm.tts.collectAsState()
+    val promiseTodos by vm.promiseTodos.collectAsState()
 
     val activeCharacter = characters.firstOrNull { it.id == activeId }
 
@@ -285,6 +286,9 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                         onSaveTtsRemoteToken = vm::saveTtsToken,
                         onDiscoverTtsRemote = vm::discoverTtsServer,
                         onUploadTtsVoices = vm::uploadVoicesToRemote,
+                        promiseTodos = promiseTodos,
+                        onCompletePromise = { vm.resolvePromise(it, com.deeptalking.core.model.PromiseStatus.Resolved) },
+                        onClosePromise = { vm.resolvePromise(it, com.deeptalking.core.model.PromiseStatus.Cancelled) },
                     )
                 }
             }

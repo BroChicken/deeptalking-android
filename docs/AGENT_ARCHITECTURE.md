@@ -207,7 +207,7 @@ BackgroundTasks.scheduleTurn  后台串行维护：文风校对、快速回应�
 
 ### 注入与衰减
 
-- `buildVolatileContext(character, query, memory, now, proactiveTurn, hotTopicTurn, recentAssistantReplies)` — 把最相关的记忆与本轮动态上下文注入本轮 prompt（只注入 `AppLimits.Agent.TOOL_MEMORY_INJECT_LIMIT = 5` 条长期记忆，其余提示模型用 `search_memory` 检索）。**没有任何区块预算**：这是主对话请求体，所有块整块注入（只保留"每条条目"级别的兜底上限，靠提示词的软限制让它尽量不触发）。区块顺序按"越靠后越近"排列：可选话题库 → 角色当前状态 → 待跟进承诺 → 世界书 → 群成员私人记忆 → 用户最新纠正 → 互动节奏 → 场景概要 → 长期召回 + 取用说明/主体约定 → 时间基准 → 消息时间元数据 → 风格尾块 + 本轮指令。**最末尾两条系统触发的本轮指令**：`proactiveTurn`（主动开场）与 `hotTopicTurn`（热榜开场，见 `HotTopicPolicy`：每角色每逻辑日掷一次、10%、每天 1 次/每周 2 次；命中时要求先调一个热榜工具——`zhihu_hot` 优先——再挑一条话题带入）。两条都只加在 volatile 上下文尾部，**不进 system prompt**，所以不会打乱缓存前缀。`metadata` 回传本轮真正注入的召回 ID 与世界书条目，供主线在回复落盘后精确清除 `pendingRecall` 与累计 `mentions`。检索查询经 `buildMemoryQuery()` 扩展：用户明显指代前文时附加最近对话，避免短指代召回不到正确记忆。
+- `buildVolatileContext(character, query, memory, now, proactiveTurn, hotTopicTurn, recentAssistantReplies)` — 把最相关的记忆与本轮动态上下文注入本轮 prompt（只注入 `AppLimits.Agent.TOOL_MEMORY_INJECT_LIMIT = 5` 条长期记忆，其余提示模型用 `search_memory` 检索）。**没有任何区块预算**：这是主对话请求体，所有块整块注入（只保留"每条条目"级别的兜底上限，靠提示词的软限制让它尽量不触发）。区块顺序按"越靠后越近"排列：可选话题库 → 角色当前状态 → 长期约定提醒 → 待跟进承诺 → 世界书 → 群成员私人记忆 → 用户最新纠正 → 互动节奏 → 场景概要 → 长期召回 + 取用说明/主体约定 → 时间基准 → 消息时间元数据 → 风格尾块 + 本轮指令。**最末尾两条系统触发的本轮指令**：`proactiveTurn`（主动开场）与 `hotTopicTurn`（热榜开场，见 `HotTopicPolicy`：每角色每逻辑日掷一次、10%、每天 1 次/每周 2 次；命中时要求先调一个热榜工具——`zhihu_hot` 优先——再挑一条话题带入）。两条都只加在 volatile 上下文尾部，**不进 system prompt**，所以不会打乱缓存前缀。`metadata` 回传本轮真正注入的召回 ID 与世界书条目，供主线在回复落盘后精确清除 `pendingRecall` 与累计 `mentions`。检索查询经 `buildMemoryQuery()` 扩展：用户明显指代前文时附加最近对话，避免短指代召回不到正确记忆。
 - `MemoryPolicy.applyMemoryDecay()`：按时间衰减 events/promises 的重要性与状态。
 - `MemoryPolicy.computeEffectiveImportance()`：`(importance + learnedBonus) × decay`（0-10 封顶）。
 
@@ -302,10 +302,25 @@ BackgroundTasks.scheduleTurn  后台串行维护：文风校对、快速回应�
 ### 场景概要
 
 - `BackgroundTasks.checkScene()`：以 `dynamicState.currentLocation` 作为场景标识。
-- `summarizeScene()`：把"这一段已告一段落的情节"压缩成 1-2 段（≤300 字）**只含剧情要点**的记忆（谁做了什么/学到或决定了什么/地点物品伤势关系变化/新发现/未解决的目标承诺威胁期限）；写明主体、绝对日期、不引对白、不编造。
+- `summarizeScene()`：把"这一段已告一段落的情节"压缩成 1-2 段（≤300 字）**只含剧情要点**的记忆（谁做了什么/学到或决定了什么/地点物品伤势关系变化/新发现/未解决的目标承诺威胁期限）；写明主体、绝对日期、不引对白、不编造。**输入带时间**：在规则与转录之间拼一个 `【时间基准】`（当前本地时间/时区/ISO/逻辑日，与 volatile 逐字同款），转录每行前面标该条消息自身的时间 `yyyy-MM-dd HH:mm（逻辑日 YYYY-MM-DD 时段）`，没有可用时间戳的消息标 `（本条时间未知）`；提示词据此要求"日期只能依据给到的时间信息写、无时间标注的消息不得编日期"。存储结构与检索未变。
 - 触发：**场景切换**（location 变化）或**场景超长**（`Scene.SPAN`(12) 条消息），且消息数 ≥ `Scene.MIN_MESSAGES`(6)。
 - 游标存 `character.sceneState`（`key`/`startCount`/`startSequence`/`messageCount`，按消息 `sequence` 推进）。
 - 注入：最近 2 条渲染为 `【场景概要（较早情节的压缩记录…）】`。
+
+### 承诺提醒与待办（promises）
+
+- **推送资格闸门** `MemoryEvidence.promisePushDecision()`：只有**用户本人同意**的约定才会变成提醒。`promisor=character`（角色单方承诺，即以前会推给用户的"角色答应你的事"）照常存进记忆但**永不推送、永不排期**；`promisor=user` 要求 `sourceMessageIds` 解析得出且全是用户原话（`evidence` 必须逐字对上）；`promisor=relationship`（双方约定）还必须有另一方原话佐证；其余（群组成员名 / 空 / 旧数据）一律不可推送。
+- **期限必须落在用户原话里**：模型给的 `dueAt` 还要能被用户原话定位（`dueAtBackedByUserEvidence`）；定位不到时返回 `dueAtNeedsConfirmation=true`、`confirmedDueAt=null` —— **不排期**，待办列表显示「待确认期限」并回头问用户。可排期的只有 `confirmedDueAtMillis`。
+- **排期与撤销**（app 层）：`AppViewModel.scheduleDueReminders` 只扫**刚回过一轮的那个角色**——已到点则 `NativeCore.postReminder`（立即弹出）并写 `notifiedAt`，未到点则 `scheduleReminder`（`Reminders`：WorkManager `ExistingWorkPolicy.REPLACE`，一个 id 至多一条待发）。`NativeCore.cancelReminder` → `Reminders.cancel` 一次撤掉**待发任务 + 已弹出的通知 + registry 记录**（幂等）。完成 / 关闭 / 角色删除都会撤销：所有角色写入经 `AppViewModel.writeCharacterChanges`，用 `promisesLosingActiveStatus(before, after)` 只撤销**本次**失去 active 的那些 id（不牵连无关提醒）；删角色前先按 `activePromiseIds` 全量撤销（行删掉后就再也拿不到那些 id 了）。
+- **设置页待办列表**（`:feature:settings` 的 `promiseTodos(character)` + `PromiseTodoList`）：纯**派生视图**，不改任何记忆字段。分桶（`PromiseTodoSection`）：进行中 / 待确认期限 / 周期性约定 / 已超时（可折叠）/ 不提醒（可折叠），每行可「完成 / 关闭」（`AppViewModel.resolvePromise`）。`promiseTodos` 用每分钟 ticker 重新采样 `now`，所以「已超时」由 `dueAt < now` 推导、不是新字段（列表在屏幕上时也能看到条目越过期限）。
+- **周期性约定永不进超时**：`isRecurringPromise` 命中「每 / 一直 / 永远」即单独一桶——"每晚十点"不会在第一个期限就被判成过期。
+- **不提醒桶只展示不删除**：角色单方承诺 / 缺用户原话的条目仍留在记忆里（用户可以自己「关闭」它），它们只是永远不会成为提醒。
+
+### 重复记忆检测（只读）
+
+- `MemoryPolicy.findDuplicateMemoryGroups(items, keySimilarity = MEMORY_DUPLICATE_KEY_SIMILARITY(0.86), valueSimilarity = MEMORY_DUPLICATE_VALUE_SIMILARITY(= NEAR_DUP_SIMILARITY 0.72))`：**只读**检测疑似重复的长期记忆分组，供后续界面 / 人工确认。它**不改输入、不合并不删除**，也不改变任何既有写入 / 裁剪行为（**没有**自动合并）。
+- 配对判据（同一 `category` + `subject` 分桶内，值比较要求两侧都非空、键比较要求两侧归一化后都非空，避免两个空字段互相坍缩）：归一化键完全相同 → 键相似 ≥ `keySimilarity` → 值相似 ≥ `valueSimilarity`，按此固定优先级取第一个命中的判据（`MemoryDuplicateReason`）。
+- 贪心锚点分组：桶内按输入顺序访问，每个条目并入**第一个**锚点匹配上的组，否则自己成为新锚点；桶、锚点、成员都保持输入顺序 → 同一输入总是逐字节相同的结果。单条目组丢弃，空 / 单条输入返回空表。
 
 ## 六、上下文与预算
 
@@ -319,6 +334,7 @@ BackgroundTasks.scheduleTurn  后台串行维护：文风校对、快速回应�
 | `TOOL_MEMORY_INJECT_LIMIT` | 5 | 每轮注入的长期记忆条数 |
 | 世界书注入 | `Lorebook.INJECT_ENTRIES`(6) 条 | 预算 `INJECT_CHARS`(1400) 装不下的条目**跳过、继续装后面的** |
 | 场景概要 | `Scene.SUMMARIES`(2) 条 | 整条注入（写入时已受 300/400 字约束） |
+| 长期约定提醒 | `STANDING_COMMITMENT_LIMIT`(4) 条 / 每行 `LINE_CHARS`(100) / 整段 `BLOCK_CHARS`(420) | 确定性挑周期性 promises/habits；**无命中时整段不出现** |
 | 每条兜底上限 | 短期正文/长期 value/群私人 1200、长期 key 120 | 仅为兜底；提示词软限制让它尽量不触发 |
 
 ### 请求装配与缓存前缀
@@ -394,11 +410,13 @@ tools: AUTO 阶段全部工具 / SUBMIT 阶段只有 submit_response
 
 ### volatile 段落（按顺序）
 
-可选话题库 → 角色当前状态（+群成员状态）→ **待跟进承诺** → **世界书资料** → 成员私人记忆 → 用户最新纠正 → 互动节奏（重连/久别）→ **场景概要** → 本轮主动召回的相关长期记忆 + 记忆取用说明 + 记忆主体约定 → 时间基准 → 消息时间元数据 → 结尾多样性 → **本轮节奏骨架** → 冷场/话题切换指令 →（主动开场时）角色主动开场 →（热榜开场时）热榜指令 → **快速回应视角提醒** → **违规纠正提醒** → **每 N 轮语气回顾** → **声音契约（单角色）/群聊声音锁定（群聊）**。
+可选话题库 → 角色当前状态（+群成员状态）→ **长期约定提醒** → **待跟进承诺** → **世界书资料** → 成员私人记忆 → 用户最新纠正 → 互动节奏（重连/久别）→ **场景概要** → 本轮主动召回的相关长期记忆 + 记忆取用说明 + 记忆主体约定 → 时间基准 → 消息时间元数据 → 结尾多样性 → **本轮节奏骨架** → 冷场/话题切换指令 →（主动开场时）角色主动开场 →（热榜开场时）热榜指令 → **快速回应视角提醒** → **违规纠正提醒** → **每 N 轮语气回顾** → **声音契约（单角色）/群聊声音锁定（群聊）**。
 
 > 顺序原则是"越靠后越近"：更早的背景（话题库/状态/承诺/世界书）在前，较早情节（场景）→ 较早记忆（长期召回）→ 现在（时间基准/时间线）→ 本轮指令（尾块）在后。**短期窗口不在这里**：它整窗注入到历史之前（见"请求装配与缓存前缀"）。
 >
 > 记忆取用说明：提醒召回条目"按关键词与时间粗略召回，可能只有部分相关或已过时"，不得硬提旧事、不得当作用户刚说过的话。
+>
+> **长期约定提醒（周期性/仪式类）**：`Prompts.buildStandingCommitmentBlock()` 用确定性判据（`category` ∈ promises/habits 且 `status=active` 且 key/value 命中周期性词表——`每(个)?(天|日|晚|早|晨|周|月|年|次|回|逢|一)` / `一直|永远|始终|照例|如常` / `every( day|night|week|month|time)` / `always` / `forever`，裸「每」不算）挑出"每晚…/一直…"这类每轮都生效的约定，只注入**一行摘要 +（若有）期限**，约定正文本体仍靠检索。上限 `STANDING_COMMITMENT_LIMIT`(4) 条 / 每行 `STANDING_COMMITMENT_LINE_CHARS`(100) / 整段 `STANDING_COMMITMENT_BLOCK_CHARS`(420)，排序 importance ↓ → 最近更新 ↓ → id（同一角色输出恒定）；**无命中时整段不出现**（不出标题、不留空行）。它是"固定仪式被静默遗忘"的补丁，不是第二份记忆注入。
 
 ### 语气/风格遵从（attention）
 
@@ -496,5 +514,7 @@ tools: AUTO 阶段全部工具 / SUBMIT 阶段只有 submit_response
 | `max_output_tokens` | 8 192 | 主对话请求体 |
 | `DYNAMIC_STATE_FIELDS` | 6 | `Prompts`（`currentTone` 取代旧关系两字段） |
 | `STATIC_PROFILE_FIELDS` | 12 | `Prompts` |
+| `STANDING_COMMITMENT_LIMIT` / `STANDING_COMMITMENT_LINE_CHARS` / `STANDING_COMMITMENT_BLOCK_CHARS` | 4 / 100 / 420 | `Prompts`：长期约定提醒的条数 / 每行 / 整段上限（无命中不出段） |
+| `MEMORY_DUPLICATE_KEY_SIMILARITY` / `MEMORY_DUPLICATE_VALUE_SIMILARITY` | 0.86 / 0.72 | `MemoryPolicy`：只读重复检测的键 / 值相似度阈值（后者同 `NEAR_DUP_SIMILARITY`） |
 | JSON 示例 | 固定一份精简示例 | system 前缀从首轮起稳定 |
 | 请求追踪字段 | `RequestMetric[]` | taskType/platform/phase/status/tokens/hitRate/durationMs/prefixChange/commonHistoryMessages/hashes |

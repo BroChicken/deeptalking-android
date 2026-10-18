@@ -6,6 +6,7 @@ import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.DynamicState
 import com.deeptalking.core.model.GroupMember
+import com.deeptalking.core.model.LongTermMemory
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.MemoryCategory
 import com.deeptalking.core.model.MemorySubject
@@ -584,6 +585,108 @@ private fun getPromiseContext(character: Character, selectedIds: Set<String>?): 
     }
 }
 
+// ---------------------------------------------------------------------------
+// Standing (periodic / ritual) commitments.
+//
+// A deal like “每晚晚安吻后说一次鱼鱼爱你，不许重样” is stored as an ordinary long-term
+// memory, so it only reached the model when keyword retrieval happened to hit it — most
+// nights it was silently forgotten. Injecting *all* long-term memory every turn is not an
+// option (it grows the context and dilutes attention), so this is one small, fixed slot:
+// a deterministic filter keeps only the periodic ones and injects a one-line summary
+// (plus due time when there is one). The body itself is still only injected on retrieval.
+// ---------------------------------------------------------------------------
+
+/** At most this many standing commitments are reminded per turn. */
+internal const val STANDING_COMMITMENT_LIMIT = 4
+
+/** Hard per-line cap; a longer summary is truncated to fit. */
+internal const val STANDING_COMMITMENT_LINE_CHARS = 100
+
+/** Hard cap for the whole reminder segment (header + lines): lower-ranked lines drop out. */
+internal const val STANDING_COMMITMENT_BLOCK_CHARS = 420
+
+private const val STANDING_COMMITMENT_HEADER =
+    "【长期约定提醒（你与对方之间的长期约定/固定仪式，每一轮都要记得，不要因为对方没提就当它不存在；" +
+        "这是系统给的内部提醒，不要在 reply 里复述，也不要向对方点明这是“约定”）】"
+
+/**
+ * Deterministic “periodic / ritual” markers. A bare 「每」 is deliberately absent (「每个人」
+ * is not a ritual) and anything merely *possibly* periodic is left out — missing one such
+ * reminder costs less than reminding the character of a deal that is not recurring.
+ */
+private val PERIODIC_COMMITMENT_MARKERS = Regex(
+    "每(个)?(天|日|晚|早|晨|周|月|年|次|回|逢|一)|" +
+        "一直|永远|始终|照例|如常|" +
+        "every(\\s+|-)?(day|night|week|month|time)|always|forever",
+    RegexOption.IGNORE_CASE,
+)
+
+/**
+ * True only for an **active** promise/habit whose text carries a periodic marker. `status`
+ * exists on every long-term item but only means something for a promise, so anything that
+ * is not an active promise/habit is skipped rather than guessed at.
+ */
+internal fun isStandingCommitment(item: LongTermMemory): Boolean {
+    if (item.category != MemoryCategory.Promises && item.category != MemoryCategory.Habits) return false
+    if (item.status != PromiseStatus.Active) return false
+    val text = item.key + " " + item.value
+    if (text.isBlank()) return false
+    return PERIODIC_COMMITMENT_MARKERS.containsMatchIn(text)
+}
+
+/** Epoch millis used only for ordering; 0 when absent/unparseable. */
+private fun recencyRank(item: LongTermMemory): Long =
+    parseZoned(item.updatedAt)?.toInstant()?.toEpochMilli()
+        ?: parseZoned(item.createdAt)?.toInstant()?.toEpochMilli()
+        ?: 0L
+
+/**
+ * The periodic commitments to remind every turn: importance first, then most recently
+ * updated, then id — so the same character always yields the same injection.
+ */
+internal fun selectStandingCommitments(character: Character): List<LongTermMemory> =
+    character.longTerm
+        .filter { isStandingCommitment(it) }
+        .sortedWith(
+            compareByDescending<LongTermMemory> { it.importance }
+                .thenByDescending { recencyRank(it) }
+                .thenBy { it.id },
+        )
+        .take(STANDING_COMMITMENT_LIMIT)
+
+/** One-line summary of a commitment (+ due time, when present), capped at [STANDING_COMMITMENT_LINE_CHARS]. */
+private fun standingCommitmentLine(character: Character, item: LongTermMemory): String {
+    val due = if (item.dueAt.isNullOrBlank()) {
+        ""
+    } else {
+        "（截止/约定时间：" + localStampWithSlot(item.dueAt) + "）"
+    }
+    val value = if (item.value.isBlank()) "" else ": " + maskUserWord(character, trimText(item.value, 80))
+    val line = "- " + maskUserWord(character, trimText(item.key, 40)) + value + due
+    return if (line.length > STANDING_COMMITMENT_LINE_CHARS) {
+        line.take(STANDING_COMMITMENT_LINE_CHARS - 1) + "…"
+    } else {
+        line
+    }
+}
+
+/**
+ * The standing-commitment reminder segment, or `""` when there is nothing to remind — an
+ * empty result emits **no** header and no blank separator, so a turn without periodic
+ * deals gains nothing at all.
+ */
+internal fun buildStandingCommitmentBlock(character: Character): String {
+    val lines = selectStandingCommitments(character).map { standingCommitmentLine(character, it) }
+    if (lines.isEmpty()) return ""
+    val body = StringBuilder()
+    for (line in lines) {
+        if (STANDING_COMMITMENT_HEADER.length + body.length + 1 + line.length > STANDING_COMMITMENT_BLOCK_CHARS) break
+        body.append('\n').append(line)
+    }
+    if (body.isEmpty()) return ""
+    return STANDING_COMMITMENT_HEADER + body
+}
+
 /** Legacy `buildTopicSuggestions`. */
 private fun buildTopicSuggestions(character: Character): List<String> {
     val sources = mutableListOf<String>()
@@ -812,6 +915,11 @@ suspend fun buildVolatileContext(
         }
     }
     block("【角色当前状态，可随对话变化】\n" + stateLines.joinToString("\n"))
+
+    // A small, fixed reminder of the periodic/ritual deals (see buildStandingCommitmentBlock)
+    // — they belong to every turn, but must never grow into a second memory dump. Sits next
+    // to the promises block; an empty result adds nothing (no header, no blank segment).
+    block(buildStandingCommitmentBlock(character))
 
     val promises = getPromiseContext(character, selectedPromiseIds)
     if (promises.isNotEmpty()) block("【待跟进承诺】\n$promises")

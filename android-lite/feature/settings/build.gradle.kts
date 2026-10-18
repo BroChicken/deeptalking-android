@@ -23,6 +23,9 @@ dependencies {
     implementation(project(":core:security"))
     implementation(project(":core:notifications"))
     implementation(project(":engine:ondevice"))
+    // The 待办 list reads the push-eligibility gate (`promisePushDecision`); `feature → domain`
+    // is the allowed direction (see AGENTS.md §2).
+    implementation(project(":domain:memory"))
     implementation(libs.androidx.activity.compose)
     implementation(platform(libs.compose.bom))
     implementation(libs.compose.ui)
@@ -31,4 +34,6 @@ dependencies {
     implementation(libs.lifecycle.viewmodel.compose)
     implementation(libs.lifecycle.runtime.compose)
     debugImplementation(libs.compose.ui.tooling)
+
+    testImplementation(libs.junit)
 }

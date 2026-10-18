@@ -521,4 +521,179 @@ class MemoryPolicyTest {
         // consumption needs no marker to be cleared for that).
         assertEquals(1, fixed.revision)
     }
+
+    // --- long-term duplicate detection (advisory) -------------------------------------------
+    //
+    // The detector only *reports* suspected duplicate groups for a later confirmation UI. It
+    // must never merge, reorder, or drop anything, and it must be deterministic.
+
+    private fun memory(
+        id: String,
+        category: MemoryCategory = MemoryCategory.Relationship,
+        subject: MemorySubject = MemorySubject.Relationship,
+        key: String,
+        value: String,
+    ) = LongTermMemory(id = id, category = category, subject = subject, key = key, value = value)
+
+    @Test
+    fun duplicateDetectorGroupsSameKeyUnderSameCategoryAndSubject() {
+        val groups = findDuplicateMemoryGroups(
+            listOf(
+                memory("m1", key = "晚安约定", value = "用户与角色约定每晚晚安吻后说爱你"),
+                memory("m2", key = "晚安约定。", value = "用户与角色约定每晚晚安吻后说爱你"),
+                memory("m3", key = "晚安约定", value = "用户与角色约定每晚晚安吻后说爱你"),
+            ),
+        )
+        assertEquals(1, groups.size)
+        val group = groups.single()
+        assertEquals(MemoryCategory.Relationship, group.category)
+        assertEquals(MemorySubject.Relationship, group.subject)
+        assertEquals("m1", group.anchorId)
+        assertEquals(listOf("m1", "m2", "m3"), group.members.map { it.id })
+        assertEquals(listOf("晚安约定", "晚安约定。", "晚安约定"), group.members.map { it.key })
+        assertEquals(
+            listOf(
+                MemoryDuplicateReason.ANCHOR,
+                MemoryDuplicateReason.SAME_KEY,
+                MemoryDuplicateReason.SAME_KEY,
+            ),
+            group.members.map { it.reason },
+        )
+    }
+
+    @Test
+    fun duplicateDetectorSeparatesDifferentSubjectAndCategory() {
+        // Same key and value, but a different subject → not a pair.
+        assertTrue(
+            findDuplicateMemoryGroups(
+                listOf(
+                    memory("s1", subject = MemorySubject.User, key = "晚安约定", value = "同一件事"),
+                    memory("s2", subject = MemorySubject.Relationship, key = "晚安约定", value = "同一件事"),
+                ),
+            ).isEmpty(),
+        )
+        // Same key and subject, but a different category → not a pair.
+        assertTrue(
+            findDuplicateMemoryGroups(
+                listOf(
+                    memory("c1", category = MemoryCategory.Relationship, key = "晚安约定", value = "同一件事"),
+                    memory("c2", category = MemoryCategory.Promises, key = "晚安约定", value = "同一件事"),
+                ),
+            ).isEmpty(),
+        )
+        // Same bucket but unrelated keys *and* unrelated values → not a pair.
+        assertTrue(
+            findDuplicateMemoryGroups(
+                listOf(
+                    memory("d1", key = "晚安约定", value = "用户与角色约定每晚晚安吻后说爱你"),
+                    memory("d2", key = "早餐习惯", value = "角色每天清晨为用户准备一杯热豆浆"),
+                ),
+            ).isEmpty(),
+        )
+    }
+
+    @Test
+    fun duplicateDetectorValueSimilarityIsInclusiveAtTheThreshold() {
+        val v1 = "用户喜欢在睡前喝一杯热牛奶"
+        val v2 = "用户喜欢在睡前喝一杯温牛奶"
+        val similarity = textSimilarity(v1, v2)
+        assertTrue(similarity > 0.0 && similarity < 1.0)
+        // Deliberately *just below* the default threshold, so the default call must not flag it.
+        assertTrue(similarity < MEMORY_DUPLICATE_VALUE_SIMILARITY)
+        val pair = listOf(
+            memory("m1", category = MemoryCategory.Habits, subject = MemorySubject.User, key = "甲", value = v1),
+            memory("m2", category = MemoryCategory.Habits, subject = MemorySubject.User, key = "乙", value = v2),
+        )
+        assertTrue(findDuplicateMemoryGroups(pair).isEmpty())
+
+        // Exactly at the measured similarity the `>=` boundary includes the pair.
+        val atBoundary = findDuplicateMemoryGroups(pair, valueSimilarity = similarity)
+        assertEquals(1, atBoundary.size)
+        assertEquals(MemoryDuplicateReason.SIMILAR_VALUE, atBoundary.single().members[1].reason)
+        assertEquals(similarity, atBoundary.single().members[1].similarity, 1e-12)
+
+        // A hair above it: excluded again.
+        assertTrue(findDuplicateMemoryGroups(pair, valueSimilarity = similarity + 1e-6).isEmpty())
+
+        // Identical wording is always over the default threshold.
+        assertEquals(1, findDuplicateMemoryGroups(listOf(pair[0], pair[0].copy(id = "m3"))).size)
+    }
+
+    @Test
+    fun duplicateDetectorFlagsSimilarKeysAndNormalizesKeyEquality() {
+        val keyA = "用户和角色之间每晚睡前都要互道晚安并且说一句我爱你的固定约定"
+        val keyB = "用户和角色之间每天睡前都要互道晚安并且说一句我爱你的固定约定"
+        val pair = listOf(
+            memory("k1", key = keyA, value = "角色答应每晚睡前先给用户一个晚安吻"),
+            memory("k2", key = keyB, value = "角色每天清晨为用户准备好早餐"),
+        )
+        val keySimilarity = textSimilarity(keyA, keyB)
+        assertTrue(keySimilarity >= MEMORY_DUPLICATE_KEY_SIMILARITY)
+        val grouped = findDuplicateMemoryGroups(pair)
+        assertEquals(1, grouped.size)
+        assertEquals(MemoryDuplicateReason.SIMILAR_KEY, grouped.single().members[1].reason)
+        assertEquals(keySimilarity, grouped.single().members[1].similarity, 1e-12)
+        // A stricter key threshold splits them again (explicit threshold parameter).
+        assertTrue(
+            findDuplicateMemoryGroups(pair, keySimilarity = keySimilarity + 1e-6).isEmpty(),
+        )
+
+        // Punctuation-only difference is the same normalized key.
+        val sameKey = findDuplicateMemoryGroups(
+            listOf(
+                memory("n1", key = "晚安约定。", value = "第一件事"),
+                memory("n2", key = "晚安约定", value = "第二件完全不同的事"),
+            ),
+        )
+        assertEquals(MemoryDuplicateReason.SAME_KEY, sameKey.single().members[1].reason)
+
+        // Two blank keys with unrelated values must never collapse on "both empty".
+        assertTrue(
+            findDuplicateMemoryGroups(
+                listOf(
+                    memory("z1", key = "", value = "用户喜欢咖啡"),
+                    memory("z2", key = "", value = "角色喜欢在雨天散步"),
+                ),
+            ).isEmpty(),
+        )
+    }
+
+    @Test
+    fun duplicateDetectorIsDeterministic() {
+        val items = listOf(
+            memory("a", key = "晚安约定", value = "用户与角色约定每晚晚安吻后说爱你"),
+            memory("b", category = MemoryCategory.Habits, subject = MemorySubject.User, key = "饮品", value = "用户喜欢喝美式咖啡"),
+            memory("c", key = "晚安约定。", value = "用户与角色约定每晚晚安吻后说爱你"),
+            memory("d", category = MemoryCategory.Habits, subject = MemorySubject.User, key = "咖啡", value = "用户喜欢喝美式咖啡。"),
+            memory("e", key = "旅行计划", value = "两人计划下个月去海边"),
+        )
+        val first = findDuplicateMemoryGroups(items)
+        val second = findDuplicateMemoryGroups(items)
+        assertEquals(first, second)
+        assertEquals(listOf("a", "c"), first[0].members.map { it.id })
+        assertEquals(listOf("b", "d"), first[1].members.map { it.id })
+    }
+
+    @Test
+    fun duplicateDetectorReturnsNothingForEmptyOrSingleInput() {
+        assertTrue(findDuplicateMemoryGroups(emptyList()).isEmpty())
+        assertTrue(findDuplicateMemoryGroups(listOf(memory("only", key = "晚安约定", value = "唯一一条"))).isEmpty())
+    }
+
+    @Test
+    fun duplicateDetectorDoesNotMutateOrDropEntries() {
+        val items = listOf(
+            memory("m1", key = "晚安约定", value = "用户与角色约定每晚晚安吻后说爱你"),
+            memory("m2", key = "晚安约定", value = "用户与角色约定每晚晚安吻后说爱你"),
+            memory("m3", category = MemoryCategory.Events, subject = MemorySubject.World, key = "雨天", value = "两人在窗边听雨"),
+        )
+        val before = items.toList()
+        val groups = findDuplicateMemoryGroups(items)
+        // The input list is untouched (same size, same entries, same order).
+        assertEquals(before, items)
+        assertEquals(3, items.size)
+        assertEquals(listOf("m1", "m2"), groups.single().members.map { it.id })
+        // The unrelated entry is neither grouped nor removed.
+        assertTrue(items.any { it.id == "m3" })
+    }
 }

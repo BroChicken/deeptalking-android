@@ -14,6 +14,10 @@ import com.deeptalking.core.model.SourceEvidence
 import com.deeptalking.core.model.StaticFillMeta
 import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.domain.memory.MemoryServiceImpl
+import com.deeptalking.domain.memory.formatAbsoluteDate
+import com.deeptalking.domain.memory.getTimeSlot
+import com.deeptalking.domain.memory.logicalDay
+import com.deeptalking.domain.memory.parseZoned
 import com.deeptalking.engine.ondevice.LlmBackend
 import com.deeptalking.engine.ondevice.LlmChunk
 import com.deeptalking.engine.ondevice.LlmRequest
@@ -26,6 +30,8 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.time.Instant
+import java.time.format.DateTimeFormatter
+import java.util.Locale
 
 private class ScriptedLlm(private val responses: MutableList<String>) : LlmBackend {
     override val id = "scripted"
@@ -292,6 +298,78 @@ class BackgroundTasksTest {
         assertEquals(BackgroundTasks.TaskStatus.Success, status)
         assertTrue(updated.scenes.isEmpty())
         assertEquals(0, llm.requests.size)
+    }
+
+    // ------------------------------------------------- scene input carries real times
+
+    /** A scene ready to summarize: the location changed and 6 messages followed the cursor. */
+    private fun sceneCharacter(messages: List<ChatMessage>) = Character(
+        id = "c1",
+        name = "小雨",
+        instant = messages,
+        dynamicState = DynamicState(currentLocation = "咖啡馆"),
+        sceneState = SceneState(key = "图书馆", startCount = 0, startSequence = 0, messageCount = 0),
+    )
+
+    @Test
+    fun sceneInputCarriesEveryMessageTimeAndTheCurrentDate() = runBlocking {
+        // The scene prompt demands absolute dates and the transcript used to carry no time at
+        // all, so the model guessed (wrote 2026-06-12 for a scene that happened 2026-10-17).
+        // Every line now carries that message's own local clock + logical day/slot, and the
+        // input opens with the current real date/time.
+        val (background, llm) = tasks(listOf("用户和小雨在咖啡馆聊了很久，约好周末一起去看展。"))
+        val first = "2026-10-17T06:23:00Z"
+        val messages = (1..6).map { index ->
+            ChatMessage(
+                id = "m$index",
+                role = if (index % 2 == 0) Role.Assistant else Role.User,
+                content = "对话内容$index",
+                timestamp = if (index == 1) first else "2026-10-17T08:30:00Z",
+                sequence = index,
+            )
+        }
+        val now = Instant.parse("2026-10-18T07:04:05Z")
+        val (status, updated) = background.summarizeScene(sceneCharacter(messages), "咖啡馆", now)
+        assertEquals(BackgroundTasks.TaskStatus.Success, status)
+        assertEquals(1, updated.scenes.size)
+
+        val prompt = llm.requests.single().input.last().content
+        // Each message keeps its own time: local clock + logical day + slot.
+        val zoned = parseZoned(first)!!
+        val stamp = zoned.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")) +
+            "（逻辑日 " + formatAbsoluteDate(logicalDay(zoned)) + " " + getTimeSlot(zoned.toLocalTime()) + "）"
+        assertTrue("消息自身的时间没有被喂给模型: $stamp", prompt.contains("[1] $stamp 用户: 对话内容1"))
+        // …and the input opens with the current real date/time.
+        val nowZoned = parseZoned(now.toString())!!
+        assertTrue(prompt.contains("【时间基准】"))
+        assertTrue(
+            prompt.contains(
+                "当前本地时间: " + nowZoned.format(
+                    DateTimeFormatter.ofPattern("yyyy年MM月dd日EEEE HH:mm:ss", Locale.CHINA),
+                ),
+            ),
+        )
+        assertTrue(prompt.contains("逻辑日: " + formatAbsoluteDate(logicalDay(nowZoned))))
+    }
+
+    @Test
+    fun sceneInputNeverInventsDatesForMessagesWithoutATime() = runBlocking {
+        val (background, llm) = tasks(listOf("用户和小雨聊了一会儿。"))
+        val messages = (1..6).map { index ->
+            ChatMessage(id = "m$index", role = Role.User, content = "对话内容$index", sequence = index)
+        }
+        val (status, _) = background.summarizeScene(
+            sceneCharacter(messages),
+            "咖啡馆",
+            Instant.parse("2026-10-18T07:04:05Z"),
+        )
+        assertEquals(BackgroundTasks.TaskStatus.Success, status)
+        val prompt = llm.requests.single().input.last().content
+        // No usable time → the line says so and carries no date at all, rather than a guess.
+        assertTrue(prompt.contains("[1] （本条时间未知） 用户: 对话内容1"))
+        val messageLines = prompt.lines().filter { it.startsWith("[") }
+        assertEquals(6, messageLines.size)
+        assertTrue("时间未知的消息不得带日期", messageLines.all { !it.contains("20") })
     }
 
     @Test
@@ -921,6 +999,55 @@ class BackgroundTasksTest {
         assertTrue(outcome.character.shortTerm.none { it.id == "s1" })
         assertEquals(20, outcome.character.shortTerm.size)
         assertTrue(outcome.character.shortTerm.all { it.id.startsWith("f") })
+    }
+
+    // ------------------------------------------ analysis input: the flag vs. producibility
+
+    /** The `analyzed` value the input entry [id] was sent with, or null when it is absent. */
+    private fun analyzedFlagOf(prompt: String, id: String): String? =
+        Regex("\\{\"id\":\"" + Regex.escape(id) + "\".*?\"analyzed\":(true|false)")
+            .find(prompt)?.groupValues?.get(1)
+
+    @Test
+    fun analysisInputFlagsTheProducibleBatchAndTheContextBatchApart() = runBlocking {
+        // The flag means "context-only for this pass", not "already recorded": the oldest entry
+        // is this pass's production target (analyzed=false), and the newest leftovers — which
+        // have *not* been folded yet — are context (analyzed=true). The prompt must therefore
+        // stop describing that context batch as 已整理, which is what made the model treat the
+        // freshest events as already stored and under-record them.
+        val (background, llm) = tasks(listOf("""{"status":"ok","analyzedShortTermIds":["s1"],"longTerm":[]}"""))
+        val outcome = background.analyzeShortToLongTermStatus(analyzableCharacter())
+        assertEquals(BackgroundTasks.TaskStatus.Success, outcome.status)
+
+        val prompt = llm.requests.single().input.last().content
+        assertEquals("false", analyzedFlagOf(prompt, "s1")) // producible this pass
+        assertEquals("true", analyzedFlagOf(prompt, "s21")) // newest leftover: context only
+        assertFalse("上下文批次不该被说成已整理", prompt.contains("前一轮已整理过"))
+        assertTrue("应说明该批是本轮的非产出对象", prompt.contains("本轮不作为产出对象"))
+        assertTrue("应说明它们尚未整理", prompt.contains("尚未"))
+        assertTrue(prompt.contains("不得因为看到它们就认为其中的事实已经记录过"))
+        // The return convention still holds: the whole producible set is acknowledged, and
+        // consumption stays positional (context is never consumed).
+        assertEquals(listOf("s1"), outcome.consumed.map { it.id })
+        assertEquals(20, outcome.character.shortTerm.size)
+    }
+
+    @Test
+    fun analysisStillRefusesToProduceForContextOnlyEntries() = runBlocking {
+        // No duplicating: the context batch is held back, so a long-term entry citing one of
+        // those ids cannot land this pass (it belongs to a later one), while the entry citing
+        // the batch entry from the same reply does.
+        val response = """{"status":"ok","analyzedShortTermIds":["s1","s21"],"longTerm":[""" +
+            """{"category":"events","subject":"user","key":"上下文里的重复条目","value":"用户2026-08-01下午待整理的事",""" +
+            """"sourceShortTermIds":["s21"],"sourceMessageIds":["u1"],"evidence":"用户喜欢喝美式咖啡。"},""" +
+            """{"category":"userProfile","subject":"user","key":"饮品","value":"用户喜欢喝美式咖啡。",""" +
+            """"sourceShortTermIds":["s1"],"sourceMessageIds":["u1"],"evidence":"用户喜欢喝美式咖啡。"}]}"""
+        val (background, _) = tasks(listOf(response))
+        val outcome = background.analyzeShortToLongTermStatus(analyzableCharacter())
+        assertEquals(BackgroundTasks.TaskStatus.Success, outcome.status)
+        assertEquals(listOf("饮品"), outcome.character.longTerm.map { it.key })
+        assertEquals(listOf("s1"), outcome.consumed.map { it.id })
+        assertTrue(outcome.character.shortTerm.any { it.id == "s21" })
     }
 
     // ------------------------------------------------- world-book trigger (per turn)

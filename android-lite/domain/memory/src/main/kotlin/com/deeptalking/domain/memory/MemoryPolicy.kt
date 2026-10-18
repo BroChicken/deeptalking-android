@@ -989,3 +989,180 @@ fun resolveMemoryConflicts(character: Character, now: String = Instant.now().toS
         longTerm = resolveMemoryConflicts(character.longTerm, now),
         members = character.members.map { it.copy(longTerm = resolveMemoryConflicts(it.longTerm, now)) },
     )
+
+// ---- duplicate detection (advisory only) ----------------------------------------------
+//
+// Long-term memory accumulates several near-identical entries for one fact (the same promise
+// re-extracted over a few turns, the same relationship fact reworded). Folding them
+// automatically is unsafe: two genuinely different promises that share wording would be
+// merged and their details lost. This section therefore only *reports* suspected groups for
+// a later UI / manual confirmation — it never merges, reorders, or drops anything, and it
+// touches no existing write/trim path.
+
+/**
+ * Normalized identity of a long-term memory **key** for duplicate detection: lowercase with
+ * punctuation/symbols/whitespace stripped (the same normalization [textSimilarity] uses), so
+ * `"晚安约定。"` and `"晚安约定"` are the same label. Note the write path
+ * ([upsertLongTermMemory]) deliberately keeps such keys apart (exact match only); detection
+ * merely *reports* the pair, it never folds it.
+ */
+fun normalizeMemoryKey(key: String): String = normalizeMemoryText(key)
+
+/**
+ * Key similarity at which two non-empty keys under one category + subject are flagged as a
+ * suspected duplicate pair. Keys are short labels, where bigram Jaccard is noisy, so this is
+ * deliberately stricter than [MEMORY_DUPLICATE_VALUE_SIMILARITY].
+ */
+const val MEMORY_DUPLICATE_KEY_SIMILARITY = 0.86
+
+/**
+ * Value similarity at which two non-empty values under one category + subject are flagged
+ * as a suspected duplicate pair. Aligned with the global near-duplicate rule
+ * ([AppLimits.Memory.NEAR_DUP_SIMILARITY]) so the advisory signal matches the wording
+ * similarity the rest of the memory pipeline already treats as "the same fact".
+ */
+const val MEMORY_DUPLICATE_VALUE_SIMILARITY = AppLimits.Memory.NEAR_DUP_SIMILARITY
+
+/** Why a member of a [MemoryDuplicateGroup] is suspected to repeat the group's anchor. */
+enum class MemoryDuplicateReason {
+    /** The group's anchor itself (similarity 1.0 by definition). */
+    ANCHOR,
+
+    /** The normalized keys are identical. */
+    SAME_KEY,
+
+    /** The normalized keys are both non-empty and similar at [MEMORY_DUPLICATE_KEY_SIMILARITY]. */
+    SIMILAR_KEY,
+
+    /** The keys did not match, but the values are similar at [MEMORY_DUPLICATE_VALUE_SIMILARITY]. */
+    SIMILAR_VALUE,
+}
+
+/** One member of a suspected duplicate [MemoryDuplicateGroup], with the criterion that tied it to the anchor. */
+data class MemoryDuplicateMember(
+    val id: String,
+    val key: String,
+    val reason: MemoryDuplicateReason,
+    /** Similarity to the group's anchor (always 1.0 for [MemoryDuplicateReason.ANCHOR] / [MemoryDuplicateReason.SAME_KEY]). */
+    val similarity: Double,
+)
+
+/**
+ * A suspected duplicate group (advisory — nothing is merged or removed). Members share one
+ * category + subject and one of the criteria in [MemoryDuplicateReason]; they are listed in
+ * input order with the anchor first, so the group is stable for the same input.
+ */
+data class MemoryDuplicateGroup(
+    val category: MemoryCategory,
+    val subject: MemorySubject,
+    /** Id of the group's anchor (the first member by input order). */
+    val anchorId: String,
+    /** Stable identity of the group: `category/subject/normalized-anchor-key`. */
+    val groupId: String,
+    /** Members in input order, the anchor first. Always at least two. */
+    val members: List<MemoryDuplicateMember>,
+)
+
+/** Verdict of one pair comparison: the criterion and the similarity it was based on. */
+private data class DuplicateMatch(val reason: MemoryDuplicateReason, val similarity: Double)
+
+/**
+ * Classifies one candidate pair that already shares category + subject. Returns `null` when
+ * the pair is not a suspected duplicate.
+ *
+ * Order is fixed: an identical normalized key first ([MemoryDuplicateReason.SAME_KEY]), then a
+ * highly similar key, then a highly similar value. A key comparison needs **both** keys
+ * non-empty, so two entries with blank keys can never collapse on "both empty".
+ */
+private fun classifyDuplicatePair(
+    anchor: LongTermMemory,
+    other: LongTermMemory,
+    keySimilarity: Double,
+    valueSimilarity: Double,
+): DuplicateMatch? {
+    val anchorKey = normalizeMemoryKey(anchor.key)
+    val otherKey = normalizeMemoryKey(other.key)
+    if (anchorKey.isNotEmpty() && otherKey.isNotEmpty()) {
+        if (anchorKey == otherKey) return DuplicateMatch(MemoryDuplicateReason.SAME_KEY, 1.0)
+        val similarity = textSimilarity(anchor.key, other.key)
+        if (similarity >= keySimilarity) return DuplicateMatch(MemoryDuplicateReason.SIMILAR_KEY, similarity)
+    }
+    val anchorValue = normalizeMemoryText(anchor.value)
+    val otherValue = normalizeMemoryText(other.value)
+    if (anchorValue.isNotEmpty() && otherValue.isNotEmpty()) {
+        val similarity = textSimilarity(anchor.value, other.value)
+        if (similarity >= valueSimilarity) return DuplicateMatch(MemoryDuplicateReason.SIMILAR_VALUE, similarity)
+    }
+    return null
+}
+
+/**
+ * Advisory detection of near-duplicate long-term memories: returns groups of entries that
+ * likely describe the same fact, for a later confirmation UI. It is **pure** — the input
+ * list is never mutated, nothing is merged or removed, and no existing write/trim behaviour
+ * changes.
+ *
+ * A pair is suspected only when it shares **category *and* subject** and either its
+ * normalized keys are identical, its keys are similar at [keySimilarity]
+ * ([MEMORY_DUPLICATE_KEY_SIMILARITY] by default), or its values are similar at
+ * [valueSimilarity] ([MEMORY_DUPLICATE_VALUE_SIMILARITY] by default, matching the global
+ * near-duplicate rule). The thresholds are parameters so callers/tests can pin the boundary.
+ *
+ * Grouping is greedy and anchor-based: within one category + subject bucket the entries are
+ * visited in input order, and each entry joins the **first** group whose anchor it matches
+ * (otherwise it starts a new group). Buckets keep input order, anchors keep input order and
+ * members keep input order, so the same input always yields the byte-identical result.
+ * Single-entry groups are dropped; empty and single-entry inputs return an empty list.
+ */
+fun findDuplicateMemoryGroups(
+    items: List<LongTermMemory>,
+    keySimilarity: Double = MEMORY_DUPLICATE_KEY_SIMILARITY,
+    valueSimilarity: Double = MEMORY_DUPLICATE_VALUE_SIMILARITY,
+): List<MemoryDuplicateGroup> {
+    if (items.size < 2) return emptyList()
+
+    // Insertion-ordered buckets: iteration is deterministic for a given input order.
+    val buckets = linkedMapOf<Pair<MemoryCategory, MemorySubject>, MutableList<LongTermMemory>>()
+    for (item in items) buckets.getOrPut(item.category to item.subject) { mutableListOf() } += item
+
+    val groups = mutableListOf<MemoryDuplicateGroup>()
+    for ((bucketKey, bucket) in buckets) {
+        if (bucket.size < 2) continue
+        val (category, subject) = bucketKey
+        val anchors = mutableListOf<LongTermMemory>()
+        val members = mutableListOf<MutableList<MemoryDuplicateMember>>()
+        for (item in bucket) {
+            var matchedIndex = -1
+            var match: DuplicateMatch? = null
+            for (index in anchors.indices) {
+                val candidate = classifyDuplicatePair(anchors[index], item, keySimilarity, valueSimilarity)
+                if (candidate != null) {
+                    matchedIndex = index
+                    match = candidate
+                    break
+                }
+            }
+            if (matchedIndex >= 0 && match != null) {
+                members[matchedIndex] += MemoryDuplicateMember(item.id, item.key, match.reason, match.similarity)
+            } else {
+                anchors += item
+                members += mutableListOf(
+                    MemoryDuplicateMember(item.id, item.key, MemoryDuplicateReason.ANCHOR, 1.0),
+                )
+            }
+        }
+        for (index in anchors.indices) {
+            val group = members[index]
+            if (group.size < 2) continue
+            val anchor = anchors[index]
+            groups += MemoryDuplicateGroup(
+                category = category,
+                subject = subject,
+                anchorId = anchor.id,
+                groupId = "${category.legacyKey}/${subject.name.lowercase()}/${normalizeMemoryKey(anchor.key)}",
+                members = group.toList(),
+            )
+        }
+    }
+    return groups
+}

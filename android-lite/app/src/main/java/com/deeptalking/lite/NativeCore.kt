@@ -1156,6 +1156,16 @@ class NativeCore(context: Context) {
     }
 
     /**
+     * Retracts the reminder for [id]: pending work + an already-posted notification + the
+     * registry entry (`Reminders.cancel`). Called when the backing promise is completed,
+     * cancelled, removed or its character is deleted. Idempotent.
+     */
+    fun cancelReminder(id: String) {
+        if (id.isBlank()) return
+        com.deeptalking.core.notifications.Reminders.cancel(appContext, id)
+    }
+
+    /**
      * Builds a per-turn orchestrator using the current config snapshot so model,
      * base URL, temperature and stream settings always reflect the latest
      * choices from Settings. Background tasks (prose memory extraction, style
