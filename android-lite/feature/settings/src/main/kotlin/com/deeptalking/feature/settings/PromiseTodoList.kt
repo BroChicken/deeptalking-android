@@ -25,9 +25,6 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.deeptalking.core.designsystem.legacy
-import java.time.Instant
-import java.time.ZoneId
-import java.time.format.DateTimeFormatter
 
 /**
  * The 待办 list: the active character's promises, bucketed by [PromiseTodoSection].
@@ -133,17 +130,6 @@ private fun TodoAction(label: String, onClick: () -> Unit) {
     ) {
         Text(label, fontSize = 11.sp, color = legacy.text)
     }
-}
-
-private val TODO_DUE_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
-
-private fun dueLabel(todo: PromiseTodo): String = when {
-    todo.dueAtMillis != null ->
-        "期限：" + TODO_DUE_FORMAT.format(
-            Instant.ofEpochMilli(todo.dueAtMillis).atZone(ZoneId.systemDefault()),
-        )
-    !todo.unconfirmedDueAt.isNullOrBlank() -> "待确认期限：${todo.unconfirmedDueAt}"
-    else -> "无期限"
 }
 
 private fun sectionLabel(section: PromiseTodoSection): String = when (section) {

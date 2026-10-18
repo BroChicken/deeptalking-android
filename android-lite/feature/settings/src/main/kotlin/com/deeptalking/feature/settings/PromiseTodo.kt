@@ -6,6 +6,27 @@ import com.deeptalking.core.model.MemoryCategory
 import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.domain.memory.PromisePushDecision
 import com.deeptalking.domain.memory.promisePushDecision
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+
+/** 待办行上的期限只在**已在对话里说清、可核对**时显示，且一律渲染成绝对时间。 */
+internal val TODO_DUE_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
+
+/**
+ * 待办的期限文案。
+ *
+ * 确认过的期限渲染成本地绝对时间；未确认的期限**不展示模型给的相对说法**（"稍后/今晚/下周"这类），
+ * 只提示去把具体日期时间说清楚——待办里不出现相对时间。
+ */
+internal fun dueLabel(todo: PromiseTodo): String = when {
+    todo.dueAtMillis != null ->
+        "期限：" + TODO_DUE_FORMAT.format(
+            Instant.ofEpochMilli(todo.dueAtMillis).atZone(ZoneId.systemDefault()),
+        )
+    !todo.unconfirmedDueAt.isNullOrBlank() -> "待确认期限（请在对话里说明具体日期与时间）"
+    else -> "无期限"
+}
 
 /**
  * The 待办 bucket one stored promise appears in.

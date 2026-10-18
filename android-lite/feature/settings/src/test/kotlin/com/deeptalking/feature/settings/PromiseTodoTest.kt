@@ -8,6 +8,7 @@ import com.deeptalking.core.model.MemorySubject
 import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.Role
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -64,6 +65,20 @@ class PromiseTodoTest {
     /** One hour before / after the fixture's due time. */
     private val beforeDue = at(dueAt) - 3_600_000L
     private val afterDue = at(dueAt) + 3_600_000L
+
+    @Test
+    fun dueLabelShowsOnlyAbsoluteTimesAndNeverTheModelsRelativeWording() {
+        // 已确认的期限：只渲染成本地绝对时间。
+        val confirmed = promiseTodos(character.copy(longTerm = listOf(userPromise())), beforeDue).single()
+        assertTrue(Regex("^期限：\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}$").matches(dueLabel(confirmed)))
+
+        // 未确认的期限：不得把模型给的相对说法显示出来。
+        val vague = userPromise(id = "p2", due = "稍后", key = "做饭", value = "我做饭给你吃")
+            .copy(evidence = "我做饭给你吃")
+        val label = dueLabel(promiseTodos(character.copy(longTerm = listOf(vague)), beforeDue).single())
+        assertTrue(label.contains("待确认期限"))
+        assertFalse(label.contains("稍后"))
+    }
 
     @Test
     fun userConfirmedPromiseWithLocatedDueTimeIsOngoing() {
