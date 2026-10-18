@@ -8,6 +8,8 @@ import com.deeptalking.core.model.GroupMember
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.LorebookOrigin
 import com.deeptalking.core.model.StaticProfile
+import com.deeptalking.core.model.capacityLorebookEntries
+import com.deeptalking.core.model.lorebookCapacityCount
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -388,6 +390,154 @@ class CharacterParityTest {
             com.deeptalking.core.common.AppLimits.Lorebook.CONTENT_CHARS,
             CharacterParity.capLorebookContent("x".repeat(3000)).length,
         )
+    }
+
+    // ------------------------------------------------ 成员世界书（页签跟随正在编辑的对象）
+
+    private fun entry(id: String, name: String = id, createdAt: String = "2026-01-01T00:00:00Z") =
+        LorebookEntry(id = id, name = name, content = "内容-$id", createdAt = createdAt)
+
+    private fun group(
+        shared: List<LorebookEntry> = emptyList(),
+        m1: List<LorebookEntry> = emptyList(),
+        m2: List<LorebookEntry> = emptyList(),
+        m1Archive: List<LorebookEntry> = emptyList(),
+        m2Archive: List<LorebookEntry> = emptyList(),
+    ) = Character(
+        id = "g",
+        isGroup = true,
+        lorebook = shared,
+        members = listOf(
+            GroupMember(id = "m1", name = "甲", lorebook = m1, lorebookArchive = m1Archive),
+            GroupMember(id = "m2", name = "乙", lorebook = m2, lorebookArchive = m2Archive),
+        ),
+    )
+
+    @Test
+    fun lorebookViewFollowsTheEditedMemberAndNeverFallsBackToTheSharedBook() {
+        val group = group(
+            shared = listOf(entry("s1")),
+            m1 = listOf(entry("a1")),
+            m2 = listOf(entry("b1")),
+            m2Archive = listOf(entry("b9")),
+        )
+
+        assertEquals(listOf("s1"), CharacterParity.lorebookOf(group, null).map { it.id })
+        assertEquals(listOf("a1"), CharacterParity.lorebookOf(group, "m1").map { it.id })
+        assertEquals(listOf("b1"), CharacterParity.lorebookOf(group, "m2").map { it.id })
+
+        assertEquals(emptyList<String>(), CharacterParity.lorebookArchiveOf(group, null).map { it.id })
+        assertEquals(emptyList<String>(), CharacterParity.lorebookArchiveOf(group, "m1").map { it.id })
+        assertEquals(listOf("b9"), CharacterParity.lorebookArchiveOf(group, "m2").map { it.id })
+
+        // 未知 / 空 id 不回落到本体：绝不能把成员的编辑写进共享世界书。
+        assertTrue(CharacterParity.lorebookOf(group, "nope").isEmpty())
+        assertTrue(CharacterParity.lorebookOf(group, "").isEmpty())
+        assertTrue(CharacterParity.lorebookArchiveOf(group, "nope").isEmpty())
+    }
+
+    @Test
+    fun memberEntryEditLandsOnThatMemberOnlyAndIsAddressedById() {
+        val group = group(
+            shared = listOf(entry("s1", "本体条目")),
+            m1 = listOf(entry("a1", "甲条目")),
+            m2 = listOf(entry("b1", "乙条目"), entry("b2", "乙二")),
+        )
+
+        // m2 在 members[1]：按 id 定位（不是下标），改的必须是它。
+        val updated = CharacterParity.updateMemberLorebookEntry(group, "m2", entry("b1", "乙改"))
+        assertEquals("乙改", updated.members[1].lorebook.first { it.id == "b1" }.name)
+        assertEquals("乙二", updated.members[1].lorebook.first { it.id == "b2" }.name)
+        assertEquals(listOf("a1"), updated.members[0].lorebook.map { it.id })
+        assertEquals(group.lorebook, updated.lorebook)
+        assertEquals(group.members[0], updated.members[0])
+
+        // 找不到 / id 为空：原样返回，不误写本体或别的成员。
+        assertEquals(group, CharacterParity.updateMemberLorebookEntry(group, "nope", entry("b1", "x")))
+        assertEquals(group, CharacterParity.updateMemberLorebookEntry(group, "", entry("b1", "x")))
+    }
+
+    @Test
+    fun archivingAMemberEntryMovesItIntoThatMembersArchiveOnly() {
+        val group = group(
+            shared = listOf(entry("s1")),
+            m1 = listOf(entry("a1"), entry("a2")),
+            m2 = listOf(entry("b1")),
+        )
+
+        val archived = CharacterParity.archiveMemberLorebookEntry(group, "m1", "a1")
+
+        // 条目从该成员的在册列表进入**该成员的**归档。
+        assertEquals(listOf("a2"), archived.members[0].lorebook.map { it.id })
+        assertEquals(listOf("a1"), archived.members[0].lorebookArchive.map { it.id })
+        // 本体与其它成员不受影响（本体归档也没被写入）。
+        assertEquals(listOf("s1"), archived.lorebook.map { it.id })
+        assertTrue(archived.lorebookArchive.isEmpty())
+        assertEquals(listOf("b1"), archived.members[1].lorebook.map { it.id })
+        assertTrue(archived.members[1].lorebookArchive.isEmpty())
+        // 归档条目既不在在册列表（不会被注入），也不再计入全局名额。
+        assertEquals(3, archived.lorebookCapacityCount())
+        assertTrue(archived.capacityLorebookEntries().none { it.id == "a1" })
+    }
+
+    @Test
+    fun restoringAMemberEntryPutsItBackIntoThatMembersBook() {
+        val group = group(
+            shared = listOf(entry("s1")),
+            m1 = listOf(entry("a2")),
+            m2 = listOf(entry("b1")),
+            m1Archive = listOf(entry("a1")),
+        )
+
+        val restored = CharacterParity.restoreMemberLorebookEntry(group, "m1", "a1")
+
+        assertEquals(listOf("a2", "a1"), restored.members[0].lorebook.map { it.id })
+        assertTrue(restored.members[0].lorebookArchive.isEmpty())
+        // 本体与其它成员不受影响。
+        assertEquals(listOf("s1"), restored.lorebook.map { it.id })
+        assertTrue(restored.lorebookArchive.isEmpty())
+        assertEquals(listOf("b1"), restored.members[1].lorebook.map { it.id })
+
+        // 该成员并不拥有这条归档 id 时不还原（别的书也不动）。
+        assertEquals(group, CharacterParity.restoreMemberLorebookEntry(group, "m2", "a1"))
+        assertEquals(group, CharacterParity.restoreMemberLorebookEntry(group, "nope", "a1"))
+    }
+
+    @Test
+    fun restoringAMemberEntryNeverEvictsTheRestoredEntryItself() {
+        val limit = AppLimits.Lorebook.ENTRIES
+        val idle = "2020-01-01T00:00:00Z"
+        // 该成员的在册列表正好占满全局名额，归档里那条同样"最久未活跃"（id 还排在最前）。
+        val group = group(
+            m1 = (1..limit).map { entry("e$it", createdAt = idle) },
+            m1Archive = listOf(entry("back", createdAt = idle)),
+        )
+
+        val restored = CharacterParity.restoreMemberLorebookEntry(group, "m1", "back")
+
+        // 恢复的条目留在书里，被淘汰的是另一位（id 最小的 e1）——恢复时不排除自身就会被立刻打回归档。
+        assertTrue(restored.members[0].lorebook.any { it.id == "back" })
+        assertEquals(listOf("e1"), restored.members[0].lorebookArchive.map { it.id })
+        assertEquals(limit, restored.lorebookCapacityCount())
+    }
+
+    @Test
+    fun addingToAMemberBookArchivesTheGloballyOldestIntoItsOwnBook() {
+        val limit = AppLimits.Lorebook.ENTRIES
+        val group = group(
+            shared = listOf(entry("s-old", createdAt = "2020-01-01T00:00:00Z")),
+            m1 = (1 until limit).map { entry("a$it", createdAt = "2026-01-01T00:00:00Z") },
+        )
+
+        val added = CharacterParity.addMemberLorebookEntry(group, "m1", entry("new", createdAt = "2026-06-01T00:00:00Z"))
+
+        // 名额仍是全局的：新条目落在成员的世界书，被淘汰的是全局最久未活跃的本体条目，
+        // 并且按"从哪本书来就进哪本归档"进了**本体**的归档。
+        assertEquals(limit, added.lorebookCapacityCount())
+        assertTrue(added.members[0].lorebook.any { it.id == "new" })
+        assertTrue(added.lorebook.isEmpty())
+        assertEquals(listOf("s-old"), added.lorebookArchive.map { it.id })
+        assertTrue(added.members[0].lorebookArchive.isEmpty())
     }
 
     @Test

@@ -345,11 +345,26 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
             character = characters.firstOrNull { it.id == target.id } ?: target,
             onDismiss = { editingCharacter = null; editingMemberIndex = null },
             onUpdate = vm::saveCharacterEdit,
-            onAddLorebook = vm::addLorebookEntry,
-            onRemoveLorebook = vm::removeLorebookEntry,
-            onUpdateLorebook = vm::updateLorebookEntry,
-            onArchiveLorebook = vm::archiveLorebookEntry,
-            onRestoreLorebook = vm::restoreLorebookEntry,
+            onAddLorebook = { characterId, memberId, entry ->
+                if (memberId == null) vm.addLorebookEntry(characterId, entry)
+                else vm.addMemberLorebookEntry(characterId, memberId, entry)
+            },
+            onRemoveLorebook = { characterId, memberId, entryId ->
+                if (memberId == null) vm.removeLorebookEntry(characterId, entryId)
+                else vm.removeMemberLorebookEntry(characterId, memberId, entryId)
+            },
+            onUpdateLorebook = { characterId, memberId, entry ->
+                if (memberId == null) vm.updateLorebookEntry(characterId, entry)
+                else vm.updateMemberLorebookEntry(characterId, memberId, entry)
+            },
+            onArchiveLorebook = { characterId, memberId, entryId ->
+                if (memberId == null) vm.archiveLorebookEntry(characterId, entryId)
+                else vm.archiveMemberLorebookEntry(characterId, memberId, entryId)
+            },
+            onRestoreLorebook = { characterId, memberId, entryId ->
+                if (memberId == null) vm.restoreLorebookEntry(characterId, entryId)
+                else vm.restoreMemberLorebookEntry(characterId, memberId, entryId)
+            },
             onGenerateAvatar = { char, cb -> vm.generateEmojiAvatar(char, cb) },
             onFillMember = { char, index, hint -> vm.fillGroupMember(char, index, hint) },
             initialMemberIndex = editingMemberIndex,

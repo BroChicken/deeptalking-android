@@ -1019,10 +1019,11 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         }
     }
 
-    private fun emitArchiveNotice(archived: List<LorebookEntry>) {
+    private fun emitArchiveNotice(archived: List<LorebookEntry>, memberName: String? = null) {
         if (archived.isEmpty()) return
+        val who = memberName?.takeIf { it.isNotBlank() }?.let { "（成员：$it）" }.orEmpty()
         eventsState.tryEmit(
-            UiEvent("世界书已满，已归档最久未活跃的 ${archived.size} 条：${archived.joinToString("、") { it.name }}"),
+            UiEvent("世界书已满，已归档最久未活跃的 ${archived.size} 条$who：${archived.joinToString("、") { it.name }}"),
         )
     }
 
@@ -1040,6 +1041,100 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             live.copy(lorebook = live.lorebook.map { if (it.id == entry.id) entry else it })
         }
     }
+
+    // -------------------------------------------------- member world books
+
+    /**
+     * The same five world-book edits, aimed at **one member's** book. The member is addressed
+     * by **id**, not by its index: the card editor's member list is a snapshot and may have
+     * changed while the dialog was open. Only that member's book/archive is touched — the
+     * shared book and every other member are left alone ([CharacterParity.updateMemberLorebook]
+     * is the single addressing point shared with the editor's draft mirror).
+     */
+    fun addMemberLorebookEntry(characterId: String, memberId: String, entry: LorebookEntry) {
+        patchCharacter(characterId) { live ->
+            val withEntry = CharacterParity.updateMemberLorebook(live, memberId) { it.copy(lorebook = it.lorebook + entry) }
+            if (withEntry == live) return@patchCharacter live
+            val overflow = lorebookOverflow(withEntry)
+            if (overflow <= 0) {
+                withEntry
+            } else {
+                val adjustment = archiveToFit(withEntry, overflow, excludeIds = setOf(entry.id))
+                if (adjustment.unmet > 0) {
+                    eventsState.tryEmit(UiEvent("世界书已满（其余条目为人工维护或常驻），无法新增；请先归档或删除一些条目"))
+                    live
+                } else {
+                    emitArchiveNotice(adjustment.archived, memberNameOf(live, memberId))
+                    adjustment.character
+                }
+            }
+        }
+    }
+
+    fun updateMemberLorebookEntry(characterId: String, memberId: String, entry: LorebookEntry) {
+        patchCharacter(characterId) { live ->
+            CharacterParity.updateMemberLorebook(live, memberId) { member ->
+                member.copy(lorebook = member.lorebook.map { if (it.id == entry.id) entry else it })
+            }
+        }
+    }
+
+    fun removeMemberLorebookEntry(characterId: String, memberId: String, entryId: String) {
+        patchCharacter(characterId) { live ->
+            CharacterParity.updateMemberLorebook(live, memberId) { member ->
+                member.copy(
+                    lorebook = member.lorebook.filterNot { it.id == entryId },
+                    lorebookArchive = member.lorebookArchive.filterNot { it.id == entryId },
+                )
+            }
+        }
+    }
+
+    /** Soft-deletes one member's entry into **that member's** archive; restorable from the editor. */
+    fun archiveMemberLorebookEntry(characterId: String, memberId: String, entryId: String) {
+        patchCharacter(characterId) { live ->
+            CharacterParity.updateMemberLorebook(live, memberId) { member ->
+                val entry = member.lorebook.firstOrNull { it.id == entryId } ?: return@updateMemberLorebook member
+                member.copy(
+                    lorebook = member.lorebook.filterNot { it.id == entryId },
+                    lorebookArchive = member.lorebookArchive + entry,
+                )
+            }
+        }
+    }
+
+    /**
+     * Restores one member's archived entry back into **that member's** book, then fits the
+     * global capacity again (`restoreArchivedLorebookEntry` reads the owning book off the
+     * archive list itself). The member must actually own the archived id, so a stale editor
+     * cannot pull another book's entry into this member. The restored entry is excluded from
+     * eviction — it is the oldest precisely because it had been idle.
+     */
+    fun restoreMemberLorebookEntry(characterId: String, memberId: String, entryId: String) {
+        patchCharacter(characterId) { live ->
+            val owns = live.members.firstOrNull { it.id == memberId }
+                ?.lorebookArchive?.any { it.id == entryId } == true
+            if (!owns) return@patchCharacter live
+            val restored = live.restoreArchivedLorebookEntry(entryId)
+            if (restored == live) return@patchCharacter live
+            val overflow = lorebookOverflow(restored)
+            if (overflow <= 0) {
+                restored
+            } else {
+                val adjustment = archiveToFit(restored, overflow, excludeIds = setOf(entryId))
+                if (adjustment.unmet > 0) {
+                    eventsState.tryEmit(UiEvent("世界书已满（其余条目为人工维护或常驻），无法恢复该条目"))
+                    live
+                } else {
+                    emitArchiveNotice(adjustment.archived, memberNameOf(live, memberId))
+                    adjustment.character
+                }
+            }
+        }
+    }
+
+    private fun memberNameOf(character: Character, memberId: String): String? =
+        character.members.firstOrNull { it.id == memberId }?.name
 
     // ----------------------------------------------------------------- stickers
 

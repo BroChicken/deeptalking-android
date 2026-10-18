@@ -463,11 +463,12 @@ object CharacterEditorHost {
         character: Character,
         onDismiss: () -> Unit,
         onUpdate: (Character) -> Unit,
-        onAddLorebook: (String, LorebookEntry) -> Unit,
-        onRemoveLorebook: (String, String) -> Unit,
-        onUpdateLorebook: (String, LorebookEntry) -> Unit,
-        onArchiveLorebook: (String, String) -> Unit,
-        onRestoreLorebook: (String, String) -> Unit,
+        // 世界书写通：第二个参数是"这本书属于谁"——成员 id，null = 本体（共享世界书）。
+        onAddLorebook: (String, String?, LorebookEntry) -> Unit,
+        onRemoveLorebook: (String, String?, String) -> Unit,
+        onUpdateLorebook: (String, String?, LorebookEntry) -> Unit,
+        onArchiveLorebook: (String, String?, String) -> Unit,
+        onRestoreLorebook: (String, String?, String) -> Unit,
         onGenerateAvatar: (Character, (String?) -> Unit) -> Unit,
         onFillMember: (Character, Int, String) -> Unit,
         initialMemberIndex: Int? = null,
@@ -491,11 +492,11 @@ fun CharacterEditorDialog(
     character: Character,
     onDismiss: () -> Unit,
     onUpdate: (Character) -> Unit,
-    onAddLorebook: (String, LorebookEntry) -> Unit,
-    onRemoveLorebook: (String, String) -> Unit,
-    onUpdateLorebook: (String, LorebookEntry) -> Unit,
-    onArchiveLorebook: (String, String) -> Unit,
-    onRestoreLorebook: (String, String) -> Unit,
+    onAddLorebook: (String, String?, LorebookEntry) -> Unit,
+    onRemoveLorebook: (String, String?, String) -> Unit,
+    onUpdateLorebook: (String, String?, LorebookEntry) -> Unit,
+    onArchiveLorebook: (String, String?, String) -> Unit,
+    onRestoreLorebook: (String, String?, String) -> Unit,
     onGenerateAvatar: (Character, (String?) -> Unit) -> Unit,
     onFillMember: (Character, Int, String) -> Unit,
     initialMemberIndex: Int? = null,
@@ -505,6 +506,9 @@ fun CharacterEditorDialog(
     var draft by remember(character.id) { mutableStateOf(character) }
     var memberIndex by remember(character.id) { mutableStateOf(initialMemberIndex) }
     val editingMember = memberIndex?.let { draft.members.getOrNull(it) }
+    // 世界书页签跟随"正在编辑的对象"：编辑成员时落该成员的世界书，否则落本体。
+    // 成员 id 为空（历史数据）时不装作有成员上下文——按今天的本体行为处理，避免把编辑写丢。
+    val editingMemberId = editingMember?.id?.takeIf { it.isNotBlank() }
     // 保存时被规范化 / 命中对比句的字段：先给一条可见提示，再让用户确认保存（不要静默清洗）。
     var pendingNotices by remember(character.id) { mutableStateOf<List<CharacterParity.EditNotice>>(emptyList()) }
 
@@ -553,34 +557,64 @@ fun CharacterEditorDialog(
                         1 -> StateTab(draft = draft, memberIndex = memberIndex, onDraft = ::applyDraft)
                         2 -> LorebookTab(
                             draft = draft,
+                            memberId = editingMemberId,
+                            memberName = editingMember?.name,
                             // A world-book edit is applied to the draft **and** patched onto
                             // the stored row: the dialog's draft is a snapshot from when it
                             // opened, so without the local update the checkbox/text the user
                             // just touched keeps rendering the old value — and the next edit
-                            // (computed from the same snapshot) would undo this one.
+                            // (computed from the same snapshot) would undo this one. The
+                            // member branch patches the member addressed **by id** on the live
+                            // row, so a changed member list cannot put the edit on someone else.
                             onAddLorebook = {
                                 // Capacity is judged globally (shared book + members) and the
                                 // overflow is archived, exactly like the store does — so the
                                 // draft never shows an entry the store refused.
                                 val entry = CharacterParity.newLorebookEntry()
-                                applyDraft(CharacterParity.addLorebookEntry(draft, entry))
-                                onAddLorebook(draft.id, entry)
+                                val target = editingMemberId
+                                applyDraft(
+                                    if (target == null) CharacterParity.addLorebookEntry(draft, entry)
+                                    else CharacterParity.addMemberLorebookEntry(draft, target, entry),
+                                )
+                                onAddLorebook(draft.id, target, entry)
                             },
                             onRemoveLorebook = { entryId ->
-                                applyDraft(draft.copy(lorebook = CharacterParity.removeLorebookEntry(draft.lorebook, entryId)))
-                                onRemoveLorebook(draft.id, entryId)
+                                val target = editingMemberId
+                                applyDraft(
+                                    if (target == null) {
+                                        draft.copy(lorebook = CharacterParity.removeLorebookEntry(draft.lorebook, entryId))
+                                    } else {
+                                        CharacterParity.removeMemberLorebookEntry(draft, target, entryId)
+                                    },
+                                )
+                                onRemoveLorebook(draft.id, target, entryId)
                             },
                             onUpdateLorebook = { entry ->
-                                applyDraft(draft.copy(lorebook = CharacterParity.updateLorebookEntry(draft.lorebook, entry)))
-                                onUpdateLorebook(draft.id, entry)
+                                val target = editingMemberId
+                                applyDraft(
+                                    if (target == null) {
+                                        draft.copy(lorebook = CharacterParity.updateLorebookEntry(draft.lorebook, entry))
+                                    } else {
+                                        CharacterParity.updateMemberLorebookEntry(draft, target, entry)
+                                    },
+                                )
+                                onUpdateLorebook(draft.id, target, entry)
                             },
                             onArchiveLorebook = { entryId ->
-                                applyDraft(CharacterParity.archiveLorebookEntry(draft, entryId))
-                                onArchiveLorebook(draft.id, entryId)
+                                val target = editingMemberId
+                                applyDraft(
+                                    if (target == null) CharacterParity.archiveLorebookEntry(draft, entryId)
+                                    else CharacterParity.archiveMemberLorebookEntry(draft, target, entryId),
+                                )
+                                onArchiveLorebook(draft.id, target, entryId)
                             },
                             onRestoreLorebook = { entryId ->
-                                applyDraft(CharacterParity.restoreLorebookEntry(draft, entryId))
-                                onRestoreLorebook(draft.id, entryId)
+                                val target = editingMemberId
+                                applyDraft(
+                                    if (target == null) CharacterParity.restoreLorebookEntry(draft, entryId)
+                                    else CharacterParity.restoreMemberLorebookEntry(draft, target, entryId),
+                                )
+                                onRestoreLorebook(draft.id, target, entryId)
                             },
                         )
                     }
@@ -758,6 +792,8 @@ private fun StateTab(draft: Character, memberIndex: Int?, onDraft: (Character) -
 @Composable
 private fun LorebookTab(
     draft: Character,
+    memberId: String?,
+    memberName: String?,
     onAddLorebook: () -> Unit,
     onRemoveLorebook: (String) -> Unit,
     onUpdateLorebook: (LorebookEntry) -> Unit,
@@ -765,11 +801,23 @@ private fun LorebookTab(
     onRestoreLorebook: (String) -> Unit,
 ) {
     val legacy = MaterialTheme.legacy
+    // 页签跟随"正在编辑的对象"：成员视图显示该成员的世界书 + 该成员的归档，本体视图不变。
+    val entries = CharacterParity.lorebookOf(draft, memberId)
+    val archive = CharacterParity.lorebookArchiveOf(draft, memberId)
+    var archiveExpanded by remember(memberId) { mutableStateOf(true) }
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        if (draft.lorebook.isEmpty()) {
-            Text("还没有条目。可以让 AI 在建卡时生成，或在对话中自动补充。", fontSize = 12.sp, color = legacy.textMuted)
+        if (entries.isEmpty()) {
+            Text(
+                if (memberId == null) {
+                    "还没有条目。可以让 AI 在建卡时生成，或在对话中自动补充。"
+                } else {
+                    "${memberName.orEmpty().ifBlank { "该成员" }}还没有世界书条目。对话中会被自动补充，也可以手动添加。"
+                },
+                fontSize = 12.sp,
+                color = legacy.textMuted,
+            )
         }
-        draft.lorebook.forEach { entry ->
+        entries.forEach { entry ->
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -837,35 +885,66 @@ private fun LorebookTab(
             }
         }
         LegacyButton("+ 添加条目", primary = false, onClick = onAddLorebook)
-        if (draft.lorebookArchive.isNotEmpty()) {
+        // 归档区：成员视图同样要出现（成员世界书为空、归档非空时以前完全看不见），
+        // 本体视图保持原有渲染（标题 + 每行一条，直接展开）。
+        if (archive.isNotEmpty()) {
             Spacer(Modifier.height(4.dp))
-            Text(
-                "归档（不注入、不计名额，可恢复）",
-                fontSize = 12.sp,
-                color = legacy.textMuted,
-            )
-            draft.lorebookArchive.forEach { entry ->
+            if (memberId == null) {
+                Text(
+                    "归档（不注入、不计名额，可恢复）",
+                    fontSize = 12.sp,
+                    color = legacy.textMuted,
+                )
+                archive.forEach { entry ->
+                    LorebookArchiveRow(entry) { onRestoreLorebook(entry.id) }
+                }
+            } else {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(legacy.panel)
-                        .border(1.dp, legacy.inputBorder, RoundedCornerShape(8.dp))
-                        .padding(horizontal = 10.dp, vertical = 8.dp),
+                        .clickable { archiveExpanded = !archiveExpanded },
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(entry.name.ifBlank { "（未命名）" }, fontSize = 12.sp, color = legacy.text)
-                        if (entry.content.isNotBlank()) {
-                            Text(entry.content, fontSize = 11.sp, color = legacy.textMuted, maxLines = 2)
-                        }
-                    }
-                    Spacer(Modifier.width(6.dp))
-                    TextButton(onClick = { onRestoreLorebook(entry.id) }) {
-                        Text("恢复", fontSize = 12.sp, color = legacy.accent)
+                    Text(if (archiveExpanded) "▾" else "▸", fontSize = 12.sp, color = legacy.textMuted)
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        "归档（不注入、不计名额，可恢复）",
+                        fontSize = 12.sp,
+                        color = legacy.textMuted,
+                    )
+                }
+                if (archiveExpanded) {
+                    archive.forEach { entry ->
+                        LorebookArchiveRow(entry) { onRestoreLorebook(entry.id) }
                     }
                 }
             }
+        }
+    }
+}
+
+/** 归档区的一行：条目名/内容预览 + 「恢复」。本体与成员视图共用同一渲染。 */
+@Composable
+private fun LorebookArchiveRow(entry: LorebookEntry, onRestore: () -> Unit) {
+    val legacy = MaterialTheme.legacy
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(legacy.panel)
+            .border(1.dp, legacy.inputBorder, RoundedCornerShape(8.dp))
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(entry.name.ifBlank { "（未命名）" }, fontSize = 12.sp, color = legacy.text)
+            if (entry.content.isNotBlank()) {
+                Text(entry.content, fontSize = 11.sp, color = legacy.textMuted, maxLines = 2)
+            }
+        }
+        Spacer(Modifier.width(6.dp))
+        TextButton(onClick = onRestore) {
+            Text("恢复", fontSize = 12.sp, color = legacy.accent)
         }
     }
 }

@@ -7,7 +7,9 @@ import com.deeptalking.core.model.GroupMember
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.LorebookOrigin
 import com.deeptalking.core.model.StaticProfile
+import com.deeptalking.core.model.archiveOldestLorebookEntries
 import com.deeptalking.core.model.convergeLorebookCapacity
+import com.deeptalking.core.model.lorebookCapacityCount
 import com.deeptalking.core.model.restoreArchivedLorebookEntry
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -442,6 +444,77 @@ object CharacterParity {
     /** Restores an archived entry to its original book (shared archive first, then members). */
     fun restoreLorebookEntry(character: Character, entryId: String): Character =
         character.restoreArchivedLorebookEntry(entryId).convergeLorebookCapacity()
+
+    // ------------------------------------------------ member world books
+
+    /**
+     * 世界书页签跟随"正在编辑的对象"：[memberId] 是成员 id 时取**该成员**的世界书（连同它的归档），
+     * `null` 表示本体（共享世界书）。成员一律按 **id** 定位（成员列表可能在编辑期间变过）。
+     * id 为空或找不到该成员时返回空列表——绝不回落到本体，免得把成员的编辑写进本体。
+     */
+    fun lorebookOf(character: Character, memberId: String?): List<LorebookEntry> =
+        if (memberId == null) character.lorebook else memberBook(character, memberId)?.lorebook.orEmpty()
+
+    fun lorebookArchiveOf(character: Character, memberId: String?): List<LorebookEntry> =
+        if (memberId == null) character.lorebookArchive else memberBook(character, memberId)?.lorebookArchive.orEmpty()
+
+    private fun memberBook(character: Character, memberId: String): GroupMember? =
+        memberId.takeIf { it.isNotBlank() }?.let { id -> character.members.firstOrNull { it.id == id } }
+
+    /**
+     * 只改**该成员**（按 id 定位）——其它成员与本体世界书一字不动；id 为空或找不到该成员时原样返回。
+     * 成员写通（草稿镜像与数据库补写）都走这一个寻址函数，保证两处落点一致。
+     */
+    fun updateMemberLorebook(
+        character: Character,
+        memberId: String,
+        transform: (GroupMember) -> GroupMember,
+    ): Character {
+        if (memberId.isBlank() || character.members.none { it.id == memberId }) return character
+        return character.copy(members = character.members.map { if (it.id == memberId) transform(it) else it })
+    }
+
+    /** 往**该成员**的世界书加一条，随后走全局容量收敛（本体 + 成员合计，与本体同规则）。 */
+    fun addMemberLorebookEntry(character: Character, memberId: String, entry: LorebookEntry): Character =
+        updateMemberLorebook(character, memberId) { it.copy(lorebook = it.lorebook + entry) }
+            .convergeLorebookCapacity()
+
+    fun updateMemberLorebookEntry(character: Character, memberId: String, entry: LorebookEntry): Character =
+        updateMemberLorebook(character, memberId) { member ->
+            member.copy(lorebook = member.lorebook.map { if (it.id == entry.id) entry else it })
+        }
+
+    fun removeMemberLorebookEntry(character: Character, memberId: String, entryId: String): Character =
+        updateMemberLorebook(character, memberId) { member ->
+            member.copy(
+                lorebook = member.lorebook.filterNot { it.id == entryId },
+                lorebookArchive = member.lorebookArchive.filterNot { it.id == entryId },
+            )
+        }
+
+    /** 把该成员的一条在册条目移进**该成员**的归档（从哪本书来就进哪本归档）。 */
+    fun archiveMemberLorebookEntry(character: Character, memberId: String, entryId: String): Character =
+        updateMemberLorebook(character, memberId) { member ->
+            val entry = member.lorebook.firstOrNull { it.id == entryId } ?: return@updateMemberLorebook member
+            member.copy(
+                lorebook = member.lorebook.filterNot { it.id == entryId },
+                lorebookArchive = member.lorebookArchive + entry,
+            )
+        }
+
+    /**
+     * 把条目从**该成员的归档**移回**该成员的世界书**（复用本体的 `restoreArchivedLorebookEntry`：
+     * 归档列表本身就记录了"从哪本书来"），再走一次容量收敛——排除该条目本身，免得它因为最久未活跃
+     * 又被立刻淘汰回去。成员归档里没有这条 id 时原样返回。
+     */
+    fun restoreMemberLorebookEntry(character: Character, memberId: String, entryId: String): Character {
+        val member = memberBook(character, memberId) ?: return character
+        if (member.lorebookArchive.none { it.id == entryId }) return character
+        val restored = character.restoreArchivedLorebookEntry(entryId)
+        val overflow = restored.lorebookCapacityCount() - AppLimits.Lorebook.ENTRIES
+        if (overflow <= 0) return restored
+        return restored.archiveOldestLorebookEntries(overflow, excludeIds = setOf(entryId)).first
+    }
 
     fun splitLorebookKeywords(raw: String): List<String> =
         raw.split(',', '，', '、', '\n')
