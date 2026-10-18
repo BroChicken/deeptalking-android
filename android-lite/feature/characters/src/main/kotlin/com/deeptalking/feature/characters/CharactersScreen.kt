@@ -64,8 +64,6 @@ import com.deeptalking.core.model.GroupMember
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.LorebookOrigin
 import com.deeptalking.core.model.StaticProfile
-import com.deeptalking.core.model.isStaticFieldManual
-import com.deeptalking.core.model.withStaticFieldManual
 private val STATIC_FIELDS = listOf(
     "gender" to "性别",
     "age" to "年龄",
@@ -468,6 +466,8 @@ object CharacterEditorHost {
         onAddLorebook: (String, LorebookEntry) -> Unit,
         onRemoveLorebook: (String, String) -> Unit,
         onUpdateLorebook: (String, LorebookEntry) -> Unit,
+        onArchiveLorebook: (String, String) -> Unit,
+        onRestoreLorebook: (String, String) -> Unit,
         onGenerateAvatar: (Character, (String?) -> Unit) -> Unit,
         onFillMember: (Character, Int, String) -> Unit,
         initialMemberIndex: Int? = null,
@@ -478,6 +478,8 @@ object CharacterEditorHost {
         onAddLorebook = onAddLorebook,
         onRemoveLorebook = onRemoveLorebook,
         onUpdateLorebook = onUpdateLorebook,
+        onArchiveLorebook = onArchiveLorebook,
+        onRestoreLorebook = onRestoreLorebook,
         onGenerateAvatar = onGenerateAvatar,
         onFillMember = onFillMember,
         initialMemberIndex = initialMemberIndex,
@@ -492,6 +494,8 @@ fun CharacterEditorDialog(
     onAddLorebook: (String, LorebookEntry) -> Unit,
     onRemoveLorebook: (String, String) -> Unit,
     onUpdateLorebook: (String, LorebookEntry) -> Unit,
+    onArchiveLorebook: (String, String) -> Unit,
+    onRestoreLorebook: (String, String) -> Unit,
     onGenerateAvatar: (Character, (String?) -> Unit) -> Unit,
     onFillMember: (Character, Int, String) -> Unit,
     initialMemberIndex: Int? = null,
@@ -501,9 +505,6 @@ fun CharacterEditorDialog(
     var draft by remember(character.id) { mutableStateOf(character) }
     var memberIndex by remember(character.id) { mutableStateOf(initialMemberIndex) }
     val editingMember = memberIndex?.let { draft.members.getOrNull(it) }
-    // 编辑器打开那一刻的快照。人工标记只认「相对快照真正改动过」的字段，绝不能用实时数据行，
-    // 否则后台（模型 / 补全任务）改过的字段会被误标成用户手写。
-    val initialSnapshot = remember(character.id) { character }
     // 保存时被规范化 / 命中对比句的字段：先给一条可见提示，再让用户确认保存（不要静默清洗）。
     var pendingNotices by remember(character.id) { mutableStateOf<List<CharacterParity.EditNotice>>(emptyList()) }
 
@@ -558,13 +559,12 @@ fun CharacterEditorDialog(
                             // just touched keeps rendering the old value — and the next edit
                             // (computed from the same snapshot) would undo this one.
                             onAddLorebook = {
-                                // The cap is enforced here too, so the draft never shows an
-                                // entry the store refused.
-                                if (draft.lorebook.size < AppLimits.Lorebook.ENTRIES) {
-                                    val entry = CharacterParity.newLorebookEntry()
-                                    applyDraft(draft.copy(lorebook = CharacterParity.addLorebookEntry(draft.lorebook, entry)))
-                                    onAddLorebook(draft.id, entry)
-                                }
+                                // Capacity is judged globally (shared book + members) and the
+                                // overflow is archived, exactly like the store does — so the
+                                // draft never shows an entry the store refused.
+                                val entry = CharacterParity.newLorebookEntry()
+                                applyDraft(CharacterParity.addLorebookEntry(draft, entry))
+                                onAddLorebook(draft.id, entry)
                             },
                             onRemoveLorebook = { entryId ->
                                 applyDraft(draft.copy(lorebook = CharacterParity.removeLorebookEntry(draft.lorebook, entryId)))
@@ -573,6 +573,14 @@ fun CharacterEditorDialog(
                             onUpdateLorebook = { entry ->
                                 applyDraft(draft.copy(lorebook = CharacterParity.updateLorebookEntry(draft.lorebook, entry)))
                                 onUpdateLorebook(draft.id, entry)
+                            },
+                            onArchiveLorebook = { entryId ->
+                                applyDraft(CharacterParity.archiveLorebookEntry(draft, entryId))
+                                onArchiveLorebook(draft.id, entryId)
+                            },
+                            onRestoreLorebook = { entryId ->
+                                applyDraft(CharacterParity.restoreLorebookEntry(draft, entryId))
+                                onRestoreLorebook(draft.id, entryId)
                             },
                         )
                     }
@@ -584,7 +592,7 @@ fun CharacterEditorDialog(
         },
         confirmButton = {
             TextButton(onClick = {
-                val result = CharacterParity.normalizeUserEditedDraft(draft, initialSnapshot, memberIndex)
+                val result = CharacterParity.normalizeUserEditedDraft(draft, memberIndex = memberIndex)
                 // 有规范化 / 对比句时先亮出提示，再让用户按第二下确认保存；用户接着改了字段
                 // （applyDraft 清空提示）就重新提示，绝不静默改掉用户手写的内容。
                 if (result.notices.isEmpty() || pendingNotices.isNotEmpty()) {
@@ -646,24 +654,6 @@ private fun BasicTab(
         else onDraft(draft.copy(members = draft.members.toMutableList().also { it[memberIndex] = member.copy(emoji = value) }))
     }
 
-    /** 「人工手写 ↔ 角色维护」开关：解除后模型可正常自动更新该字段。 */
-    fun updateManual(key: String, manual: Boolean) {
-        val index = memberIndex
-        if (member == null || index == null) {
-            onDraft(draft.copy(staticFieldMeta = withStaticFieldManual(draft.staticFieldMeta, key, manual)))
-        } else {
-            onDraft(
-                draft.copy(
-                    members = draft.members.toMutableList().also {
-                        it[index] = member.copy(
-                            staticFieldMeta = withStaticFieldManual(member.staticFieldMeta, key, manual),
-                        )
-                    },
-                ),
-            )
-        }
-    }
-
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (member != null) {
             Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(MaterialTheme.legacy.border))
@@ -691,26 +681,15 @@ private fun BasicTab(
             Text("成员：" + draft.members.joinToString("、") { it.name }, fontSize = 12.sp, color = MaterialTheme.legacy.textMuted)
         } else {
             val profile = member?.staticProfile ?: draft.staticProfile
-            val fieldMeta = member?.staticFieldMeta ?: draft.staticFieldMeta
             STATIC_FIELDS.forEach { (key, label) ->
-                Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    ) {
-                        Text(label, fontSize = 12.sp, color = MaterialTheme.legacy.textMuted)
-                        ManualLockChip(isStaticFieldManual(fieldMeta, key)) { manual -> updateManual(key, manual) }
-                    }
-                    LegacyField(
-                        value = staticValue(profile, key),
-                        onValueChange = { updateProfile(withStatic(profile, key, it)) },
-                        minLines = if (key == "background") 2 else 1,
-                    )
-                }
+                LegacyField(
+                    value = staticValue(profile, key),
+                    onValueChange = { updateProfile(withStatic(profile, key, it)) },
+                    minLines = if (key == "background") 2 else 1,
+                )
             }
             Text(
-                "点「人工手写」＝锁定该字段，模型不再自动改写；点「角色维护」＝让角色接管。" +
-                    "你手写的字段保存时不会被截断，对比句也会原样保留。",
+                "你手写的字段保存时不会被截断，对比句也会原样保留。",
                 fontSize = 12.sp,
                 color = MaterialTheme.legacy.textMuted,
             )
@@ -782,6 +761,8 @@ private fun LorebookTab(
     onAddLorebook: () -> Unit,
     onRemoveLorebook: (String) -> Unit,
     onUpdateLorebook: (LorebookEntry) -> Unit,
+    onArchiveLorebook: (String) -> Unit,
+    onRestoreLorebook: (String) -> Unit,
 ) {
     val legacy = MaterialTheme.legacy
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -811,6 +792,7 @@ private fun LorebookTab(
                     LorebookOwnerChip(entry.origin) { origin ->
                         onUpdateLorebook(entry.copy(origin = origin))
                     }
+                    TextButton(onClick = { onArchiveLorebook(entry.id) }) { Text("归档", fontSize = 12.sp, color = legacy.textSecondary) }
                     TextButton(onClick = { onRemoveLorebook(entry.id) }) { Text("删除", fontSize = 12.sp, color = legacy.textSecondary) }
                 }
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -855,6 +837,36 @@ private fun LorebookTab(
             }
         }
         LegacyButton("+ 添加条目", primary = false, onClick = onAddLorebook)
+        if (draft.lorebookArchive.isNotEmpty()) {
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "归档（不注入、不计名额，可恢复）",
+                fontSize = 12.sp,
+                color = legacy.textMuted,
+            )
+            draft.lorebookArchive.forEach { entry ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(legacy.panel)
+                        .border(1.dp, legacy.inputBorder, RoundedCornerShape(8.dp))
+                        .padding(horizontal = 10.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(entry.name.ifBlank { "（未命名）" }, fontSize = 12.sp, color = legacy.text)
+                        if (entry.content.isNotBlank()) {
+                            Text(entry.content, fontSize = 11.sp, color = legacy.textMuted, maxLines = 2)
+                        }
+                    }
+                    Spacer(Modifier.width(6.dp))
+                    TextButton(onClick = { onRestoreLorebook(entry.id) }) {
+                        Text("恢复", fontSize = 12.sp, color = legacy.accent)
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -876,29 +888,6 @@ private fun LorebookOwnerChip(origin: LorebookOrigin, onSwitch: (LorebookOrigin)
             .padding(horizontal = 8.dp, vertical = 4.dp),
     ) {
         Text(if (manual) "人工维护" else "AI 维护", fontSize = 12.sp, color = accent)
-    }
-}
-
-/**
- * 静态字段归属：人工手写 ↔ 角色维护。**人工**字段模型不会自动改写（`submit_response`
- * 跳过并提示，`update_character_field` 需用户本轮明确要求），点一下交还给角色即可恢复自动更新。
- */
-@Composable
-private fun ManualLockChip(manual: Boolean, onSwitch: (Boolean) -> Unit) {
-    val legacy = MaterialTheme.legacy
-    Box(
-        modifier = Modifier
-            .clip(RoundedCornerShape(6.dp))
-            .background(if (manual) legacy.warning.copy(alpha = 0.18f) else legacy.panel)
-            .border(1.dp, if (manual) legacy.warning else legacy.inputBorder, RoundedCornerShape(6.dp))
-            .clickable { onSwitch(!manual) }
-            .padding(horizontal = 6.dp, vertical = 2.dp),
-    ) {
-        Text(
-            if (manual) "🔒 人工手写" else "角色维护",
-            fontSize = 11.sp,
-            color = if (manual) legacy.warning else legacy.textMuted,
-        )
     }
 }
 

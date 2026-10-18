@@ -6,7 +6,6 @@ import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.ShortTermMemory
 import com.deeptalking.core.model.StaticProfile
-import com.deeptalking.core.model.withStaticFieldManual
 import com.deeptalking.domain.memory.MemoryServiceImpl
 import com.deeptalking.engine.ondevice.LlmBackend
 import com.deeptalking.engine.ondevice.LlmChunk
@@ -78,62 +77,6 @@ class ChatOrchestratorTest {
         // to by the whole-window extraction pass (see BackgroundTasks), so a `shortTerm`
         // field in a turn reply is ignored on purpose.
         assertTrue("turn shortTerm must be ignored", result.updatedCharacter.shortTerm.isEmpty())
-    }
-
-    @Test
-    fun `submit_response staticFields skips a manual-locked field and reports it`() = runBlocking {
-        val args = """
-            {"reply":"嗯，今天天气不错。","quickReplies":["是啊","出去走走"],
-             "staticFields":{"personality":{"value":"更外向","sourceMessageIds":["m1"],"evidence":"今天天气不错"}}}
-        """.trimIndent()
-        val protected = character().copy(
-            staticProfile = StaticProfile(personality = "冷静"),
-            staticFieldMeta = withStaticFieldManual(emptyMap(), "personality", true),
-        )
-        val orchestrator = ChatOrchestrator(
-            llm = ScriptedLlm(args),
-            tools = ToolRegistry(listOf(NoTools())),
-            memory = MemoryServiceImpl(),
-            config = AppConfig(),
-        )
-
-        val result = orchestrator.run(
-            character = protected,
-            history = listOf(ChatMessage(id = "m1", role = Role.User, content = "今天天气不错")),
-            userText = "今天天气不错",
-        )
-
-        assertEquals("冷静", result.updatedCharacter.staticProfile.personality)
-        assertEquals(listOf("性格特征"), result.lockedStaticFields)
-        assertTrue(result.staticChanges.isEmpty())
-    }
-
-    @Test
-    fun `submit_response staticFields still updates a manual-locked field when the user asks`() = runBlocking {
-        val args = """
-            {"reply":"好，我会更外向一点。","quickReplies":["那就好","谢谢"],
-             "staticFields":{"personality":{"value":"更外向","sourceMessageIds":["m1"],"evidence":"你性格改成更外向些"}}}
-        """.trimIndent()
-        val protected = character().copy(
-            staticProfile = StaticProfile(personality = "冷静"),
-            staticFieldMeta = withStaticFieldManual(emptyMap(), "personality", true),
-        )
-        val orchestrator = ChatOrchestrator(
-            llm = ScriptedLlm(args),
-            tools = ToolRegistry(listOf(NoTools())),
-            memory = MemoryServiceImpl(),
-            config = AppConfig(),
-        )
-
-        val result = orchestrator.run(
-            character = protected,
-            history = listOf(ChatMessage(id = "m1", role = Role.User, content = "你性格改成更外向些")),
-            userText = "你性格改成更外向些",
-        )
-
-        assertEquals("更外向", result.updatedCharacter.staticProfile.personality)
-        assertTrue(result.lockedStaticFields.isEmpty())
-        assertEquals(listOf("性格特征"), result.staticChanges)
     }
 
     @Test

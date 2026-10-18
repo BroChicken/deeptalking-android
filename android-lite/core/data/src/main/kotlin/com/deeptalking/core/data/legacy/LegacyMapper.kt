@@ -25,6 +25,7 @@ import com.deeptalking.core.model.ShortTermMemory
 import com.deeptalking.core.model.StaticFillMeta
 import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.core.model.Sticker
+import com.deeptalking.core.model.convergeLorebookCapacity
 import com.deeptalking.core.model.mergeSources
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -318,7 +319,6 @@ private fun mapInstant(dto: LegacyInstantMessage, imageSink: StickerSink?): Chat
         },
     internalOnly = dto.internalOnly == true,
     staticChanges = dto.staticChanges ?: emptyList(),
-    lockedStaticFields = dto.lockedStaticFields ?: emptyList(),
     lorebookChanges = dto.lorebookChanges ?: emptyList(),
     styleViolations = (dto.styleViolations ?: emptyList()).filter { it in STYLE_VIOLATION_LABELS },
     quickReplyIssues = (dto.quickReplyIssues ?: emptyList()).filter { it in QUICK_REPLY_ISSUE_LABELS },
@@ -478,7 +478,8 @@ private fun mapMembers(dto: LegacyCharacter, stickerSink: StickerSink?): List<Gr
             dynamicStateMeta = mapDynamicStateMeta(member.dynamicStateMeta),
             shortTerm = (memory?.shortTerm ?: emptyList()).map { mapShortTerm(it) }.takeLast(80),
             longTerm = mapLongTermList(memory?.longTerm),
-            lorebook = (member.lorebook ?: emptyList()).map { mapLorebook(it) }.take(200),
+            lorebook = (member.lorebook ?: emptyList()).map { mapLorebook(it) },
+            lorebookArchive = (member.lorebookArchive ?: emptyList()).map { mapLorebook(it) },
             instant = (memory?.instant ?: emptyList())
                 .filter { it.isLoading != true }
                 .map { mapInstant(it, stickerSink) }
@@ -559,7 +560,8 @@ fun mapCharacter(dto: LegacyCharacter, stickerSink: StickerSink?): Character {
         dynamicState = effectiveDynamic,
         shortTerm = (memory?.shortTerm ?: emptyList()).map { mapShortTerm(it) }.takeLast(80),
         longTerm = mapLongTermList(memory?.longTerm),
-        lorebook = (dto.lorebook ?: emptyList()).map { mapLorebook(it) }.take(200),
+        lorebook = (dto.lorebook ?: emptyList()).map { mapLorebook(it) },
+        lorebookArchive = (dto.lorebookArchive ?: emptyList()).map { mapLorebook(it) },
         stickers = mapStickers(dto.stickers, stickerSink),
         instant = mapInstantMessages(memory?.instant, stickerSink).takeLast(160),
         dynamicStateMeta = mapDynamicStateMeta(dto.dynamicStateMeta),
@@ -586,7 +588,10 @@ fun mapCharacter(dto: LegacyCharacter, stickerSink: StickerSink?): Character {
         lorebookMigratedAt = dto.lorebookMigratedAt,
         revision = (memory?.revision ?: 0).coerceAtLeast(0),
     )
-    return repairMessageSequences(character)
+    // One-time convergence: a legacy/backup row may carry more live entries than the ceiling
+    // (the old per-list `take(200)` is gone). The oldest overflow moves to the archive —
+    // never manual/常驻 entries — so an import lands at exactly the ceiling by itself.
+    return repairMessageSequences(character.convergeLorebookCapacity())
 }
 
 private fun mapScene(dto: LegacyScene): SceneSummary = SceneSummary(

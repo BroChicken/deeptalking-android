@@ -50,6 +50,7 @@ fun mergeCharacterChanges(before: Character, after: Character, live: Character):
         pendingRecall = pick(before.pendingRecall, after.pendingRecall, live.pendingRecall),
         lastInjectedRecallIds = pick(before.lastInjectedRecallIds, after.lastInjectedRecallIds, live.lastInjectedRecallIds),
         lorebook = mergeLorebook(before.lorebook, after.lorebook, live.lorebook),
+        lorebookArchive = mergeLorebook(before.lorebookArchive, after.lorebookArchive, live.lorebookArchive),
         members = mergeMembers(before.members, after.members, live.members),
     )
 }
@@ -135,4 +136,5 @@ internal fun mergeMemberChanges(before: GroupMember, after: GroupMember, live: G
         lorebookMigratedAt = pick(before.lorebookMigratedAt, after.lorebookMigratedAt, live.lorebookMigratedAt),
         memoryRepairVersion = pick(before.memoryRepairVersion, after.memoryRepairVersion, live.memoryRepairVersion),
         lorebook = mergeLorebook(before.lorebook, after.lorebook, live.lorebook),
+        lorebookArchive = mergeLorebook(before.lorebookArchive, after.lorebookArchive, live.lorebookArchive),
     )

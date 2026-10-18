@@ -184,7 +184,6 @@ data class LegacyInstantMessage(
     @SerialName("internalOnly") val internalOnly: Boolean? = null,
     @SerialName("isLoading") val isLoading: Boolean? = null,
     @SerialName("staticChanges") val staticChanges: List<String>? = null,
-    @SerialName("lockedStaticFields") val lockedStaticFields: List<String>? = null,
     @SerialName("lorebookChanges") val lorebookChanges: List<String>? = null,
     @SerialName("styleViolations") val styleViolations: List<String>? = null,
     @SerialName("quickReplyIssues") val quickReplyIssues: List<String>? = null,
@@ -329,6 +328,8 @@ data class LegacyCharacter(
     @SerialName("avatarRepairPending") val avatarRepairPending: Boolean? = null,
     @SerialName("stickers") val stickers: List<LegacySticker>? = null,
     @SerialName("lorebook") val lorebook: List<LegacyLorebookEntry>? = null,
+    /** Archived world-book entries (native-only; absent in legacy backups). */
+    @SerialName("lorebookArchive") val lorebookArchive: List<LegacyLorebookEntry>? = null,
     @SerialName("memory") val memory: LegacyMemory? = null,
     /**
      * Bounded chat archive (store A). Absent in every pre-split backup, where the whole
@@ -366,6 +367,8 @@ data class LegacyGroupMember(
     @SerialName("dynamicStateMeta") val dynamicStateMeta: JsonElement? = null,
     @SerialName("roleInGroup") val roleInGroup: String? = null,
     @SerialName("lorebook") val lorebook: List<LegacyLorebookEntry>? = null,
+    /** Archived world-book entries (native-only; absent in legacy backups). */
+    @SerialName("lorebookArchive") val lorebookArchive: List<LegacyLorebookEntry>? = null,
     @SerialName("memory") val memory: LegacyMemory? = null,
     @SerialName("avatarRepairPending") val avatarRepairPending: Boolean? = null,
     @SerialName("staticFillMeta") val staticFillMeta: LegacyStaticFillMeta? = null,

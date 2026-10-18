@@ -9,6 +9,7 @@ import com.deeptalking.domain.agent.AgentTool
 import com.deeptalking.domain.agent.AgentToolResult
 import com.deeptalking.domain.agent.prompts.trimText
 import com.deeptalking.domain.memory.MemoryService
+import com.deeptalking.domain.memory.dueAtBackedByUserEvidence
 import com.deeptalking.domain.memory.hasValidUserEvidence
 import com.deeptalking.domain.memory.parseRelativeText
 import com.deeptalking.domain.memory.parseZoned
@@ -31,7 +32,7 @@ class SetReminderTool(private val memory: MemoryService) : AgentTool {
 
     override val definition = ToolDefinition(
         name = "set_reminder",
-        description = "记录“需要用户参与”的待办/约定，且**必须由用户自己明确提出或同意**（如用户说“我明天要交报告”“记得提醒我买药”）。调用时必须附用户原话：sourceMessageIds 填用户消息ID、evidence 逐字摘录用户原话。角色要求用户去做的事、角色的建议或叮嘱，一律不得用本工具记录——应先自然征询用户，等用户自己答应后再记。到时间可在对话中温和提起。群组对话中若要记入某位成员的私人记忆可传 memberName。",
+        description = "记录“需要用户参与”的待办/约定，且**必须由用户自己明确提出或同意**（如用户说“我明天要交报告”“记得提醒我买药”）。调用时必须附用户原话：sourceMessageIds 填用户消息ID、evidence 逐字摘录用户原话。角色要求用户去做的事、角色的建议或叮嘱，一律不得用本工具记录——应先自然征询用户，等用户自己答应后再记。到时间可在对话中温和提起。**期限必须能在用户原话里找到依据**：dueAt/timeRef 只有在 evidence 原话里出现了日期或时间词（“明天”“下周三”“2026-08-10”“晚上九点”）时才能填，且必须与用户说的那一天一致；用户没提时间就别填，工具会拒绝无法核对期限的调用。群组对话中若要记入某位成员的私人记忆可传 memberName。",
         parametersJson = buildJsonObject {
             put("type", "object")
             put("additionalProperties", false)
@@ -80,6 +81,16 @@ class SetReminderTool(private val memory: MemoryService) : AgentTool {
         val parsedKey = parseRelativeText(reminderKey, baseZoned)
         val parsedValue = parseRelativeText(reminderValue, baseZoned)
         val dueAt = MemoryToolSupport.normalizeTimestamp(ToolArgs.string(args, "dueAt"), null) ?: resolved?.iso
+        // 期限必须能在用户原话里定位（相对词按消息时间换算后再核对日期）。核对不了就不建排期，
+        // 明确回报原因，绝不静默接受一个模型自己给的期限。
+        if (dueAt != null && !dueAtBackedByUserEvidence(resolvedSources.filter { it.role == "user" }, dueAt)) {
+            return AgentToolResult(
+                errorJson(
+                    "无法核对期限：用户原话里没有可解析的日期/时间词，或该期限与用户说的不是同一天。" +
+                        "请先在对话中与用户确认时间；也可以省略 dueAt/timeRef，只记录约定本身（不排期提醒）",
+                ),
+            )
+        }
 
         val store = member?.longTerm ?: character.longTerm
         val existing = store.firstOrNull {

@@ -7,7 +7,6 @@ import com.deeptalking.domain.agent.prompts.STATIC_PROFILE_FIELDS
 import com.deeptalking.domain.agent.prompts.staticFieldLabel
 import com.deeptalking.domain.agent.prompts.withStaticField
 import com.deeptalking.core.model.StaticFieldRules
-import com.deeptalking.core.model.isStaticFieldManual
 import com.deeptalking.domain.memory.hasStaticEditIntent
 import com.deeptalking.domain.memory.hasValidUserEvidence
 import com.deeptalking.domain.memory.parseRelativeText
@@ -36,7 +35,7 @@ class UpdateCharacterFieldTool : AgentTool {
 
     override val definition = ToolDefinition(
         name = "update_character_field",
-        description = "精准修改角色基础设定字段（性别/年龄/种族/外貌特征/性格特征/恐惧弱点/背景故事/说话风格/语言方言/对用户的称呼）。当用户直接要求修改这些设定（如\"把我职业改成教师\"\"我现在是学生了\"\"你性格应该更冷酷些\"\"别叫我用户，叫我明明\"）时，必须调用本工具立即生效；value一律写成**明确的简短陈述句**：只写内容本身、一个字段一件事（短字段几十字、外貌/性格/恐惧弱点/说话风格一两句、背景故事另计；**数值上限见规则 3.5**，超长会被截断）；**禁止「不是…而是…」这类对比句**（会被拒收，请直接写陈述句，如性格\"性格冷静克制，遇事沉稳。\"）；禁止括号注释、理由、整句说明或解释性文字；\"对用户的称呼\"只填一个简短称呼词、不带任何解释。群组实体不维护基础设定字段（世界观并入群组描述），成员的个人字段请在该成员卡片上修改。不要在submit_response的staticFields里重复提交本工具已改的字段。用户在卡片里标记为**人工手写**的字段默认不得改写，只有用户本轮明确要求改该字段时才可通过本工具更新。",
+        description = "精准修改角色基础设定字段（性别/年龄/种族/外貌特征/性格特征/恐惧弱点/背景故事/说话风格/语言方言/对用户的称呼）。当用户直接要求修改这些设定（如\"把我职业改成教师\"\"我现在是学生了\"\"你性格应该更冷酷些\"\"别叫我用户，叫我明明\"）时，必须调用本工具立即生效；value一律写成**明确的简短陈述句**：只写内容本身、一个字段一件事（短字段几十字、外貌/性格/恐惧弱点/说话风格一两句、背景故事另计；**数值上限见规则 3.5**，超长会被截断）；**禁止「不是…而是…」这类对比句**（会被拒收，请直接写陈述句，如性格\"性格冷静克制，遇事沉稳。\"）；禁止括号注释、理由、整句说明或解释性文字；\"对用户的称呼\"只填一个简短称呼词、不带任何解释。群组实体不维护基础设定字段（世界观并入群组描述），成员的个人字段请在该成员卡片上修改。不要在submit_response的staticFields里重复提交本工具已改的字段。",
         parametersJson = buildJsonObject {
             put("type", "object")
             put("additionalProperties", false)
@@ -91,12 +90,7 @@ class UpdateCharacterFieldTool : AgentTool {
         val resolvedSources = hasValidUserEvidence(context.character, sourceIds, evidence)
             ?: return AgentToolResult(errorJson("evidence 必须逐字来自 sourceMessageIds 指定的用户消息，找不到用户原话时不修改"))
         if (!hasStaticEditIntent(field, resolvedSources)) {
-            val reason = if (isStaticFieldManual(context.character.staticFieldMeta, field)) {
-                "「$label」已被用户标记为人工手写，本轮用户未明确要求修改，静态设定不修改"
-            } else {
-                "用户并未明确要求修改「$label」，静态设定不修改"
-            }
-            return AgentToolResult(errorJson(reason))
+            return AgentToolResult(errorJson("用户并未明确要求修改「$label」，静态设定不修改"))
         }
         val updated = context.character.copy(
             staticProfile = withStaticField(context.character.staticProfile, field, value),

@@ -21,11 +21,15 @@ import com.deeptalking.core.model.TtsPhase
 import com.deeptalking.core.model.SpeechSegment
 import com.deeptalking.core.model.extractSpeechSegments
 import com.deeptalking.core.model.extractSpeechText
+import com.deeptalking.core.model.convergeLorebookCapacity
 import com.deeptalking.core.model.mergeCharacterChanges
+import com.deeptalking.core.model.restoreArchivedLorebookEntry
 import com.deeptalking.domain.agent.HotTopicCounters
 import com.deeptalking.domain.agent.HotTopicPolicy
 import com.deeptalking.domain.agent.OrchestratorResult
 import com.deeptalking.domain.agent.prompts.buildShortTermBlock
+import com.deeptalking.domain.memory.archiveToFit
+import com.deeptalking.domain.memory.lorebookOverflow
 import com.deeptalking.engine.ondevice.TtsSpeaker
 import com.deeptalking.engine.ondevice.TtsTurn
 import com.deeptalking.engine.remote.RemoteTtsProbe
@@ -631,7 +635,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 fieldsMigrationVersion = "1.2.0",
                 lorebookMigratedAt = now,
             )
-            core.data.characters.upsert(character)
+            core.data.characters.upsert(character.convergeLorebookCapacity())
             activeIdState.value = character.id
         }
     }
@@ -661,7 +665,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 fieldsMigrationVersion = "1.2.0",
                 lorebookMigratedAt = now,
             )
-            core.data.characters.upsert(group)
+            core.data.characters.upsert(group.convergeLorebookCapacity())
             activeIdState.value = group.id
         }
     }
@@ -716,7 +720,16 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 dynamicState = draft.dynamicState,
                 dynamicStateMeta = draft.dynamicStateMeta,
                 groupSharedDynamic = draft.groupSharedDynamic,
-                members = draft.members,
+                // Background tasks own each member's world book; the card editor does not
+                // expose member books, so keep the live lists — a whole-list write would
+                // roll back an archive/consolidation that ran while the dialog was open.
+                members = draft.members.map { member ->
+                    val liveMember = live.members.firstOrNull { it.id == member.id } ?: return@map member
+                    member.copy(
+                        lorebook = liveMember.lorebook,
+                        lorebookArchive = liveMember.lorebookArchive,
+                    )
+                },
             )
         }
     }
@@ -839,7 +852,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 fieldsMigrationVersion = "1.2.0",
                 lorebookMigratedAt = now,
             )
-            core.data.characters.upsert(group)
+            core.data.characters.upsert(group.convergeLorebookCapacity())
             onDone(true)
         }
     }
@@ -886,20 +899,78 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
      * World-book edits from the editor. Each one patches the live row: the entry the UI
      * shows is the entry that is stored (same id), consecutive edits cannot overwrite each
      * other, and a background consolidation that touched another entry survives.
+     *
+     * Capacity is judged **globally** (shared book + members): adding the entry archives the
+     * oldest evictable entries when the book is full, and refuses (with a visible prompt)
+     * when only manual/常驻 entries are left.
      */
     fun addLorebookEntry(characterId: String, entry: LorebookEntry) {
         patchCharacter(characterId) { live ->
-            if (live.lorebook.size >= AppLimits.Lorebook.ENTRIES) {
-                eventsState.tryEmit(UiEvent("世界书条目已达上限（${AppLimits.Lorebook.ENTRIES} 条）"))
-                live
+            val withEntry = live.copy(lorebook = live.lorebook + entry)
+            val overflow = lorebookOverflow(withEntry)
+            if (overflow <= 0) {
+                withEntry
             } else {
-                live.copy(lorebook = live.lorebook + entry)
+                val adjustment = archiveToFit(withEntry, overflow, excludeIds = setOf(entry.id))
+                if (adjustment.unmet > 0) {
+                    eventsState.tryEmit(UiEvent("世界书已满（其余条目为人工维护或常驻），无法新增；请先归档或删除一些条目"))
+                    live
+                } else {
+                    emitArchiveNotice(adjustment.archived)
+                    adjustment.character
+                }
             }
         }
     }
 
+    /** Soft-deletes a live entry into the archive; restorable from the editor. */
+    fun archiveLorebookEntry(characterId: String, entryId: String) {
+        patchCharacter(characterId) { live ->
+            val entry = live.lorebook.firstOrNull { it.id == entryId } ?: return@patchCharacter live
+            live.copy(
+                lorebook = live.lorebook.filterNot { it.id == entryId },
+                lorebookArchive = live.lorebookArchive + entry,
+            )
+        }
+    }
+
+    /** Restores an archived entry; if that overflows, the same capacity rule frees room. */
+    fun restoreLorebookEntry(characterId: String, entryId: String) {
+        patchCharacter(characterId) { live ->
+            val restored = live.restoreArchivedLorebookEntry(entryId)
+            if (restored == live) return@patchCharacter live
+            val overflow = lorebookOverflow(restored)
+            if (overflow <= 0) {
+                restored
+            } else {
+                // Never re-archive the entry being restored: it is the oldest precisely
+                // because it had been idle, and the user just asked for it back.
+                val adjustment = archiveToFit(restored, overflow, excludeIds = setOf(entryId))
+                if (adjustment.unmet > 0) {
+                    eventsState.tryEmit(UiEvent("世界书已满（其余条目为人工维护或常驻），无法恢复该条目"))
+                    live
+                } else {
+                    emitArchiveNotice(adjustment.archived)
+                    adjustment.character
+                }
+            }
+        }
+    }
+
+    private fun emitArchiveNotice(archived: List<LorebookEntry>) {
+        if (archived.isEmpty()) return
+        eventsState.tryEmit(
+            UiEvent("世界书已满，已归档最久未活跃的 ${archived.size} 条：${archived.joinToString("、") { it.name }}"),
+        )
+    }
+
     fun removeLorebookEntry(characterId: String, entryId: String) {
-        patchCharacter(characterId) { live -> live.copy(lorebook = live.lorebook.filterNot { it.id == entryId }) }
+        patchCharacter(characterId) { live ->
+            live.copy(
+                lorebook = live.lorebook.filterNot { it.id == entryId },
+                lorebookArchive = live.lorebookArchive.filterNot { it.id == entryId },
+            )
+        }
     }
 
     fun updateLorebookEntry(characterId: String, entry: LorebookEntry) {
@@ -1313,7 +1384,6 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                         timestamp = Instant.now().toString(),
                         internalOnly = false,
                         staticChanges = finalResult.staticChanges,
-                        lockedStaticFields = finalResult.lockedStaticFields,
                         lorebookChanges = finalResult.lorebookChanges,
                     ),
                 )

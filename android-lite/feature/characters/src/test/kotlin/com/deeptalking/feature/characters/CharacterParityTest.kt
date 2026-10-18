@@ -8,8 +8,6 @@ import com.deeptalking.core.model.GroupMember
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.LorebookOrigin
 import com.deeptalking.core.model.StaticProfile
-import com.deeptalking.core.model.isStaticFieldManual
-import com.deeptalking.core.model.withStaticFieldManual
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -245,7 +243,7 @@ class CharacterParityTest {
             ),
         )
 
-        val result = CharacterParity.normalizeUserEditedDraft(character, initial = character, base = base, zone = zone)
+        val result = CharacterParity.normalizeUserEditedDraft(character, base = base, zone = zone)
 
         assertEquals("他不是冷漠，而是懒得解释。", result.character.staticProfile.personality)
         assertEquals(longBackground, result.character.staticProfile.background)
@@ -267,65 +265,6 @@ class CharacterParityTest {
 
         assertEquals("", normalized.staticProfile.personality)
         assertTrue(normalized.staticProfile.background.length <= AppLimits.StaticProfile.BACKGROUND_CHARS)
-    }
-
-    @Test
-    fun onlyFieldsTheUserActuallyChangedAreMarkedManual() {
-        val initial = Character(
-            id = "c",
-            name = "林晚",
-            staticProfile = StaticProfile(personality = "冷静", background = "旧背景"),
-        )
-        val edited = initial.copy(
-            staticProfile = initial.staticProfile.copy(personality = "冷静克制", gender = "男"),
-        )
-
-        val result = CharacterParity.normalizeUserEditedDraft(edited, initial = initial, base = base, zone = zone)
-
-        assertTrue(isStaticFieldManual(result.character.staticFieldMeta, "personality"))
-        assertTrue(isStaticFieldManual(result.character.staticFieldMeta, "gender"))
-        assertFalse(isStaticFieldManual(result.character.staticFieldMeta, "background"))
-        assertFalse(isStaticFieldManual(result.character.staticFieldMeta, "appearance"))
-    }
-
-    @Test
-    fun withoutAnInitialSnapshotNothingIsMarkedManual() {
-        val character = Character(id = "c", name = "林晚", staticProfile = StaticProfile(personality = "冷静"))
-
-        val result = CharacterParity.normalizeUserEditedDraft(character, base = base, zone = zone)
-
-        assertTrue(result.character.staticFieldMeta.isEmpty())
-    }
-
-    @Test
-    fun anUntouchedManualFieldStaysLockedUntilTheSwitchFreesIt() {
-        val locked = withStaticFieldManual(emptyMap(), "personality", true)
-        val character = Character(
-            id = "c",
-            name = "林晚",
-            staticProfile = StaticProfile(personality = "冷静"),
-            staticFieldMeta = locked,
-        )
-
-        val kept = CharacterParity.normalizeUserEditedDraft(character, initial = character, base = base, zone = zone)
-        assertTrue(isStaticFieldManual(kept.character.staticFieldMeta, "personality"))
-
-        // 「让角色接管」把草稿里的标记清掉，且本次没改文本 → 解除。
-        val unlocked = character.copy(staticFieldMeta = withStaticFieldManual(locked, "personality", false))
-        val freed = CharacterParity.normalizeUserEditedDraft(unlocked, initial = character, base = base, zone = zone)
-        assertFalse(isStaticFieldManual(freed.character.staticFieldMeta, "personality"))
-    }
-
-    @Test
-    fun aGroupMemberEditMarksTheMemberFieldOnly() {
-        val member = GroupMember(id = "m", name = "阿黎", staticProfile = StaticProfile(personality = "冷静"))
-        val group = Character(id = "g", isGroup = true, members = listOf(member))
-        val edited = group.copy(members = listOf(member.copy(staticProfile = member.staticProfile.copy(personality = "冷静克制"))))
-
-        val result = CharacterParity.normalizeUserEditedDraft(edited, initial = group, memberIndex = 0, base = base, zone = zone)
-
-        assertTrue(isStaticFieldManual(result.character.members[0].staticFieldMeta, "personality"))
-        assertTrue(result.character.staticFieldMeta.isEmpty())
     }
 
     @Test
@@ -397,8 +336,11 @@ class CharacterParityTest {
         val b = LorebookEntry(id = "b", name = "乙", content = "乙内容")
         val base = listOf(a, b)
 
-        val added = CharacterParity.addLorebookEntry(base, LorebookEntry(id = "c", name = "丙", content = "丙内容"))
-        assertEquals(listOf("a", "b", "c"), added.map { it.id })
+        val added = CharacterParity.addLorebookEntry(
+            Character(id = "c1", lorebook = base),
+            LorebookEntry(id = "c", name = "丙", content = "丙内容"),
+        )
+        assertEquals(listOf("a", "b", "c"), added.lorebook.map { it.id })
         assertEquals(base, listOf(a, b))
 
         val removed = CharacterParity.removeLorebookEntry(base, "a")
@@ -415,13 +357,16 @@ class CharacterParityTest {
     }
 
     @Test
-    fun addingBeyondTheEntryCapIsRefused() {
+    fun addingBeyondTheEntryCapArchivesTheOldest() {
         val full = (1..com.deeptalking.core.common.AppLimits.Lorebook.ENTRIES).map {
-            LorebookEntry(id = "e$it", name = "n$it", content = "c")
+            LorebookEntry(id = "e$it", name = "n$it", content = "c", createdAt = "2026-01-01T00:00:00Z")
         }
-        val next = CharacterParity.addLorebookEntry(full, LorebookEntry(id = "extra", name = "x", content = "c"))
-        assertEquals(full.size, next.size)
-        assertFalse(next.any { it.id == "extra" })
+        val character = Character(id = "c1", lorebook = full)
+        val next = CharacterParity.addLorebookEntry(character, LorebookEntry(id = "extra", name = "x", content = "c"))
+        // Capacity-driven: the new entry lands and the oldest live entry is archived.
+        assertEquals(com.deeptalking.core.common.AppLimits.Lorebook.ENTRIES, next.lorebook.size)
+        assertTrue(next.lorebook.any { it.id == "extra" })
+        assertEquals(listOf("e1"), next.lorebookArchive.map { it.id })
     }
 
     @Test

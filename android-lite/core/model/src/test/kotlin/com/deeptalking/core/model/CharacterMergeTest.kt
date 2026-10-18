@@ -67,6 +67,19 @@ class CharacterMergeTest {
     }
 
     @Test
+    fun theLorebookArchiveMergesPerEntryToo() {
+        val before = Character(id = "c1", lorebook = listOf(entry("live", "a")))
+        val after = before.copy(lorebookArchive = listOf(entry("arc", "归档")))
+        // Another writer archived a different entry while we were working.
+        val live = before.copy(lorebookArchive = listOf(entry("other", "别人归档的")))
+
+        val merged = mergeCharacterChanges(before, after, live)
+
+        assertEquals(listOf("arc", "other"), merged.lorebookArchive.map { it.id }.sorted())
+        assertEquals(listOf("live"), merged.lorebook.map { it.id })
+    }
+
+    @Test
     fun memberWorldBooksMergePerEntryToo() {
         val member = GroupMember(id = "m1", name = "甲", lorebook = listOf(entry("a", "旧")))
         val before = Character(id = "c1", isGroup = true, members = listOf(member))
@@ -91,17 +104,5 @@ class CharacterMergeTest {
         val merged = mergeCharacterChanges(before, before, live)
 
         assertEquals(live, merged)
-    }
-
-    @Test
-    fun theManualLockFlagSurvivesAThreeWayMerge() {
-        val before = Character(id = "c1")
-        val after = before.copy(staticFieldMeta = withStaticFieldManual(before.staticFieldMeta, "personality", true))
-        val live = before.copy(name = "并发改名")
-
-        val merged = mergeCharacterChanges(before, after, live)
-
-        assertEquals("并发改名", merged.name)
-        assertTrue(isStaticFieldManual(merged.staticFieldMeta, "personality"))
     }
 }

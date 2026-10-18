@@ -9,13 +9,13 @@ import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.ShortTermMemory
 import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.core.model.Sticker
-import com.deeptalking.core.model.withStaticFieldManual
 import com.deeptalking.domain.agent.AgentContext
 import com.deeptalking.domain.agent.ToolRegistry
 import com.deeptalking.engine.ondevice.ToolCall
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.time.Instant
@@ -129,6 +129,66 @@ class MemoryToolsTest {
     }
 
     @Test
+    fun `set_reminder rejects a due time the user never mentioned`() = runBlocking {
+        val character = Character(
+            id = "c1",
+            instant = listOf(userTurn("m1", "记得帮我买药")),
+        )
+        val args = """
+            {"key":"买药","value":"帮用户买药","sourceMessageIds":["m1"],
+             "evidence":"记得帮我买药","dueAt":"2026-08-10T09:00:00"}
+        """.trimIndent()
+        val result = SetReminderTool(memory).execute(call("set_reminder", args), context(character))
+        assertTrue("期限必须能在用户原话里定位", result.contentJson.contains("\"ok\":false"))
+        assertTrue(result.contentJson.contains("期限"))
+        assertNull("拒绝时不应落库", result.updatedCharacter)
+    }
+
+    @Test
+    fun `set_reminder accepts a due time that lands on the day the user named`() = runBlocking {
+        val character = Character(
+            id = "c1",
+            instant = listOf(
+                ChatMessage(
+                    id = "m1",
+                    role = Role.User,
+                    content = "我明天要交报告。",
+                    timestamp = "2026-08-09T12:00:00",
+                ),
+            ),
+        )
+        val args = """
+            {"key":"交报告","value":"交报告","sourceMessageIds":["m1"],
+             "evidence":"我明天要交报告","dueAt":"2026-08-10T09:00:00"}
+        """.trimIndent()
+        val result = SetReminderTool(memory).execute(call("set_reminder", args), context(character))
+        assertTrue(result.contentJson.contains("\"ok\":true"))
+        val promise = result.updatedCharacter!!.longTerm.first { it.category == MemoryCategory.Promises }
+        assertNotNull(promise.dueAt)
+    }
+
+    @Test
+    fun `set_reminder rejects a due time that contradicts what the user said`() = runBlocking {
+        val character = Character(
+            id = "c1",
+            instant = listOf(
+                ChatMessage(
+                    id = "m1",
+                    role = Role.User,
+                    content = "我明天要交报告。",
+                    timestamp = "2026-08-09T12:00:00",
+                ),
+            ),
+        )
+        val args = """
+            {"key":"交报告","value":"交报告","sourceMessageIds":["m1"],
+             "evidence":"我明天要交报告","timeRef":{"explicit":"2026-08-11T09:00:00"}}
+        """.trimIndent()
+        val result = SetReminderTool(memory).execute(call("set_reminder", args), context(character))
+        assertTrue("用户说的“明天”不是模型给的那天", result.contentJson.contains("\"ok\":false"))
+    }
+
+    @Test
     fun `update_memory corrects a short term entry and requeues it`() = runBlocking {
         val character = Character(
             id = "c1",
@@ -226,34 +286,6 @@ class MemoryToolsTest {
         val result = UpdateCharacterFieldTool().execute(call("update_character_field", args), context(character))
         assertTrue(result.contentJson.contains("\"ok\":true"))
         assertEquals("冷静", result.updatedCharacter!!.staticProfile.personality)
-    }
-
-    @Test
-    fun `update_character_field refuses a manual-locked field when the user did not ask`() = runBlocking {
-        val character = Character(
-            id = "c1",
-            instant = listOf(userTurn("m1", "今天我心情很好")),
-            staticProfile = StaticProfile(personality = "冷静"),
-            staticFieldMeta = withStaticFieldManual(emptyMap(), "personality", true),
-        )
-        val args = """{"field":"personality","value":"更外向","sourceMessageIds":["m1"],"evidence":"今天我心情很好"}"""
-        val result = UpdateCharacterFieldTool().execute(call("update_character_field", args), context(character))
-        assertTrue(result.contentJson.contains("\"ok\":false"))
-        assertTrue(result.contentJson.contains("人工手写"))
-    }
-
-    @Test
-    fun `update_character_field allows a manual-locked field when the user asks for it`() = runBlocking {
-        val character = Character(
-            id = "c1",
-            instant = listOf(userTurn("m1", "你性格改成更外向些")),
-            staticProfile = StaticProfile(personality = "冷静"),
-            staticFieldMeta = withStaticFieldManual(emptyMap(), "personality", true),
-        )
-        val args = """{"field":"personality","value":"更外向","sourceMessageIds":["m1"],"evidence":"你性格改成更外向些"}"""
-        val result = UpdateCharacterFieldTool().execute(call("update_character_field", args), context(character))
-        assertTrue(result.contentJson.contains("\"ok\":true"))
-        assertEquals("更外向", result.updatedCharacter!!.staticProfile.personality)
     }
 
     @Test

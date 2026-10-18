@@ -7,6 +7,7 @@ import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.LorebookOrigin
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.ShortTermMemory
+import com.deeptalking.core.model.lorebookCapacityCount
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
@@ -265,23 +266,33 @@ class LorebookStoreTest {
     }
 
     @Test
-    fun evictionRetiresModelEntryAfterThreeMissesButExemptsUserAndAlwaysActive() {
-        val entries = listOf(
-            LorebookEntry(id = "ai", name = "AI", content = "c", origin = LorebookOrigin.Model, keywords = listOf("k")),
-            LorebookEntry(id = "active", name = "常驻", content = "c", origin = LorebookOrigin.Model, alwaysActive = true),
-            LorebookEntry(id = "user", name = "用户", content = "c", origin = LorebookOrigin.User),
+    fun upsertOnAFullCharacterIsRefusedWhenTheGlobalCapacityIsReached() {
+        // Capacity is global (shared book + members) and only model entries count.
+        val model = (1..AppLimits.Lorebook.ENTRIES).map {
+            LorebookEntry(id = "e$it", name = "n$it", content = "c", origin = LorebookOrigin.Model)
+        }
+        val character = Character(
+            id = "c1",
+            lorebook = model,
+            shortTerm = listOf(ShortTermMemory(id = "s1", content = "新增 内容")),
         )
-        var current = entries
-        current = evictStaleLorebookEntries(current).kept
-        assertEquals(3, current.size)
-        current = evictStaleLorebookEntries(current).kept
-        assertEquals(3, current.size)
-        val third = evictStaleLorebookEntries(current)
-        assertEquals(1, third.removed.size)
-        assertEquals("ai", third.removed[0].id)
-        assertEquals(2, third.kept.size)
-        assertTrue(third.kept.any { it.id == "active" })
-        assertTrue(third.kept.any { it.id == "user" })
+        val (unchanged, refused) = upsertLorebookEntryForCharacter(
+            character,
+            LorebookProposal("新增", "内容"),
+            sourceShortTermIds = listOf("s1"),
+        )
+        assertFalse(refused.ok)
+        assertTrue(refused.reason.contains("上限"))
+        assertSame(character, unchanged)
+    }
+
+    @Test
+    fun manualEntriesDoNotCountTowardTheGlobalCapacity() {
+        val manual = (1..AppLimits.Lorebook.ENTRIES).map {
+            LorebookEntry(id = "u$it", name = "手工$it", content = "c", origin = LorebookOrigin.User)
+        }
+        // A book full of manual entries still has all 200 model slots free.
+        assertEquals(0, Character(id = "c1", lorebook = manual).lorebookCapacityCount())
     }
 
     @Test

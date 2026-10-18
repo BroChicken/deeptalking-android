@@ -340,6 +340,8 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
             onAddLorebook = vm::addLorebookEntry,
             onRemoveLorebook = vm::removeLorebookEntry,
             onUpdateLorebook = vm::updateLorebookEntry,
+            onArchiveLorebook = vm::archiveLorebookEntry,
+            onRestoreLorebook = vm::restoreLorebookEntry,
             onGenerateAvatar = { char, cb -> vm.generateEmojiAvatar(char, cb) },
             onFillMember = { char, index, hint -> vm.fillGroupMember(char, index, hint) },
             initialMemberIndex = editingMemberIndex,

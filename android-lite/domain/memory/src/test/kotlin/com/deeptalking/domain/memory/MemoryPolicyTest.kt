@@ -362,6 +362,127 @@ class MemoryPolicyTest {
         assertEquals(2, dedupeShortTerm(listOf(short, full.copy(id = "s4", eventTime = "2026-10-13T03:29:09Z"))).size)
     }
 
+    // --- same-event guard: the structured fields get the last word -------------------------
+    //
+    // A fold re-reads the low-water leftovers, so its re-summary can carry the earlier beat
+    // along *and then* describe a second one: containment stays at 1.00 while the entry is a
+    // different event. These two texts measure Jaccard 0.65 / containment 1.00 / 39 bigrams,
+    // so the global near-duplicate rule (0.72) cannot fire and only the same-event rule is
+    // under test. They sit in one logical day + slot (identity equal).
+    private val earlierBeat = "2026-10-13夜里，家中卧室，小雨把笔搁回床头，说用户的手稳，那格本就留给他自己拿主意。"
+    private val laterBeat = earlierBeat + "；随后瑟瑞斯推门进来，把本子收进抽屉，说自己要管着。"
+
+    private fun beat(id: String, content: String, participants: List<String> = emptyList(), location: String = "") =
+        ShortTermMemory(
+            id = id,
+            content = content,
+            eventTime = "2026-10-13T17:29:09Z",
+            participants = participants,
+            location = location,
+        )
+
+    @Test
+    fun dedupeShortTermKeepsFragmentsAboutDifferentPeopleApart() {
+        val deduped = dedupeShortTerm(
+            listOf(
+                beat("p1", earlierBeat, participants = listOf("小雨"), location = "家中卧室"),
+                beat("p2", laterBeat, participants = listOf("瑟瑞斯"), location = "家中卧室"),
+            ),
+        )
+        // Same place, but the casts share nobody: merging would take the earlier time and
+        // blend two evenings' fragments into one entry.
+        assertEquals(listOf("p1", "p2"), deduped.map { it.id })
+    }
+
+    @Test
+    fun dedupeShortTermKeepsFragmentsInDifferentPlacesApart() {
+        val deduped = dedupeShortTerm(
+            listOf(
+                beat("l1", earlierBeat, participants = listOf("瑟瑞斯"), location = "家中卧室"),
+                beat("l2", laterBeat, participants = listOf("瑟瑞斯"), location = "楼下便利店"),
+            ),
+        )
+        assertEquals(listOf("l1", "l2"), deduped.map { it.id })
+    }
+
+    @Test
+    fun dedupeShortTermKeepsContradictingFactsApart() {
+        // Same people, same place, same slot — but the second fragment reverses the outcome
+        // (答应 → 拒绝), so the two must not be folded into one "fact".
+        val promised = beat(
+            "c1",
+            "2026-10-13夜里，家中卧室，小雨答应把本子借给用户，说第二天早上来取。",
+            participants = listOf("小雨"),
+        )
+        val refused = beat(
+            "c2",
+            "2026-10-13夜里，家中卧室，小雨答应把本子借给用户，说第二天早上来取；" +
+                "可小雨随后改口拒绝借给用户，说本子要收进抽屉自己管。",
+            participants = listOf("小雨"),
+        )
+        assertEquals(listOf("c1", "c2"), dedupeShortTerm(listOf(promised, refused)).map { it.id })
+
+        // The same term asserted on one side and denied on the other is a conflict too.
+        val denied = beat(
+            "c4",
+            "2026-10-13夜里，家中卧室，小雨没答应把本子借给用户，两人说定第二天早上再说；" +
+                "用户追问原因，小雨说本子自己还要用一阵子。",
+            participants = listOf("小雨"),
+        )
+        assertEquals(listOf("c1", "c4"), dedupeShortTerm(listOf(promised, denied)).map { it.id })
+
+        // A pair one narration can hold in sequence ("开始…结束") is NOT a conflict: the
+        // longer side states both, and this is one beat written out again in full.
+        val rain = beat(
+            "c5",
+            "2026-10-13夜里，家中卧室，小雨说这场雨从傍晚开始下，两人靠在窗边听雨。",
+            participants = listOf("小雨"),
+        )
+        val rainLater = beat(
+            "c6",
+            "2026-10-13夜里，家中卧室，小雨说这场雨从傍晚开始下，两人靠在窗边听雨；" +
+                "雨到凌晨才结束，两人一直没睡，谁也没再提本子的事。",
+            participants = listOf("小雨"),
+        )
+        assertEquals(listOf("c5"), dedupeShortTerm(listOf(rain, rainLater)).map { it.id })
+    }
+
+    @Test
+    fun dedupeShortTermStillMergesTheSameEventWithCompatibleFields() {
+        // Regression guard: the genuine same beat, rewritten longer, still collapses. One
+        // cast is a subset of the other (the shape a re-summarized beat has), and a place
+        // named inside the longer one is the same place — neither is a difference.
+        val merged = dedupeShortTerm(
+            listOf(
+                beat("k1", earlierBeat, participants = listOf("瑟瑞斯"), location = "卧室"),
+                beat("k2", laterBeat, participants = listOf("瑟瑞斯", "用户"), location = "家中卧室"),
+            ),
+        )
+        assertEquals(1, merged.size)
+        assertEquals(laterBeat.length, merged[0].content.length)
+        assertEquals(setOf("瑟瑞斯", "用户"), merged[0].participants.toSet())
+    }
+
+    @Test
+    fun dedupeShortTermMergesWhenStructuredFieldsAreMissing() {
+        // Legacy imports carry no participants/location: unknown never blocks the merge,
+        // so the behaviour is exactly what it was before the guard.
+        assertEquals(1, dedupeShortTerm(listOf(beat("u1", earlierBeat), beat("u2", laterBeat))).size)
+    }
+
+    @Test
+    fun dedupeShortTermNearDuplicateRuleIgnoresStructuredFields() {
+        // The global wording rule is untouched: byte-identical descriptions are one entry
+        // even when the (mis-attributed) casts do not overlap.
+        val deduped = dedupeShortTerm(
+            listOf(
+                beat("n1", earlierBeat, participants = listOf("小雨")),
+                beat("n2", earlierBeat, participants = listOf("瑟瑞斯")),
+            ),
+        )
+        assertEquals(1, deduped.size)
+    }
+
     @Test
     fun repairMemoriesCollapsesShortAndLongDuplicates() {
         val character = Character(

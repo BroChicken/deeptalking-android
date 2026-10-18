@@ -454,6 +454,13 @@ const val MEMORY_REPAIR_VERSION = 3
  *    while the *next* beat of the same scene measured 0.62 — so the rule does not swallow
  *    two different beats.
  *
+ * Rule 2 additionally requires that nothing in the entries' **structured fields** says
+ * they are two *different* events: when the fold's re-summary carries the earlier beat
+ * along and then describes a second one about other people, another place, or a
+ * contradicting fact, containment stays high but the merge would take the earlier time
+ * and blend the two facts (see [definitelyDifferentEvents]). Rule 1 (global wording
+ * similarity) is untouched, so genuine duplicates still collapse.
+ *
  * Different days/slots are never merged on wording alone, so the pass cannot drop a
  * unique fact into an unrelated one.
  *
@@ -481,8 +488,12 @@ fun dedupeShortTerm(items: List<ShortTermMemory>): List<ShortTermMemory> {
             // re-reads the low-water leftovers as context, so the model re-summarizes recent
             // events, and the write path only merges into the newest few entries — those
             // pairs otherwise stay in the window and get injected twice on every request.
+            // High containment alone is not enough: a re-summary that carries the earlier
+            // beat along and then adds a *different* one keeps the containment high, so the
+            // structured fields get the last word on whether this is really one event.
             if (identity.isNotEmpty() && identity == identities[index] &&
-                containedIn(signatures[index], signature) >= SAME_EVENT_CONTAINMENT
+                containedIn(signatures[index], signature) >= SAME_EVENT_CONTAINMENT &&
+                !definitelyDifferentEvents(result[index], item)
             ) {
                 dupIndex = index
                 break
@@ -589,6 +600,99 @@ private const val SAME_EVENT_CONTAINMENT = 0.75
  * summary of a beat is an order of magnitude longer (measured pairs held 50+ bigrams).
  */
 private const val MIN_SAME_EVENT_GRAMS = 16
+
+/**
+ * True when two entries sharing one logical day + slot are nevertheless **known** to be
+ * two different events, so the high-containment rule must not fold them into one (the
+ * merge would take the earlier time and blend the two facts).
+ *
+ * Every check below reads a structured field and is deliberately conservative: a missing
+ * field means "unknown", and unknown never blocks the merge, so entries imported without
+ * `participants` / `location` keep the previous behaviour exactly.
+ *
+ * - **Place**: both locations are known and neither contains the other (so "卧室" vs
+ *   "主卧" — one name inside the other — is still the same place). Different places in a
+ *   single slot are different scenes.
+ * - **People**: both casts are known and share nobody. Shared people mean the same scene
+ *   kept going; a fully disjoint cast means a different moment. A shorter cast that is a
+ *   subset of the longer one is *not* a difference — that is exactly the shape of a beat
+ *   summarized once briefly and once in full.
+ * - **Facts**: the two texts assert a contradicting fact about the same topic
+ *   ([contradictsOnSameTopic]) — an antonym pair, or the same term asserted and denied.
+ */
+private fun definitelyDifferentEvents(a: ShortTermMemory, b: ShortTermMemory): Boolean =
+    locationsDiffer(a.location, b.location) ||
+        castsDisjoint(a.participants, b.participants) ||
+        contradictsOnSameTopic(a.content, b.content)
+
+/** Both places known and neither named by the other. */
+private fun locationsDiffer(a: String, b: String): Boolean {
+    val left = normalizeMemoryText(a)
+    val right = normalizeMemoryText(b)
+    if (left.isEmpty() || right.isEmpty()) return false
+    return !left.contains(right) && !right.contains(left)
+}
+
+/** Both casts known and disjoint (nobody appears on both sides). */
+private fun castsDisjoint(a: List<String>, b: List<String>): Boolean {
+    val left = a.map { normalizeMemoryText(it) }.filter { it.isNotEmpty() }.toSet()
+    val right = b.map { normalizeMemoryText(it) }.filter { it.isNotEmpty() }.toSet()
+    if (left.isEmpty() || right.isEmpty()) return false
+    return left.none { it in right }
+}
+
+/**
+ * Antonym pairs whose two sides assert opposite outcomes of the **same** act. Matched as
+ * plain substrings of the normalized text, so this only reads wording that states a
+ * result — it never guesses from similarity.
+ *
+ * Deliberately excludes pairs that one narration can legitimately contain in sequence
+ * ("开始…结束", "打开…关闭", "留下…离开"): the longer side then states both, and vetoing
+ * the merge would split one beat that was merely written out again in full.
+ */
+private val CONTRADICTION_PAIRS: List<Pair<String, String>> = listOf(
+    "答应" to "拒绝",
+    "同意" to "拒绝",
+    "接受" to "拒绝",
+    "承认" to "否认",
+    "记得" to "忘记",
+    "记得" to "忘了",
+    "成功" to "失败",
+    "和好" to "决裂",
+)
+
+/** Frames that deny the term they precede ("不答应", "没答应", "未答应", "并没有答应", ...). */
+private val NEGATION_FRAMES: List<String> = listOf("不", "没", "未", "别", "拒绝", "无")
+
+private val CONTRADICTION_TERMS: List<String> = CONTRADICTION_PAIRS.flatMap { listOf(it.first, it.second) }.distinct()
+
+/** True when the text states [term] in the negative ("没答应") rather than the positive. */
+private fun deniesTerm(text: String, term: String): Boolean =
+    NEGATION_FRAMES.any { text.contains(it + term) }
+
+/**
+ * True when two texts assert conflicting facts about the same topic: an antonym pair
+ * ("答应" / "拒绝"), or the same term asserted on one side and denied on the other
+ * ("答应了" / "没答应"). Only used on pairs that are already almost wholly contained in
+ * one another, so both sides are demonstrably about the same topic — a coincidental
+ * opposite word in unrelated text cannot reach this check.
+ */
+private fun contradictsOnSameTopic(a: String, b: String): Boolean {
+    val left = normalizeMemoryText(a)
+    val right = normalizeMemoryText(b)
+    if (left.isEmpty() || right.isEmpty() || left == right) return false
+    for ((first, second) in CONTRADICTION_PAIRS) {
+        if ((left.contains(first) && right.contains(second)) || (left.contains(second) && right.contains(first))) {
+            return true
+        }
+    }
+    for (term in CONTRADICTION_TERMS) {
+        if (left.contains(term) && right.contains(term) && deniesTerm(left, term) != deniesTerm(right, term)) {
+            return true
+        }
+    }
+    return false
+}
 
 /** Input to [addShortTermMemory] (legacy `sourceData`). */
 data class ShortTermDraft(

@@ -220,7 +220,7 @@ BackgroundTasks.scheduleTurn  后台串行维护：文风校对、快速回应�
 | 抽取（instant→shortTerm） | `instant` 满 `INSTANT`(60) | `extractionRetryAt` / `extractionFailures` | 整窗折叠成"日期+时段"事件摘要 |
 | 分析（shortTerm→longTerm） | `shortTerm` 低水位之上攒够 20 条 | `analysisRetryAt` / `analysisFailures` | **逐条容错**（单条校验不过只丢该条）＋**ack 宽容**（只承认批次内 id，缺的下轮再送）＋**截断抢救** `AnalysisSalvage`＋显式 `max_output_tokens` |
 | 场景概要 | 场景切换或跨度 ≥ `Scene.SPAN`(12) 条 | `sceneRetryAt` / `sceneFailures` | `summarizeScene` |
-| 世界书整理 | 跟随**抽取**：处理本次折叠刚产出的那批短期（排在分析之前） | `lorebookRetryAt` / `lorebookFailures` | `consolidateLorebook` + 淘汰；失败的那批留在内存待重试 |
+| 世界书整理 | 跟随**抽取**：处理本次折叠刚产出的那批短期（排在分析之前） | `lorebookRetryAt` / `lorebookFailures` | `consolidateLorebook` + 容量驱动归档；失败的那批留在内存待重试 |
 
 `scheduleMemoryRetry()` 统一指数退避（5 分钟 → 30 分钟封顶）；成功后清零。
 
@@ -239,7 +239,6 @@ BackgroundTasks.scheduleTurn  后台串行维护：文风校对、快速回应�
 - **只写明确的简短陈述句**：禁止「不是 A 而是 B」这类对比句（`contrastReason` 命中即**拒收**，工具会回一条明确错误让模型当场改写；它不静默截断也不偷改语义）。
 - **按字段收敛**（`AppLimits.StaticProfile`）：短字段（性别/年龄/种族/语言/称呼）**40 字**、叙述字段（外貌/性格/恐惧弱点/说话风格）**120 字**、背景故事**250 字**；超长按句末标点回退截断（`clamp`）。动态状态等非基础设定字段不受这些上限约束。
 - **两条通道语义不同**（`:feature:characters` 的 `FieldCleaning`）：**模型 / 建卡通道**（`MemoryToolSupport.cleanFieldValue`、`FieldCleaning.cleanFieldValue`）保留上面两条严格规则；**用户手写通道**（编辑器保存，`FieldCleaning.cleanUserWrittenField`）**对比句原样保留、不截断**，只去字段名前缀 / 括号说明，并把每一条处理作为可见提示回报给用户。注入侧另有单字段 600（背景 800）、整段 8000 字上限兜底，所以卡片存更长的文本不会撑大提示词。
-- **人工手写锁**：用户在卡片编辑器里真正改动过的静态字段会写成 `staticFieldMeta[key].manual=true`（随角色导出/导入、三方合并保留；旧数据缺失即未锁定）。`submit_response.staticFields` 对这些字段直接跳过并给可见提示，`update_character_field` 回明确原因；仅当**本轮用户明确要求**改该字段时才放行（用户点「角色维护」即解除锁定）。
 
 ### 动态状态（6 字段）
 
@@ -251,18 +250,18 @@ BackgroundTasks.scheduleTurn  后台串行维护：文风校对、快速回应�
 
 ### 世界书（lorebook）
 
-`char.lorebook = [{ id, name, keywords[], content, enabled, order, alwaysActive, origin, mentions, lastMentionedAt, misses }]`
+`char.lorebook = [{ id, name, keywords[], content, enabled, order, alwaysActive, origin, mentions, lastMentionedAt, misses }]`；`char.lorebookArchive = [...]`（归档，`GroupMember.lorebookArchive` 同理）。`misses` 仅为存档兼容保留，**已不参与任何判定**。
 
 **定位：世界层设定的唯一去处**（时代与世界观、地点、组织、专有名词、历史、规则）。静态字段只承载"人/群组本人"的设定（群组 `description` = 群组前提、单角色 `basicInfo.background` = 个人背景），世界观一律不写进静态字段。
 
 - **两种模式**：`alwaysActive: true`（常驻，每轮都注入，用于世界前提/规则）与关键词命中（被提到才注入，省 token）。**没关键词的条目不被拒收**：改用**条目名当触发词**。常驻数量受 `MAX_ALWAYS_ACTIVE`(6) 约束（超限只是降级、绝不整条丢弃）。
-- **来源与保护**：`origin: 'user' | 'ai'`（界面显示为「人工维护」/「AI 维护」，点一下即可切换）。`user` 的条目**不会被模型覆盖，也不参与自动淘汰**；`ai` 的条目模型可维护（更新=整条替换）。**归属只由这个开关决定**：编辑名字/关键词/内容、勾「启用」「常驻」都不改变归属；界面新建条目默认 `ai`。
+- **来源与保护**：`origin: 'user' | 'ai'`（界面显示为「人工维护」/「AI 维护」，点一下即可切换）。`user` 的条目**不会被模型覆盖、不计入 200 名额、也不参与自动淘汰**；`ai` 的条目模型可维护（更新=整条替换）。**归属只由这个开关决定**：编辑名字/关键词/内容、勾「启用」「常驻」都不改变归属；界面新建条目默认 `ai`。
 - **模型维护（三入口）**：
   1. 建卡/群组升级时由模型产出初始条目（`CharacterParity` 的 `lorebook` 字段，2-4 条，标记 `ai`）。
   2. 主循环工具 `upsert_lorebook_entry`：先按 `entryId`/`name` 精确匹配——**精确命中时用新 `content` 替换该条目原有内容**，未命中再用近似匹配（名称 bigram / 共享关键词 / 内容相似度）找**同一事物的近似条目**并**整条替换**（允许变短、允许把 `alwaysActive` 改回 false），确实没有近似条目才新建；要求 `sourceMessageIds` + `evidence` 可回溯，且**不得覆盖 `origin:user` 条目**。
-  3. 记忆子任务 `consolidateLorebook()`：跟随**短期抽取**（排在长期分析之前，读的正是本次折叠刚产出的那批短期；清理流程则读它即将消费的那批），把现有条目的**完整内容**（最近更新的 12 条 / 累计 ≤6000 字；其余只给名字+关键词并注明"本轮不要更新此条"）交给模型，要求"同一事物只一条：沿用原名，把完整原文里仍有效的部分 + 新事实**重新总结成一条去整条替换**（允许变短、一条只讲一件事、目标 300 字 / 硬上限 400 字）"（`AUTO_ENTRIES_PER_PASS`(3) 条上限，按 `sourceShortTermIds` 校验）；超 400 字的条目**退回模型重写一次**，仍超才放弃；写完后本地 `dedupeLorebook()` 兜底并执行淘汰。**写回只动世界书**（逐条并进最新列表，另有 `dedupeLorebook`），不再因为"运行期间角色版本变了"整批作废；**失败的那批留在内存**（`LorebookRetryStore`），下一轮维护时与新的批次一起重试，连续多次失败后弹窗询问「重试 / 忽略」（忽略即按用户意愿丢弃并写进请求日志）。每趟都会以 `status=note` 记录"写入 N 条 / 跳过 M 条（原因）"。另有一次性重写 `rebuildOversizedLorebook`：内容 >400 字的旧 AI 条目交给模型按主题拆成 1~3 条并原地替换。
-- **隐藏自动淘汰**：`LorebookStore.evictStaleLorebookEntries()` 每轮整理把未被注入的 `ai` 条目 `misses + 1`，达 3 即退役；条目被注入时 `markLorebookMentions()` 把 `misses` 归零。`misses` 不展示给模型、也不由模型管理。**退役不默默发生**：每趟退役的条目名称以 `status=note` 写进请求日志（与"真失败"的 `failed` 分开）。
-- 归一化：写入受 `AppLimits.Lorebook` 约束（`ENTRIES` 200 / `KEYWORDS_PER_ENTRY` 8 / `NAME_CHARS` 60 / `CONTENT_CHARS` 400——**超限写入直接拒收、退回模型重写，绝不截断**）；角色卡弹窗第三个标签页编辑（展示来源徽标/常驻开关/最近提及）。
+  3. 记忆子任务 `consolidateLorebook()`：跟随**短期抽取**（排在长期分析之前，读的正是本次折叠刚产出的那批短期；清理流程则读它即将消费的那批），把现有条目的**完整内容**（最近更新的 12 条 / 累计 ≤6000 字；其余只给名字+关键词并注明"本轮不要更新此条"）交给模型，要求"同一事物只一条：沿用原名，把完整原文里仍有效的部分 + 新事实**重新总结成一条去整条替换**（允许变短、一条只讲一件事、目标 300 字 / 硬上限 400 字）"（`AUTO_ENTRIES_PER_PASS`(3) 条上限，按 `sourceShortTermIds` 校验）；超 400 字的条目**退回模型重写一次**，仍超才放弃；写完后本地 `dedupeLorebook()` 兜底，**再按容量规则分包**（见下）。**写回只动世界书**（逐条并进最新列表，另有 `dedupeLorebook`），不再因为"运行期间角色版本变了"整批作废；**失败的那批留在内存**（`LorebookRetryStore`），下一轮维护时与新的批次一起重试，连续多次失败后弹窗询问「重试 / 忽略」（忽略即按用户意愿丢弃并写进请求日志）。每趟都会以 `status=note` 记录"写入 N 条 / 跳过 M 条（原因）/ 归档了哪些"。另有一次性重写 `rebuildOversizedLorebook`：内容 >400 字的旧 AI 条目交给模型按主题拆成 1~3 条并原地替换。
+- **容量驱动淘汰（200 上限，全局计数）**：一个单角色、或一个群组（本体 + 全体成员的世界书）**合计** 200 条——只统计 **`ai` 条目**；**人工维护条目不计入、永不淘汰、永不被自动改写**；**归档不计名额、不注入、不参与命中统计**。活跃时间 = `max(lastMentionedAt, createdAt)`（单一排序键，二者同级；都缺失时排最后，绝不因时间缺失而误删）。**平时不淘汰**：只有"本批新增放不下"时才腾位置，腾的数量 = `当前启用总数 + 本批真正新增数 − 200`（<0 记 0）；单次最多 `EVICT_MAX_PER_PASS`(4) 条（`Character.archiveOldestLorebookEntries` + `LorebookStore.archiveToFit`），需要更多时本次只写放得下的部分、其余下次再写并在 note 里说明。排序确定性：活跃时间 ↑ → 累计命中次数 ↑（少的先淘汰）→ 条目 id ↑，同一输入两次结果一致；重试按"当前还缺几个位置"重算，**幂等**（够了就是 0 条）。淘汰 + 新增/更新在**同一次角色更新**里提交（沿用 `consolidateLorebook` 返回同一 `Character` 的结构），失败什么都不变。**可淘汰池为空**（全是人工/常驻）+ 放不下 → **拒写并可见提示**，绝不删除受保护内容。**超容状态**（旧档导入 >200）走一次性收敛 `convergeLorebookCapacity()`（收敛到 200、进归档）。**归档可恢复**：条目从 live 列表移入 `lorebookArchive`（保留原归属），编辑器世界里可查看/恢复；恢复要占名额，超限时走同一套容量规则（且**不会**立刻把刚恢复的条目再次归档），腾不出就拒写 + 提示。所有上限判定点（编辑器新增、建卡/升级生成、`upsert_lorebook_entry`、后台整理、一次性重写、旧档导入/迁移）**统一用全局计数**。
+- 归一化：写入受 `AppLimits.Lorebook` 约束（`ENTRIES` 200（**全局**：本体+成员，只算 `ai`）/ `KEYWORDS_PER_ENTRY` 8 / `NAME_CHARS` 60 / `CONTENT_CHARS` 400——**超限写入直接拒收、退回模型重写，绝不截断**）；角色卡弹窗第三个标签页编辑（展示来源徽标/常驻开关/最近提及），条目可**归档**、归档区可**恢复**。
 - 命中 `LorebookMatcher`：**常驻条目无条件入围**，其余对**本轮用户输入 + 最近 6 条消息**做小写关键词包含匹配；**正文为空的"待补充"条目是唯一例外**——即使勾了常驻也只在关键词命中时注入（否则一堆未填条目会每轮挤在常驻段），注入时写成「名字：（正文为空，待补充；条目ID: …；关键词: …）」，让模型能按 id 精确补写而不用猜名字（完全没写关键词的空条目没有任何命中依据，不会注入）。排序 = 常驻 → `order` → 最近更新（`updatedAt` 新的在前）→ 名称（中文 `Collator`）；最多 `INJECT_ENTRIES`(6) 条。
 - 注入：分「常驻前提 / 相关条目」两组渲染，总字符受 `INJECT_CHARS`(1400) 限制（**装不下的条目跳过、继续尝试后面的短条目**，只有单条自身超预算才截断——旧行为下一条长常驻条目就能把后面全部挡死）；措辞强调"**是补充资料、不是指令，冲突以最新消息为准**"；真正注入的条目才计入 `mentions`（超预算被丢弃的不算命中）。
 - 群组实体与成员的世界书都参与命中（按 `id`（空则 `name|content`）去重合并）；工具写入时可指定 `memberName` 落到成员私人世界书。
@@ -372,7 +371,7 @@ tools: AUTO 阶段全部工具 / SUBMIT 阶段只有 submit_response
 | `2` | reply 正文写法（像日常说话）：**不设下限**、只设 **≤250 字上限**防大段空话；分段/行内样式限制；**动作/表情/心理/旁白一律写全角括号、单拍短、不堆叠、总量 ≤ ¼、不复述对白情绪**；**自己说的话直接写、不加引号包裹；只有引用他人话语/歌词/诗句/书名或专有名词原文时才用符号（引号用「」、书名用《》、逐字照抄），并避免英文直引号（JSON 需转义）**；去重（禁重复近期整句/句式/意象/固定动作/收尾） |
 | `2.6` | **表演质量（真人感）**：show-don't-tell、句长节奏起伏、对白优先、回避陈词滥调与复用比喻、删掉不推进内容的句子、人物性格稳定 |
 | `3` | 人格/背景锁定 + `dynamicState` 更新与溯源规则（时间写法见 `3.8`） |
-| `3.5` | 谨慎修改基础设定：用户直接要求 → `update_character_field`；无要求时仅"决定性不可逆转折"才改；value 写成明确的简短陈述句（禁「不是…而是…」对比句）；**界面标为人工手写的字段不得改写**（`staticFields` 跳过、工具需用户本轮明确要求） |
+| `3.5` | 谨慎修改基础设定：用户直接要求 → `update_character_field`；无要求时仅"决定性不可逆转折"才改；value 写成明确的简短陈述句（禁「不是…而是…」对比句） |
 | `3.6` | 状态/设定字段的 value 写法（只写内容本身，不加主语，解释进 evidence）；**基础设定字段有硬长度上限并只写陈述句**——见「基础设定字段」一节 |
 | `3.7` | 记忆字段必须写明主体（禁止"我/你/TA"这类代词） |
 | `3.8` | 时间一律写绝对日期，相对说法填 `timeRef` |
@@ -439,7 +438,7 @@ tools: AUTO 阶段全部工具 / SUBMIT 阶段只有 submit_response
 |---|---|---|
 | 一键建卡 `buildQuickGeneratePrompt` | `feature:characters` 的 `CharacterParity` | 输出完整字段 JSON；**禁止套路名字与模板人设**；`personality` 写行为倾向；`background` 只写角色本人经历（世界观写 `lorebook`）；`speakingStyle` 必须是「调性描述；示例：<台词1> / <台词2> / <台词3>」（`CHARACTER_QUALITY_RULE` + `SPEAKING_STYLE_SAMPLES_RULE`）；群组分支要求成员说话方式显著不同，并输出 2-4 条初始 `lorebook` 条目 |
 | 群组升级 `upgradeToGroup` | `:app` 的 `AppViewModel` | 与建卡同一套质量约束；`additionalMembers` 不得重复原角色与彼此姓名；可补 0-3 条 `lorebook`（只补近期已出现的世界层设定）；原角色世界书并入群组 |
-| 世界书整理 `consolidateLorebook` | `BackgroundTasks` | **跟随短期抽取**（排在长期分析之前）；只从**已发生的短期摘要**里沉淀世界层设定（`sourceShortTermIds` 必须可回溯）、禁止推测扩写；给出已有条目的完整内容；"同一事物只一条：整条替换、允许变短、≤400 字"；≤`AUTO_ENTRIES_PER_PASS`(3) 条；写后本地去重并执行 `misses` 淘汰；**只写世界书**，失败留在内存重试/交给用户决定 |
+| 世界书整理 `consolidateLorebook` | `BackgroundTasks` | **跟随短期抽取**（排在长期分析之前）；只从**已发生的短期摘要**里沉淀世界层设定（`sourceShortTermIds` 必须可回溯）、禁止推测扩写；给出已有条目的完整内容；"同一事物只一条：整条替换、允许变短、≤400 字"；≤`AUTO_ENTRIES_PER_PASS`(3) 条；写后本地去重并按容量规则归档（全局 200、单次 ≤`EVICT_MAX_PER_PASS`(4)、人工/常驻豁免）；**只写世界书**，失败留在内存重试/交给用户决定 |
 | 世界书一次性迁移 `migrateWorldLore` | `BackgroundTasks` / `NativeCore.runWorldLoreMigration` | 把旧数据 `description`/`background` 里的世界观拆成条目（只整理已有信息）；人工维护条目不受影响；可选同时精简原文 |
 | 成员补全 `fillMemberFields` | `NativeCore` / `CharacterParity.applyMemberFillPayload` | **已有字段是绝对权威，不得改写/润色/替换**；只填空字段；说话方式须与群内其他成员显著不同；无把握则省略 |
 | 空字段补全 `autoFillStaticFields` | `BackgroundTasks` | 只补缺失字段，绝不覆盖已有设定；缺 `speakingStyle` 时套用示例台词约束；群组成员再叠加"彼此不同" |

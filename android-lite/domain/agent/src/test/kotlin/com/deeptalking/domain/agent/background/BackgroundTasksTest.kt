@@ -129,9 +129,53 @@ class BackgroundTasksTest {
     }
 
     @Test
-    fun retiredLorebookEntriesAreReportedAsANote() = runBlocking {
-        // An AI entry that misses the threshold is retired; that used to be completely
-        // silent, so "这条设定怎么没了" had no answer anywhere.
+    fun aFullWorldBookArchivesOnlyTheOldestAndReportsIt() = runBlocking {
+        // Capacity-driven: a quiet pass evicts nothing; only a batch that does not fit
+        // archives, and only the oldest / least-active entries. The retirement is visible
+        // (that used to be completely silent, so "这条设定怎么没了" had no answer anywhere).
+        val notes = mutableListOf<Pair<String, String>>()
+        val llm = ScriptedLlm(
+            mutableListOf("""{"entries":[{"name":"新条目","keywords":["新"],"content":"新增的内容","sourceShortTermIds":["s1"]}]}"""),
+        )
+        val background = BackgroundTasks(
+            llm,
+            MemoryServiceImpl(),
+            onAuxiliaryNote = { task, note -> notes += task to note },
+        )
+        val filler = (1..AppLimits.Lorebook.ENTRIES).map { index ->
+            // A unique CJK tag per entry so the near-duplicate compaction can never fold two
+            // fillers (or a filler and the new entry) together.
+            val tag = (0x4E00 + index).toChar()
+            com.deeptalking.core.model.LorebookEntry(
+                id = "e$index",
+                name = "旧$tag",
+                content = "内$tag",
+                keywords = listOf("关$tag"),
+                origin = com.deeptalking.core.model.LorebookOrigin.Model,
+                createdAt = "2026-01-01T%02d:%02d:00Z".format(index / 60, index % 60),
+            )
+        }
+        val character = Character(
+            id = "c1",
+            lorebook = filler,
+            shortTerm = listOf(ShortTermMemory(id = "s1", content = "新条目 新增的内容", sourceMessageIds = listOf("m1"))),
+        )
+        val (status, updated) = background.consolidateLorebook(character, character.shortTerm)
+        assertEquals(BackgroundTasks.TaskStatus.Success, status)
+        assertEquals(AppLimits.Lorebook.ENTRIES, updated.lorebook.size)
+        assertTrue(updated.lorebook.any { it.name == "新条目" })
+        // Only the single overflow was archived — the oldest by active time.
+        assertEquals(listOf("e1"), updated.lorebookArchive.map { it.id })
+        val retirement = notes.firstOrNull { it.second.contains("归档了最久未活跃的 1 条") }
+        assertTrue("没有上报归档", retirement != null)
+        assertEquals("lorebook", retirement!!.first)
+        assertTrue(retirement.second.contains(filler.first().name))
+    }
+
+    @Test
+    fun aQuietPassNeverEvictsEvenEntriesThatMissedEveryPass() = runBlocking {
+        // The legacy miss-streak eviction is gone: with nothing new to write, nothing is
+        // archived even if an entry has not been mentioned for many passes.
         val notes = mutableListOf<Pair<String, String>>()
         val llm = ScriptedLlm(mutableListOf("""{"entries":[]}"""))
         val background = BackgroundTasks(
@@ -144,7 +188,8 @@ class BackgroundTasksTest {
             name = "底线测试与约定",
             content = "旧的约定",
             origin = com.deeptalking.core.model.LorebookOrigin.Model,
-            misses = 2,
+            misses = 99,
+            createdAt = "2020-01-01T00:00:00Z",
         )
         val character = Character(
             id = "c1",
@@ -153,13 +198,9 @@ class BackgroundTasksTest {
         )
         val (status, updated) = background.consolidateLorebook(character, character.shortTerm)
         assertEquals(BackgroundTasks.TaskStatus.Success, status)
-        assertTrue(updated.lorebook.isEmpty())
-        // The pass also reports how many entries it wrote, so the retirement note is looked
-        // up by content instead of by position.
-        val retirement = notes.firstOrNull { it.second.contains("淘汰了 1 条") }
-        assertTrue("没有上报淘汰", retirement != null)
-        assertEquals("lorebook", retirement!!.first)
-        assertTrue(retirement.second.contains("底线测试与约定"))
+        assertEquals(listOf(stale), updated.lorebook)
+        assertTrue(updated.lorebookArchive.isEmpty())
+        assertTrue(notes.none { it.second.contains("归档") })
     }
 
     @Test

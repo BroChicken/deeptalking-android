@@ -160,6 +160,13 @@ object AppLimits {
         const val MAX_ALWAYS_ACTIVE = 6
         /** Max entries a single consolidation pass may add/update. */
         const val AUTO_ENTRIES_PER_PASS = 3
+
+        /**
+         * Hard ceiling on how many entries one capacity-driven eviction may archive. A normal
+         * batch only ever needs [AUTO_ENTRIES_PER_PASS] at most; the cap exists so one
+         * abnormal batch can never clear a world book in a single pass.
+         */
+        const val EVICT_MAX_PER_PASS = 4
     }
 
     object Scene {

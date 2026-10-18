@@ -1,16 +1,16 @@
 package com.deeptalking.domain.memory
 
 import com.deeptalking.core.common.AppLimits
-import com.deeptalking.core.common.trimTo
 import com.deeptalking.core.model.LorebookEntry
-import com.deeptalking.core.model.LorebookOrigin
 import java.text.Collator
 import java.util.Locale
 
 /**
- * Lorebook selection, similarity-based replacement/dedup and eviction helpers
- * ported from `src/js/memory/lorebook.js`. Pure and deterministic: inputs are
- * never mutated.
+ * Lorebook selection and similarity-based replacement/dedup helpers ported from
+ * `src/js/memory/lorebook.js`. Pure and deterministic: inputs are never mutated.
+ * Eviction is no longer a miss-streak rule — it is capacity-driven (see
+ * `Character.archiveOldestLorebookEntries` in `:core:model` and
+ * `LorebookStore.archiveToFit`).
  *
  * Ordering honours the legacy `order` field through [matchLorebookEntries]'s
  * `orderOf` selector; the native [LorebookEntry] does not carry `order` yet, so
@@ -30,7 +30,6 @@ data class LorebookLimits(
     val contentChars: Int = AppLimits.Lorebook.CONTENT_CHARS,
     val nameSimilarity: Double = 0.5,
     val contentSimilarity: Double = 0.45,
-    val evictionMisses: Int = 3,
     /** How many recent instant messages feed the keyword haystack (legacy `scanMessages`). */
     val scanMessages: Int = 6,
 )
@@ -126,7 +125,7 @@ fun findSimilarLorebookEntry(
  * - keywords: [incoming]'s (deduped, capped); kept from [existing] when
  *   [incoming] carries none, so a replacement never becomes unhittable.
  * - alwaysActive: taken verbatim from [incoming] (it can flip back to false).
- * - `enabled = true`, `misses = 0`, `updatedAt = incoming.updatedAt ?: existing`.
+ * - `enabled = true`, `updatedAt = incoming.updatedAt ?: existing`.
  */
 fun replaceLorebookEntry(
     existing: LorebookEntry,
@@ -138,7 +137,6 @@ fun replaceLorebookEntry(
     keywords = incoming.keywords.distinct().take(limits.keywordsPerEntry).ifEmpty { existing.keywords },
     alwaysActive = incoming.alwaysActive,
     enabled = true,
-    misses = 0,
     updatedAt = incoming.updatedAt ?: existing.updatedAt,
 )
 
@@ -246,37 +244,3 @@ fun select(
     orderOf: (LorebookEntry) -> Int = { DEFAULT_LOREBOOK_ORDER },
 ): List<LorebookEntry> =
     applyCharCap(matchLorebookEntries(entries, query, recentMessages, limits, orderOf), limits.injectChars)
-
-/** Result of an eviction pass: entries to keep and entries retired this round. */
-data class EvictionResult(
-    val kept: List<LorebookEntry>,
-    val removed: List<LorebookEntry>,
-)
-
-/** Miss count after one consolidation pass that did not mention the entry. */
-fun nextMisses(entry: LorebookEntry): Int = entry.misses + 1
-
-/** Whether an entry should be retired after a miss. Always-active/user entries never are. */
-fun shouldEvict(entry: LorebookEntry, threshold: Int = LorebookLimits().evictionMisses): Boolean =
-    entry.origin == LorebookOrigin.Model && !entry.alwaysActive && nextMisses(entry) >= threshold
-
-/**
- * Evicts stale AI entries: model-origin, non-always-active entries whose miss
- * streak reaches [threshold]. Kept stale entries get their miss counter bumped.
- */
-fun evictStaleLorebookEntries(
-    entries: List<LorebookEntry>,
-    threshold: Int = LorebookLimits().evictionMisses,
-): EvictionResult {
-    val kept = mutableListOf<LorebookEntry>()
-    val removed = mutableListOf<LorebookEntry>()
-    for (entry in entries) {
-        if (entry.origin != LorebookOrigin.Model || entry.alwaysActive) {
-            kept += entry
-            continue
-        }
-        val bumped = entry.copy(misses = nextMisses(entry))
-        if (bumped.misses >= threshold) removed += bumped else kept += bumped
-    }
-    return EvictionResult(kept = kept, removed = removed)
-}

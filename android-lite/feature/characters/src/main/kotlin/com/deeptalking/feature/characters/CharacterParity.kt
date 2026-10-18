@@ -7,8 +7,8 @@ import com.deeptalking.core.model.GroupMember
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.LorebookOrigin
 import com.deeptalking.core.model.StaticProfile
-import com.deeptalking.core.model.isStaticFieldManual
-import com.deeptalking.core.model.withStaticFieldManual
+import com.deeptalking.core.model.convergeLorebookCapacity
+import com.deeptalking.core.model.restoreArchivedLorebookEntry
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -54,12 +54,6 @@ object CharacterParity {
     private val DYNAMIC_FIELD_KEYS = setOf(
         "currentSituation", "currentLocation", "currentMood", "currentOccupation",
         "currentGoal", "currentTone",
-    )
-
-    /** The editor's basic-profile fields, in `StaticProfile` order (人工标记逐个比对用). */
-    private val STATIC_FIELD_KEYS = listOf(
-        "gender", "age", "race", "appearance", "personality",
-        "fears", "background", "speakingStyle", "language", "userAddress",
     )
 
     private val GROUP_SHARED_DYNAMIC_FIELDS = setOf("currentSituation", "currentLocation")
@@ -311,12 +305,10 @@ object CharacterParity {
      * "把用户手写的静态字段当模型输出清洗"：
      * - 静态字段（含 `roleInGroup`）走 [FieldCleaning.cleanUserWrittenField]：**对比句保留原文、
      *   不按 40/120/250 硬截断**，只做去前缀 / 去括号说明等轻度规范化，并逐条回报原因；
-     * - 只把**本次真正改动过**的静态字段标为人工（对比 [initial] 快照；[initial] 为 null 时不标记）；
-     * - 动态状态仍按原规则清洗并清掉 AI 记账（动态字段不进人工锁定）。
+     * - 动态状态仍按原规则清洗并清掉 AI 记账。
      */
     fun normalizeUserEditedDraft(
         character: Character,
-        initial: Character? = null,
         memberIndex: Int? = null,
         base: ZonedDateTime = ZonedDateTime.now(),
         zone: ZoneId = base.zone,
@@ -328,11 +320,6 @@ object CharacterParity {
             val updated = source.copy(
                 roleInGroup = cleanUserRoleInGroup(source.roleInGroup, notices),
                 staticProfile = cleaned,
-                staticFieldMeta = markManualFields(
-                    source.staticFieldMeta,
-                    cleaned,
-                    initial?.members?.getOrNull(memberIndex)?.staticProfile,
-                ),
                 dynamicState = normalizeDynamicState(source.dynamicState, base, zone),
                 dynamicStateMeta = source.dynamicStateMeta - DYNAMIC_FIELD_KEYS,
             )
@@ -354,7 +341,6 @@ object CharacterParity {
         return UserEditedDraft(
             character.copy(
                 staticProfile = cleaned,
-                staticFieldMeta = markManualFields(character.staticFieldMeta, cleaned, initial?.staticProfile),
                 dynamicState = normalizeDynamicState(character.dynamicState, base, zone),
                 dynamicStateMeta = character.dynamicStateMeta - DYNAMIC_FIELD_KEYS,
             ),
@@ -386,39 +372,6 @@ object CharacterParity {
         val result = FieldCleaning.cleanUserWrittenField("roleInGroup", value)
         result.reasons.forEach { notices += EditNotice(FieldCleaning.labelOf("roleInGroup"), it) }
         return result.value
-    }
-
-    /**
-     * 只把本次**真正改动过**的静态字段标为人工，其余保留编辑器里的开关状态。
-     * [initial] 提供编辑器打开时的快照——不能用实时数据行，否则后台改动会被误标。
-     * [initial] 为 null（建卡 / 测试）时不标记。
-     */
-    private fun markManualFields(
-        meta: Map<String, JsonElement>,
-        edited: StaticProfile,
-        initial: StaticProfile?,
-    ): Map<String, JsonElement> {
-        if (initial == null) return meta
-        var result = meta
-        STATIC_FIELD_KEYS.forEach { key ->
-            val manual = isStaticFieldManual(result, key) || staticProfileValue(initial, key) != staticProfileValue(edited, key)
-            if (isStaticFieldManual(result, key) != manual) result = withStaticFieldManual(result, key, manual)
-        }
-        return result
-    }
-
-    private fun staticProfileValue(profile: StaticProfile, key: String): String = when (key) {
-        "gender" -> profile.gender
-        "age" -> profile.age
-        "race" -> profile.race
-        "appearance" -> profile.appearance
-        "personality" -> profile.personality
-        "fears" -> profile.fears
-        "background" -> profile.background
-        "speakingStyle" -> profile.speakingStyle
-        "language" -> profile.language
-        "userAddress" -> profile.userAddress
-        else -> ""
     }
 
     private fun normalizeStaticProfile(profile: StaticProfile, base: ZonedDateTime, zone: ZoneId): StaticProfile = profile.copy(
@@ -462,15 +415,33 @@ object CharacterParity {
      * World-book list edits. They are pure so the editor stays a thin wrapper: the dialog
      * applies one to its local draft (so the change is visible immediately) *and* the same
      * one is patched onto the stored row.
+     *
+     * Adding is capacity-driven: the entry is appended and, if the **global** count (shared
+     * book + members) now exceeds the ceiling, the oldest evictable entries are archived —
+     * exactly what the store does, so the draft never shows an entry the store refused.
+     * Manual (user) entries are never counted and never archived.
      */
-    fun addLorebookEntry(list: List<LorebookEntry>, entry: LorebookEntry): List<LorebookEntry> =
-        if (list.size >= AppLimits.Lorebook.ENTRIES) list else list + entry
+    fun addLorebookEntry(character: Character, entry: LorebookEntry): Character =
+        character.copy(lorebook = character.lorebook + entry).convergeLorebookCapacity()
 
     fun removeLorebookEntry(list: List<LorebookEntry>, entryId: String): List<LorebookEntry> =
         list.filterNot { it.id == entryId }
 
     fun updateLorebookEntry(list: List<LorebookEntry>, entry: LorebookEntry): List<LorebookEntry> =
         list.map { if (it.id == entry.id) entry else it }
+
+    /** Moves a live entry to the archive (reversible; the store does the same on save). */
+    fun archiveLorebookEntry(character: Character, entryId: String): Character {
+        val entry = character.lorebook.firstOrNull { it.id == entryId } ?: return character
+        return character.copy(
+            lorebook = character.lorebook.filterNot { it.id == entryId },
+            lorebookArchive = character.lorebookArchive + entry,
+        )
+    }
+
+    /** Restores an archived entry to its original book (shared archive first, then members). */
+    fun restoreLorebookEntry(character: Character, entryId: String): Character =
+        character.restoreArchivedLorebookEntry(entryId).convergeLorebookCapacity()
 
     fun splitLorebookKeywords(raw: String): List<String> =
         raw.split(',', '，', '、', '\n')

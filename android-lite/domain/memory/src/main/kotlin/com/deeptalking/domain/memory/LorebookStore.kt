@@ -5,6 +5,8 @@ import com.deeptalking.core.common.trimTo
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.LorebookOrigin
+import com.deeptalking.core.model.archiveOldestLorebookEntries
+import com.deeptalking.core.model.lorebookCapacityCount
 import java.time.Instant
 import kotlinx.serialization.Serializable
 
@@ -27,6 +29,38 @@ data class LorebookUpsertResult(
     val created: Boolean = false,
     val mergedIntoUser: Boolean = false,
 )
+
+/** Result of fitting a world book back under the ceiling after new entries were written. */
+data class LorebookCapacityAdjustment(
+    /** The character with the oldest evictable overflow moved into the archive. */
+    val character: Character,
+    /** Entries archived to make room, in oldest-first order. */
+    val archived: List<LorebookEntry> = emptyList(),
+    /** Slots that could not be freed (the evictable pool — manual/常驻 only — ran out). */
+    val unmet: Int = 0,
+)
+
+/**
+ * Archives the oldest evictable entries until [overflow] slots are free — never more than
+ * [AppLimits.Lorebook.EVICT_MAX_PER_PASS] in one call. [excludeIds] are never archived.
+ * `unmet` reports the slots that could not be freed because only manual/常驻 entries were
+ * left; the caller refuses the write rather than touching protected content.
+ */
+fun archiveToFit(
+    character: Character,
+    overflow: Int,
+    excludeIds: Set<String> = emptySet(),
+): LorebookCapacityAdjustment {
+    val wanted = overflow.coerceAtLeast(0)
+    if (wanted == 0) return LorebookCapacityAdjustment(character)
+    val plan = minOf(wanted, AppLimits.Lorebook.EVICT_MAX_PER_PASS)
+    val (updated, archived) = character.archiveOldestLorebookEntries(plan, excludeIds)
+    return LorebookCapacityAdjustment(character = updated, archived = archived, unmet = wanted - archived.size)
+}
+
+/** Overflow in slots: how far [character] is above the ceiling (0 when it fits). */
+fun lorebookOverflow(character: Character): Int =
+    (character.lorebookCapacityCount() - AppLimits.Lorebook.ENTRIES).coerceAtLeast(0)
 
 /**
  * A proposed lorebook entry (model output) before validation/merge.
@@ -116,12 +150,17 @@ fun resolveLorebookAlwaysActive(
  * Inserts or replaces [proposal] into [list]. A matching or near-duplicate AI
  * entry is rewritten whole (see [replaceLorebookEntry]); user-written entries are
  * protected; an entry with no keywords falls back to its own name as the trigger.
+ *
+ * [maxEntries] is the ceiling the *owning pool* enforces: `null` disables the
+ * per-list guard for callers that manage the global capacity themselves
+ * (`upsertLorebookEntryForCharacter`, background consolidation).
  */
 fun upsertLorebookEntry(
     list: List<LorebookEntry>,
     proposal: LorebookProposal,
     entryId: String = "",
     nowIso: String = Instant.now().toString(),
+    maxEntries: Int? = AppLimits.Lorebook.ENTRIES,
 ): LorebookUpsertResult {
     val name = proposal.name.trim().take(AppLimits.Lorebook.NAME_CHARS)
     val content = proposal.content.trim()
@@ -151,7 +190,6 @@ fun upsertLorebookEntry(
             keywords = if (keywords.isNotEmpty()) keywords else exact.keywords,
             // An omitted field keeps the stored value (`null` = the model did not answer).
             alwaysActive = resolveLorebookAlwaysActive(list, exact, proposal.alwaysActive),
-            misses = 0,
             updatedAt = nowIso,
         )
         return LorebookUpsertResult(true, list = replaceEntry(list, exact.id, updated), entry = updated)
@@ -186,7 +224,7 @@ fun upsertLorebookEntry(
         LorebookEntry(name = name, content = content),
         proposal.alwaysActive,
     )
-    if (list.size >= AppLimits.Lorebook.ENTRIES) {
+    if (maxEntries != null && list.size >= maxEntries) {
         return LorebookUpsertResult(false, "世界书条目已达上限")
     }
     val entry = LorebookEntry(
@@ -205,6 +243,10 @@ fun upsertLorebookEntry(
 /**
  * Applies a model-proposed entry to a character: writes to the shared lorebook or
  * a named member's private lorebook, validating `sourceShortTermIds` + evidence.
+ *
+ * Capacity is judged **globally** (shared book + every member): a caller that wants the
+ * cap enforced must leave [enforceCapacity] true. Background consolidation passes
+ * `false` because it manages the batch's capacity itself (archive-then-write in one step).
  */
 fun upsertLorebookEntryForCharacter(
     character: Character,
@@ -212,20 +254,24 @@ fun upsertLorebookEntryForCharacter(
     sourceShortTermIds: List<String>,
     entryId: String = "",
     memberName: String? = null,
+    enforceCapacity: Boolean = true,
 ): Pair<Character, LorebookUpsertResult> {
     if (!resolveLorebookSources(character, sourceShortTermIds, proposal.content)) {
         return character to LorebookUpsertResult(false, "来源或证据无法对应")
+    }
+    if (enforceCapacity && character.lorebookCapacityCount() >= AppLimits.Lorebook.ENTRIES) {
+        return character to LorebookUpsertResult(false, "世界书条目已达上限")
     }
     if (!memberName.isNullOrBlank()) {
         val wanted = memberName.trim().lowercase()
         val member = character.members.firstOrNull { it.name.trim().lowercase() == wanted }
             ?: return character to LorebookUpsertResult(false, "找不到成员「$memberName」")
-        val result = upsertLorebookEntry(member.lorebook, proposal, entryId)
+        val result = upsertLorebookEntry(member.lorebook, proposal, entryId, maxEntries = null)
         if (!result.ok) return character to result
         val members = character.members.map { if (it.id == member.id) it.copy(lorebook = result.list) else it }
         return character.copy(members = members) to result
     }
-    val result = upsertLorebookEntry(character.lorebook, proposal, entryId)
+    val result = upsertLorebookEntry(character.lorebook, proposal, entryId, maxEntries = null)
     if (!result.ok) return character to result
     return character.copy(lorebook = result.list) to result
 }
@@ -298,8 +344,9 @@ fun normalizeGeneratedLorebook(
 
 /**
  * Records that [injected] entries were actually placed into context (legacy
- * `markLorebookMentions`): bumps `mentions`, stamps `lastMentionedAt` and resets
- * the `misses` streak. Returns new entries; the input is not modified.
+ * `markLorebookMentions`): bumps `mentions` and stamps `lastMentionedAt` (the active-time
+ * source for capacity). `misses` is no longer maintained. Returns new entries; the input
+ * is not modified.
  */
 fun markLorebookMentions(
     entries: List<LorebookEntry>,
@@ -310,7 +357,7 @@ fun markLorebookMentions(
     val ids = injected.map { it.id }.toHashSet()
     return entries.map { entry ->
         if (entry.id in ids) {
-            entry.copy(mentions = entry.mentions + 1, lastMentionedAt = nowIso, misses = 0)
+            entry.copy(mentions = entry.mentions + 1, lastMentionedAt = nowIso)
         } else {
             entry
         }

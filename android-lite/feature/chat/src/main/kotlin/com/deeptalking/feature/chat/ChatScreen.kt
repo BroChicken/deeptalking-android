@@ -497,9 +497,6 @@ private fun MessageRow(
                         message.staticChanges.takeIf { !isUser && it.isNotEmpty() }?.let {
                             Text("⚡ ${it.joinToString(" · ")}已修改", fontSize = 11.sp, color = colors.warning, modifier = Modifier.padding(top = 4.dp))
                         }
-                        message.lockedStaticFields.takeIf { !isUser && it.isNotEmpty() }?.let {
-                            Text("🔒 ${it.joinToString(" · ")}已设为人工手写，本次未自动修改", fontSize = 11.sp, color = colors.warning, modifier = Modifier.padding(top = 4.dp))
-                        }
                         message.lorebookChanges.takeIf { !isUser && it.isNotEmpty() }?.let {
                             Text("📖 ${it.joinToString(" · ")}", fontSize = 11.sp, color = colors.warning, modifier = Modifier.padding(top = 4.dp))
                         }

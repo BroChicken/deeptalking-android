@@ -10,6 +10,15 @@ import androidx.work.WorkManager
 import androidx.work.workDataOf
 import java.util.concurrent.TimeUnit
 
+/**
+ * Reminder delivery: [schedule] enqueues a one-shot [ReminderWorker] through WorkManager
+ * (`ExistingWorkPolicy.REPLACE` = at most one pending reminder per id), [post] pushes the
+ * notification immediately, and [cancel] retracts both halves — the pending work *and* a
+ * notification that already fired — so a promise that is completed/cancelled stops reminding.
+ *
+ * Every id is tracked in [ReminderRegistry], which is the observable "this reminder is still
+ * pending" view callers (and tests) can query.
+ */
 object Reminders {
 
     fun schedule(context: Context, id: String, triggerAtMillis: Long, title: String, text: String) {
@@ -26,14 +35,23 @@ object Reminders {
             )
             .build()
         WorkManager.getInstance(context).enqueueUniqueWork(
-            workName(id),
+            reminderWorkName(id),
             ExistingWorkPolicy.REPLACE,
             request,
         )
+        ReminderRegistry.register(id)
     }
 
+    /**
+     * Cancels the reminder for [id]: the pending work is removed, a notification that already
+     * fired is dismissed, and the id stops being reported as scheduled. Callers invoke this
+     * when the backing promise is completed or cancelled. Safe to call for an id that has no
+     * pending reminder.
+     */
     fun cancel(context: Context, id: String) {
-        WorkManager.getInstance(context).cancelUniqueWork(workName(id))
+        WorkManager.getInstance(context).cancelUniqueWork(reminderWorkName(id))
+        NotificationManagerCompat.from(context).cancel(reminderNotificationTag(id))
+        ReminderRegistry.unregister(id)
     }
 
     fun post(context: Context, id: String, title: String, text: String) {
@@ -43,7 +61,7 @@ object Reminders {
         val contentIntent = launchIntent?.let {
             PendingIntent.getActivity(
                 context,
-                id.hashCode(),
+                reminderNotificationTag(id),
                 it,
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
             )
@@ -60,11 +78,9 @@ object Reminders {
             .build()
 
         try {
-            NotificationManagerCompat.from(context).notify(id.hashCode(), notification)
+            NotificationManagerCompat.from(context).notify(reminderNotificationTag(id), notification)
         } catch (t: SecurityException) {
             // POST_NOTIFICATIONS not granted; nothing else to do.
         }
     }
-
-    private fun workName(id: String): String = "deeptalking_reminder_$id"
 }

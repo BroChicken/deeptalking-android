@@ -40,6 +40,8 @@ data class GroupMember(
     val shortTerm: List<ShortTermMemory> = emptyList(),
     val longTerm: List<LongTermMemory> = emptyList(),
     val lorebook: List<LorebookEntry> = emptyList(),
+    /** Archived world-book entries for this member: not counted, not injected, restorable. */
+    val lorebookArchive: List<LorebookEntry> = emptyList(),
     /** Member conversation window (legacy `member.memory.instant`). */
     val instant: List<ChatMessage> = emptyList(),
     /** Member pending recall items (legacy `member.memory.pendingRecall`). */
@@ -74,6 +76,8 @@ data class Character(
     val shortTerm: List<ShortTermMemory> = emptyList(),
     val longTerm: List<LongTermMemory> = emptyList(),
     val lorebook: List<LorebookEntry> = emptyList(),
+    /** Archived world-book entries: not counted, not injected, restorable from the editor. */
+    val lorebookArchive: List<LorebookEntry> = emptyList(),
     val stickers: List<Sticker> = emptyList(),
     /** Legacy short conversation window (JS `memory.instant`). */
     val instant: List<ChatMessage> = emptyList(),

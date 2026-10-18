@@ -172,6 +172,9 @@ class BackupService(
             putJsonArray("history") { messages.forEach { add(instantToJson(it)) } }
         }
         putJsonArray("lorebook") { character.lorebook.forEach { add(lorebookToJson(it)) } }
+        if (character.lorebookArchive.isNotEmpty()) {
+            putJsonArray("lorebookArchive") { character.lorebookArchive.forEach { add(lorebookToJson(it)) } }
+        }
         putJsonArray("stickers") { character.stickers.forEach { add(stickerToJson(it)) } }
         if (character.fieldsMigrationVersion.isNotBlank()) {
             put("fieldsMigrationVersion", character.fieldsMigrationVersion)
@@ -219,6 +222,9 @@ class BackupService(
             ),
         )
         putJsonArray("lorebook") { member.lorebook.forEach { add(lorebookToJson(it)) } }
+        if (member.lorebookArchive.isNotEmpty()) {
+            putJsonArray("lorebookArchive") { member.lorebookArchive.forEach { add(lorebookToJson(it)) } }
+        }
         member.staticFillMeta?.let { put("staticFillMeta", staticFillMetaToJson(it)) }
         if (member.staticFieldMeta.isNotEmpty()) {
             put("staticFieldMeta", JsonObject(member.staticFieldMeta))
@@ -329,9 +335,6 @@ class BackupService(
         }
         if (message.staticChanges.isNotEmpty()) {
             putJsonArray("staticChanges") { message.staticChanges.forEach { add(it) } }
-        }
-        if (message.lockedStaticFields.isNotEmpty()) {
-            putJsonArray("lockedStaticFields") { message.lockedStaticFields.forEach { add(it) } }
         }
         if (message.lorebookChanges.isNotEmpty()) {
             putJsonArray("lorebookChanges") { message.lorebookChanges.forEach { add(it) } }

@@ -143,7 +143,7 @@ class LorebookMatcherTest {
     }
 
     @Test
-    fun markMentionsBumpsInjectedAndResetsTheirMisses() {
+    fun markMentionsBumpsInjectedAndLeavesTheLegacyMissCounterUntouched() {
         val injected = entry("a", "甲", keywords = listOf("k"), misses = 2, mentions = 1)
         val untouched = entry("b", "乙", keywords = listOf("k"), misses = 5)
         val entries = listOf(injected, untouched, entry("u", "用户", alwaysActive = true))
@@ -151,7 +151,8 @@ class LorebookMatcherTest {
         val marked = markLorebookMentions(entries, listOf(injected), nowIso = "2026-01-01T00:00:00Z")
 
         assertEquals(2, marked[0].mentions)
-        assertEquals(0, marked[0].misses)
+        // `misses` is kept only for archive compatibility; eviction no longer reads it.
+        assertEquals(2, marked[0].misses)
         assertEquals("2026-01-01T00:00:00Z", marked[0].lastMentionedAt)
         assertEquals(5, marked[1].misses)
         assertEquals(0, marked[1].mentions)

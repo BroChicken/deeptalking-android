@@ -1,6 +1,7 @@
 package com.deeptalking.core.data.legacy
 
 import com.deeptalking.core.data.AppJson
+import com.deeptalking.core.common.AppLimits
 import com.deeptalking.core.data.CharacterRepository
 import com.deeptalking.core.data.ChatRepository
 import com.deeptalking.core.data.ConfigRepository
@@ -14,6 +15,7 @@ import com.deeptalking.core.model.AppConfig
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.LongTermMemory
+import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.LorebookOrigin
 import com.deeptalking.core.model.MemoryCategory
 import com.deeptalking.core.model.MemorySubject
@@ -23,6 +25,7 @@ import com.deeptalking.core.model.SceneState
 import com.deeptalking.core.model.SceneSummary
 import com.deeptalking.core.model.ShortTermMemory
 import com.deeptalking.core.model.StaticFillMeta
+import com.deeptalking.core.model.lorebookCapacityCount
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.runTest
@@ -550,6 +553,54 @@ class LegacyMapperTest {
         assertEquals("forest", restored.scenes.single().key)
         assertEquals("hi", restored.instant.single().content)
         assertEquals(2, restored.staticFillMeta?.failures)
+    }
+
+    @Test
+    fun importingAnOverCapacityWorldBookConvergesIntoTheArchive() {
+        val entries = (1..(AppLimits.Lorebook.ENTRIES + 5)).joinToString(",") { index ->
+            """{"id":"e$index","name":"n$index","content":"c","origin":"ai","lastMentionedAt":"2026-01-01T00:00:00.${"%04d".format(index)}Z"}"""
+        }
+        val json =
+            """{"characters":{"c1":{"id":"c1","entityType":"character","basicInfo":{"name":"A"},"lorebook":[$entries]}}}"""
+        val character = mapCharacter(parse(json).characters!!.getValue("c1"), null)
+        // The one-time convergence lands at exactly the ceiling; the oldest overflow is archived.
+        assertEquals(AppLimits.Lorebook.ENTRIES, character.lorebookCapacityCount())
+        assertEquals(listOf("e1", "e2", "e3", "e4", "e5"), character.lorebookArchive.map { it.id })
+    }
+
+    @Test
+    fun exportAndImportRoundTripTheLorebookArchive() = runTest {
+        val characterDao = FakeCharacterDao()
+        val characters = CharacterRepository(characterDao)
+        val chat = ChatRepository(FakeMessageDao())
+        val config = ConfigRepository(FakeConfigDao())
+        characters.upsert(
+            Character(
+                id = "c1",
+                name = "Aria",
+                lorebook = listOf(
+                    LorebookEntry(id = "live1", name = "在线", content = "x", origin = LorebookOrigin.Model, createdAt = "2026-02-01T00:00:00Z"),
+                ),
+                lorebookArchive = listOf(
+                    LorebookEntry(id = "arc1", name = "归档", content = "y", origin = LorebookOrigin.Model, createdAt = "2020-01-01T00:00:00Z"),
+                    LorebookEntry(id = "arc2", name = "手工归档", content = "z", origin = LorebookOrigin.User),
+                ),
+            )
+        )
+        val exported = BackupService(characters, chat, config).exportJson(activeCharacterId = "c1")
+        val freshDao = FakeCharacterDao()
+        val fresh = LegacyImportService(
+            CharacterRepository(freshDao),
+            ChatRepository(FakeMessageDao()),
+            ConfigRepository(FakeConfigDao()),
+            null,
+        )
+        assertEquals(1, fresh.importJson(exported).characters)
+        val restored = CharacterRepository(freshDao).get("c1")!!
+        assertEquals(listOf("live1"), restored.lorebook.map { it.id })
+        assertEquals(listOf("arc1", "arc2"), restored.lorebookArchive.map { it.id })
+        // Ownership (manual vs model) survives the round trip.
+        assertEquals(LorebookOrigin.User, restored.lorebookArchive.first { it.id == "arc2" }.origin)
     }
 
     @Test

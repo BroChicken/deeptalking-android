@@ -11,7 +11,6 @@ import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.StaticProfile
-import com.deeptalking.core.model.isStaticFieldManual
 import com.deeptalking.domain.agent.prompts.DYNAMIC_STATE_FIELDS
 import com.deeptalking.domain.agent.prompts.PersonaInputs
 import com.deeptalking.domain.agent.prompts.RequestBuilder
@@ -62,12 +61,6 @@ data class OrchestratorResult(
     val proactive: Boolean = false,
     /** Static profile field labels auto-adjusted this turn (legacy `staticChanges`). */
     val staticChanges: List<String> = emptyList(),
-    /**
-     * Static profile field labels the model tried to auto-adjust but the field was
-     * locked as 人工手写 (user-authored) in the card editor, so the write was skipped.
-     * Surfaced as a visible hint on the assistant turn.
-     */
-    val lockedStaticFields: List<String> = emptyList(),
     /** Lorebook entry names created/updated this turn (legacy `lorebookChanges`). */
     val lorebookChanges: List<String> = emptyList(),
     /** File ref of a sticker the character chose to send this turn, if any. */
@@ -253,8 +246,7 @@ class ChatOrchestrator(
             ).copy(instant = memoryInstant),
             injectedRecallIds,
         )
-        val applied = applyMemory(base, parsed, memoryAssistant)
-        val updated = applied.character
+        val updated = applyMemory(base, parsed, memoryAssistant)
 
         // The visible reply may be replaced by the style critique before it is shown,
         // matching the legacy flow (critique runs inline; repair + extraction run after).
@@ -311,7 +303,6 @@ class ChatOrchestrator(
             updatedCharacter = characterWithInstant,
             proactive = proactive,
             staticChanges = diffStaticChanges(character, characterWithInstant),
-            lockedStaticFields = applied.lockedStaticFields,
             lorebookChanges = diffLorebookChanges(character, characterWithInstant),
             stickerFileRef = outcome.stickerFileRef,
             rawReply = outcome.text,
@@ -392,7 +383,7 @@ class ChatOrchestrator(
         character: Character,
         parsed: ParsedTurn,
         assistantMessage: ChatMessage,
-    ): MemoryApply {
+    ): Character {
         val nowBase = ZonedDateTime.now()
         // Short-term memory is *not* written from the turn: `parsed.shortTerm` is
         // ignored so the window is only appended to by the whole-window extraction
@@ -410,7 +401,6 @@ class ChatOrchestrator(
             updated = memory.setPendingRecall(updated, recall.category, recall.tags)
         }
 
-        val lockedStaticFields = mutableListOf<String>()
         parsed.staticFields?.let { fields ->
             var profile = updated.staticProfile
             fields.forEach { (key, element) ->
@@ -422,14 +412,7 @@ class ChatOrchestrator(
                 if (value.isEmpty()) return@forEach
                 val resolved = hasValidUserEvidence(updated, fieldSourceIds(obj), fieldEvidence(obj), sources)
                     ?: return@forEach
-                if (!hasStaticEditIntent(key, resolved)) {
-                    // 用户在卡片里标为「人工手写」的字段：模型不得无用户要求就改写
-                    // （用户在编辑器里点「让角色接管」才会解除）。挡下的字段给界面一条可见提示。
-                    if (isStaticFieldManual(updated.staticFieldMeta, key)) {
-                        lockedStaticFields += STATIC_PROFILE_FIELDS.first { it.first == key }.second
-                    }
-                    return@forEach
-                }
+                if (!hasStaticEditIntent(key, resolved)) return@forEach
                 profile = withStaticField(profile, key, value)
             }
             updated = updated.copy(staticProfile = profile)
@@ -458,11 +441,8 @@ class ChatOrchestrator(
             updated = updated.copy(members = members)
         }
 
-        return MemoryApply(resolveMemoryConflicts(updated), lockedStaticFields)
+        return resolveMemoryConflicts(updated)
     }
-
-    /** [applyMemory] 的结果：折进记忆后的角色 + 被「人工手写」锁定挡下的字段标签（给界面提示）。 */
-    private data class MemoryApply(val character: Character, val lockedStaticFields: List<String> = emptyList())
 
     /** Applies one `dynamicState` object through the field cleaning + evidence gate. */
     private fun applyDynamicStateFields(

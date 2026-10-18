@@ -16,6 +16,7 @@ import com.deeptalking.core.model.SceneSummary
 import com.deeptalking.core.model.ShortTermMemory
 import com.deeptalking.core.model.SourceEvidence
 import com.deeptalking.core.model.StaticFillMeta
+import com.deeptalking.core.model.convergeLorebookCapacity
 import com.deeptalking.domain.agent.ApiRetry
 import com.deeptalking.domain.agent.ResponseParser
 import com.deeptalking.domain.agent.isTransientApiError
@@ -31,21 +32,21 @@ import com.deeptalking.domain.agent.prompts.trimText
 import com.deeptalking.domain.agent.prompts.withDynamicField
 import com.deeptalking.domain.agent.prompts.withStaticField
 import com.deeptalking.domain.agent.sessionIdFor
-import com.deeptalking.domain.memory.LorebookLimits
 import com.deeptalking.domain.memory.LorebookProposal
 import com.deeptalking.domain.memory.MemoryService
 import com.deeptalking.domain.memory.ShortTermDraft
 import com.deeptalking.domain.memory.addShortTermMemory
 import com.deeptalking.domain.memory.applyMemoryDecay
+import com.deeptalking.domain.memory.archiveToFit
 import com.deeptalking.domain.memory.dedupeLorebook
 import com.deeptalking.domain.memory.dedupeShortTerm
 import com.deeptalking.domain.memory.ensureMessageSequences
-import com.deeptalking.domain.memory.evictStaleLorebookEntries
 import com.deeptalking.domain.memory.evidenceMatchesSource
 import com.deeptalking.domain.memory.getTimeSlot
 import com.deeptalking.domain.memory.isValidAutomaticMemory
 import com.deeptalking.domain.memory.knownSources
 import com.deeptalking.domain.memory.logicalDay
+import com.deeptalking.domain.memory.lorebookOverflow
 import com.deeptalking.domain.memory.needsLorebookRewrite
 import com.deeptalking.domain.memory.parseZoned
 import com.deeptalking.domain.memory.resolveDynamicStateSources
@@ -1032,28 +1033,15 @@ class BackgroundTasks(
             )
         }
 
-        // Eviction only runs after the batch parsed cleanly (legacy order). Retired entries
-        // are real content: they are reported (as a note, not a failure) so "这条设定怎么
-        // 没了" has an answer in the request log instead of being silent.
-        val rootEviction = evictStaleLorebookEntries(character.lorebook)
-        val memberEvictions = character.members.map { it to evictStaleLorebookEntries(it.lorebook) }
-        val retired = rootEviction.removed + memberEvictions.flatMap { it.second.removed }
-        if (retired.isNotEmpty()) {
-            onAuxiliaryNote(
-                "lorebook",
-                "淘汰了 ${retired.size} 条世界书条目（连续 ${LorebookLimits().evictionMisses} 次整理未被提及）：" +
-                    retired.joinToString("、") { it.name },
-            )
-        }
-        var working = character.copy(
-            lorebook = rootEviction.kept,
-            members = character.members.map { member ->
-                val kept = memberEvictions.firstOrNull { it.first.id == member.id }?.second?.kept
-                member.copy(lorebook = kept ?: member.lorebook)
-            },
-        )
+        // Capacity is driven, not miss-driven: a normal pass adds its handful of entries and
+        // archives nothing. Only when this batch genuinely does not fit do we archive the
+        // oldest, least-active model entries — at most EVICT_MAX_PER_PASS, so one abnormal
+        // batch can never clear a world book. User hand-written and 常驻 entries are never
+        // touched; when only those are left, the write that does not fit is deferred instead.
+        var working = character
         var written = 0
         val refused = mutableListOf<String>()
+        val createdIds = mutableListOf<String>()
         items.forEach { obj ->
             val proposal = LorebookProposal(
                 name = obj.string("name"),
@@ -1064,25 +1052,64 @@ class BackgroundTasks(
                 alwaysActive = optionalBoolean(obj, "alwaysActive"),
             )
             val ids = stringList(obj["sourceShortTermIds"]).map { it.trim() }.filter { it.isNotEmpty() }
-            val (next, result) = upsertLorebookEntryForCharacter(working, proposal, ids)
+            // Capacity is judged once, after the whole batch lands, so the part that fits is
+            // still written this round.
+            val (next, result) = upsertLorebookEntryForCharacter(working, proposal, ids, enforceCapacity = false)
             working = next
             when {
                 !result.ok -> refused += "${proposal.name}（${result.reason}）"
                 result.mergedIntoUser -> refused += "${proposal.name}（已有同设定的用户手写条目）"
-                else -> written++
+                else -> {
+                    written++
+                    if (result.created) result.entry?.let { createdIds += it.id }
+                }
             }
         }
-        // "写了几条 / 为什么没写" must be answerable from the device: a refused write used
-        // to be dropped on the floor, so a world book that never grew looked like a model
-        // that never tried.
-        onAuxiliaryNote(
-            "lorebook",
-            "本次整理写入 $written 条（来源 ${fresh.size} 条短期记忆）" +
-                (if (refused.isNotEmpty()) "，跳过 ${refused.size} 条：${refused.joinToString("；").take(300)}" else ""),
-        )
+
+        // De-duplicate first so a merged near-duplicate does not claim a second slot.
         working = working.copy(
             lorebook = dedupeLorebook(working.lorebook),
             members = working.members.map { it.copy(lorebook = dedupeLorebook(it.lorebook)) },
+        )
+
+        val archived = mutableListOf<LorebookEntry>()
+        var deferred = 0
+        val overflow = lorebookOverflow(working)
+        if (overflow > 0) {
+            val adjustment = archiveToFit(working, overflow, excludeIds = createdIds.toSet())
+            working = adjustment.character
+            archived += adjustment.archived
+            if (adjustment.unmet > 0) {
+                // The evictable pool is exhausted (the book is all manual/常驻): keep what
+                // fits and defer the rest rather than touch protected content.
+                val drop = createdIds.takeLast(adjustment.unmet.coerceAtMost(createdIds.size)).toSet()
+                if (drop.isNotEmpty()) {
+                    working = working.copy(
+                        lorebook = working.lorebook.filterNot { it.id in drop },
+                        members = working.members.map { member ->
+                            member.copy(lorebook = member.lorebook.filterNot { it.id in drop })
+                        },
+                    )
+                    deferred = drop.size
+                    written -= drop.size
+                }
+            }
+        }
+
+        // "写了几条 / 为什么没写 / 归档了哪些" must be answerable from the device: a refused
+        // write used to be dropped on the floor. One combined note keeps the log readable.
+        val note = buildString {
+            append("本次整理写入 $written 条（来源 ${fresh.size} 条短期记忆）")
+            if (refused.isNotEmpty()) append("，跳过 ${refused.size} 条：${refused.joinToString("；").take(300)}")
+            if (archived.isNotEmpty()) {
+                append("；世界书已满，归档了最久未活跃的 ${archived.size} 条：")
+                append(archived.joinToString("、") { it.name })
+            }
+            if (deferred > 0) append("；可淘汰条目已用尽，剩余 $deferred 条下次整理再写")
+        }
+        onAuxiliaryNote("lorebook", note)
+
+        working = working.copy(
             counters = working.counters.copy(
                 lorebookScannedCount = working.counters.lorebookScannedCount + fresh.size,
             ),
@@ -1183,8 +1210,7 @@ class BackgroundTasks(
         }
         if (rewritten.isEmpty()) return TaskStatus.Failure to character
         val replaced = list.flatMap { if (it.id == entry.id) rewritten else listOf(it) }
-            .take(AppLimits.Lorebook.ENTRIES)
-        return TaskStatus.Success to if (memberIndex < 0) {
+        val rebuilt = if (memberIndex < 0) {
             character.copy(lorebook = replaced)
         } else {
             character.copy(
@@ -1193,6 +1219,9 @@ class BackgroundTasks(
                 },
             )
         }
+        // A rewrite can split one entry into up to three; converge globally so the split
+        // never pushes the book past the ceiling (the oldest overflow is archived).
+        return TaskStatus.Success to rebuilt.convergeLorebookCapacity()
     }
 
     /**
@@ -1578,10 +1607,13 @@ class BackgroundTasks(
                 keywords = stringList(obj["keywords"]),
                 alwaysActive = (obj["alwaysActive"] as? JsonPrimitive)?.contentOrNull == "true",
             )
-            val result = upsertLorebookEntry(lorebook, proposal)
+            val result = upsertLorebookEntry(lorebook, proposal, maxEntries = null)
             if (result.ok) lorebook = result.list
         }
         var updated = character.copy(lorebook = lorebook, lorebookMigratedAt = Instant.now().toString())
+            // Global capacity is judged once, shared book + members alike; the oldest live
+            // overflow goes to the archive instead of silently growing past the ceiling.
+            .convergeLorebookCapacity()
         if (trimSource) {
             val newSource = data?.string("trimmedSource")?.trim().orEmpty()
             val limit = if (isGroup) 1200 else 800

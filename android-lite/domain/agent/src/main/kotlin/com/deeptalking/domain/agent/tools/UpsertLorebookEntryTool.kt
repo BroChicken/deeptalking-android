@@ -1,6 +1,7 @@
 package com.deeptalking.domain.agent.tools
 
 import com.deeptalking.core.common.AppLimits
+import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.LorebookOrigin
 import com.deeptalking.domain.agent.AgentContext
@@ -8,6 +9,8 @@ import com.deeptalking.domain.agent.AgentTool
 import com.deeptalking.domain.agent.AgentToolResult
 import com.deeptalking.domain.memory.parseRelativeText
 import com.deeptalking.domain.memory.parseZoned
+import com.deeptalking.domain.memory.archiveToFit
+import com.deeptalking.domain.memory.lorebookOverflow
 import com.deeptalking.domain.memory.resolveLorebookAlwaysActive
 import com.deeptalking.domain.memory.resolveLorebookSources
 import com.deeptalking.domain.memory.resolveTimeRef
@@ -82,19 +85,40 @@ class UpsertLorebookEntryTool : AgentTool {
             val result = upsert(member.lorebook, entryId, name, content, keywords, alwaysActive)
             if (!result.ok || result.entry == null) return AgentToolResult(errorJson(result.reason.ifEmpty { "世界书写入失败" }))
             val updatedMembers = character.members.map { if (it.id == member.id) it.copy(lorebook = result.list) else it }
+            val fitted = fitCapacity(character.copy(members = updatedMembers), result.created, result.entry?.id)
+                ?: return AgentToolResult(errorJson(LOREBOOK_FULL_MESSAGE))
             return AgentToolResult(
                 contentJson = entryJson(result.entry, result.created, result.mergedIntoUser),
-                updatedCharacter = character.copy(members = updatedMembers),
+                updatedCharacter = fitted,
             )
         }
 
         val result = upsert(character.lorebook, entryId, name, content, keywords, alwaysActive)
         if (!result.ok || result.entry == null) return AgentToolResult(errorJson(result.reason.ifEmpty { "世界书写入失败" }))
+        val fitted = fitCapacity(character.copy(lorebook = result.list), result.created, result.entry?.id)
+            ?: return AgentToolResult(errorJson(LOREBOOK_FULL_MESSAGE))
         return AgentToolResult(
             contentJson = entryJson(result.entry, result.created, result.mergedIntoUser),
-            updatedCharacter = character.copy(lorebook = result.list),
+            updatedCharacter = fitted,
         )
     }
+}
+
+private const val LOREBOOK_FULL_MESSAGE =
+    "世界书已满（其余条目均为人工维护或常驻，不计入淘汰）。新增前请先在角色编辑器里归档或删除一些条目。"
+
+/**
+ * Capacity gate for a tool write: a genuinely new entry that pushes the **global** count
+ * (shared book + members) over the ceiling archives the oldest evictable entries. The new
+ * entry itself is never a candidate (it was just accepted). Returns null when only protected
+ * (manual/常驻) entries are left — the caller refuses the write.
+ */
+private fun fitCapacity(character: Character, created: Boolean, createdId: String?): Character? {
+    if (!created) return character
+    val overflow = lorebookOverflow(character)
+    if (overflow <= 0) return character
+    val adjustment = archiveToFit(character, overflow, excludeIds = setOfNotNull(createdId))
+    return if (adjustment.unmet > 0) null else adjustment.character
 }
 
 private const val NAME_SIMILARITY = 0.5
@@ -129,7 +153,6 @@ private fun upsert(
             // Omitted field (null) keeps the stored value: a reply that does not mention
             // `alwaysActive` must not switch an existing 常驻 entry off.
             alwaysActive = resolveLorebookAlwaysActive(list, exact, alwaysActive),
-            misses = 0,
             updatedAt = Instant.now().toString(),
         )
         return UpsertResult(true, list = replace(list, exact.id, updated), entry = updated, created = false)
@@ -145,7 +168,6 @@ private fun upsert(
             content = content,
             keywords = if (keywords.isNotEmpty()) keywords else similar.keywords,
             alwaysActive = resolveLorebookAlwaysActive(list, similar, alwaysActive),
-            misses = 0,
             updatedAt = Instant.now().toString(),
         )
         return UpsertResult(true, list = replace(list, similar.id, merged), entry = merged, created = false)
@@ -154,9 +176,6 @@ private fun upsert(
     // No keywords and not always-on would never be injected at all; use the entry name
     // as the trigger instead of rejecting the entry outright.
     val triggerKeywords = keywords.ifEmpty { listOf(name) }
-    if (list.size >= AppLimits.Lorebook.ENTRIES) {
-        return UpsertResult(false, "世界书条目已达上限 ${AppLimits.Lorebook.ENTRIES} 条")
-    }
     // The always-active ceiling demotes a new entry to keyword-driven instead of rejecting
     // it — the model's content is the valuable part and must not be thrown away.
     val active = resolveLorebookAlwaysActive(list, LorebookEntry(name = name, content = content), alwaysActive)
@@ -172,7 +191,9 @@ private fun upsert(
         createdAt = now,
         updatedAt = now,
     )
-    return UpsertResult(true, list = (list + entry).take(AppLimits.Lorebook.ENTRIES), entry = entry, created = true)
+    // Capacity is judged globally by the caller (`fitCapacity`); the per-list guard is not
+    // used here any more.
+    return UpsertResult(true, list = list + entry, entry = entry, created = true)
 }
 
 private fun findEntry(list: List<LorebookEntry>, entryId: String, name: String): LorebookEntry? {

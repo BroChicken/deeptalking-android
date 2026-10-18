@@ -349,14 +349,66 @@ fun detectStyleViolations(reply: String?, character: Character?, prevReplies: Li
  * 为什么单独抽出来：文风修订（`critiqueStyle`）只该动**风格**，而引用段落、歌词、
  * 书名、专有名词是**内容**——它们被改写就等于篡改了别人的原话或作品名。这里提供
  * 确定性的比对依据，而不是只靠一句"请保留引用"的提示词。
+ *
+ * 开闭不同的包裹符（「」『』《》〈〉“”‘’）天然成对，一个孤立的开符最多只是配不上，
+ * 不会把中间大段正文吞进同一个片段，所以直接用正则取。
  */
-private val PROTECTED_SPANS = Regex(
-    "「[^」]*」|『[^』]*』|《[^》]*》|〈[^〉]*〉|“[^”]*”|‘[^’]*’|\"[^\"]*\"|'[^']*'",
+private val PAIRED_SPANS = Regex(
+    "「[^」]*」|『[^』]*』|《[^》]*》|〈[^〉]*〉|“[^”]*”|‘[^’]*’",
 )
 
+/**
+ * 开闭同形的引号（`"` 与 `'`）：孤立出现时会把"后面很远的下一个引号"当成闭合，
+ * 于是把中间整段正文吞成一个"引用片段"——修一点点就整条回退的误判来源。
+ * 这类引号改为**同一句内**才配对（见 [ambiguousQuoteSpans]）。
+ */
+private const val AMBIGUOUS_QUOTES = "\"'"
+
+/** 句子边界：同形引号不跨句配对。与 [extractReplyEnding] 的句末标点保持一致，外加换行。 */
+private const val SENTENCE_TERMINATORS = "。！？!?…\n"
+
+/** 紧跟在句末标点之后、仍属于上一句的收尾符（如 `"早点睡。"` 的闭合引号、`)`、`】`）。 */
+private const val TRAILING_CLOSERS = "\"'”’）)】]"
+
+/**
+ * 取出同形引号（`"` `'`）的成对片段：从左到右扫描，**同一句内**按出现顺序两两配对；
+ * 句子结束时（句末标点后不是收尾符）句内没配上的引号直接作废，绝不跨句吞并。
+ *
+ * 例：`我回了一句"好。 他说："早点睡。"` —— 前两个引号分别落在两句里（都未配对，作废），
+ * 只有同一句内的 `"早点睡。"` 成为保护片段。
+ */
+private fun ambiguousQuoteSpans(text: String): List<IntRange> {
+    val spans = mutableListOf<IntRange>()
+    val open = mutableMapOf<Char, Int>()
+    text.forEachIndexed { index, ch ->
+        when {
+            ch in AMBIGUOUS_QUOTES -> {
+                val start = open.remove(ch)
+                if (start == null) open[ch] = index else spans += start..index
+            }
+
+            ch in SENTENCE_TERMINATORS && !endsClauseWithTrailingCloser(text, index) -> open.clear()
+        }
+    }
+    return spans
+}
+
+/** [index] 处的句末标点后面（跳过连续句末标点）紧跟收尾符时，视为同一句的收尾，不切句。 */
+private fun endsClauseWithTrailingCloser(text: String, index: Int): Boolean {
+    var next = index + 1
+    while (next < text.length && text[next] in SENTENCE_TERMINATORS) next++
+    return next < text.length && text[next] in TRAILING_CLOSERS
+}
+
 /** 按出现顺序取出 [text] 里所有被引号/书名号包裹的引用段落。 */
-fun quotedSpans(text: String?): List<String> =
-    PROTECTED_SPANS.findAll(text.orEmpty()).map { it.value }.toList()
+fun quotedSpans(text: String?): List<String> {
+    val value = text.orEmpty()
+    if (value.isEmpty()) return emptyList()
+    val spans = mutableListOf<IntRange>()
+    PAIRED_SPANS.findAll(value).forEach { spans += it.range }
+    spans += ambiguousQuoteSpans(value)
+    return spans.sortedBy { it.first }.map { value.substring(it.first, it.last + 1) }
+}
 
 /**
  * 修订稿是否**完整保留了**原文里的引用段落与受保护的专有名词。
@@ -364,6 +416,10 @@ fun quotedSpans(text: String?): List<String> =
  * 任一引用段落被改写、增删或换序，或某个专有名词（世界书条目名、角色/成员名、
  * 对用户的称呼）在原文里出现却在修订稿里消失，都判为不合格 —— 调用方据此
  * **整体回退**到原文（不做局部修补：局部修补会留下半截被改写的引用）。
+ *
+ * 引用片段的切分见 [quotedSpans]：开闭同形的 `"` `'` 只在同一句内配对，所以原文里
+ * 一个孤立引号不会把相邻大段正文并成一个"引用"，也就不会让极小改写被误判成整条回退；
+ * 而真正被引号包住的段落一旦被改写或删除，仍然照旧回退。
  */
 fun keepsProtectedContent(original: String, revised: String, protectedNames: List<String>): Boolean {
     if (quotedSpans(original) != quotedSpans(revised)) return false

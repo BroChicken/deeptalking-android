@@ -232,4 +232,65 @@ class StyleGuardTest {
         // 原文里没有的名字不参与判定。
         assertTrue(keepsProtectedContent(original, "她把《夜曲》放给阿岩听。", listOf("林晚")))
     }
+
+    @Test
+    fun unpairedQuoteDoesNotSwallowTheTextAroundIt() {
+        // 只有一个孤立引号时，不能把"孤立引号 → 远处的下一个引号"之间的正文当成一个引用片段。
+        assertEquals(
+            listOf("\"早点睡。\""),
+            quotedSpans("我回了一句\"好。 他说：\"早点睡。\""),
+        )
+        // 孤立引号之后的闭合引号，仍属于同一句里的引用。
+        assertEquals(
+            listOf("\"好。\""),
+            quotedSpans("我回了一句\"好。\""),
+        )
+    }
+
+    @Test
+    fun critiqueIsAcceptedWhenOnlyAnUnpairedQuoteRegionIsRewritten() {
+        val original = "我回了一句\"好。 他把灯拧暗：\"早点睡。\""
+        // 两处极小改写都落在孤立引号与下一个引号之间：不再整条回退。
+        val revised = "我回了一句\"行。 他把灯拧暗，压低了声音：\"早点睡。\""
+        assertTrue(keepsProtectedContent(original, revised, emptyList()))
+        // 同一段里真正的引用被动过 → 照旧回退。
+        assertFalse(keepsProtectedContent(original, "我回了一句\"好。 他把灯拧暗：\"睡吧。\"", emptyList()))
+    }
+
+    @Test
+    fun critiqueIsStillRejectedWhenARealQuotedPassageIsLost() {
+        val original = "她低声说\"你别熬夜\"，我没接话。"
+        // 引用被改写 → 回退
+        assertFalse(keepsProtectedContent(original, "她低声说\"你要早点睡\"，我没接话。", emptyList()))
+        // 引用被删掉 → 回退
+        assertFalse(keepsProtectedContent(original, "她低声说你别熬夜，我没接话。", emptyList()))
+        // 引用逐字保留（其余文风可改）→ 通过
+        assertTrue(keepsProtectedContent(original, "她只低声说了句\"你别熬夜\"。我没接话。", emptyList()))
+    }
+
+    @Test
+    fun critiqueIsStillRejectedWhenANameDisappearsNextToAnUnpairedQuote() {
+        val original = "我回了一句\"好。 小雨说：早点睡。"
+        assertFalse(keepsProtectedContent(original, "我回了一句\"好。 她说：早点睡。", listOf("小雨")))
+        assertTrue(keepsProtectedContent(original, "我回了一句\"好。 小雨说：早点睡。", listOf("小雨")))
+    }
+
+    @Test
+    fun critiquePassesWhenNoQuotedPassageIsTouched() {
+        // 完全没动引用（含书名号与直角引号）的正常通过路径不受切分方式影响。
+        assertTrue(
+            keepsProtectedContent(
+                "他说「早点睡」，我点头，把《夜曲》放回桌上。",
+                "他低声道「早点睡」。我点了点头，才把《夜曲》放回桌上。",
+                emptyList(),
+            ),
+        )
+        assertTrue(
+            keepsProtectedContent(
+                "她低声说\"你别熬夜\"，我没接话。",
+                "她低声说\"你别熬夜\"。我没接话。",
+                emptyList(),
+            ),
+        )
+    }
 }

@@ -5,6 +5,7 @@ import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.LongTermMemory
 import com.deeptalking.core.model.MemoryCategory
 import com.deeptalking.core.model.MemorySubject
+import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.ShortTermMemory
 import org.junit.Assert.assertEquals
@@ -18,8 +19,8 @@ import java.time.temporal.ChronoUnit
 
 class MemoryEvidenceTest {
 
-    private fun userMessage(id: String, content: String): ChatMessage =
-        ChatMessage(id = id, role = Role.User, content = content)
+    private fun userMessage(id: String, content: String, timestamp: String? = null): ChatMessage =
+        ChatMessage(id = id, role = Role.User, content = content, timestamp = timestamp)
 
     private fun assistantMessage(id: String, content: String): ChatMessage =
         ChatMessage(id = id, role = Role.Assistant, content = content)
@@ -220,5 +221,188 @@ class MemoryEvidenceTest {
         assertFalse(shouldCaptureUserTurn("你好"))
         assertFalse(shouldCaptureUserTurn("嗯嗯"))
         assertFalse(shouldCaptureUserTurn("好"))
+    }
+
+    // ---- promise reminder eligibility (推送资格) ----------------------------------------
+
+    private fun promise(
+        id: String = "p1",
+        subject: MemorySubject = MemorySubject.User,
+        promisor: String? = "user",
+        sourceIds: List<String> = listOf("u1"),
+        evidence: String = "我明天要交报告",
+        dueAt: String? = null,
+        status: PromiseStatus = PromiseStatus.Active,
+    ) = LongTermMemory(
+        id = id,
+        category = MemoryCategory.Promises,
+        subject = subject,
+        key = "交报告",
+        value = "用户明天交报告",
+        evidence = evidence,
+        sourceMessageIds = sourceIds,
+        dueAt = dueAt,
+        promisor = promisor,
+        promisee = "character",
+        status = status,
+    )
+
+    @Test
+    fun characterSelfPromiseIsStillStoredButNeverPushable() {
+        val assistant = assistantMessage("a1", "我会在明天晚上陪你去医院。")
+        val character = Character(
+            id = "c1",
+            instant = listOf(userMessage("u1", "我一个人不敢去。"), assistant),
+        )
+        val item = promise(
+            subject = MemorySubject.Relationship,
+            promisor = "character",
+            sourceIds = listOf("current_response"),
+            evidence = "我会在明天晚上陪你去医院",
+            dueAt = "2026-08-10T19:00:00",
+        )
+        // 角色的单方承诺是真实发生的设定：照常存进记忆……
+        assertTrue(isValidAutomaticMemory(character, item, assistantMessage = assistant))
+        // ……但它不该变成对用户的待办推送。
+        val decision = promisePushDecision(character, item, assistantMessage = assistant)
+        assertFalse(decision.pushable)
+        assertEquals(PromisePushReason.CHARACTER_SELF_PROMISE, decision.reason)
+        assertNull(decision.confirmedDueAt)
+        assertNull(decision.confirmedDueAtMillis)
+        assertFalse(decision.dueAtNeedsConfirmation)
+    }
+
+    @Test
+    fun agreementWithOnlyTheUserSideQuotedIsNotPushable() {
+        val character = Character(
+            id = "c1",
+            instant = listOf(
+                userMessage("u1", "那我们明天九点见吧。"),
+                assistantMessage("a1", "好，明天九点见。"),
+            ),
+        )
+        // 模型只引用了用户的话，却把 subject/promisor 写成"双方约定"。
+        val inferred = promise(
+            subject = MemorySubject.Relationship,
+            promisor = "relationship",
+            sourceIds = listOf("u1"),
+            evidence = "明天九点见",
+        )
+        assertTrue("写入闸门本身接受它", isValidAutomaticMemory(character, inferred))
+        val inferredDecision = promisePushDecision(character, inferred)
+        assertFalse(inferredDecision.pushable)
+        assertEquals(PromisePushReason.RELATIONSHIP_NEEDS_BOTH_SIDES, inferredDecision.reason)
+
+        // 双方原话都在（用户 + 角色）才算数。
+        val both = inferred.copy(sourceMessageIds = listOf("u1", "a1"))
+        val bothDecision = promisePushDecision(character, both)
+        assertTrue(bothDecision.pushable)
+        assertEquals(PromisePushReason.USER_CONFIRMED, bothDecision.reason)
+    }
+
+    @Test
+    fun promisePushDecisionRequiresAnActiveUserPromisor() {
+        val character = Character(id = "c1", instant = listOf(userMessage("u1", "我明天要交报告")))
+        assertEquals(
+            PromisePushReason.NOT_ACTIVE_PROMISE,
+            promisePushDecision(character, promise(status = PromiseStatus.Resolved)).reason,
+        )
+        assertEquals(
+            PromisePushReason.NOT_USER_PROMISOR,
+            promisePushDecision(character, promise(promisor = null)).reason,
+        )
+        assertEquals(
+            PromisePushReason.NOT_USER_PROMISOR,
+            promisePushDecision(character, promise(promisor = "小明")).reason,
+        )
+        assertEquals(
+            "用户原话对不上就不是用户说的",
+            PromisePushReason.NO_USER_EVIDENCE,
+            promisePushDecision(character, promise(evidence = "我明天要写周报")).reason,
+        )
+        assertTrue(promisePushDecision(character, promise()).pushable)
+    }
+
+    @Test
+    fun userAgreedPromiseWithLocatableDueTimeIsPushable() {
+        val character = Character(
+            id = "c1",
+            instant = listOf(userMessage("u1", "我明天要交报告。", timestamp = "2026-08-09T12:00:00")),
+        )
+        val decision = promisePushDecision(character, promise(dueAt = "2026-08-10T09:00:00"))
+        assertTrue(decision.pushable)
+        assertEquals(PromisePushReason.USER_CONFIRMED, decision.reason)
+        assertEquals("2026-08-10T09:00:00", decision.confirmedDueAt)
+        assertNotNull(decision.confirmedDueAtMillis)
+        assertFalse(decision.dueAtNeedsConfirmation)
+
+        // 没有期限的承诺可以推送，但没有任何可排期的期限。
+        val noDue = promisePushDecision(character, promise())
+        assertTrue(noDue.pushable)
+        assertNull(noDue.confirmedDueAt)
+        assertNull(noDue.confirmedDueAtMillis)
+        assertFalse(noDue.dueAtNeedsConfirmation)
+    }
+
+    @Test
+    fun dueTimeTheUserNeverMentionedIsMarkedForConfirmation() {
+        val character = Character(
+            id = "c1",
+            instant = listOf(userMessage("u1", "记得帮我买药", timestamp = "2026-08-01T12:00:00")),
+        )
+        val item = promise(evidence = "记得帮我买药", dueAt = "2026-08-10T09:00:00")
+        val decision = promisePushDecision(character, item)
+        assertTrue(decision.pushable)
+        assertNull("用户没提时间 → 不建排期", decision.confirmedDueAt)
+        assertNull(decision.confirmedDueAtMillis)
+        assertTrue("返回里标明待确认期限", decision.dueAtNeedsConfirmation)
+
+        // 期限被模型挪到用户没说的那一天，同样不可信。
+        val moved = promisePushDecision(
+            character,
+            item.copy(dueAt = "2026-09-01T09:00:00"),
+        )
+        assertTrue(moved.dueAtNeedsConfirmation)
+        assertNull(moved.confirmedDueAt)
+    }
+
+    @Test
+    fun dueAtBackedByUserEvidenceChecksDatesAndTimeWords() {
+        val noTime = listOf(SourceRef("u1", "user", "记得帮我买药。", timestamp = "2026-08-01T12:00:00"))
+        assertFalse("用户原话里没有任何时间词", dueAtBackedByUserEvidence(noTime, "2026-08-10T09:00:00"))
+        assertFalse("没有期限就没有依据", dueAtBackedByUserEvidence(noTime, null))
+        assertFalse("没有用户来源", dueAtBackedByUserEvidence(emptyList(), "2026-08-10T09:00:00"))
+
+        // 相对词按消息自身的时间换算：8-09 说“明天”就是 8-10。
+        val tomorrow = listOf(SourceRef("u2", "user", "我明天要交报告。", timestamp = "2026-08-09T12:00:00"))
+        assertTrue(dueAtBackedByUserEvidence(tomorrow, "2026-08-10T09:00:00"))
+        assertFalse("挪到另一天就不算", dueAtBackedByUserEvidence(tomorrow, "2026-08-11T09:00:00"))
+
+        // 绝对日期（ISO 与中文写法）。
+        val absolute = listOf(SourceRef("u3", "user", "截止时间是 2026-08-10。", timestamp = "2026-08-01T12:00:00"))
+        assertTrue(dueAtBackedByUserEvidence(absolute, "2026-08-10T18:00:00"))
+        val chinese = listOf(SourceRef("u4", "user", "8月10号之前给他。", timestamp = "2026-08-01T12:00:00"))
+        assertTrue(dueAtBackedByUserEvidence(chinese, "2026-08-10T09:00:00"))
+        assertFalse(dueAtBackedByUserEvidence(chinese, "2026-08-12T09:00:00"))
+
+        // 只有粗粒度时间词（没说是哪天）→ 可以接受；没有时间词 → 不行。
+        val coarse = listOf(SourceRef("u5", "user", "我晚上去取。", timestamp = "2026-08-01T12:00:00"))
+        assertTrue(dueAtBackedByUserEvidence(coarse, "2026-08-10T20:00:00"))
+
+        // 消息本身没有时间戳时，相对词无法换算，只能要求"出现了时间词"。
+        val undated = listOf(SourceRef("u6", "user", "我明天要交报告。"))
+        assertTrue(dueAtBackedByUserEvidence(undated, "2026-08-10T09:00:00"))
+    }
+
+    @Test
+    fun containsTemporalExpressionAcceptsRealTimeWordsOnly() {
+        assertTrue(containsTemporalExpression("我明天要交报告"))
+        assertTrue(containsTemporalExpression("下周三上午开会"))
+        assertTrue(containsTemporalExpression("三天后给他"))
+        assertTrue(containsTemporalExpression("截止 2026-08-10"))
+        assertTrue(containsTemporalExpression("晚上九点见"))
+        assertFalse(containsTemporalExpression("记得帮我买药"))
+        assertFalse("‘周围’不是时间词", containsTemporalExpression("周围的人都回来了"))
+        assertFalse("模糊说法不算可定位期限", containsTemporalExpression("以后再说吧"))
     }
 }
