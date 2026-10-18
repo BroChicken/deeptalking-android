@@ -307,14 +307,14 @@ BackgroundTasks.scheduleTurn  后台串行维护：文风校对、快速回应�
 - 游标存 `character.sceneState`（`key`/`startCount`/`startSequence`/`messageCount`，按消息 `sequence` 推进）。
 - 注入：最近 2 条渲染为 `【场景概要（较早情节的压缩记录…）】`。
 
-### 承诺提醒与待办（promises）
+### 用户约定与待办（promises）
 
-- **推送资格闸门** `MemoryEvidence.promisePushDecision()`：只有**用户本人同意**的约定才会变成提醒。`promisor=character`（角色单方承诺，即以前会推给用户的"角色答应你的事"）照常存进记忆但**永不推送、永不排期**；`promisor=user` 要求 `sourceMessageIds` 解析得出且全是用户原话（`evidence` 必须逐字对上）；`promisor=relationship`（双方约定）还必须有另一方原话佐证；其余（群组成员名 / 空 / 旧数据）一律不可推送。**确认结论会落盘**：严格闸门通过的那一刻把 `pushConfirmedAt`（时间）与 `pushConfirmedDueAt`（当时被确认的 `dueAt`）写进记忆；之后即使引用消息滑出即时/短期窗口、来源再也解析不出来，这条约定也**不会退化成「不提醒」**——闸门在来源还活着时判过一次就是既成事实。标记按 `dueAt` 失效（期限被改写或删除即回到严格判定）；**期限定位不到**（`dueAtNeedsConfirmation`）的条目**不打标**，否则等于把模型自己给的日期追认成"用户确认过的期限"。
-- **期限必须落在用户原话里**：模型给的 `dueAt` 还要能被用户原话定位（`dueAtBackedByUserEvidence`）；定位不到时返回 `dueAtNeedsConfirmation=true`、`confirmedDueAt=null` —— **不排期**，待办列表显示「待确认期限」并回头问用户。可排期的只有 `confirmedDueAtMillis`。
-- **排期与撤销**（app 层）：`AppViewModel.scheduleDueReminders` 只扫**刚回过一轮的那个角色**——已到点则 `NativeCore.postReminder`（立即弹出）并写 `notifiedAt`，未到点则 `scheduleReminder`（`Reminders`：WorkManager `ExistingWorkPolicy.REPLACE`，一个 id 至多一条待发）。`NativeCore.cancelReminder` → `Reminders.cancel` 一次撤掉**待发任务 + 已弹出的通知 + registry 记录**（幂等）。完成 / 关闭 / 角色删除都会撤销：所有角色写入经 `AppViewModel.writeCharacterChanges`，用 `promisesLosingActiveStatus(before, after)` 只撤销**本次**失去 active 的那些 id（不牵连无关提醒）；删角色前先按 `activePromiseIds` 全量撤销（行删掉后就再也拿不到那些 id 了）。这一遍扫描同时负责**落盘确认结论**（上面那条标记，幂等；无期限的已确认约定也打标，只是没有日期可排）。**导入 / 恢复备份**成功后 `AppViewModel` 会调 `NativeCore.cancelAllReminders`（`Reminders.cancelAll`：先按固定 tag `cancelAllWorkByTag` 撤掉**所有**待发 WorkManager 任务——包括上次进程运行排下的那些，进程内的 registry 重启即空，只遍历它会漏——再按 registry 快照撤掉已弹出的通知）——数据被整套替换后，旧提醒不该再响。
+- **准入闸门** `MemoryEvidence.promisePushDecision()`：只有**用户本人同意**的约定才算"已确认"。`promisor=character`（角色单方承诺）照常存进记忆，但**永不计入已确认**；`promisor=user` 要求 `sourceMessageIds` 解析得出且全是用户原话（`evidence` 必须逐字对上）；`promisor=relationship`（双方约定）还必须有另一方原话佐证；其余（群组成员名 / 空 / 旧数据）一律不计入。**确认结论会落盘**：严格闸门通过的那一刻把 `pushConfirmedAt`（时间）与 `pushConfirmedDueAt`（当时被确认的 `dueAt`）写进记忆；之后即使引用消息滑出即时/短期窗口、来源再也解析不出来，这条约定也**不会退化成「不提醒」**——闸门在来源还活着时判过一次就是既成事实。标记按 `dueAt` 失效（期限被改写或删除即回到严格判定）；**期限定位不到**（`dueAtNeedsConfirmation`）的条目**不打标**，否则等于把模型自己给的日期追认成"用户确认过的期限"。
+- **期限必须落在用户原话里**：模型给的 `dueAt` 还要能被用户原话定位（`dueAtBackedByUserEvidence`）；定位不到时返回 `dueAtNeedsConfirmation=true`、`confirmedDueAt=null`，待办列表显示「待确认期限」并回头问用户。
+- **确认结论落盘（无通知投递）**（app 层）：`AppViewModel.recordPromiseConfirmations` 只扫**刚回过一轮的那个角色**，把"用户本人确认、且期限能在他原话里定位"的结论写进 `pushConfirmedAt`/`pushConfirmedDueAt`（幂等；无期限的已确认约定也打标），供设置页待办分桶使用。用户侧**没有任何通知通道**：约定既不排期也不出现在通知栏/消息栏，应用不持有通知权限，也没有 WorkManager 任务；`LongTermMemory` 只有上面两个确认标记，没有"已通知"时间。完成 / 关闭 / 删除角色只是改记忆状态（列表随即重算）。
 - **设置页待办列表**（`:feature:settings` 的 `promiseTodos(characters)` + `PromiseTodoList`）：**跨全部角色**聚合（每行带所属角色 id/name，角色多于一个时行首显示角色名；单角色的顺序与旧版逐字节一致，`TODO_ORDER` = 分区 → 期限 → key → 角色名 → 角色 id → 条目 id）。纯**派生视图**，不改任何记忆字段。分桶（`PromiseTodoSection`）：进行中 / 待确认期限 / 周期性约定 / 已超时（可折叠）/ 不提醒（可折叠），每行可「完成 / 关闭」（`AppViewModel.resolvePromise(characterId, promiseId, status)` → 纯函数 `resolvePromiseIn`，只落到该行所属角色）。`promiseTodos` 用每分钟 ticker 重新采样 `now`，所以「已超时」由 `dueAt < now` 推导、不是新字段（列表在屏幕上时也能看到条目越过期限）。
 - **周期性约定永不进超时**：`isRecurringPromise` 命中「每 / 一直 / 永远」即单独一桶——"每晚十点"不会在第一个期限就被判成过期。
-- **不提醒桶只展示不删除**：角色单方承诺 / 缺用户原话的条目仍留在记忆里（用户可以自己「关闭」它），它们只是永远不会成为提醒。
+- **不提醒桶只展示不删除**：角色单方承诺 / 缺用户原话的条目仍留在记忆里（用户可以自己「关闭」它），它们只是不会计入"已确认"。
 
 ## 六、上下文与预算
 

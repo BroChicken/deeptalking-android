@@ -418,12 +418,11 @@ data class LongTermMemory(
     val updatedAt: String? = null,
     val lastRecalled: String? = null,
     val recallCount: Int = 0,
-    /** When a due-reminder notification was posted for this promise (native `set_reminder` firing). */
-    val notifiedAt: String? = null,
     /**
-     * When the strict push gate ([com.deeptalking.domain.memory.promisePushDecision]) last passed
-     * for this promise, ISO. The confirmation conclusion is persisted so that once the citing
-     * messages slide out of the live window the promise does not degrade into 「不提醒」.
+     * When the strict agreement gate ([com.deeptalking.domain.memory.promisePushDecision]) last
+     * passed for this promise, ISO. The conclusion is persisted so that once the citing messages
+     * slide out of the live window the promise does not degrade into 「不提醒」. It only feeds the
+     * 待办 list in settings — nothing is pushed to the user.
      */
     val pushConfirmedAt: String? = null,
     /**

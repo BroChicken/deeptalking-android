@@ -30,7 +30,7 @@ import com.deeptalking.core.designsystem.legacy
  * The 待办 list: **every** character's promises, bucketed by [PromiseTodoSection].
  *
  * It is a *view* only — 完成/关闭 are handed back through [onComplete]/[onClose] as
- * `(characterId, promiseId)`, which flip the promise's status and retract its reminder. No
+ * `(characterId, promiseId)`, which flip the promise's status. No
  * section removes anything: a 已超时 or 不提醒 agreement stays visible in its own bucket and
  * stays stored in memory.
  *

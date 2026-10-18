@@ -104,7 +104,6 @@ fun SettingsScreen(
     loadApiKey: (String) -> String? = { null },
     testResult: String?,
     onSave: (AppConfig, apiKey: String?) -> Unit,
-    onTestReminder: () -> Unit,
     onTestConnection: (AppConfig, String?) -> Unit,
     ttsEnabled: Boolean = false,
     ttsAutoRead: Boolean = false,
@@ -286,8 +285,6 @@ fun SettingsScreen(
             edited.quickReplyRepair,
             hint = "快速回应不像用户会说的话时，后台用“用户本人”身份重写一次",
         ) { persist(edited.copy(quickReplyRepair = it)) }
-
-        LegacyButton("测试提醒", modifier = Modifier.fillMaxWidth(), onClick = onTestReminder)
 
         PromiseTodoList(
             todos = promiseTodos,

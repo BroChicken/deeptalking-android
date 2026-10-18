@@ -1129,50 +1129,6 @@ class NativeCore(context: Context) {
     fun applyMemberFill(member: GroupMember, raw: String): GroupMember =
         com.deeptalking.feature.characters.CharacterParity.applyMemberFillPayload(member, raw, java.time.ZonedDateTime.now())
 
-    fun scheduleTestReminder() {
-        com.deeptalking.core.notifications.Reminders.schedule(
-            context = appContext,
-            id = "test-reminder",
-            triggerAtMillis = System.currentTimeMillis() + 5_000L,
-            title = "DeepTalking",
-            text = "提醒功能测试：这是一条本地通知。",
-        )
-    }
-
-    /** Posts a reminder notification immediately (Android-native equivalent of "到时间提醒"). */
-    fun postReminder(id: String, text: String) {
-        com.deeptalking.core.notifications.Reminders.post(appContext, id, "DeepTalking · 待办提醒", text)
-    }
-
-    /** Schedules a reminder notification at [triggerAtMillis] (idempotent per id). */
-    fun scheduleReminder(id: String, triggerAtMillis: Long, text: String) {
-        com.deeptalking.core.notifications.Reminders.schedule(
-            context = appContext,
-            id = id,
-            triggerAtMillis = triggerAtMillis,
-            title = "DeepTalking · 待办提醒",
-            text = text,
-        )
-    }
-
-    /**
-     * Retracts the reminder for [id]: pending work + an already-posted notification + the
-     * registry entry (`Reminders.cancel`). Called when the backing promise is completed,
-     * cancelled, removed or its character is deleted. Idempotent.
-     */
-    fun cancelReminder(id: String) {
-        if (id.isBlank()) return
-        com.deeptalking.core.notifications.Reminders.cancel(appContext, id)
-    }
-
-    /**
-     * Retracts every pending reminder. Called after an import/restore replaces the whole
-     * data set, so a reminder for a promise that no longer exists cannot still fire.
-     */
-    fun cancelAllReminders() {
-        com.deeptalking.core.notifications.Reminders.cancelAll(appContext)
-    }
-
     /**
      * Builds a per-turn orchestrator using the current config snapshot so model,
      * base URL, temperature and stream settings always reflect the latest

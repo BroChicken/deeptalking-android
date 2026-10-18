@@ -57,8 +57,7 @@ enum class PromiseTodoSection {
 
     /**
      * 待确认期限: the user did confirm the promise, but the model's `dueAt` is not locatable in
-     * the user's own words. Deliberately never scheduled — the list asks the user instead of
-     * firing a reminder on a date nobody agreed to.
+     * the user's own words. The list asks the user instead of showing a date nobody agreed to.
      */
     NEEDS_DUE_CONFIRMATION,
 
@@ -73,8 +72,9 @@ enum class PromiseTodoSection {
 
     /**
      * 不提醒: the memory is kept, but the *user* is not the one who agreed it (角色的单方承诺,
-     * 缺少用户原话) — so it never becomes a reminder. It is still listed here (collapsed) because
-     * it is a real memory the user may want to see or close; nothing is deleted.
+     * 缺少用户原话) — so it never counts as a confirmed agreement. It is still listed here
+     * (collapsed) because it is a real memory the user may want to see or close; nothing is
+     * deleted.
      */
     NOT_PUSHABLE,
 }
@@ -119,9 +119,9 @@ fun isRecurringPromise(memory: LongTermMemory): Boolean {
  * The 待办 view of [character]'s own promises, oldest-due first inside each section.
  *
  * Only active `Promises` memories of the character itself are listed (member promises live in
- * the member stores and are not scanned by the due-reminder pass either). A promise that is not
+ * the member stores and are not scanned by the confirmation pass either). A promise that is not
  * pushable stays visible under [PromiseTodoSection.NOT_PUSHABLE] — it is never deleted, it just
- * never becomes a reminder.
+ * never counts as a confirmed agreement.
  */
 fun promiseTodos(character: Character, nowMillis: Long = System.currentTimeMillis()): List<PromiseTodo> =
     character.longTerm
@@ -188,7 +188,7 @@ fun resolvePromiseIn(
             if (memory.id != promiseId) {
                 memory
             } else {
-                memory.copy(status = status, updatedAt = nowIso, notifiedAt = null)
+                memory.copy(status = status, updatedAt = nowIso)
             }
         },
     )
@@ -225,30 +225,3 @@ internal fun dayOnlyEndMillis(dueAt: String?, zone: ZoneId = ZoneId.systemDefaul
     val date = runCatching { LocalDate.parse(text.replace('/', '-')) }.getOrNull() ?: return null
     return date.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
 }
-
-/**
- * Ids of promises that were active in [before] and are **no longer** active in [after] —
- * resolved, cancelled or dropped entirely. These are exactly the reminders that must be
- * retracted (the pending work *and* a notification that already fired).
- *
- * Targeted on purpose: cancelling every non-active promise on every write would also tear
- * down reminders that are unrelated to this write.
- */
-fun promisesLosingActiveStatus(before: Character, after: Character): List<String> {
-    val stillActive = after.longTerm
-        .filter { it.category == MemoryCategory.Promises && it.status == PromiseStatus.Active }
-        .mapTo(HashSet()) { it.id }
-    return before.longTerm
-        .filter { it.category == MemoryCategory.Promises && it.status == PromiseStatus.Active }
-        .map { it.id }
-        .filter { it.isNotEmpty() && it !in stillActive }
-        .distinct()
-}
-
-/** Every active promise id on [character], for a wholesale retraction (character deleted). */
-fun activePromiseIds(character: Character): List<String> =
-    character.longTerm
-        .filter { it.category == MemoryCategory.Promises && it.status == PromiseStatus.Active }
-        .map { it.id }
-        .filter { it.isNotEmpty() }
-        .distinct()

@@ -32,9 +32,7 @@ import com.deeptalking.domain.memory.hasValidPushConfirmation
 import com.deeptalking.domain.memory.lorebookOverflow
 import com.deeptalking.domain.memory.promisePushDecision
 import com.deeptalking.feature.settings.PromiseTodo
-import com.deeptalking.feature.settings.activePromiseIds
 import com.deeptalking.feature.settings.promiseTodos
-import com.deeptalking.feature.settings.promisesLosingActiveStatus
 import com.deeptalking.feature.settings.resolvePromiseIn
 import com.deeptalking.engine.ondevice.TtsSpeaker
 import com.deeptalking.engine.ondevice.TtsTurn
@@ -702,20 +700,11 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
      * stored row (see [mergeCharacterChanges]). A whole-row write would roll back anything
      * a concurrent writer changed while this writer was working — a world-book entry, a
      * memory, the user's own edit — which is exactly the bug the scoped write fixes.
-     *
-     * Every character write funnels through here, so this is also where a promise that just
-     * flipped to Resolved/Cancelled (or was dropped) has its reminder retracted — the pending
-     * WorkManager job *and* a notification that already fired. Without this hook nothing ever
-     * cancelled a reminder: completing a promise left the old schedule armed.
      */
     private suspend fun writeCharacterChanges(before: Character, after: Character) {
         characterWriteMutex.withLock {
             val live = core.data.characters.get(after.id) ?: after
             core.data.characters.upsert(mergeCharacterChanges(before, after, live))
-        }
-        promisesLosingActiveStatus(before, after).forEach { promiseId ->
-            runCatching { core.cancelReminder(promiseId) }
-                .onFailure { DeepTalkingApp.recordError(it) }
         }
     }
 
@@ -758,16 +747,6 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
 
     fun deleteCharacter(id: String) {
         viewModelScope.launch {
-            // Retract the character's reminders first: the row (and with it the promise ids)
-            // is gone afterwards, so nothing could cancel them any more.
-            runCatching { core.data.characters.get(id) }
-                .getOrNull()
-                ?.let { activePromiseIds(it) }
-                .orEmpty()
-                .forEach { promiseId ->
-                    runCatching { core.cancelReminder(promiseId) }
-                        .onFailure { DeepTalkingApp.recordError(it) }
-                }
             core.data.characters.delete(id)
             core.data.chat.clear(id)
             if (activeIdState.value == id) activeIdState.value = null
@@ -795,7 +774,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     /**
-     * Flips one promise out of `Active` and retracts its reminder (完成 / 关闭 from the list).
+     * Flips one promise out of `Active` (完成 / 关闭 from the 待办 list), so it leaves the list.
      * The owning [characterId] comes from the row, so a flip lands on its own character and
      * never touches another's promises.
      */
@@ -804,7 +783,6 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         viewModelScope.launch {
             val before = core.data.characters.get(characterId) ?: return@launch
             val after = resolvePromiseIn(before, promiseId, status, Instant.now().toString()) ?: return@launch
-            // `writeCharacterChanges` is the funnel that retracts the reminder for the flip.
             writeCharacterChanges(before, after)
         }
     }
@@ -1565,12 +1543,12 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                         ),
                     )
                 }
-                val withReminders = scheduleDueReminders(finalResult.updatedCharacter)
+                val withConfirmations = recordPromiseConfirmations(finalResult.updatedCharacter)
                 // Write only what this turn changed. The turn's result is built from the
                 // snapshot taken when the turn started, so writing it whole would roll back
                 // anything a background pass changed while the model was answering (and a
                 // background world-book write would be rolled back likewise).
-                writeCharacterChanges(character, withReminders)
+                writeCharacterChanges(character, withConfirmations)
                 quickRepliesState.value = finalResult.quickReplies
                 statusState.value = ""
                 recordMetrics(
@@ -1642,59 +1620,35 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     }
 
     /**
-     * Native equivalent of a due reminder: for the active character's active promises whose
-     * push decision allows it, post a notification once when due (marking
-     * [LongTermMemory.notifiedAt]) or schedule it for the future. Only the character that
-     * just took a turn is scanned, never every character.
+     * Records the **confirmation conclusion** for the active character's promises: a promise
+     * the user themself agreed to (and whose due time their own words locate) gets
+     * [LongTermMemory.pushConfirmedAt] / `pushConfirmedDueAt` stamped here, while the citing
+     * sources are still live. Later, when those messages slide out of the window and the
+     * sources no longer resolve, the promise must not drop to 「不提醒」. Idempotent: an
+     * already-valid confirmation is never rewritten. Only the character that just took a turn
+     * is scanned, never every character.
      *
      * The gate is [promisePushDecision]: a promise the **user** did not agree to
-     * (`promisor=character`, or no user-verbatim evidence) is neither posted nor scheduled —
-     * its memory stays stored and visible, it just never becomes a reminder. A due time the
-     * user's own words do not locate is likewise not scheduled (the 待办 list shows it as
-     * 「待确认期限」instead).
+     * (`promisor=character`, or no user-verbatim evidence) is not stamped — its memory stays
+     * stored and visible, it just never counts as a confirmed agreement. A due time the user's
+     * own words do not locate is likewise never stamped (`dueAtNeedsConfirmation`); stamping it
+     * would later promote the model's unconfirmed date into a confirmed one. A promise with no
+     * due time at all **is** stamped — it is a real user-agreed agreement, it just has no date.
+     *
+     * Nothing is delivered to the user: the 待办 list in settings is the only surface (see
+     * `feature:settings`'s `PromiseTodo`), and it derives its buckets from this very decision.
      */
-    private fun scheduleDueReminders(character: Character): Character {
-        val now = System.currentTimeMillis()
+    private fun recordPromiseConfirmations(character: Character): Character {
         var changed = false
         val longTerm = character.longTerm.map { memory ->
             val decision = promisePushDecision(character, memory)
             if (!decision.pushable) return@map memory
-            // Persist the confirmation conclusion: the citing sources are still live on this very
-            // pass, so record it now. Later, when those messages slide out of the window and the
-            // sources no longer resolve, the promise must not drop to 「不提醒」. Idempotent: an
-            // already-valid confirmation is never rewritten.
-            //
-            // A due time the user's own words do **not** locate is deliberately never stamped
-            // (`dueAtNeedsConfirmation`): stamping it would later promote the model's unconfirmed
-            // date into a confirmed one. A promise with no due time at all **is** stamped — it is
-            // a real user-agreed agreement, it just has no date to remind on.
-            val confirmed = if (!decision.dueAtNeedsConfirmation && !hasValidPushConfirmation(memory)) {
-                changed = true
-                memory.copy(
-                    pushConfirmedAt = Instant.now().toString(),
-                    pushConfirmedDueAt = decision.confirmedDueAt,
-                )
-            } else {
-                memory
-            }
-            // `confirmedDueAtMillis` already implies `pushable` + a user-located due time.
-            val due = decision.confirmedDueAtMillis ?: return@map confirmed
-            val text = "${confirmed.key}：${confirmed.value}"
-            when {
-                confirmed.notifiedAt != null -> {
-                    if (due > now) core.scheduleReminder(confirmed.id, due, text)
-                    confirmed
-                }
-                due <= now -> {
-                    core.postReminder(confirmed.id, text)
-                    changed = true
-                    confirmed.copy(notifiedAt = Instant.now().toString())
-                }
-                else -> {
-                    core.scheduleReminder(confirmed.id, due, text)
-                    confirmed
-                }
-            }
+            if (decision.dueAtNeedsConfirmation || hasValidPushConfirmation(memory)) return@map memory
+            changed = true
+            memory.copy(
+                pushConfirmedAt = Instant.now().toString(),
+                pushConfirmedDueAt = decision.confirmedDueAt,
+            )
         }
         return if (changed) character.copy(longTerm = longTerm) else character
     }
@@ -1970,8 +1924,6 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         viewModelScope.launch { core.data.config.update(core.currentConfig().copy(activeTheme = themeId)) }
     }
 
-    fun testReminder() = core.scheduleTestReminder()
-
     fun hasApiKey(platform: String = ""): Boolean =
         !core.secrets.getApiKey(platform).isNullOrBlank() || !core.secrets.getApiKey().isNullOrBlank()
 
@@ -2021,9 +1973,6 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 eventsState.tryEmit(UiEvent("导入失败：${error.message ?: error}"))
                 return@launch
             }
-            // The import replaced the whole store, so every reminder scheduled for the old
-            // data must be retracted ("数据里没这条承诺，通知却响了").
-            runCatching { core.cancelAllReminders() }.onFailure { DeepTalkingApp.recordError(it) }
             val all = core.data.characters.observeAll().first()
             val restored = summary.activeCharacterId?.takeIf { id -> all.any { it.id == id } }
             activeIdState.value = restored ?: all.firstOrNull()?.id

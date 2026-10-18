@@ -25,7 +25,6 @@ include(":core:network")
 include(":core:database")
 include(":core:data")
 include(":core:security")
-include(":core:notifications")
 include(":core:designsystem")
 
 // Domain

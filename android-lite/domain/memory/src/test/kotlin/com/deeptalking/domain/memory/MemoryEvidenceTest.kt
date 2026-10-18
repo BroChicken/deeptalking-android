@@ -224,7 +224,7 @@ class MemoryEvidenceTest {
         assertFalse(shouldCaptureUserTurn("好"))
     }
 
-    // ---- promise reminder eligibility (推送资格) ----------------------------------------
+    // ---- promise confirmation eligibility (待办分桶) -------------------------------------
 
     private fun promise(
         id: String = "p1",
@@ -417,7 +417,7 @@ class MemoryEvidenceTest {
         val decision = promisePushDecision(character, item)
 
         // 按 8-09 的消息时间换算，"明天"正是 8-10；用事件日（8-11）换算会算成 8-12，把
-        // 一条用户明确说过期限的约定误判成「待确认期限」（既不排期，也不允许写成提醒）。
+        // 一条用户明确说过期限的约定误判成「待确认期限」（日期就核对不上）。
         assertTrue(decision.pushable)
         assertFalse(decision.dueAtNeedsConfirmation)
         assertEquals("2026-08-10T09:00:00", decision.confirmedDueAt)

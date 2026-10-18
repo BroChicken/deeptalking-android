@@ -225,7 +225,6 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                         loadApiKey = { platform -> vm.storedApiKey(platform) },
                         testResult = vm.testResult.collectAsState().value,
                         onSave = vm::saveSettings,
-                        onTestReminder = vm::testReminder,
                         onTestConnection = { cfg, key -> vm.testApiConnection(cfg, key) },
                         ttsEnabled = tts.enabled,
                         ttsAutoRead = tts.autoRead,

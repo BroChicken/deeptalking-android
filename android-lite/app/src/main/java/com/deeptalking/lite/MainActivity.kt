@@ -1,16 +1,13 @@
 package com.deeptalking.lite
 
-import android.Manifest
 import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
-import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import com.deeptalking.core.notifications.NotificationChannels
 
 class MainActivity : ComponentActivity() {
 
@@ -19,10 +16,6 @@ class MainActivity : ComponentActivity() {
         // Let the system bars follow the phone's dark/light mode (dark system =
         // dark bottom bar, light system = light bar) and draw edge-to-edge.
         enableEdgeToEdge()
-        NotificationChannels.ensure(this)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFICATIONS)
-        }
         // If the previous run crashed, show the platform dialog (no Compose) so the
         // trace is always readable/copyable even when composition itself was the cause.
         val crash = DeepTalkingApp.lastCrash
@@ -53,9 +46,5 @@ class MainActivity : ComponentActivity() {
                 recreate()
             }
             .show()
-    }
-
-    private companion object {
-        const val REQUEST_NOTIFICATIONS = 20001
     }
 }

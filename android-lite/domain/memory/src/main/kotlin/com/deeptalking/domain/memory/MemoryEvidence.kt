@@ -211,7 +211,7 @@ fun resolveDynamicStateSources(
     return hasValidUserEvidence(character, ids, evidence, sources)
 }
 
-// ---- promise reminder eligibility (推送资格) -------------------------------------------
+// ---- promise confirmation eligibility (待办分桶) ----------------------------------------
 
 /**
  * Promisor values used by the prompt contract (rule 5.5):
@@ -226,12 +226,12 @@ const val PROMISOR_USER: String = "user"
 const val PROMISOR_CHARACTER: String = "character"
 const val PROMISOR_RELATIONSHIP: String = "relationship"
 
-/** Why a stored promise is (not) eligible to become a pushed reminder — see [promisePushDecision]. */
+/** Why a stored promise is (not) counted as a user-confirmed agreement — see [promisePushDecision]. */
 enum class PromisePushReason {
-    /** 用户明确同意（单方承诺 = 用户原话；双方约定 = 双方原话都有）：可以推送。 */
+    /** 用户明确同意（单方承诺 = 用户原话；双方约定 = 双方原话都有）：计入「已确认」。 */
     USER_CONFIRMED,
 
-    /** 角色单方面的承诺（`promisor=character`）：照常存进记忆，但绝不推送。 */
+    /** 角色单方面的承诺（`promisor=character`）：照常存进记忆，但不计入「已确认」。 */
     CHARACTER_SELF_PROMISE,
 
     /** `promisor` 不是 `user`/`relationship`（群组成员名、空、旧数据）：没有"用户明确同意"这个依据。 */
@@ -248,12 +248,15 @@ enum class PromisePushReason {
 }
 
 /**
- * Verdict of [promisePushDecision]: whether a stored promise may be turned into a pushed
- * reminder, and — when it may — which due time the *user's own words* actually support.
+ * Verdict of [promisePushDecision]: whether a stored promise is a **user-confirmed agreement**,
+ * and — when it is — which due time the *user's own words* actually support.
  *
  * [pushable] answers "did the user themself agree to this?", independently of the due time:
- * an eligible promise with [dueAtNeedsConfirmation] must not be scheduled yet (ask the user
- * first), while [confirmedDueAt] is the only due time a caller may schedule.
+ * an eligible promise with [dueAtNeedsConfirmation] has no confirmed date yet (ask the user
+ * first), while [confirmedDueAt] is the only due time a caller may show as confirmed.
+ *
+ * (The name is historical: this gate used to decide what to push as a notification. The app
+ * has no notification channel any more — the verdict only feeds the 待办 list in settings.)
  */
 data class PromisePushDecision(
     /** True when the user (or both sides) agreed to this promise; false for a character self-promise. */
@@ -262,32 +265,32 @@ data class PromisePushDecision(
     /** The due time the user's own words locate, ISO, or null when there is none / it is unbacked. */
     val confirmedDueAt: String? = null,
     val confirmedDueAtMillis: Long? = null,
-    /** The model supplied a due time but the user's words do not locate it → 待确认期限，先别排期。 */
+    /** The model supplied a due time but the user's words do not locate it → 待确认期限。 */
     val dueAtNeedsConfirmation: Boolean = false,
 )
 
 /**
- * The reminder-eligibility gate over one stored promise (推送资格的数据闸门).
+ * The confirmation gate over one stored promise (待办分桶的数据闸门).
  *
- * A promise may become a pushed reminder only when **the user themself agreed to it**:
+ * A promise counts as a user-confirmed agreement only when **the user themself agreed to it**:
  *
- * - `promisor=character` (角色的单方面承诺) → NOT pushable. The memory is still stored
- *   normally ([isValidAutomaticMemory] keeps accepting it); it simply never becomes a
- *   reminder. This is the case that used to push "角色答应你的事" at the user.
- * - `promisor=user` → pushable only when [LongTermMemory.sourceMessageIds] resolve and
+ * - `promisor=character` (角色的单方面承诺) → not confirmed. The memory is still stored
+ *   normally ([isValidAutomaticMemory] keeps accepting it); it simply never counts as a
+ *   confirmed agreement.
+ * - `promisor=user` → confirmed only when [LongTermMemory.sourceMessageIds] resolve and
  *   every resolved source is the user's (`evidence` must be a verbatim user excerpt).
- * - `promisor=relationship` (双方约定) → pushable only when, besides the user's verbatim
+ * - `promisor=relationship` (双方约定) → confirmed only when, besides the user's verbatim
  *   words, an assistant source that overlaps the evidence is also cited. An agreement the
- *   model inferred from the user's line alone is therefore not pushable.
- * - anything else → not pushable.
+ *   model inferred from the user's line alone is therefore not confirmed.
+ * - anything else → not confirmed.
  *
  * The due time is checked separately: [dueAtBackedByUserEvidence] must locate the model's
  * `dueAt` in the user's original words. When it cannot, the decision returns
- * `confirmedDueAt = null` and `dueAtNeedsConfirmation = true` — the caller must not create a
- * schedule and should surface "待确认期限" instead.
+ * `confirmedDueAt = null` and `dueAtNeedsConfirmation = true`, and the 待办 list shows
+ * "待确认期限" instead.
  *
- * Callers (e.g. the due-reminder scan) are expected to filter on `pushable` and to schedule
- * only `confirmedDueAtMillis`.
+ * Callers (the 待办 view and the confirmation-stamping pass) read `pushable`,
+ * `confirmedDueAtMillis` and `dueAtNeedsConfirmation`.
  */
 fun promisePushDecision(
     character: Character,

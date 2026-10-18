@@ -16,8 +16,8 @@ import java.time.LocalDateTime
 import java.time.ZoneId
 
 /**
- * The 待办 rules: which promises are listed at all, which may be pushed, when an item is 已超时,
- * and which promises have their reminder retracted on a status flip.
+ * The 待办 rules: which promises are listed at all, which count as user-confirmed, when an item
+ * is 已超时, and how a status flip lands on the owning character only.
  *
  * Times are **local** (like `MemoryEvidenceTest`), so the fixtures do not depend on the test
  * JVM's zone: `2026-08-10T09:00:00` is due at 09:00 wherever the tests run.
@@ -263,61 +263,6 @@ class PromiseTodoTest {
         )
     }
 
-    @Test
-    fun flippedPromiseIsRetractedAndUnchangedOnesAreNot() {
-        val before = character.copy(
-            longTerm = listOf(userPromise(id = "kept"), userPromise(id = "flipped")),
-        )
-        val after = before.copy(
-            longTerm = listOf(
-                userPromise(id = "kept"),
-                userPromise(id = "flipped", status = PromiseStatus.Resolved),
-            ),
-        )
-
-        assertEquals(listOf("flipped"), promisesLosingActiveStatus(before, after))
-    }
-
-    @Test
-    fun deletedPromiseAlsoCountsAsRetracted() {
-        val before = character.copy(longTerm = listOf(userPromise(id = "gone"), userPromise(id = "kept")))
-        val after = before.copy(longTerm = listOf(userPromise(id = "kept")))
-
-        assertEquals(listOf("gone"), promisesLosingActiveStatus(before, after))
-    }
-
-    @Test
-    fun alreadyInactivePromisesAreNotRetractedAgain() {
-        val before = character.copy(longTerm = listOf(userPromise(id = "old", status = PromiseStatus.Cancelled)))
-        val after = before.copy(longTerm = listOf(userPromise(id = "old", status = PromiseStatus.Resolved)))
-
-        assertTrue(promisesLosingActiveStatus(before, after).isEmpty())
-    }
-
-    @Test
-    fun unrelatedMemoryEditsChangeNothing() {
-        val before = character.copy(longTerm = listOf(userPromise(id = "p1")))
-        val after = before.copy(
-            dynamicState = before.dynamicState.copy(currentSituation = "在厨房"),
-            longTerm = listOf(userPromise(id = "p1", key = "给角色做饭（改）")),
-        )
-
-        assertTrue(promisesLosingActiveStatus(before, after).isEmpty())
-    }
-
-    @Test
-    fun activePromiseIdsCoversEveryLivePromiseOfALeavingCharacter() {
-        val character = character.copy(
-            longTerm = listOf(
-                userPromise(id = "a"),
-                userPromise(id = "b", status = PromiseStatus.Resolved),
-                userPromise(id = "c"),
-            ),
-        )
-
-        assertEquals(listOf("a", "c"), activePromiseIds(character))
-    }
-
     // ---- confirmed promises whose sources are gone, and the cross-character list ----------
 
     @Test
@@ -375,7 +320,6 @@ class PromiseTodoTest {
         val after = resolvePromiseIn(before, "p1", PromiseStatus.Resolved, "2026-08-09T13:00:00Z")!!
         assertEquals(PromiseStatus.Resolved, after.longTerm.single().status)
         assertEquals("2026-08-09T13:00:00Z", after.longTerm.single().updatedAt)
-        assertNull(after.longTerm.single().notifiedAt)
         assertEquals(PromiseStatus.Active, other.longTerm.single().status)
 
         // No-ops: unknown id, an already-non-active promise, or a flip to Active.

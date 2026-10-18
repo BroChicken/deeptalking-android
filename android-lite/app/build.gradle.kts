@@ -68,7 +68,6 @@ dependencies {
     implementation(project(":core:data"))
     implementation(project(":core:network"))
     implementation(project(":core:security"))
-    implementation(project(":core:notifications"))
     implementation(project(":core:designsystem"))
     implementation(project(":engine:ondevice"))
     implementation(project(":engine:cosyvoice"))
