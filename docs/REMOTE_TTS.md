@@ -38,6 +38,11 @@ Windows 上也可以直接双击 `tools\run-cosyvoice-server.bat`（默认就是
 `-Api` 模式下把 `voices/*.gguf` **每个文件按文件名映射成一个同名音色**；**起服后自检实际监听地址**
 并打印 `PHONE -> http://<地址>:8080`（模型加载要 30–90 秒，这行会在加载完之后出现）。
 
+**日志落盘**：启动器把服务端自己的输出捕获到脚本同目录的 `server.log`（stdout：启动横幅 + `[REQ]`
+请求日志，含每次请求的 `elapsed_ms=` / `bytes=`）和 `server.log.err`（stderr：错误）。每次启动会先把
+上一份挪成 `*.prev`，所以上一次的日志也留着。控制台不再是唯一去处——从快捷方式起的启动器往往没有
+可回看的控制台，出问题要查的就是这个文件；`-LogFile ''` 可退回只在控制台输出。
+
 **绑哪个地址（`-Bind auto`，默认）**：只绑**手机链路**的那一个具体地址，按「记忆的链路 → USB 共享 →
 蓝牙 PAN → SSID 匹配到的手机热点」的顺序挑；挑不出来就**一直等**（`-WaitLinkSeconds`，默认 `-1`；
 每 10 秒报一次活地址，按 Ctrl+C 放弃；设 `0` 则立即放弃）。**绝不静默绑 `0.0.0.0`**——
@@ -192,7 +197,7 @@ curl.exe -sS -o out.pcm -w "%{http_code}`n" -X POST http://<IP>:8080/v1/audio/sp
 | `tau_r` | 0.1 | 重复抑制：出现复读就调大 |
 | `win_size` | 10 | 重复检查窗口，与 `tau_r` 配对 |
 | `min_token_text_ratio` | 2.0 | 最少生成量：句子被截断就调大 |
-| `max_token_text_ratio` | 20.0 | 最多生成量：拖沓/复读就调小 |
+| `max_token_text_ratio` | 20.0 | 长度上限（**硬截断**：调小会让句子念不完；想更快请用 `speed`，见 9.2） |
 | 访问口令 | 空 | 对应服务端 `--api-key`（仅远程引擎显示）；服务端未设口令就留空 |
 
 `flow`（DiT 扩散步数）**不是** App 开关，是编译期常量：当前**手机 5、PC 10**（唯一保留的差异，
@@ -328,6 +333,7 @@ powershell -File tools/.work/cosyvoice-server/run-server.ps1 -Stop
 | 朗读没有声音但没报错 | 音色名与服务器注册名不一致；服务端日志会显示未找到 speaker |
 | 首音很久才响 | 服务端用 CPU；改用 GPU 后端（`-Backend cuda0`），或确认已启用 DiT KV cache（`-DitKvFixedSlots 2`） |
 | 朗读失败：socket closed 之类 | 链路被拔线/共享关闭；切回端侧引擎即可（远程失败**不会**自动降级） |
+| **同一句话越念越长**（第二遍比第一遍久、第三遍更久），最后服务端进程崩掉 | 服务端的跨请求状态累积（第 10.1 节）。判据：`server.log` 里同一段文本的 `bytes=` 一次比一次大；换个音色立刻恢复正常。本地 checkout 已修好，见 10.1 的验证与回滚 |
 | PC 一锁屏/休眠就断 | 把 `cosyvoice-server` 注册成服务或关掉休眠 |
 | 服务占用好几 GB 内存 | 见第 6 节的内存构成；不用时用 `-Stop` 停掉，或调小 `-DitKvCacheLength` |
 
@@ -458,7 +464,27 @@ App 侧的内置音色带一个**来源标记**（`VoiceInfo.source` = 资源内
 | `tau_r` | 0.1 | 音质（**重复抑制**） | 出现"复读"就调大 |
 | `win_size` | 10 | 音质（重复检查窗口，与 `tau_r` 配对） | 与 `tau_r` 一起调 |
 | `min_token_text_ratio` | 2.0 | 音质（**漏字**） | 句子被截断就调大 |
-| `max_token_text_ratio` | 20.0 | 音质（**拖长**） | 拖沓/复读就调小 |
+| `max_token_text_ratio` | 20.0 | 长度上限（**硬截断**，不是压缩） | 只在模型复读循环时调小；想让朗读更快请用 `speed`（见下） |
+
+**`max_token_text_ratio` 实测（PC 端，91 字同一段原文，`min_token_text_ratio` 固定 2）**：它是**硬截断**，
+不是"把话压缩得更快"——上限一旦低于模型自己想跑的长度，句子就**念不完**（不只是变短）：
+
+| `max_token_text_ratio` | 产出音频 | 相对默认长度 | 听感 |
+|---|---|---|---|
+| **20（默认）** | 24–29 s | 100% | 句子完整 |
+| 8 | 28.2 s | 100% | 上限还没生效（模型自己就停在这里） |
+| 5 | 17.7 s | **62%** | **念不完（实测）** |
+| 3 | 10.6 s | 37% | 明显截断 |
+
+模型**会自己停**，默认值下产出约 7 倍文本 token 是**正常长度**——因为这条台词的 `instructions`
+就是"**语速慢**"。同一段 91 字实测：指令"语速慢"= 28.4 s（3.2 字/秒）、不加指令 = 19.3 s
+（4.7 字/秒）、指令"语速快" = 17.7 s（5.1 字/秒）。**所以别用这个上限去"压短"**：想快就改台词里的
+语速指令，或调 App 的朗读速度 `speed`（同一段：1.0 → 28.4 s、1.25 → 22.7 s、1.5 → 18.9 s，**不丢字**）。
+`max_token_text_ratio` 只在模型**复读循环**（同一句反复念）时才有用，那种情况才调小、并接受截断风险。
+
+（顺带一条调试经验：请求里的 `seed` 只能让**长度**复现，**波形**复现不了——同一 seed 连发三次都是
+28.36 s，音频却各不相同（flow 的扩散噪声没吃请求 seed）。所以这类 A/B 只能比长度 + 用耳朵听，
+不能靠字节比对。）
 
 ### 9.3 不能做成 App 开关的
 
@@ -471,5 +497,76 @@ PC 端合成吃满 CUDA。实测（RTX 4060 Laptop 8GB）：**开着《天国拯
 7651/8188 MiB 显存、GPU 100%），一句 3.5 秒的话要 **326 秒**，第二次请求 900 秒超时；
 没有游戏占用时同一句话在十几秒量级。用远程朗读前请先退出游戏（或把 `-MaxLlmLen`/步数
 调低，并保留流式，慢速下至少能边出边听）。
+
+## 10. 电脑侧 checkout 上的本地补丁
+
+服务端源码在 `D:\cosyvoice-server`（上游 [Lourdle/cosyvoice.cpp](https://github.com/Lourdle/cosyvoice.cpp)
+的 checkout，**不是本仓库的一部分、也不带 git**）。下面两处本地修改是本仓库功能所依赖的，
+**重装或更新上游后必须重新打上**，否则对应功能会退化或直接坏掉：
+
+| 补丁 | 文件 | 作用 |
+|---|---|---|
+| 音色上传接口 | `tools/server/cosyvoice-server.cpp`（`--voice-dir`）、`tools/server/cosyvoice-server.h`（`voice_dir`）、`tools/server/cosyvoice-server-backend.cpp`（`POST /v1/voices`） | 见第 8 节；没有它 App 的「上传本机音色到电脑」会返回 404 |
+| **每请求重置生成状态** | `tools/server/cosyvoice-server-backend.cpp`、`src/cosyvoice-tts.cpp` | 见 10.1；没有它朗读会越念越长，最后把服务端进程打崩 |
+
+改完用 VS 开发者环境重编，然后把产物同步到启动器的 `bin/`（**`cosyvoice.dll` 也要同步**，
+改动在库里时 exe 不会重新链接）：
+
+```powershell
+cmd /c "call `"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat`" >nul && cmake --build D:\cosyvoice-server\build-cuda"
+Copy-Item D:\cosyvoice-server\build-cuda\bin\cosyvoice-server.exe,D:\cosyvoice-server\build-cuda\bin\cosyvoice.dll `
+  tools\.work\cosyvoice-server\bin\ -Force     # 先停服，否则文件被占用
+```
+
+### 10.1 每请求重置生成状态（朗读越念越长 / 服务端崩溃）
+
+**症状**：同一个音色、同一段文本，念第二遍比第一遍久、第三遍更久，服务端重启后第一遍又正常；
+累积到一定程度进程直接崩，stderr 里是
+`ggml.c: GGML_ASSERT(cgraph->n_nodes < cgraph->size) failed`。
+
+**判据**：`server.log` 里同一段文本的 `bytes=` / `elapsed_ms=` 一次比一次大。正常应该是
+**稳定**的（同一段 91 字约 1.1–1.3 MB / 24–28 s，只有随机波动）。另一个一秒钟就能确认的判据：
+**换一个音色立刻恢复正常**（session 的键里有音色）。
+
+**原因**：服务端在启动时为每个 (并发槽, 音色) 建**一个** `cosyvoice_tts_context`（TTS session）
+并跨请求复用，而 `src/cosyvoice-tts.cpp` 的 `tts_job()` 会**原地改写这个 session**：
+
+- `cosyvoice_prompt_set(ctx, this, ...)` 默认 `inplace=true`：instruct 模式下截断 `prompt_text`、
+  把 `llm_prompt_speech_tokens`（音色的参考语音 token）`reset()` 掉，而且从不恢复；
+- session 继承的 `cosyvoice_tokenization_result_impl::tokens` 是**追加**写入的
+  （`cosyvoice_vocab::tokenize` 不先清空），而合成真正用的就是 `get_tokens()/get_n_tokens()`；
+- session 里还有 `prompt_speech_feat` / `llm_embedding` / `flow_embedding` 等生成态。
+
+于是每次朗读都在上一次的残骸上继续生成：文本越堆越多、模型越跑越长，直到计算图溢出。
+
+**修法（三处，缺一不可）**：
+
+| 位置 | 改动 |
+|---|---|
+| `tools/server/cosyvoice-server-backend.cpp`，`/v1/audio/speech` 处理器 | 取到并发槽后调 `cosyvoice_empty_buffer_cache(model_ctx)`：清 offload 的 KV、重建计算图、重置 prompt crc（放在请求**开始**而不是结束，被中断的请求也不会留状态） |
+| 同上，**非流式**分支 | **每个请求新建一个 session**：`cosyvoice_tts_context_new(model_ctx, voice.prompt.get())`，用完即弃。注册音色那份 prompt 是母版（session 只是它的拷贝，从不被改写），所以新建即干净 |
+| `src/cosyvoice-tts.cpp`，`tts_job()` | 进入时 `tokens.clear()`；退出时用 guard 把 `prompt_text` / `llm_prompt_speech_tokens` / `prompt_crc32` 还原 |
+
+App 固定走**非流式**（`stream=false`），所以每请求新建 session 就够；**流式路径仍然复用缓存的
+session**，只有 `tts_job()` 的两条守卫在兜底（流式要用到时请照上面的思路一起改）。
+
+**验证**：服务端在跑时，同一段文本、同一音色连发 3 次，看日志里的 `bytes=` 是否稳定：
+
+```powershell
+$token = (Get-Content tools\tts-token.txt | Where-Object { $_ -and -not $_.TrimStart().StartsWith('#') } |
+  Select-Object -First 1) -replace '^\s*token\s*[:=]\s*', ''
+$body = '{"model":"cosyvoice-3","voice":"<音色名>","input":"<一段 80~90 字的台词>","response_format":"pcm","stream":false}'
+1..3 | ForEach-Object {
+  curl.exe -sS -o NUL -w "%{http_code} %{size_download}`n" -X POST "http://<IP>:8080/v1/audio/speech" `
+    -H "Authorization: Bearer $token" -H "Content-Type: application/json" -d $body
+}
+Get-Content tools\.work\cosyvoice-server\server.log -Tail 8
+```
+
+若 `size_download` 递增（例如 1.32MB → 2.46MB → 3.75MB），说明补丁没打上或没同步到 `bin/`。
+
+**回滚**：改动前的二进制备份在 `tools\.work\cosyvoice-server\bin\`：
+`cosyvoice-server.exe.bak-before-emptycache-fix`、`cosyvoice-server.exe.bak-before-promptguard-fix`、
+`cosyvoice.dll.bak-before-promptguard-fix`（都不进 git）。
 
 
