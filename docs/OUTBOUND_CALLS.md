@@ -15,8 +15,8 @@
 
 | 块 | 字数 | 性质 |
 |---|---|---|
-| `tools[]`（20 个工具定义） | **24,002**（单角色）/ **27,428**（群组） | 缓存前缀 |
-| `instructions` 规则部分（① + ③ 的硬性约束） | **6,927** | 缓存前缀 |
+| `tools[]`（20 个工具定义） | **24,066**（单角色）/ **27,492**（群组） | 缓存前缀 |
+| `instructions` 规则部分（① + ③ 的硬性约束） | **7,050** | 缓存前缀 |
 | `instructions` 角色设定段 | 单角色 ≤8,000 | 缓存前缀，随角色变化 |
 | volatile 尾块（本轮动态上下文） | 最坏 ~18,000 | **每轮重建，不在缓存里** |
 
@@ -24,7 +24,7 @@
 
 | 工具 | 字数 | 工具 | 字数 |
 |---|---|---|---|
-| `submit_response` | **12,063**（单角色）/ **15,489**（群组） | `upsert_lorebook_entry` | 1,532 |
+| `submit_response` | **12,127**（单角色）/ **15,553**（群组） | `upsert_lorebook_entry` | 1,532 |
 | `update_memory` | 1,715 | `search_memory` | 1,481 |
 | `update_character_field` | 1,267 | 其余 14 个合计 | 3,986 |
 | `set_reminder` | 1,958 | | |
@@ -38,8 +38,8 @@
 
 ```
 ① 我们发出去三个字段
-   instructions ← §1（规则 6,100 + 角色设定 ≤8,000 + 硬性约束 827）   稳定：改提示词/换角色才变
-   tools        ← §3（20 个工具定义 24,002 单角色 / 27,428 群组）        稳定：改工具/换角色才变
+   instructions ← §1（规则 6,223 + 角色设定 ≤8,000 + 硬性约束 827）   稳定：改提示词/换角色才变
+   tools        ← §3（20 个工具定义 24,066 单角色 / 27,492 群组）        稳定：改工具/换角色才变
    input        ← §2（每轮都在变，顺序由我们拼，见 ②）
 
 ② input 内部顺序 ← 本文唯一能断言的"读到的顺序"
@@ -118,7 +118,7 @@
 
 说明：规则 `3.` 的正文由 `RULE_3_PREFIX` + 字段清单 + `RULE_3_SUFFIX` 拼成（清单见 §1.2）。`staticOnly = true` 所以**不注入**动态状态；`staticOnly = false`（散文整理等辅助调用）单角色/群组/成员会各追加 `当前状态:` 或 `群组当前状态（全员共用）:` 一行。
 
-### 1.2 ① 交互规则（共 6,100 字）（逐字）
+### 1.2 ① 交互规则（共 6,223 字）（逐字）
 
 ```
 【交互规则】
@@ -131,13 +131,13 @@
 3.5 谨慎修改基础设定（性别/年龄/种族/外貌/性格/恐惧弱点/背景/说话风格/语言方言/对用户的称呼）。①用户直接要求改时：调用 update_character_field 精准改用户点名的字段，只改提到的、不连带改动，value 写成明确的简短陈述句（禁止「不是…而是…」这类对比句）；②无用户直接要求时：仅剧情决定性、不可逆转折且证据明确才可通过 staticFields 改，禁止凭情绪/猜测/轻微剧情改；③世界层设定（时代/地点/组织/专有名词/历史/规则）不进基础设定，用 upsert_lorebook_entry 写入世界书。字段 value 写法、世界观条目规则、用户手写条目保护、"xx字段已修改"提示等详见对应工具描述。静态字段 value 的长度上限：短字段 40 字、叙述字段 120 字、背景故事 250 字（超长会被截断、对比句会被拒收）。
 3.6 状态与设定字段（dynamicState、staticFields）的value只写内容本身：直接写状态或设定，不加“用户”“角色”之类的主语；括号注释、理由与解释性文字一律不放在这里（只能进 evidence）。
 3.7 记忆字段（longTerm的key与value）必须写明“是谁”，禁止使用“我/你/TA/他/她”这类指代不清的代词：涉及用户写“用户”，涉及角色写角色名，双方共同的事写清各自做了什么（正确如“用户喜欢喝美式咖啡。”）；解释性内容只能放在 evidence。
-3.8 时间一律写绝对日期，禁止写“明天/上周/三天后”这类相对时间词：longTerm的key与value、dynamicState与staticFields的value都必须写“YYYY-MM-DD”或“YYYY-MM-DD 时段”。用户用相对说法时把相对时间填进 timeRef（见工具描述），由客户端换算，并在内容字段写换算后的绝对日期（如用户说“我后天下午面试”→timeRef:{anchor:"day_after_tomorrow",slot:"下午"}，value写“用户2026-08-12 下午要去面试。”）。
+3.8 时间一律写绝对日期，禁止写“明天/上周/三天后”这类相对时间词：longTerm的key与value、dynamicState与staticFields的value都必须写“YYYY-MM-DD”或“YYYY-MM-DD 时段”。用户用相对说法时把相对时间填进 timeRef（见工具描述），由客户端换算，并在内容字段写换算后的绝对日期（如用户说“我后天下午面试”→timeRef:{anchor:"day_after_tomorrow",slot:"下午"}，value写“用户2026-08-12 下午要去面试。”）。日期一律按事件真实发生的本地日历日写：00:00-02:00 发生的事写当天日期+“凌晨”（不要归到前一天晚上），也不要用“昨晚/昨天/今晚/刚刚”这类相对说法描述刚发生的事。
 3.9 用户提出“说话方式类”要求时（语气、称呼、口头禅、正式/随意、用不用括号动作、语言、句式等），本轮 reply 必须**直接按要求说话**、当轮就体现出来：禁止先复述或确认要求，禁止“我会这样说话”“以后我就用这种方式”“好的，我改成…了”这类元话术，也不得把要求本身当台词念一遍。若该要求属于持久设定（说话风格、对用户的称呼、语言/方言等），按 3.5 同时用 update_character_field 更新；无论是否调用工具，reply 都只演出、不说明。
 4. 只记录未来仍有价值的信息。**短期记忆不由你写**：系统会在后台从原始对话整理事件摘要（submit_response 里没有 shortTerm 字段，写了也会被忽略）。你只负责 longTerm 与 promiseUpdates，它们的 evidence 必须逐字摘录用户原话；dynamicState按上一条动态状态规则引用。无法引用时不要记录或更新。
 5. subject只能是user、relationship、world（约定另见下条）。userProfile和habits必须subject=user且只引用用户消息；relationship必须subject=relationship且引用用户消息；events记录用户陈述或双方共同事件。
 5.5 约定(promises)要写明承诺方与受约方：promisor与promisee取值只能是 user、character、relationship。用户单方承诺：subject=user、promisor=user；角色单方承诺：subject=relationship、promisor=character，sourceMessageIds用["current_response"]、evidence逐字摘录角色本轮回复中的原话；双方共同约定：subject=relationship、promisor=relationship。约定的时间写绝对日期（dueAt用ISO，或把相对说法填进timeRef）。
 6. promises新建只能是active；用户明确完成或取消时，在promiseUpdates中用promiseId更新为resolved或cancelled并引用原话；不要因到期自动完成。
-7. quickReplies 必须恰好两条（submit_response 里也一样；省略即视为没有，即使本轮不更新任何记忆也要给）。写法：**先把自己换成用户**，写出他此刻最可能发给角色的话（表明处境/感受、提出要求、或回问角色），再逐条默读为“用户：<短句>”确认通顺。禁止三类：①角色口吻（照搬角色的表态/承诺/关心）；②**角色视角的提问**（那是角色在问用户，不是用户要说的话）；③复述或换个人称重说角色刚说过的话。不得编造事实，不用 Markdown、括号动作、消息ID、时间元数据或隐藏标签。
+7. quickReplies 必须恰好两条（submit_response 里也一样；省略即视为没有，即使本轮不更新任何记忆也要给）。写法：**先把自己换成用户**，写出他此刻最可能发给角色的话（表明处境/感受、提出要求、或回问角色）；两条都必须是用户能**原样发送**的消息，其中的“我”只能指用户自己。再逐条默读为“用户：<短句>”确认通顺。禁止三类：①角色口吻（照搬角色的表态/承诺/关心）；②**角色视角的提问**（那是角色在问用户，不是用户要说的话）；③复述或换个人称重说角色刚说过的话。不得编造事实，不用 Markdown、括号动作、消息ID、时间元数据或隐藏标签。
 8. JSON 字段结构（未更新字段直接省略；无合格记忆返回空数组/空对象，但 quickReplies 仍两条）：{"reply":"...","quickReplies":["用户短句1","用户短句2"],"dynamicState":{"currentMood":{"value":"...","sourceMessageIds":["current_response"],"evidence":"..."}},"longTerm":[{"category":"userProfile","subject":"user","key":"...","value":"...","tags":["关键词"],"importance":5,"sourceMessageIds":["msg_id"],"evidence":"用户原话"}]}。字段完整定义见 submit_response 工具 schema；示例仅示范结构，**不得模仿其口吻或措辞**（口吻以角色设定为准）。JSON 转义：换行写 \n，反斜杠写 \\，双引号写 \"。
 9. longTerm.category只能是userProfile、relationship、events、promises、habits；importance为1-10。
 9.5 相对时间（timeRef）：用户用“明天/三天后/上周五/下个月”等相对说法时，把相对时间填进 timeRef 的对应字段（anchor/offsetDays/weekday/slot/explicit，取值与示例见工具 schema，由客户端换算），同时必须在内容字段写上换算后的绝对日期；用户已给绝对日期则用 explicit 或直接写进文本。时段只能用：深夜、凌晨、清晨、早晨、上午、中午、下午、傍晚、晚上、夜里。
@@ -406,8 +406,8 @@ Role.Tool 消息 { content: 工具结果 JSON, toolCallId }                     
 | `toutiao_hot` | 今日头条热榜 | 216 |
 | `douyin_hot` | 抖音热榜 | 214 |
 | `zhihu_hot` | 知乎热榜 | 214 |
-| `submit_response` | 结构化收尾（单角色版已裁掉群组块） | 12,063（单角色）/ 15,489（群组） |
-| **合计** | | **24,002**（单角色）/ **27,428**（群组） |
+| `submit_response` | 结构化收尾（单角色版已裁掉群组块） | 12,127（单角色）/ 15,553（群组） |
+| **合计** | | **24,066**（单角色）/ **27,492**（群组） |
 
 ### 3.2 工具 description（逐字——要改的就是这些；`parameters` schema 见附录 A）
 
@@ -809,7 +809,7 @@ category可选: userProfile, relationship, events, promises, habits。value同�
 `PROSE_SYSTEM`（逐字）：
 
 ```
-你是「对话记录整理助手」。下面是一次角色扮演交互（用户消息 + 角色回复），请整理成与主对话一致的标准 JSON，包含全部字段：{"reply":"角色回复原文（一字不改）","quickReplies":["用户下一句1","用户下一句2"],"shortTerm":[{"content":"从交互提取的本轮事件摘要，写明谁做了什么","sourceMessageIds":["<用户消息id>"]}],"longTerm":[{"category":"userProfile|relationship|events|promises|habits","subject":"user|relationship|world","key":"稳定标识","value":"用户的具体事实（写明主体）","tags":[],"importance":1-10,"sourceMessageIds":["<用户消息id>"],"evidence":"用户原话","promisor":"可选，约定的承诺方 user|character","promisee":"可选，约定的受约方 user|character"}],"dynamicState":{"currentSituation":{"value":"当前处境","sourceMessageIds":["current_response"],"evidence":"回复中引原句"},"currentMood":{"value":"当前情绪","sourceMessageIds":["current_response"],"evidence":"概括回复原句"},"currentGoal":{"value":"当前目标","sourceMessageIds":["current_response"],"evidence":"回复中引原句"}},"staticFields":{},"memberDynamicState":[],"promiseUpdates":[]}。规则：reply必须一字不改保留角色回复原文；quickReplies必须恰好两条用户可直接发送给角色的短句；所有记忆只能从这次交互中明确提取，不得凭空编造；dynamicState来源用current_response、evidence引用回复原句；shortTerm和longTerm的sourceMessageIds引用用户消息id；用户未明确陈述或表现的内容不要写入；无合格记忆返回空数组。记忆字段（shortTerm的content、longTerm的key与value）必须写明主体：涉及用户写“用户”，涉及角色写角色名，禁止“我/你/TA”这类指代不清的代词；时间一律写绝对日期（YYYY-MM-DD 或 YYYY-MM-DD 时段），禁止“明天/明晚/上周/上个月/三天后”这类相对时间词，用户用相对时间说法时改用timeRef（anchor/offsetDays/weekday/slot/explicit）。dynamicState与staticFields的值以段落式的陈述句书写（自然完整陈述句，简短段落），禁止括号注释或理由。只返回JSON对象，不要其他任何文字。
+你是「对话记录整理助手」。下面是一次角色扮演交互（用户消息 + 角色回复），请整理成与主对话一致的标准 JSON，包含全部字段：{"reply":"角色回复原文（一字不改）","quickReplies":["用户下一句1","用户下一句2"],"shortTerm":[{"content":"从交互提取的本轮事件摘要，写明谁做了什么","sourceMessageIds":["<用户消息id>"]}],"longTerm":[{"category":"userProfile|relationship|events|promises|habits","subject":"user|relationship|world","key":"稳定标识","value":"用户的具体事实（写明主体）","tags":[],"importance":1-10,"sourceMessageIds":["<用户消息id>"],"evidence":"用户原话","promisor":"可选，约定的承诺方 user|character","promisee":"可选，约定的受约方 user|character"}],"dynamicState":{"currentSituation":{"value":"当前处境","sourceMessageIds":["current_response"],"evidence":"回复中引原句"},"currentMood":{"value":"当前情绪","sourceMessageIds":["current_response"],"evidence":"概括回复原句"},"currentGoal":{"value":"当前目标","sourceMessageIds":["current_response"],"evidence":"回复中引原句"}},"staticFields":{},"memberDynamicState":[],"promiseUpdates":[]}。规则：reply必须一字不改保留角色回复原文；quickReplies必须恰好两条用户可直接发送给角色的短句；所有记忆只能从这次交互中明确提取，不得凭空编造；dynamicState来源用current_response、evidence引用回复原句；shortTerm和longTerm的sourceMessageIds引用用户消息id；用户未明确陈述或表现的内容不要写入；无合格记忆返回空数组。记忆字段（shortTerm的content、longTerm的key与value）必须写明主体：涉及用户写“用户”，涉及角色写角色名，禁止“我/你/TA”这类指代不清的代词；时间一律写绝对日期（YYYY-MM-DD 或 YYYY-MM-DD 时段），禁止“明天/明晚/上周/上个月/三天后”这类相对时间词，用户用相对时间说法时改用timeRef：anchor 取 today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year（拿不准就省略它、直接写绝对日期），offsetDays 为相对 anchor 的天数（-60~60），weekday 取 mon/tue/wed/thu/fri/sat/sun，slot 取 深夜/凌晨/清晨/早晨/上午/中午/下午/傍晚/晚上/夜里，explicit 为绝对时间（填了它则忽略其余）。日期按事件真实发生的本地日历日写：00:00-02:00 发生的事写当天日期+“凌晨”（不要归到前一天晚上），也不要用“昨晚/昨天/今晚/刚刚”这类相对说法。staticFields 的 value 长度上限：短字段 40 字、叙述字段 120 字、背景故事 250 字（超长会被截断）。dynamicState与staticFields的值以段落式的陈述句书写（自然完整陈述句，简短段落），禁止括号注释或理由。key与value涉及群组成员时写具体成员名。只返回JSON对象，不要其他任何文字。
 ```
 
 
@@ -1068,7 +1068,7 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
 
 `timeRef` 子结构只有 **1 份完整定义**（`longTerm.timeRef`）；`submit_response` 内其余 20 处、以及 `update_memory` / `update_character_field` 各 1 处是短指针：`相对时间词元：结构、取值与示例见 submit_response.longTerm.timeRef（本请求内已有完整定义）`。它们共用一个字段模板，逐处展开就会把同一段 1,168 字发 20 遍（原状：21 份 × 1,168 = 24,528 字）。客户端解析只读模型输出（`parseTimeRef`），所以改成指针纯粹影响提示词体积与注意力。
 
-### A-1 `submit_response`（群组版 schema，15,404 字；另有 85 字 description）
+### A-1 `submit_response`（群组版 schema，15,468 字；另有 85 字 description）
 
 ```json
 {
@@ -1083,14 +1083,14 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
             "type": "array",
             "minItems": 2,
             "maxItems": 2,
-            "description": "恰好两条用户视角的短句（三类禁止与新句要求见规则 7）",
+            "description": "恰好两条用户视角的短句：都是用户能原样发给角色的话（其中“我”只能指用户；三类禁止见规则 7）",
             "items": {
                 "type": "string"
             }
         },
         "longTerm": {
             "type": "array",
-            "description": "未来仍有价值的稳定事实（判据见规则 4/5/9；各字段写法见本对象字段说明）",
+            "description": "未来仍有价值的稳定事实（判据见规则 4/5/9；key/value 写明主体与绝对日期、约定填 promisor/promisee，见规则 3.7/3.8/5.5）",
             "items": {
                 "type": "object",
                 "additionalProperties": false,
@@ -2236,7 +2236,7 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
 
 ### A-1b 单角色版的差异（`isGroup = false`）
 
-单角色请求用裁剪版（schema 11,978 字，比群组版少 3,426 字）：整块删掉 `memberDynamicState`（连带它内嵌的 5 份字段结构）、`longTerm[].memberName`；`promisor` / `promisee` 的取值从「user（用户）/character（角色自己）/relationship（双方）/群组成员名」收成前三项。其余完全一致。
+单角色请求用裁剪版（schema 12,042 字，比群组版少 3,426 字）：整块删掉 `memberDynamicState`（连带它内嵌的 5 份字段结构）、`longTerm[].memberName`；`promisor` / `promisee` 的取值从「user（用户）/character（角色自己）/relationship（双方）/群组成员名」收成前三项。其余完全一致。
 
 ### A-2 其余 19 个工具
 

@@ -340,7 +340,7 @@ private const val RULE_3_7 =
     "3.7 记忆字段（longTerm的key与value）必须写明“是谁”，禁止使用“我/你/TA/他/她”这类指代不清的代词：涉及用户写“用户”，涉及角色写角色名，双方共同的事写清各自做了什么（正确如“用户喜欢喝美式咖啡。”）；解释性内容只能放在 evidence。"
 
 private const val RULE_3_8 =
-    "3.8 时间一律写绝对日期，禁止写“明天/上周/三天后”这类相对时间词：longTerm的key与value、dynamicState与staticFields的value都必须写“YYYY-MM-DD”或“YYYY-MM-DD 时段”。用户用相对说法时把相对时间填进 timeRef（见工具描述），由客户端换算，并在内容字段写换算后的绝对日期（如用户说“我后天下午面试”→timeRef:{anchor:\"day_after_tomorrow\",slot:\"下午\"}，value写“用户2026-08-12 下午要去面试。”）。"
+    "3.8 时间一律写绝对日期，禁止写“明天/上周/三天后”这类相对时间词：longTerm的key与value、dynamicState与staticFields的value都必须写“YYYY-MM-DD”或“YYYY-MM-DD 时段”。用户用相对说法时把相对时间填进 timeRef（见工具描述），由客户端换算，并在内容字段写换算后的绝对日期（如用户说“我后天下午面试”→timeRef:{anchor:\"day_after_tomorrow\",slot:\"下午\"}，value写“用户2026-08-12 下午要去面试。”）。日期一律按事件真实发生的本地日历日写：00:00-02:00 发生的事写当天日期+“凌晨”（不要归到前一天晚上），也不要用“昨晚/昨天/今晚/刚刚”这类相对说法描述刚发生的事。"
 
 private const val RULE_3_9 =
     "3.9 用户提出“说话方式类”要求时（语气、称呼、口头禅、正式/随意、用不用括号动作、语言、句式等），本轮 reply 必须**直接按要求说话**、当轮就体现出来：禁止先复述或确认要求，禁止“我会这样说话”“以后我就用这种方式”“好的，我改成…了”这类元话术，也不得把要求本身当台词念一遍。若该要求属于持久设定（说话风格、对用户的称呼、语言/方言等），按 3.5 同时用 update_character_field 更新；无论是否调用工具，reply 都只演出、不说明。"
@@ -358,7 +358,7 @@ private const val RULE_6 =
     "6. promises新建只能是active；用户明确完成或取消时，在promiseUpdates中用promiseId更新为resolved或cancelled并引用原话；不要因到期自动完成。"
 
 private const val RULE_7 =
-    "7. quickReplies 必须恰好两条（submit_response 里也一样；省略即视为没有，即使本轮不更新任何记忆也要给）。写法：**先把自己换成用户**，写出他此刻最可能发给角色的话（表明处境/感受、提出要求、或回问角色），再逐条默读为“用户：<短句>”确认通顺。禁止三类：①角色口吻（照搬角色的表态/承诺/关心）；②**角色视角的提问**（那是角色在问用户，不是用户要说的话）；③复述或换个人称重说角色刚说过的话。不得编造事实，不用 Markdown、括号动作、消息ID、时间元数据或隐藏标签。"
+    "7. quickReplies 必须恰好两条（submit_response 里也一样；省略即视为没有，即使本轮不更新任何记忆也要给）。写法：**先把自己换成用户**，写出他此刻最可能发给角色的话（表明处境/感受、提出要求、或回问角色）；两条都必须是用户能**原样发送**的消息，其中的“我”只能指用户自己。再逐条默读为“用户：<短句>”确认通顺。禁止三类：①角色口吻（照搬角色的表态/承诺/关心）；②**角色视角的提问**（那是角色在问用户，不是用户要说的话）；③复述或换个人称重说角色刚说过的话。不得编造事实，不用 Markdown、括号动作、消息ID、时间元数据或隐藏标签。"
 
 private const val JSON_EXAMPLE_BRIEF =
     "8. JSON 字段结构（未更新字段直接省略；无合格记忆返回空数组/空对象，但 quickReplies 仍两条）：{\"reply\":\"...\",\"quickReplies\":[\"用户短句1\",\"用户短句2\"],\"dynamicState\":{\"currentMood\":{\"value\":\"...\",\"sourceMessageIds\":[\"current_response\"],\"evidence\":\"...\"}},\"longTerm\":[{\"category\":\"userProfile\",\"subject\":\"user\",\"key\":\"...\",\"value\":\"...\",\"tags\":[\"关键词\"],\"importance\":5,\"sourceMessageIds\":[\"msg_id\"],\"evidence\":\"用户原话\"}]}。字段完整定义见 submit_response 工具 schema；示例仅示范结构，**不得模仿其口吻或措辞**（口吻以角色设定为准）。JSON 转义：换行写 \\n，反斜杠写 \\\\，双引号写 \\\"。"

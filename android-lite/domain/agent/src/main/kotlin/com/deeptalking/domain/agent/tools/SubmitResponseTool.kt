@@ -74,7 +74,7 @@ class SubmitResponseTool : AgentTool {
                             put("type", "array")
                             put("minItems", 2)
                             put("maxItems", 2)
-                            put("description", "恰好两条用户视角的短句（三类禁止与新句要求见规则 7）")
+                            put("description", "恰好两条用户视角的短句：都是用户能原样发给角色的话（其中“我”只能指用户；三类禁止见规则 7）")
                             put("items", buildJsonObject { put("type", "string") })
                         },
                     )
@@ -200,7 +200,7 @@ class SubmitResponseTool : AgentTool {
             "user（用户）/character（角色自己）/relationship（双方）"
         }
         put("type", "array")
-        put("description", "未来仍有价值的稳定事实（判据见规则 4/5/9；各字段写法见本对象字段说明）")
+        put("description", "未来仍有价值的稳定事实（判据见规则 4/5/9；key/value 写明主体与绝对日期、约定填 promisor/promisee，见规则 3.7/3.8/5.5）")
         put(
             "items",
             buildJsonObject {
