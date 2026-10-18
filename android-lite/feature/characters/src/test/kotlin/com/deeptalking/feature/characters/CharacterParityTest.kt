@@ -8,6 +8,8 @@ import com.deeptalking.core.model.GroupMember
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.LorebookOrigin
 import com.deeptalking.core.model.StaticProfile
+import com.deeptalking.core.model.isStaticFieldManual
+import com.deeptalking.core.model.withStaticFieldManual
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -227,6 +229,103 @@ class CharacterParityTest {
         val group = Character(id = "g", isGroup = true, members = listOf(member))
         val normalized = CharacterParity.normalizeEditedDraft(group, 0, base, zone)
         assertTrue(normalized.members[0].dynamicStateMeta.isEmpty())
+    }
+
+    // ------------------------------------------------ 用户手写通道（编辑器保存）
+
+    @Test
+    fun userEditedDraftKeepsContrastSentencesAndLongText() {
+        val longBackground = "他走过很多地方。".repeat(40)
+        val character = Character(
+            id = "c",
+            name = "林晚",
+            staticProfile = StaticProfile(
+                personality = "他不是冷漠，而是懒得解释。",
+                background = longBackground,
+            ),
+        )
+
+        val result = CharacterParity.normalizeUserEditedDraft(character, initial = character, base = base, zone = zone)
+
+        assertEquals("他不是冷漠，而是懒得解释。", result.character.staticProfile.personality)
+        assertEquals(longBackground, result.character.staticProfile.background)
+        assertTrue(result.notices.any { it.fieldLabel == "性格特征" && it.reason.contains("对比句") })
+    }
+
+    @Test
+    fun buildChannelStillRejectsContrastAndClamps() {
+        val character = Character(
+            id = "c",
+            name = "林晚",
+            staticProfile = StaticProfile(
+                personality = "他不是冷漠，而是懒得解释。",
+                background = "他走过很多地方。".repeat(40),
+            ),
+        )
+
+        val normalized = CharacterParity.normalizeEditedDraft(character, null, base, zone)
+
+        assertEquals("", normalized.staticProfile.personality)
+        assertTrue(normalized.staticProfile.background.length <= AppLimits.StaticProfile.BACKGROUND_CHARS)
+    }
+
+    @Test
+    fun onlyFieldsTheUserActuallyChangedAreMarkedManual() {
+        val initial = Character(
+            id = "c",
+            name = "林晚",
+            staticProfile = StaticProfile(personality = "冷静", background = "旧背景"),
+        )
+        val edited = initial.copy(
+            staticProfile = initial.staticProfile.copy(personality = "冷静克制", gender = "男"),
+        )
+
+        val result = CharacterParity.normalizeUserEditedDraft(edited, initial = initial, base = base, zone = zone)
+
+        assertTrue(isStaticFieldManual(result.character.staticFieldMeta, "personality"))
+        assertTrue(isStaticFieldManual(result.character.staticFieldMeta, "gender"))
+        assertFalse(isStaticFieldManual(result.character.staticFieldMeta, "background"))
+        assertFalse(isStaticFieldManual(result.character.staticFieldMeta, "appearance"))
+    }
+
+    @Test
+    fun withoutAnInitialSnapshotNothingIsMarkedManual() {
+        val character = Character(id = "c", name = "林晚", staticProfile = StaticProfile(personality = "冷静"))
+
+        val result = CharacterParity.normalizeUserEditedDraft(character, base = base, zone = zone)
+
+        assertTrue(result.character.staticFieldMeta.isEmpty())
+    }
+
+    @Test
+    fun anUntouchedManualFieldStaysLockedUntilTheSwitchFreesIt() {
+        val locked = withStaticFieldManual(emptyMap(), "personality", true)
+        val character = Character(
+            id = "c",
+            name = "林晚",
+            staticProfile = StaticProfile(personality = "冷静"),
+            staticFieldMeta = locked,
+        )
+
+        val kept = CharacterParity.normalizeUserEditedDraft(character, initial = character, base = base, zone = zone)
+        assertTrue(isStaticFieldManual(kept.character.staticFieldMeta, "personality"))
+
+        // 「让角色接管」把草稿里的标记清掉，且本次没改文本 → 解除。
+        val unlocked = character.copy(staticFieldMeta = withStaticFieldManual(locked, "personality", false))
+        val freed = CharacterParity.normalizeUserEditedDraft(unlocked, initial = character, base = base, zone = zone)
+        assertFalse(isStaticFieldManual(freed.character.staticFieldMeta, "personality"))
+    }
+
+    @Test
+    fun aGroupMemberEditMarksTheMemberFieldOnly() {
+        val member = GroupMember(id = "m", name = "阿黎", staticProfile = StaticProfile(personality = "冷静"))
+        val group = Character(id = "g", isGroup = true, members = listOf(member))
+        val edited = group.copy(members = listOf(member.copy(staticProfile = member.staticProfile.copy(personality = "冷静克制"))))
+
+        val result = CharacterParity.normalizeUserEditedDraft(edited, initial = group, memberIndex = 0, base = base, zone = zone)
+
+        assertTrue(isStaticFieldManual(result.character.members[0].staticFieldMeta, "personality"))
+        assertTrue(result.character.staticFieldMeta.isEmpty())
     }
 
     @Test

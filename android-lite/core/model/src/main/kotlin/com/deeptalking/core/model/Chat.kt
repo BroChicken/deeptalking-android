@@ -35,6 +35,8 @@ data class ChatMessage(
     val quickReplyIssues: List<String> = emptyList(),
     /** Static profile field labels auto-adjusted after this assistant turn (legacy `staticChanges`). */
     val staticChanges: List<String> = emptyList(),
+    /** 模型想自动改、但字段被用户标为「人工手写」而跳过的字段标签（界面可见提示）。 */
+    val lockedStaticFields: List<String> = emptyList(),
     /** Lorebook entry names created/updated after this assistant turn (legacy `lorebookChanges`). */
     val lorebookChanges: List<String> = emptyList(),
     /**

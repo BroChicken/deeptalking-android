@@ -58,4 +58,43 @@ class FieldCleaningTest {
         val result = FieldCleaning.parseRelativeText("今天气不错", base, zone)
         assertTrue(result.startsWith("今天气"))
     }
+
+    // ------------------------------------------------ 用户手写通道（编辑器保存）
+
+    @Test
+    fun userWrittenChannelKeepsContrastSentencesAndReportsWhy() {
+        val result = FieldCleaning.cleanUserWrittenField("personality", "他不是冷漠，而是懒得解释。")
+        assertEquals("他不是冷漠，而是懒得解释。", result.value)
+        assertTrue(result.reasons.any { it.contains("对比句") })
+    }
+
+    @Test
+    fun userWrittenChannelDoesNotTruncateLongText() {
+        val longBackground = "他走过很多地方。".repeat(40)
+        val background = FieldCleaning.cleanUserWrittenField("background", longBackground)
+        assertEquals(longBackground, background.value)
+        assertTrue(background.reasons.isEmpty())
+
+        val longPersonality = "性格冷静克制。".repeat(40)
+        assertEquals(longPersonality, FieldCleaning.cleanUserWrittenField("personality", longPersonality).value)
+    }
+
+    @Test
+    fun userWrittenChannelReportsPrefixAndParentheticalStripping() {
+        val prefix = FieldCleaning.cleanUserWrittenField("personality", "性格：冷静")
+        assertEquals("冷静", prefix.value)
+        assertTrue(prefix.reasons.any { it.contains("字段名前缀") })
+
+        val parenthetical = FieldCleaning.cleanUserWrittenField("personality", "冷静（用户要求）")
+        assertEquals("冷静", parenthetical.value)
+        assertTrue(parenthetical.reasons.any { it.contains("括号") })
+    }
+
+    @Test
+    fun strictChannelStillRejectsContrastAndClamps() {
+        // 建卡 / AI 草稿通道的严格语义不变。
+        assertEquals("", FieldCleaning.cleanFieldValue("personality", "他不是冷漠，而是懒得解释。"))
+        val longPersonality = "性格冷静克制。".repeat(40)
+        assertTrue(FieldCleaning.cleanFieldValue("personality", longPersonality).length <= 120)
+    }
 }

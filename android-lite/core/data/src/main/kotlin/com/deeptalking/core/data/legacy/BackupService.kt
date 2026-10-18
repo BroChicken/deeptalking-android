@@ -330,6 +330,9 @@ class BackupService(
         if (message.staticChanges.isNotEmpty()) {
             putJsonArray("staticChanges") { message.staticChanges.forEach { add(it) } }
         }
+        if (message.lockedStaticFields.isNotEmpty()) {
+            putJsonArray("lockedStaticFields") { message.lockedStaticFields.forEach { add(it) } }
+        }
         if (message.lorebookChanges.isNotEmpty()) {
             putJsonArray("lorebookChanges") { message.lorebookChanges.forEach { add(it) } }
         }

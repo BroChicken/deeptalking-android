@@ -1,6 +1,7 @@
 package com.deeptalking.core.model
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -90,5 +91,17 @@ class CharacterMergeTest {
         val merged = mergeCharacterChanges(before, before, live)
 
         assertEquals(live, merged)
+    }
+
+    @Test
+    fun theManualLockFlagSurvivesAThreeWayMerge() {
+        val before = Character(id = "c1")
+        val after = before.copy(staticFieldMeta = withStaticFieldManual(before.staticFieldMeta, "personality", true))
+        val live = before.copy(name = "并发改名")
+
+        val merged = mergeCharacterChanges(before, after, live)
+
+        assertEquals("并发改名", merged.name)
+        assertTrue(isStaticFieldManual(merged.staticFieldMeta, "personality"))
     }
 }

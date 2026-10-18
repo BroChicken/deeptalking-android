@@ -78,7 +78,7 @@ STATIC_PROFILE_FIELDS ─┬─► submit_response schema (staticFieldProperties
                        ├─► applyStaticFields / update_character_field 工具 enum
                        ├─► buildSystemPrompt（角色卡注入与成员块）
                        ├─► buildVolatileContext 的话题库 / BackgroundTasks.autoFillStaticFields
-                       ├─► 角色编辑器「基础」页签
+                       ├─► 角色编辑器「基础」页签（用户手写通道 `normalizeUserEditedDraft` / `cleanUserWrittenField`：不截断、对比句保留；改动过的字段写 `staticFieldMeta[key].manual`）
                        └─► LegacyMapper 的旧字段迁移（worldView→background 等）
 ```
 

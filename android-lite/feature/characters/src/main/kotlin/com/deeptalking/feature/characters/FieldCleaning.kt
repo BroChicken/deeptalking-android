@@ -18,6 +18,9 @@ object FieldCleaning {
 
     private const val DAY_START_HOUR = 2
 
+    /** 用户手写通道命中对比句时的提示：只建议改写，原文保留。 */
+    private const val CONTRAST_HINT = "是「不是…而是…」这类对比句，建议改写成陈述句（原文已保留）"
+
     private val STATIC_FIELD_KEYS = listOf(
         "gender", "age", "race", "appearance", "personality", "fears",
         "background", "speakingStyle", "language", "userAddress",
@@ -40,6 +43,12 @@ object FieldCleaning {
     private val FIELD_KEYS: Set<String> = (STATIC_FIELD_KEYS + DYNAMIC_FIELD_KEYS).toSet()
 
     private val FIELD_LABELS: List<String> = STATIC_FIELD_LABELS + DYNAMIC_FIELD_LABELS
+
+    /** `key → 界面标签`，用于把规范化原因回给用户（`roleInGroup` 只在成员卡上出现）。 */
+    private val FIELD_LABEL_MAP: Map<String, String> =
+        (STATIC_FIELD_KEYS zip STATIC_FIELD_LABELS).toMap() +
+            (DYNAMIC_FIELD_KEYS zip DYNAMIC_FIELD_LABELS).toMap() +
+            ("roleInGroup" to "群内定位")
 
     private val FIELD_META_MARKERS = listOf(
         "用户", "角色", "玩家", "希望", "要求", "因为", "由于", "所以", "说明", "备注",
@@ -200,21 +209,15 @@ object FieldCleaning {
     fun normalizeStaticFieldValue(key: String, value: String?, base: ZonedDateTime, zone: ZoneId = base.zone): String =
         if (key == "userAddress") normalizeUserAddress(value) else cleanFieldValue(key, parseRelativeText(value, base, zone))
 
-    /** Port of legacy `cleanFieldValue` (`src/js/memory/time.js`). */
+    /**
+     * 模型 / 建卡 / AI 补全通道：Port of legacy `cleanFieldValue` (`src/js/memory/time.js`)。
+     * **对比句拒收 + 按 40/120/250 收敛**这两条语义只在这个通道里保留。
+     */
     fun cleanFieldValue(key: String, value: String?): String {
         var text = value.orEmpty()
         if (StaticFieldRules.contrastReason(key, text) != null) return ""
 
-        val prefixMatch = Regex("^\\s*[^：:\\n]{1,24}[：:]\\s*").find(text)
-        if (prefixMatch != null) {
-            val prefix = prefixMatch.value.replace(Regex("[：:]"), "").trim()
-            val prefixIsField = prefix in FIELD_KEYS || FIELD_LABELS.any { label ->
-                label == prefix ||
-                    (label.length >= 3 && prefix.length >= 2 && (label.contains(prefix) || prefix.contains(label)))
-            }
-            if (prefixIsField) text = text.substring(prefixMatch.value.length)
-        }
-
+        fieldPrefixOf(text)?.let { prefix -> text = text.substring(prefix.length) }
         text = stripMetaParentheticals(text)
 
         if (key in SHORT_FACT_FIELDS) {
@@ -224,6 +227,59 @@ object FieldCleaning {
 
         val cleaned = trimText(text.replace(Regex("\\s+"), " ").trim(), 700)
         return StaticFieldRules.clamp(key, cleaned)
+    }
+
+    /** [cleanUserWrittenField] 的结果：规范化后的值 + 每一条对用户可见的原因。 */
+    data class UserFieldClean(val value: String, val reasons: List<String> = emptyList())
+
+    /**
+     * 用户手写通道（卡片编辑器保存）：只做轻度规范化，并**逐条回报做了什么**，由编辑器给一条
+     * 可见提示（不要静默清洗用户输入）。与模型通道 [cleanFieldValue] 的两处关键差别：
+     * - 命中「不是…而是…」这类对比句**保留原文**，只回报一条改写建议；
+     * - **不按** 40/120/250 硬截断（注入侧另有单字段 600/800、整段 8000 字上限兜底）。
+     *
+     * 建卡 / AI 生成草稿仍走 [cleanFieldValue]（严格语义不变）。
+     */
+    fun cleanUserWrittenField(key: String, value: String?): UserFieldClean {
+        var text = value.orEmpty()
+        val reasons = mutableListOf<String>()
+
+        if (StaticFieldRules.contrastReason(key, text) != null) reasons += CONTRAST_HINT
+        fieldPrefixOf(text)?.let { prefix ->
+            text = text.substring(prefix.length)
+            reasons += "去掉了字段名前缀「${prefix.replace(Regex("[：:]"), "").trim()}：」"
+        }
+        val withoutMeta = stripMetaParentheticals(text)
+        if (withoutMeta != text) {
+            reasons += "去掉了括号里的说明文字"
+            text = withoutMeta
+        }
+        if (key == "userAddress") {
+            val collapsed = normalizeUserAddress(text)
+            if (collapsed != text.trim()) reasons += "称呼只保留前 20 个字符、去掉空格"
+            text = collapsed
+        } else if (key in SHORT_FACT_FIELDS) {
+            val filtered = splitSentences(text).filterNot { isExplanatorySentence(it) }.joinToString("")
+            if (filtered != text) reasons += "去掉了说明性句子"
+            text = filtered.replace(Regex("[，,。；;、]+$"), "")
+        }
+        // 收敛水平空白（保留换行）；长度不截断。
+        text = text.replace(Regex("[ \\t\\u3000]+"), " ").trim()
+        return UserFieldClean(text, reasons)
+    }
+
+    /** 字段的界面标签（提示里给用户看）。 */
+    fun labelOf(key: String): String = FIELD_LABEL_MAP[key] ?: key
+
+    /** 开头的「字段名：」前缀；不是字段名时返回 null。 */
+    private fun fieldPrefixOf(text: String): String? {
+        val prefixMatch = Regex("^\\s*[^：:\\n]{1,24}[：:]\\s*").find(text) ?: return null
+        val prefix = prefixMatch.value.replace(Regex("[：:]"), "").trim()
+        val prefixIsField = prefix in FIELD_KEYS || FIELD_LABELS.any { label ->
+            label == prefix ||
+                (label.length >= 3 && prefix.length >= 2 && (label.contains(prefix) || prefix.contains(label)))
+        }
+        return if (prefixIsField) prefixMatch.value else null
     }
 
     private fun isMetaParenthetical(inner: String): Boolean =

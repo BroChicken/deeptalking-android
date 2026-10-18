@@ -64,6 +64,8 @@ import com.deeptalking.core.model.GroupMember
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.LorebookOrigin
 import com.deeptalking.core.model.StaticProfile
+import com.deeptalking.core.model.isStaticFieldManual
+import com.deeptalking.core.model.withStaticFieldManual
 private val STATIC_FIELDS = listOf(
     "gender" to "性别",
     "age" to "年龄",
@@ -499,6 +501,16 @@ fun CharacterEditorDialog(
     var draft by remember(character.id) { mutableStateOf(character) }
     var memberIndex by remember(character.id) { mutableStateOf(initialMemberIndex) }
     val editingMember = memberIndex?.let { draft.members.getOrNull(it) }
+    // 编辑器打开那一刻的快照。人工标记只认「相对快照真正改动过」的字段，绝不能用实时数据行，
+    // 否则后台（模型 / 补全任务）改过的字段会被误标成用户手写。
+    val initialSnapshot = remember(character.id) { character }
+    // 保存时被规范化 / 命中对比句的字段：先给一条可见提示，再让用户确认保存（不要静默清洗）。
+    var pendingNotices by remember(character.id) { mutableStateOf<List<CharacterParity.EditNotice>>(emptyList()) }
+
+    fun applyDraft(next: Character) {
+        draft = next
+        pendingNotices = emptyList()
+    }
 
     val title = when {
         editingMember != null -> "编辑成员: ${editingMember.name}"
@@ -533,11 +545,11 @@ fun CharacterEditorDialog(
                         0 -> BasicTab(
                             draft = draft,
                             memberIndex = memberIndex,
-                            onDraft = { draft = it },
+                            onDraft = ::applyDraft,
                             onGenerateAvatar = onGenerateAvatar,
                             onFillMember = onFillMember,
                         )
-                        1 -> StateTab(draft = draft, memberIndex = memberIndex, onDraft = { draft = it })
+                        1 -> StateTab(draft = draft, memberIndex = memberIndex, onDraft = ::applyDraft)
                         2 -> LorebookTab(
                             draft = draft,
                             // A world-book edit is applied to the draft **and** patched onto
@@ -550,28 +562,38 @@ fun CharacterEditorDialog(
                                 // entry the store refused.
                                 if (draft.lorebook.size < AppLimits.Lorebook.ENTRIES) {
                                     val entry = CharacterParity.newLorebookEntry()
-                                    draft = draft.copy(lorebook = CharacterParity.addLorebookEntry(draft.lorebook, entry))
+                                    applyDraft(draft.copy(lorebook = CharacterParity.addLorebookEntry(draft.lorebook, entry)))
                                     onAddLorebook(draft.id, entry)
                                 }
                             },
                             onRemoveLorebook = { entryId ->
-                                draft = draft.copy(lorebook = CharacterParity.removeLorebookEntry(draft.lorebook, entryId))
+                                applyDraft(draft.copy(lorebook = CharacterParity.removeLorebookEntry(draft.lorebook, entryId)))
                                 onRemoveLorebook(draft.id, entryId)
                             },
                             onUpdateLorebook = { entry ->
-                                draft = draft.copy(lorebook = CharacterParity.updateLorebookEntry(draft.lorebook, entry))
+                                applyDraft(draft.copy(lorebook = CharacterParity.updateLorebookEntry(draft.lorebook, entry)))
                                 onUpdateLorebook(draft.id, entry)
                             },
                         )
+                    }
+                    if (pendingNotices.isNotEmpty()) {
+                        SaveNoticesPanel(pendingNotices)
                     }
                 }
             }
         },
         confirmButton = {
             TextButton(onClick = {
-                onUpdate(CharacterParity.normalizeEditedDraft(draft, memberIndex))
-                onDismiss()
-            }) { Text("保存修改") }
+                val result = CharacterParity.normalizeUserEditedDraft(draft, initialSnapshot, memberIndex)
+                // 有规范化 / 对比句时先亮出提示，再让用户按第二下确认保存；用户接着改了字段
+                // （applyDraft 清空提示）就重新提示，绝不静默改掉用户手写的内容。
+                if (result.notices.isEmpty() || pendingNotices.isNotEmpty()) {
+                    onUpdate(result.character)
+                    onDismiss()
+                } else {
+                    pendingNotices = result.notices
+                }
+            }) { Text(if (pendingNotices.isEmpty()) "保存修改" else "继续保存") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
     )
@@ -624,6 +646,24 @@ private fun BasicTab(
         else onDraft(draft.copy(members = draft.members.toMutableList().also { it[memberIndex] = member.copy(emoji = value) }))
     }
 
+    /** 「人工手写 ↔ 角色维护」开关：解除后模型可正常自动更新该字段。 */
+    fun updateManual(key: String, manual: Boolean) {
+        val index = memberIndex
+        if (member == null || index == null) {
+            onDraft(draft.copy(staticFieldMeta = withStaticFieldManual(draft.staticFieldMeta, key, manual)))
+        } else {
+            onDraft(
+                draft.copy(
+                    members = draft.members.toMutableList().also {
+                        it[index] = member.copy(
+                            staticFieldMeta = withStaticFieldManual(member.staticFieldMeta, key, manual),
+                        )
+                    },
+                ),
+            )
+        }
+    }
+
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (member != null) {
             Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(MaterialTheme.legacy.border))
@@ -651,14 +691,29 @@ private fun BasicTab(
             Text("成员：" + draft.members.joinToString("、") { it.name }, fontSize = 12.sp, color = MaterialTheme.legacy.textMuted)
         } else {
             val profile = member?.staticProfile ?: draft.staticProfile
+            val fieldMeta = member?.staticFieldMeta ?: draft.staticFieldMeta
             STATIC_FIELDS.forEach { (key, label) ->
-                LegacyField(
-                    value = staticValue(profile, key),
-                    onValueChange = { updateProfile(withStatic(profile, key, it)) },
-                    label = label,
-                    minLines = if (key == "background") 2 else 1,
-                )
+                Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Text(label, fontSize = 12.sp, color = MaterialTheme.legacy.textMuted)
+                        ManualLockChip(isStaticFieldManual(fieldMeta, key)) { manual -> updateManual(key, manual) }
+                    }
+                    LegacyField(
+                        value = staticValue(profile, key),
+                        onValueChange = { updateProfile(withStatic(profile, key, it)) },
+                        minLines = if (key == "background") 2 else 1,
+                    )
+                }
             }
+            Text(
+                "点「人工手写」＝锁定该字段，模型不再自动改写；点「角色维护」＝让角色接管。" +
+                    "你手写的字段保存时不会被截断，对比句也会原样保留。",
+                fontSize = 12.sp,
+                color = MaterialTheme.legacy.textMuted,
+            )
             if (member != null) {
                 LegacyField(
                     value = member.roleInGroup,
@@ -821,6 +876,50 @@ private fun LorebookOwnerChip(origin: LorebookOrigin, onSwitch: (LorebookOrigin)
             .padding(horizontal = 8.dp, vertical = 4.dp),
     ) {
         Text(if (manual) "人工维护" else "AI 维护", fontSize = 12.sp, color = accent)
+    }
+}
+
+/**
+ * 静态字段归属：人工手写 ↔ 角色维护。**人工**字段模型不会自动改写（`submit_response`
+ * 跳过并提示，`update_character_field` 需用户本轮明确要求），点一下交还给角色即可恢复自动更新。
+ */
+@Composable
+private fun ManualLockChip(manual: Boolean, onSwitch: (Boolean) -> Unit) {
+    val legacy = MaterialTheme.legacy
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(if (manual) legacy.warning.copy(alpha = 0.18f) else legacy.panel)
+            .border(1.dp, if (manual) legacy.warning else legacy.inputBorder, RoundedCornerShape(6.dp))
+            .clickable { onSwitch(!manual) }
+            .padding(horizontal = 6.dp, vertical = 2.dp),
+    ) {
+        Text(
+            if (manual) "🔒 人工手写" else "角色维护",
+            fontSize = 11.sp,
+            color = if (manual) legacy.warning else legacy.textMuted,
+        )
+    }
+}
+
+/** 保存前的可见提示：哪些字段被规范化 / 命中了对比句（不要静默清洗用户手写内容）。 */
+@Composable
+private fun SaveNoticesPanel(notices: List<CharacterParity.EditNotice>) {
+    val legacy = MaterialTheme.legacy
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(legacy.warning.copy(alpha = 0.12f))
+            .border(1.dp, legacy.warning, RoundedCornerShape(8.dp))
+            .padding(10.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Text("保存前确认：以下字段会被处理", fontSize = 12.sp, color = legacy.warning)
+        notices.forEach { notice ->
+            Text("· ${notice.fieldLabel}：${notice.reason}", fontSize = 12.sp, color = legacy.text)
+        }
+        Text("确认无误请点「继续保存」。", fontSize = 12.sp, color = legacy.textMuted)
     }
 }
 

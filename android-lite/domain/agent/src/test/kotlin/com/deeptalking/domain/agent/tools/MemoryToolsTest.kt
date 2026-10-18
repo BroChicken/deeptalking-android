@@ -7,7 +7,9 @@ import com.deeptalking.core.model.MemoryCategory
 import com.deeptalking.core.model.MemorySubject
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.ShortTermMemory
+import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.core.model.Sticker
+import com.deeptalking.core.model.withStaticFieldManual
 import com.deeptalking.domain.agent.AgentContext
 import com.deeptalking.domain.agent.ToolRegistry
 import com.deeptalking.engine.ondevice.ToolCall
@@ -224,6 +226,47 @@ class MemoryToolsTest {
         val result = UpdateCharacterFieldTool().execute(call("update_character_field", args), context(character))
         assertTrue(result.contentJson.contains("\"ok\":true"))
         assertEquals("冷静", result.updatedCharacter!!.staticProfile.personality)
+    }
+
+    @Test
+    fun `update_character_field refuses a manual-locked field when the user did not ask`() = runBlocking {
+        val character = Character(
+            id = "c1",
+            instant = listOf(userTurn("m1", "今天我心情很好")),
+            staticProfile = StaticProfile(personality = "冷静"),
+            staticFieldMeta = withStaticFieldManual(emptyMap(), "personality", true),
+        )
+        val args = """{"field":"personality","value":"更外向","sourceMessageIds":["m1"],"evidence":"今天我心情很好"}"""
+        val result = UpdateCharacterFieldTool().execute(call("update_character_field", args), context(character))
+        assertTrue(result.contentJson.contains("\"ok\":false"))
+        assertTrue(result.contentJson.contains("人工手写"))
+    }
+
+    @Test
+    fun `update_character_field allows a manual-locked field when the user asks for it`() = runBlocking {
+        val character = Character(
+            id = "c1",
+            instant = listOf(userTurn("m1", "你性格改成更外向些")),
+            staticProfile = StaticProfile(personality = "冷静"),
+            staticFieldMeta = withStaticFieldManual(emptyMap(), "personality", true),
+        )
+        val args = """{"field":"personality","value":"更外向","sourceMessageIds":["m1"],"evidence":"你性格改成更外向些"}"""
+        val result = UpdateCharacterFieldTool().execute(call("update_character_field", args), context(character))
+        assertTrue(result.contentJson.contains("\"ok\":true"))
+        assertEquals("更外向", result.updatedCharacter!!.staticProfile.personality)
+    }
+
+    @Test
+    fun `update_character_field keeps the plain reason for a non-manual field`() = runBlocking {
+        val character = Character(
+            id = "c1",
+            instant = listOf(userTurn("m1", "今天我心情很好")),
+            staticProfile = StaticProfile(personality = "冷静"),
+        )
+        val args = """{"field":"personality","value":"更外向","sourceMessageIds":["m1"],"evidence":"今天我心情很好"}"""
+        val result = UpdateCharacterFieldTool().execute(call("update_character_field", args), context(character))
+        assertTrue(result.contentJson.contains("\"ok\":false"))
+        assertTrue(result.contentJson.contains("用户并未明确要求修改"))
     }
 
     @Test

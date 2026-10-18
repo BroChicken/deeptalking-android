@@ -184,6 +184,7 @@ data class LegacyInstantMessage(
     @SerialName("internalOnly") val internalOnly: Boolean? = null,
     @SerialName("isLoading") val isLoading: Boolean? = null,
     @SerialName("staticChanges") val staticChanges: List<String>? = null,
+    @SerialName("lockedStaticFields") val lockedStaticFields: List<String>? = null,
     @SerialName("lorebookChanges") val lorebookChanges: List<String>? = null,
     @SerialName("styleViolations") val styleViolations: List<String>? = null,
     @SerialName("quickReplyIssues") val quickReplyIssues: List<String>? = null,

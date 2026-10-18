@@ -1313,6 +1313,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                         timestamp = Instant.now().toString(),
                         internalOnly = false,
                         staticChanges = finalResult.staticChanges,
+                        lockedStaticFields = finalResult.lockedStaticFields,
                         lorebookChanges = finalResult.lorebookChanges,
                     ),
                 )

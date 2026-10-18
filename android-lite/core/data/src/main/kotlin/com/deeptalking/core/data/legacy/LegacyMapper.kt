@@ -318,6 +318,7 @@ private fun mapInstant(dto: LegacyInstantMessage, imageSink: StickerSink?): Chat
         },
     internalOnly = dto.internalOnly == true,
     staticChanges = dto.staticChanges ?: emptyList(),
+    lockedStaticFields = dto.lockedStaticFields ?: emptyList(),
     lorebookChanges = dto.lorebookChanges ?: emptyList(),
     styleViolations = (dto.styleViolations ?: emptyList()).filter { it in STYLE_VIOLATION_LABELS },
     quickReplyIssues = (dto.quickReplyIssues ?: emptyList()).filter { it in QUICK_REPLY_ISSUE_LABELS },

@@ -7,6 +7,8 @@ import com.deeptalking.core.model.GroupMember
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.LorebookOrigin
 import com.deeptalking.core.model.StaticProfile
+import com.deeptalking.core.model.isStaticFieldManual
+import com.deeptalking.core.model.withStaticFieldManual
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -52,6 +54,12 @@ object CharacterParity {
     private val DYNAMIC_FIELD_KEYS = setOf(
         "currentSituation", "currentLocation", "currentMood", "currentOccupation",
         "currentGoal", "currentTone",
+    )
+
+    /** The editor's basic-profile fields, in `StaticProfile` order (人工标记逐个比对用). */
+    private val STATIC_FIELD_KEYS = listOf(
+        "gender", "age", "race", "appearance", "personality",
+        "fears", "background", "speakingStyle", "language", "userAddress",
     )
 
     private val GROUP_SHARED_DYNAMIC_FIELDS = setOf("currentSituation", "currentLocation")
@@ -289,6 +297,129 @@ object CharacterParity {
             staticProfile = normalizeStaticProfile(member.staticProfile, base, zone),
             dynamicState = normalizeDynamicState(member.dynamicState, base, zone),
         )
+
+    // ------------------------------------------------- editor save (user channel)
+
+    /** 一条对用户可见的保存提示：哪个字段被怎么处理了。 */
+    data class EditNotice(val fieldLabel: String, val reason: String)
+
+    /** [normalizeUserEditedDraft] 的结果：规范化后的角色 + 需要向用户明示的处理。 */
+    data class UserEditedDraft(val character: Character, val notices: List<EditNotice>)
+
+    /**
+     * 用户手写通道（卡片编辑器保存）。与 AI / 建卡通道 [normalizeEditedDraft] 分开，避免
+     * "把用户手写的静态字段当模型输出清洗"：
+     * - 静态字段（含 `roleInGroup`）走 [FieldCleaning.cleanUserWrittenField]：**对比句保留原文、
+     *   不按 40/120/250 硬截断**，只做去前缀 / 去括号说明等轻度规范化，并逐条回报原因；
+     * - 只把**本次真正改动过**的静态字段标为人工（对比 [initial] 快照；[initial] 为 null 时不标记）；
+     * - 动态状态仍按原规则清洗并清掉 AI 记账（动态字段不进人工锁定）。
+     */
+    fun normalizeUserEditedDraft(
+        character: Character,
+        initial: Character? = null,
+        memberIndex: Int? = null,
+        base: ZonedDateTime = ZonedDateTime.now(),
+        zone: ZoneId = base.zone,
+    ): UserEditedDraft {
+        val notices = mutableListOf<EditNotice>()
+        if (memberIndex != null && memberIndex in character.members.indices) {
+            val source = character.members[memberIndex]
+            val cleaned = cleanUserStaticProfile(source.staticProfile, notices)
+            val updated = source.copy(
+                roleInGroup = cleanUserRoleInGroup(source.roleInGroup, notices),
+                staticProfile = cleaned,
+                staticFieldMeta = markManualFields(
+                    source.staticFieldMeta,
+                    cleaned,
+                    initial?.members?.getOrNull(memberIndex)?.staticProfile,
+                ),
+                dynamicState = normalizeDynamicState(source.dynamicState, base, zone),
+                dynamicStateMeta = source.dynamicStateMeta - DYNAMIC_FIELD_KEYS,
+            )
+            return UserEditedDraft(
+                character.copy(members = character.members.toMutableList().also { it[memberIndex] = updated }),
+                notices,
+            )
+        }
+        if (character.isGroup) {
+            return UserEditedDraft(
+                character.copy(
+                    groupSharedDynamic = normalizeDynamicState(character.groupSharedDynamic, base, zone),
+                    dynamicStateMeta = character.dynamicStateMeta - GROUP_SHARED_DYNAMIC_FIELDS,
+                ),
+                emptyList(),
+            )
+        }
+        val cleaned = cleanUserStaticProfile(character.staticProfile, notices)
+        return UserEditedDraft(
+            character.copy(
+                staticProfile = cleaned,
+                staticFieldMeta = markManualFields(character.staticFieldMeta, cleaned, initial?.staticProfile),
+                dynamicState = normalizeDynamicState(character.dynamicState, base, zone),
+                dynamicStateMeta = character.dynamicStateMeta - DYNAMIC_FIELD_KEYS,
+            ),
+            notices,
+        )
+    }
+
+    private fun cleanUserStaticProfile(profile: StaticProfile, notices: MutableList<EditNotice>): StaticProfile {
+        fun clean(key: String, value: String): String {
+            val result = FieldCleaning.cleanUserWrittenField(key, value)
+            result.reasons.forEach { notices += EditNotice(FieldCleaning.labelOf(key), it) }
+            return result.value
+        }
+        return profile.copy(
+            gender = clean("gender", profile.gender),
+            age = clean("age", profile.age),
+            race = clean("race", profile.race),
+            appearance = clean("appearance", profile.appearance),
+            personality = clean("personality", profile.personality),
+            fears = clean("fears", profile.fears),
+            background = clean("background", profile.background),
+            speakingStyle = clean("speakingStyle", profile.speakingStyle),
+            language = clean("language", profile.language),
+            userAddress = clean("userAddress", profile.userAddress),
+        )
+    }
+
+    private fun cleanUserRoleInGroup(value: String, notices: MutableList<EditNotice>): String {
+        val result = FieldCleaning.cleanUserWrittenField("roleInGroup", value)
+        result.reasons.forEach { notices += EditNotice(FieldCleaning.labelOf("roleInGroup"), it) }
+        return result.value
+    }
+
+    /**
+     * 只把本次**真正改动过**的静态字段标为人工，其余保留编辑器里的开关状态。
+     * [initial] 提供编辑器打开时的快照——不能用实时数据行，否则后台改动会被误标。
+     * [initial] 为 null（建卡 / 测试）时不标记。
+     */
+    private fun markManualFields(
+        meta: Map<String, JsonElement>,
+        edited: StaticProfile,
+        initial: StaticProfile?,
+    ): Map<String, JsonElement> {
+        if (initial == null) return meta
+        var result = meta
+        STATIC_FIELD_KEYS.forEach { key ->
+            val manual = isStaticFieldManual(result, key) || staticProfileValue(initial, key) != staticProfileValue(edited, key)
+            if (isStaticFieldManual(result, key) != manual) result = withStaticFieldManual(result, key, manual)
+        }
+        return result
+    }
+
+    private fun staticProfileValue(profile: StaticProfile, key: String): String = when (key) {
+        "gender" -> profile.gender
+        "age" -> profile.age
+        "race" -> profile.race
+        "appearance" -> profile.appearance
+        "personality" -> profile.personality
+        "fears" -> profile.fears
+        "background" -> profile.background
+        "speakingStyle" -> profile.speakingStyle
+        "language" -> profile.language
+        "userAddress" -> profile.userAddress
+        else -> ""
+    }
 
     private fun normalizeStaticProfile(profile: StaticProfile, base: ZonedDateTime, zone: ZoneId): StaticProfile = profile.copy(
         gender = FieldCleaning.normalizeStaticFieldValue("gender", profile.gender, base, zone),
