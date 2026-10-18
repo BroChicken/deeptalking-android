@@ -510,7 +510,11 @@ fun CharacterEditorDialog(
     // 成员 id 为空（历史数据）时不装作有成员上下文——按今天的本体行为处理，避免把编辑写丢。
     val editingMemberId = editingMember?.id?.takeIf { it.isNotBlank() }
     // 保存时被规范化 / 命中对比句的字段：先给一条可见提示，再让用户确认保存（不要静默清洗）。
-    var pendingNotices by remember(character.id) { mutableStateOf<List<CharacterParity.EditNotice>>(emptyList()) }
+    // 按 **正在编辑的对象** 记忆：切到别的成员（或退回本体）后，上一份提示就不再适用——
+    // 否则它会替另一个对象"预先确认"，把这次的规范化提示跳过去。
+    var pendingNotices by remember(character.id, memberIndex) {
+        mutableStateOf<List<CharacterParity.EditNotice>>(emptyList())
+    }
 
     fun applyDraft(next: Character) {
         draft = next
@@ -719,6 +723,7 @@ private fun BasicTab(
                 LegacyField(
                     value = staticValue(profile, key),
                     onValueChange = { updateProfile(withStatic(profile, key, it)) },
+                    label = label,
                     minLines = if (key == "background") 2 else 1,
                 )
             }

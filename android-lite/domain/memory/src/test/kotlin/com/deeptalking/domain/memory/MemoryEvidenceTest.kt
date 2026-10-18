@@ -8,6 +8,7 @@ import com.deeptalking.core.model.MemorySubject
 import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.ShortTermMemory
+import com.deeptalking.core.model.SourceEvidence
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -392,6 +393,35 @@ class MemoryEvidenceTest {
         // 消息本身没有时间戳时，相对词无法换算，只能要求"出现了时间词"。
         val undated = listOf(SourceRef("u6", "user", "我明天要交报告。"))
         assertTrue(dueAtBackedByUserEvidence(undated, "2026-08-10T09:00:00"))
+    }
+
+    @Test
+    fun aShortTermSourceResolvesRelativeWordsAgainstTheMessageTimeNotTheEventTime() {
+        // 消息已滚出即时窗口，只剩短期条目：`_sourceTs` 是"当时说的"，eventTime 是事件发生日。
+        val character = Character(
+            id = "c1",
+            shortTerm = listOf(
+                ShortTermMemory(
+                    id = "s1",
+                    content = "用户说明天要交报告",
+                    sourceMessageIds = listOf("u1"),
+                    sourceRoles = listOf("user"),
+                    userEvidence = listOf(SourceEvidence(sourceMessageId = "u1", text = "我明天要交报告")),
+                    eventTime = "2026-08-11T09:00:00",
+                    sourceTs = "2026-08-09T12:00:00",
+                ),
+            ),
+        )
+        val item = promise(sourceIds = listOf("u1"), dueAt = "2026-08-10T09:00:00")
+
+        val decision = promisePushDecision(character, item)
+
+        // 按 8-09 的消息时间换算，"明天"正是 8-10；用事件日（8-11）换算会算成 8-12，把
+        // 一条用户明确说过期限的约定误判成「待确认期限」（既不排期，也不允许写成提醒）。
+        assertTrue(decision.pushable)
+        assertFalse(decision.dueAtNeedsConfirmation)
+        assertEquals("2026-08-10T09:00:00", decision.confirmedDueAt)
+        assertNotNull(decision.confirmedDueAtMillis)
     }
 
     @Test

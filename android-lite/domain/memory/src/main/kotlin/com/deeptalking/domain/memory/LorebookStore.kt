@@ -259,21 +259,25 @@ fun upsertLorebookEntryForCharacter(
     if (!resolveLorebookSources(character, sourceShortTermIds, proposal.content)) {
         return character to LorebookUpsertResult(false, "来源或证据无法对应")
     }
-    if (enforceCapacity && character.lorebookCapacityCount() >= AppLimits.Lorebook.ENTRIES) {
-        return character to LorebookUpsertResult(false, "世界书条目已达上限")
-    }
-    if (!memberName.isNullOrBlank()) {
+    val written = if (!memberName.isNullOrBlank()) {
         val wanted = memberName.trim().lowercase()
         val member = character.members.firstOrNull { it.name.trim().lowercase() == wanted }
             ?: return character to LorebookUpsertResult(false, "找不到成员「$memberName」")
         val result = upsertLorebookEntry(member.lorebook, proposal, entryId, maxEntries = null)
         if (!result.ok) return character to result
         val members = character.members.map { if (it.id == member.id) it.copy(lorebook = result.list) else it }
-        return character.copy(members = members) to result
+        character.copy(members = members) to result
+    } else {
+        val result = upsertLorebookEntry(character.lorebook, proposal, entryId, maxEntries = null)
+        if (!result.ok) return character to result
+        character.copy(lorebook = result.list) to result
     }
-    val result = upsertLorebookEntry(character.lorebook, proposal, entryId, maxEntries = null)
-    if (!result.ok) return character to result
-    return character.copy(lorebook = result.list) to result
+    // 全局上限按**结果**判定：改/合并一条已有条目不会让条目数增长，在满额时也必须允许；
+    // 只有真正新增了一条把总数顶过上限时才拒收（并原样返回，不落半截写入）。
+    if (enforceCapacity && written.first.lorebookCapacityCount() > AppLimits.Lorebook.ENTRIES) {
+        return character to LorebookUpsertResult(false, "世界书条目已达上限")
+    }
+    return written
 }
 
 /**

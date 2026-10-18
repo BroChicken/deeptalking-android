@@ -441,9 +441,19 @@ object CharacterParity {
         )
     }
 
-    /** Restores an archived entry to its original book (shared archive first, then members). */
-    fun restoreLorebookEntry(character: Character, entryId: String): Character =
-        character.restoreArchivedLorebookEntry(entryId).convergeLorebookCapacity()
+    /**
+     * 把条目从归档移回**它原来那本书**（共享归档优先，其次成员归档），随后走一次容量收敛。
+     *
+     * 被恢复的条目本身**排除在淘汰之外**：它正是因为最久未活跃才被归档，用户刚要求把它拿回来，
+     * 不能立刻又被淘汰回去（与 [restoreMemberLorebookEntry] 同一条规则）。
+     */
+    fun restoreLorebookEntry(character: Character, entryId: String): Character {
+        val restored = character.restoreArchivedLorebookEntry(entryId)
+        if (restored == character) return character
+        val overflow = restored.lorebookCapacityCount() - AppLimits.Lorebook.ENTRIES
+        if (overflow <= 0) return restored
+        return restored.archiveOldestLorebookEntries(overflow, excludeIds = setOf(entryId)).first
+    }
 
     // ------------------------------------------------ member world books
 

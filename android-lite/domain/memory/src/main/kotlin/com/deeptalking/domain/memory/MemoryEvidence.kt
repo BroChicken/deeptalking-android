@@ -94,7 +94,11 @@ fun knownSources(character: Character): Map<String, SourceRef> {
             if (!sources.containsKey(id)) {
                 val evidence = aligned.userEvidence.firstOrNull { it.sourceMessageId == id }
                 val role = aligned.sourceRoles.getOrNull(index).orEmpty()
-                sources[id] = SourceRef(id, role, evidence?.text ?: item.content, item.eventTime ?: item.sourceTs)
+                // 相对时间要按"这条话是什么时候说的"换算：`_sourceTs` 记的就是来源消息时间，
+                // 优先级高于 eventTime（事件发生时间可能与发消息不在同一天）。原生写入的短
+                // 记忆没有 `_sourceTs`，仍回落到 eventTime。
+                val timestamp = item.sourceTs ?: item.eventTime
+                sources[id] = SourceRef(id, role, evidence?.text ?: item.content, timestamp)
             }
         }
     }
@@ -446,8 +450,9 @@ private fun chineseDatesIn(text: String): List<Pair<Int?, MonthDay>> =
  * - the user's words must carry a [containsTemporalExpression] anchor — a due time the user
  *   never mentioned is rejected outright (no schedule; the caller asks the user instead);
  * - when those words also pin an absolute date, [dueAtIso] must fall on **that** date (a
- *   relative word like "明天" is resolved against [SourceRef.timestamp], the time the message
- *   was actually sent), so a model-invented `dueAt` on a different day is rejected;
+ *   relative word like "明天" is resolved against [SourceRef.timestamp] — for a short-term
+ *   source that is the recorded source-message time (`_sourceTs`) when present, otherwise the
+ *   entry's event time — so a model-invented `dueAt` on a different day is rejected);
  * - when the anchor is only coarse ("下周" without a weekday, "晚上" without a day) the due
  *   time is accepted, because the user *did* name a time and nothing contradicts it;
  * - a source with no timestamp cannot resolve relative wording (it is deliberately **not**

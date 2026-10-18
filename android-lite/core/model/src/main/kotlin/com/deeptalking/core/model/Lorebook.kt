@@ -59,8 +59,9 @@ val LorebookEntry.activeAt: String
 
 /**
  * Whether the capacity rule may archive this entry to make room: model-maintained and not
- * 常驻 (`alwaysActive`). Manual entries and 常驻 entries are protected — they still count
- * toward the 200-slot ceiling but are never archived automatically.
+ * 常驻 (`alwaysActive`). Manual entries are never archived automatically — and they do not
+ * count toward the ceiling at all (see [capacityLorebookEntries]); 常驻 entries do count,
+ * they are just never the ones evicted.
  */
 val LorebookEntry.isEvictable: Boolean
     get() = !isManual && !alwaysActive

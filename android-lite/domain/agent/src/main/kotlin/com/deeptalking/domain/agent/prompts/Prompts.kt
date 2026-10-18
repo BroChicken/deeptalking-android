@@ -341,7 +341,7 @@ private const val RULE_3_7 =
     "3.7 记忆字段（longTerm的key与value）必须写明“是谁”，禁止使用“我/你/TA/他/她”这类指代不清的代词：涉及用户写“用户”，涉及角色写角色名，双方共同的事写清各自做了什么（正确如“用户喜欢喝美式咖啡。”）；解释性内容只能放在 evidence。"
 
 private const val RULE_3_8 =
-    "3.8 时间一律写绝对日期，禁止写“明天/上周/三天后”这类相对时间词：longTerm的key与value、dynamicState与staticFields的value都必须写“YYYY-MM-DD”或“YYYY-MM-DD 时段”。用户用相对说法时把相对时间填进 timeRef（见工具描述），由客户端换算，并在内容字段写换算后的绝对日期（如用户说“我后天下午面试”→timeRef:{anchor:\"day_after_tomorrow\",slot:\"下午\"}，value写“用户2026-08-12 下午要去面试。”）。日期一律按事件真实发生的本地日历日写：00:00-02:00 发生的事写当天日期+“凌晨”（不要归到前一天晚上），也不要用“昨晚/昨天/今晚/刚刚”这类相对说法描述刚发生的事。"
+    "3.8 时间一律写绝对日期，禁止写“明天/上周/三天后”这类相对时间词：longTerm的key与value、dynamicState与staticFields的value都必须写“YYYY-MM-DD”或“YYYY-MM-DD 时段”。用户用相对说法时把相对时间填进 timeRef（见工具描述），由客户端换算，并在内容字段写换算后的绝对日期（如用户说“我后天下午面试”→timeRef:{anchor:\"day_after_tomorrow\",slot:\"下午\"}，value写“用户2026-08-12 下午要去面试。”）。日期与时段一律以【时间基准】给出的**逻辑日**与**时段**为准（一天从 02:00 起算，00:00-02:00 属于前一天的深夜），也不要使用“昨晚/昨天/今晚/刚刚”这类相对说法描述刚发生的事。"
 
 private const val RULE_3_9 =
     "3.9 用户提出“说话方式类”要求时（语气、称呼、口头禅、正式/随意、用不用括号动作、语言、句式等），本轮 reply 必须**直接按要求说话**、当轮就体现出来：禁止先复述或确认要求，禁止“我会这样说话”“以后我就用这种方式”“好的，我改成…了”这类元话术，也不得把要求本身当台词念一遍。若该要求属于持久设定（说话风格、对用户的称呼、语言/方言等），按 3.5 同时用 update_character_field 更新；无论是否调用工具，reply 都只演出、不说明。"
@@ -663,11 +663,10 @@ private fun standingCommitmentLine(character: Character, item: LongTermMemory): 
     }
     val value = if (item.value.isBlank()) "" else ": " + maskUserWord(character, trimText(item.value, 80))
     val line = "- " + maskUserWord(character, trimText(item.key, 40)) + value + due
-    return if (line.length > STANDING_COMMITMENT_LINE_CHARS) {
-        line.take(STANDING_COMMITMENT_LINE_CHARS - 1) + "…"
-    } else {
-        line
-    }
+    if (line.length <= STANDING_COMMITMENT_LINE_CHARS) return line
+    // `take` 数的是 UTF-16 单元：正好截在 emoji 中间会留下半个代理对，先退一格再补省略号。
+    val head = line.take(STANDING_COMMITMENT_LINE_CHARS - 1)
+    return (if (head.isNotEmpty() && head.last().isHighSurrogate()) head.dropLast(1) else head) + "…"
 }
 
 /**

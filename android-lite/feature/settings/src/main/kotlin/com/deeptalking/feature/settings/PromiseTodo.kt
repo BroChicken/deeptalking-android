@@ -7,11 +7,15 @@ import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.domain.memory.PromisePushDecision
 import com.deeptalking.domain.memory.promisePushDecision
 import java.time.Instant
+import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
 /** 待办行上的期限只在**已在对话里说清、可核对**时显示，且一律渲染成绝对时间。 */
 internal val TODO_DUE_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
+
+/** 只写到"日"的期限（用户原话里没有具体几点）用这个格式，不要凭空补一个 00:00。 */
+internal val TODO_DAY_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd")
 
 /**
  * 待办的期限文案。
@@ -20,11 +24,22 @@ internal val TODO_DUE_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("y
  * 只提示去把具体日期时间说清楚——待办里不出现相对时间。
  */
 internal fun dueLabel(todo: PromiseTodo): String = when {
+    todo.dueAtMillis != null && todo.dueIsDayOnly ->
+        "期限：" + TODO_DAY_FORMAT.format(
+            Instant.ofEpochMilli(todo.dueAtMillis).atZone(ZoneId.systemDefault()),
+        )
     todo.dueAtMillis != null ->
         "期限：" + TODO_DUE_FORMAT.format(
             Instant.ofEpochMilli(todo.dueAtMillis).atZone(ZoneId.systemDefault()),
         )
-    !todo.unconfirmedDueAt.isNullOrBlank() -> "待确认期限（请在对话里说明具体日期与时间）"
+    !todo.unconfirmedDueAt.isNullOrBlank() ->
+        // 只有"用户可以自己把期限说清楚"的那一桶才提示去对话里补日期；不提醒桶的原因是
+        // 承诺方不是用户（或证据不足），提示他"去说明日期"既解决不了问题也指错了方向。
+        if (todo.section == PromiseTodoSection.NEEDS_DUE_CONFIRMATION) {
+            "待确认期限（请在对话里说明具体日期与时间）"
+        } else {
+            "期限未确认"
+        }
     else -> "无期限"
 }
 
@@ -72,6 +87,11 @@ data class PromiseTodo(
     val section: PromiseTodoSection,
     /** The due time the user's own words locate, epoch millis; null when unconfirmed/absent. */
     val dueAtMillis: Long?,
+    /**
+     * True when the located due time names a **day only** (`2026-08-10`, no clock time). The
+     * deadline then lasts the whole day: it is not 已超时 at 00:00, and the label shows no time.
+     */
+    val dueIsDayOnly: Boolean = false,
     /** The model's unconfirmed `dueAt`, ISO — shown only when [dueAtMillis] is null. */
     val unconfirmedDueAt: String?,
     /** Owning character id, so a cross-character row can be resolved back to its store. */
@@ -138,6 +158,7 @@ private fun todoOf(character: Character, memory: LongTermMemory, nowMillis: Long
         value = memory.value,
         section = sectionOf(decision, memory, nowMillis),
         dueAtMillis = confirmedDueAtMillis,
+        dueIsDayOnly = confirmedDueAtMillis != null && dayOnlyEndMillis(decision.confirmedDueAt) != null,
         unconfirmedDueAt = if (confirmedDueAtMillis == null) {
             memory.dueAt?.trim()?.takeIf { it.isNotEmpty() }
         } else {
@@ -179,15 +200,30 @@ private fun sectionOf(
     nowMillis: Long,
 ): PromiseTodoSection {
     val dueAtMillis = decision.confirmedDueAtMillis
+    // 只写到"日"的期限，整天才算到期：`parseZoned("2026-08-10")` 落在当天 00:00，直接比大小
+    // 会让它在到期日的一整天里都显示"已超时"。
+    val overdueAfter = dayOnlyEndMillis(decision.confirmedDueAt) ?: dueAtMillis
     return when {
         !decision.pushable -> PromiseTodoSection.NOT_PUSHABLE
         // Recurring is checked before the due time: "每晚十点" is not an item that "expired" tonight.
         isRecurringPromise(memory) -> PromiseTodoSection.RECURRING
         decision.dueAtNeedsConfirmation -> PromiseTodoSection.NEEDS_DUE_CONFIRMATION
-        dueAtMillis == null -> PromiseTodoSection.ONGOING
-        dueAtMillis <= nowMillis -> PromiseTodoSection.OVERDUE
+        overdueAfter == null -> PromiseTodoSection.ONGOING
+        overdueAfter <= nowMillis -> PromiseTodoSection.OVERDUE
         else -> PromiseTodoSection.ONGOING
     }
+}
+
+/**
+ * End of the local day named by a **day-only** due time (`2026-08-10` → 2026-08-11T00:00),
+ * or null when the value is not a day-only date (missing, relative wording, or it carries a
+ * clock time — those are compared at their exact instant).
+ */
+internal fun dayOnlyEndMillis(dueAt: String?, zone: ZoneId = ZoneId.systemDefault()): Long? {
+    val text = dueAt?.trim().orEmpty()
+    if (text.isEmpty() || text.contains('T') || text.contains(':')) return null
+    val date = runCatching { LocalDate.parse(text.replace('/', '-')) }.getOrNull() ?: return null
+    return date.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
 }
 
 /**

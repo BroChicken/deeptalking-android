@@ -1,6 +1,7 @@
 package com.deeptalking.core.model
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -104,5 +105,58 @@ class CharacterMergeTest {
         val merged = mergeCharacterChanges(before, before, live)
 
         assertEquals(live, merged)
+    }
+
+    private fun memory(
+        id: String,
+        key: String = "k$id",
+        due: String? = null,
+        pushConfirmedAt: String? = null,
+    ) = LongTermMemory(
+        id = id,
+        category = MemoryCategory.Promises,
+        key = key,
+        value = "v$id",
+        dueAt = due,
+        pushConfirmedAt = pushConfirmedAt,
+    )
+
+    @Test
+    fun stampingOneMemoryDoesNotDropTheOneABackgroundPassJustWrote() {
+        val before = Character(id = "c1", longTerm = listOf(memory("p1", due = "2026-08-10")))
+        // This turn only stamped its own confirmation onto p1 …
+        val after = before.copy(
+            longTerm = listOf(memory("p1", due = "2026-08-10", pushConfirmedAt = "2026-08-09T10:00:00Z")),
+        )
+        // … while a background pass wrote a brand-new memory during the reply.
+        val live = before.copy(longTerm = before.longTerm + memory("new"))
+
+        val merged = mergeCharacterChanges(before, after, live)
+
+        assertEquals(listOf("p1", "new"), merged.longTerm.map { it.id })
+        assertNotNull(merged.longTerm.first { it.id == "p1" }.pushConfirmedAt)
+    }
+
+    @Test
+    fun aMemoryRemovalIsAppliedButAConcurrentMemoryIsNotDropped() {
+        val before = Character(id = "c1", longTerm = listOf(memory("keep"), memory("drop")))
+        val after = before.copy(longTerm = listOf(memory("keep")))
+        val live = before.copy(longTerm = before.longTerm + memory("theirs"))
+
+        val merged = mergeCharacterChanges(before, after, live)
+
+        assertEquals(listOf("keep", "theirs"), merged.longTerm.map { it.id })
+    }
+
+    @Test
+    fun memoriesWithoutLocatableIdsFallBackToTheWholeListRule() {
+        // 旧数据可能没有 id：无法定位条目，就整表按"改过就写"处理，绝不按 "" 合并。
+        val before = Character(id = "c1", longTerm = listOf(memory(""), memory("")))
+        val after = before.copy(longTerm = listOf(memory("", key = "改过的")))
+        val live = before.copy(longTerm = before.longTerm + memory("obj"))
+
+        val merged = mergeCharacterChanges(before, after, live)
+
+        assertEquals(after.longTerm, merged.longTerm)
     }
 }

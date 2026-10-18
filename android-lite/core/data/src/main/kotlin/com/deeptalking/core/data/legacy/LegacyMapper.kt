@@ -272,7 +272,9 @@ fun mapLorebook(dto: LegacyLorebookEntry): LorebookEntry = LorebookEntry(
     alwaysActive = dto.alwaysActive == true,
     // `normalizeLorebook` treats anything that is not exactly "ai" as a user entry.
     origin = if (dto.origin == "ai") LorebookOrigin.Model else LorebookOrigin.User,
-    createdAt = null,
+    // 导出会写 `createdAt`，导入必须读回来：`activeAt`（淘汰排序键）在 lastMentionedAt 缺失时
+    // 只看它，丢了就会把这条老条目当成"最新"，反而优先淘汰刚写入的条目。
+    createdAt = dto.createdAt,
     updatedAt = dto.lastMentionedAt,
     mentions = (dto.mentions ?: 0.0).toInt().coerceAtLeast(0),
     lastMentionedAt = dto.lastMentionedAt,

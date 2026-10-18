@@ -25,6 +25,7 @@ object Reminders {
         NotificationChannels.ensure(context)
         val delayMillis = (triggerAtMillis - System.currentTimeMillis()).coerceAtLeast(0L)
         val request = OneTimeWorkRequestBuilder<ReminderWorker>()
+            .addTag(REMINDER_WORK_TAG)
             .setInitialDelay(delayMillis, TimeUnit.MILLISECONDS)
             .setInputData(
                 workDataOf(
@@ -55,12 +56,19 @@ object Reminders {
     }
 
     /**
-     * Retracts **every** reminder this process knows about (a snapshot of [ReminderRegistry]).
-     * Used after an import/restore *replaces* the whole data set: without it, a reminder
-     * scheduled for a promise that no longer exists would still fire ("数据里没这条承诺，
-     * 通知却响了"). Iterating a copy is deliberate — [cancel] mutates the registry.
+     * Retracts **every** reminder. Used after an import/restore *replaces* the whole data set:
+     * without it, a reminder scheduled for a promise that no longer exists would still fire
+     * ("数据里没这条承诺，通知却响了").
+     *
+     * Two halves, because the in-process registry is not durable:
+     * 1. `cancelAllWorkByTag` drops every enqueued job — including the ones a **previous run**
+     *    of the app created (the registry is empty after a restart, so iterating it alone would
+     *    silently miss them);
+     * 2. the registry snapshot dismisses the notifications those ids already posted.
      */
     fun cancelAll(context: Context) {
+        WorkManager.getInstance(context).cancelAllWorkByTag(REMINDER_WORK_TAG)
+        // Iterating a copy is deliberate — [cancel] mutates the registry.
         ReminderRegistry.scheduledIds().forEach { cancel(context, it) }
     }
 

@@ -331,6 +331,10 @@ private val WRAPPED_SPANS = Regex("「[^」]*」|『[^』]*』|《[^》]*》|〈
  *
  * 被包裹的名字是在引用别人的话（`他说「小雨，你先坐」`）或写舞台说明，不算第三人称自称；
  * 只有"光天化日之下"以第三人称提到自己（`小雨把外套搭在椅背上`）才命中。
+ *
+ * 注意包裹符的集合就是 [WRAPPED_SPANS] 列出的那些（直角引号/书名号/弯引号/圆括号）：
+ * 半角 `"` 会"孤立引号吞掉大段正文"，把它算进来反而会掩盖真实命中，所以半角引号只由
+ * [hasPairedHalfwidthQuotes] 单独统计，不参与这里的包裹判定。
  */
 private fun mentionsNameOutsideWrapping(text: String, name: String): Boolean {
     val spans = WRAPPED_SPANS.findAll(text).map { it.range }.toList()
@@ -433,7 +437,7 @@ private val PAIRED_SPANS = Regex(
 /**
  * 开闭同形的引号（`"` 与 `'`）：孤立出现时会把"后面很远的下一个引号"当成闭合，
  * 于是把中间整段正文吞成一个"引用片段"——修一点点就整条回退的误判来源。
- * 这类引号改为**同一句内**才配对（见 [ambiguousQuoteSpans]）。
+ * 这类引号改为：整段只有一对时整对保护，多于一对此才**同一句内**配对（见 [ambiguousQuoteSpans]）。
  */
 private const val AMBIGUOUS_QUOTES = "\"'"
 
@@ -444,16 +448,29 @@ private const val SENTENCE_TERMINATORS = "。！？!?…\n"
 private const val TRAILING_CLOSERS = "\"'”’）)】]"
 
 /**
- * 取出同形引号（`"` `'`）的成对片段：从左到右扫描，**同一句内**按出现顺序两两配对；
- * 句子结束时（句末标点后不是收尾符）句内没配上的引号直接作废，绝不跨句吞并。
+ * 取出同形引号（`"` `'`）的成对片段。
+ *
+ * - 某字符在整段文本里只出现**两次**：那就是一对完整的引号，允许跨句配对——`他说"我来了。
+ *   你等我。"` 整段都是被引用的原话，必须整段保护。
+ * - 出现三次及以上：孤立引号会把"后面很远的下一个引号"当成闭合，于是把中间整段正文吞成
+ *   一个"引用片段"（修一点点就整条回退的误判来源）。这时退回**同一句内**按出现顺序两两
+ *   配对：句子结束时（句末标点后不是收尾符）句内没配上的引号直接作废，绝不跨句吞并。
  *
  * 例：`我回了一句"好。 他说："早点睡。"` —— 前两个引号分别落在两句里（都未配对，作废），
  * 只有同一句内的 `"早点睡。"` 成为保护片段。
  */
 private fun ambiguousQuoteSpans(text: String): List<IntRange> {
     val spans = mutableListOf<IntRange>()
+    val singlePairs = AMBIGUOUS_QUOTES.filter { quote -> text.count { ch -> ch == quote } == 2 }
+    for (quote in singlePairs) {
+        val first = text.indexOf(quote)
+        val last = text.lastIndexOf(quote)
+        if (first in 0 until last) spans += first..last
+    }
     val open = mutableMapOf<Char, Int>()
     text.forEachIndexed { index, ch ->
+        // 整段只有一对的引号已在上面按对处理，不再参与"同句配对"。
+        if (ch in singlePairs) return@forEachIndexed
         when {
             ch in AMBIGUOUS_QUOTES -> {
                 val start = open.remove(ch)
@@ -490,9 +507,9 @@ fun quotedSpans(text: String?): List<String> {
  * 对用户的称呼）在原文里出现却在修订稿里消失，都判为不合格 —— 调用方据此
  * **整体回退**到原文（不做局部修补：局部修补会留下半截被改写的引用）。
  *
- * 引用片段的切分见 [quotedSpans]：开闭同形的 `"` `'` 只在同一句内配对，所以原文里
- * 一个孤立引号不会把相邻大段正文并成一个"引用"，也就不会让极小改写被误判成整条回退；
- * 而真正被引号包住的段落一旦被改写或删除，仍然照旧回退。
+ * 引用片段的切分见 [quotedSpans]：开闭同形的 `"` `'` 在整段只有一对时整对保护，存在多于一对
+ * 时才只在同一句内配对——所以原文里一个孤立引号不会把相邻大段正文并成一个"引用"、让极小改写
+ * 被误判成整条回退；而真正被引号包住的段落（含跨句引用）一旦被改写或删除，仍然照旧回退。
  */
 fun keepsProtectedContent(original: String, revised: String, protectedNames: List<String>): Boolean {
     if (quotedSpans(original) != quotedSpans(revised)) return false

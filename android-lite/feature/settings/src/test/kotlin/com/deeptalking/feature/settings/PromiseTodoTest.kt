@@ -153,6 +153,47 @@ class PromiseTodoTest {
     }
 
     @Test
+    fun aDayOnlyDueTimeLastsTheWholeDueDay() {
+        val dayLine = "8月10号我做饭给你吃"
+        val dayCharacter = character.copy(
+            instant = listOf(
+                ChatMessage(id = "m1", role = Role.User, content = dayLine, timestamp = sourceAt),
+                ChatMessage(id = "m2", role = Role.Assistant, content = charLine, timestamp = sourceAt),
+            ),
+        )
+        val promise = userPromise(due = "2026-08-10", value = dayLine).copy(evidence = dayLine)
+        // 当天 03:00：日期已经"到"了，但这一天还没过完。
+        val duringTheDueDay = LocalDateTime.parse("2026-08-10T03:00:00")
+            .atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+
+        val todo = promiseTodos(dayCharacter.copy(longTerm = listOf(promise)), duringTheDueDay).single()
+
+        // 只写到"日"的期限整天才算到期，不能从 00:00 起就显示"已超时"。
+        assertEquals(PromiseTodoSection.ONGOING, todo.section)
+        assertTrue(todo.dueIsDayOnly)
+        assertEquals("期限：2026-08-10", dueLabel(todo))
+
+        // 过了当天才算过期。
+        val afterTheDueDay = LocalDateTime.parse("2026-08-11T00:00:01")
+            .atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+        assertEquals(
+            PromiseTodoSection.OVERDUE,
+            promiseTodos(dayCharacter.copy(longTerm = listOf(promise)), afterTheDueDay).single().section,
+        )
+    }
+
+    @Test
+    fun aNonPushableRowNeverAsksTheUserToConfirmTheDate() {
+        // 不提醒的原因是承诺方不是用户：提示"去对话里说明日期"解决不了问题，也指错了方向。
+        val memory = userPromise().copy(promisor = "character", subject = MemorySubject.Character)
+
+        val todo = promiseTodos(character.copy(longTerm = listOf(memory)), beforeDue).single()
+
+        assertEquals(PromiseTodoSection.NOT_PUSHABLE, todo.section)
+        assertEquals("期限未确认", dueLabel(todo))
+    }
+
+    @Test
     fun recurringAgreementsNeverBecomeOverdue() {
         val nightly = userPromise(key = "每晚十点", value = "每晚十点我给他打电话")
 

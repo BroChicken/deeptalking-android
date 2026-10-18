@@ -276,6 +276,7 @@ data class LegacyLorebookEntry(
     @SerialName("order") val order: Int? = null,
     @SerialName("alwaysActive") val alwaysActive: Boolean? = null,
     @SerialName("origin") val origin: String? = null,
+    @SerialName("createdAt") val createdAt: String? = null,
     @SerialName("mentions") val mentions: Double? = null,
     @SerialName("lastMentionedAt") val lastMentionedAt: String? = null,
     @SerialName("misses") val misses: Double? = null,

@@ -12,9 +12,9 @@ package com.deeptalking.core.model
  * This helper applies only what a writer actually changed:
  *
  * - a scalar/list field is taken from [after] **only** when it differs from [before];
- * - [Character.lorebook] and each member's world book are merged **entry-wise** (keyed by
- *   entry id), so two writers that touch different entries both keep their work, and an
- *   entry added concurrently by someone else is not dropped;
+ * - [Character.lorebook], each member's world book, and the long-term memory list are merged
+ *   **entry-wise** (keyed by entry id), so two writers that touch different entries both keep
+ *   their work, and an entry added concurrently by someone else is not dropped;
  * - members are matched by id; every other field of a member follows the same rules.
  *
  * Additions are applied, changes are applied, and a removal is only applied when the
@@ -43,7 +43,7 @@ fun mergeCharacterChanges(before: Character, after: Character, live: Character):
         memoryRepairVersion = pick(before.memoryRepairVersion, after.memoryRepairVersion, live.memoryRepairVersion),
         revision = pick(before.revision, after.revision, live.revision),
         shortTerm = pick(before.shortTerm, after.shortTerm, live.shortTerm),
-        longTerm = pick(before.longTerm, after.longTerm, live.longTerm),
+        longTerm = mergeMemories(before.longTerm, after.longTerm, live.longTerm),
         instant = pick(before.instant, after.instant, live.instant),
         scenes = pick(before.scenes, after.scenes, live.scenes),
         stickers = pick(before.stickers, after.stickers, live.stickers),
@@ -86,6 +86,47 @@ internal fun mergeLorebook(
     return result
 }
 
+/**
+ * Entry-wise merge of a long-term memory list — the same rules as [mergeLorebook], keyed by id.
+ *
+ * Needed because a scalar-style `pick` on the list would let *any* writer that touched one
+ * memory (e.g. the promise-confirmation stamp) rewrite the whole list from its own snapshot and
+ * drop a memory a concurrent background pass had just written.
+ *
+ * Two pathological shapes deliberately fall back to the whole-list rule instead of guessing:
+ * a blank id (legacy rows that cannot be located) and a duplicated id (`associateBy` would
+ * silently collapse two distinct entries into one).
+ */
+internal fun mergeMemories(
+    before: List<LongTermMemory>,
+    after: List<LongTermMemory>,
+    live: List<LongTermMemory>,
+): List<LongTermMemory> {
+    if (before == after) return live
+    if (!isLocatable(before) || !isLocatable(after)) return after
+    val beforeById = before.associateBy { it.id }
+    val afterById = after.associateBy { it.id }
+    val result = live.toMutableList()
+    afterById.forEach { (id, item) ->
+        val index = result.indexOfFirst { it.id == id }
+        val previous = beforeById[id]
+        when {
+            index < 0 -> if (previous == null && !live.any { it.id == id }) result += item
+            previous != item -> result[index] = item
+            else -> Unit
+        }
+    }
+    val removed = beforeById.keys - afterById.keys
+    if (removed.isNotEmpty()) result.removeAll { it.id in removed }
+    return result
+}
+
+/** True when every entry carries a non-blank, unique id, so an entry-wise merge is well defined. */
+private fun isLocatable(items: List<LongTermMemory>): Boolean {
+    if (items.any { it.id.isBlank() }) return false
+    return items.map { it.id }.toSet().size == items.size
+}
+
 /** Member-wise merge: same rules one level down (including each member's world book). */
 internal fun mergeMembers(
     before: List<GroupMember>,
@@ -121,7 +162,7 @@ internal fun mergeMemberChanges(before: GroupMember, after: GroupMember, live: G
         dynamicState = pick(before.dynamicState, after.dynamicState, live.dynamicState),
         dynamicStateMeta = pick(before.dynamicStateMeta, after.dynamicStateMeta, live.dynamicStateMeta),
         shortTerm = pick(before.shortTerm, after.shortTerm, live.shortTerm),
-        longTerm = pick(before.longTerm, after.longTerm, live.longTerm),
+        longTerm = mergeMemories(before.longTerm, after.longTerm, live.longTerm),
         instant = pick(before.instant, after.instant, live.instant),
         pendingRecall = pick(before.pendingRecall, after.pendingRecall, live.pendingRecall),
         scenes = pick(before.scenes, after.scenes, live.scenes),

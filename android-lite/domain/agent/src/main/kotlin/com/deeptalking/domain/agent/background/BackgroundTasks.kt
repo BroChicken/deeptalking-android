@@ -1093,6 +1093,9 @@ class BackgroundTasks(
 
         // "写了几条 / 为什么没写 / 归档了哪些" must be answerable from the device: a refused
         // write used to be dropped on the floor. One combined note keeps the log readable.
+        // 单次淘汰上限（EVICT_MAX_PER_PASS）用尽时，`unmet` 里超出"可撤回的新建条目"的那部分
+        // 并没有被处理掉——如实报出来，不要让它看起来像已经收敛。
+        val stillOver = lorebookOverflow(working)
         val note = buildString {
             append("本次整理写入 $written 条（来源 ${fresh.size} 条短期记忆）")
             if (refused.isNotEmpty()) append("，跳过 ${refused.size} 条：${refused.joinToString("；").take(300)}")
@@ -1101,6 +1104,7 @@ class BackgroundTasks(
                 append(archived.joinToString("、") { it.name })
             }
             if (deferred > 0) append("；可淘汰条目已用尽，剩余 $deferred 条下次整理再写")
+            if (stillOver > 0) append("；本次淘汰已达单次上限，仍有 $stillOver 条超出上限")
         }
         onAuxiliaryNote("lorebook", note)
 
@@ -1738,8 +1742,9 @@ class BackgroundTasks(
         reply: String,
         userText: String,
         current: List<String>,
+        prevReplies: List<String> = emptyList(),
     ): List<String> {
-        val currentIssues = detectQuickReplyIssues(current, character, reply)
+        val currentIssues = detectQuickReplyIssues(current, character, reply, prevReplies)
         if (current.size >= 2 && currentIssues.isEmpty()) return current
         val fallback = listOf("嗯", "继续")
         val prompt = buildQuickReplyAsUserPrompt(character, reply)
@@ -1754,7 +1759,8 @@ class BackgroundTasks(
         if (raw.isBlank()) return fallback
         val list = ResponseParser.parseQuickReplyList(ResponseParser.parseJsonLenient(raw))
         if (list.size < 2) return fallback
-        if (detectQuickReplyIssues(list, character, reply).isNotEmpty()) return fallback
+        // 与录制路径同一套校验：修复稿若在复述角色自己前几轮的台词，同样是角色口吻，必须丢掉。
+        if (detectQuickReplyIssues(list, character, reply, prevReplies).isNotEmpty()) return fallback
         return list
     }
 
@@ -1776,15 +1782,16 @@ class BackgroundTasks(
         if (styleViolations.isNotEmpty()) {
             working = updateReplyMessage(working, reply) { it.copy(styleViolations = styleViolations) }
         }
+        val mirror = recentReplyTexts(working, QUICK_REPLY_GUARD.mirrorLookback)
         val issues = detectQuickReplyIssues(
             currentQuickReplies,
             working,
             reply,
             // 角色最近几轮自己说过的话：快速回应若在复述它们，就是在用角色的口吻说话。
-            recentReplyTexts(working, QUICK_REPLY_GUARD.mirrorLookback),
+            mirror,
         )
         if (quickReplyRepairEnabled && (currentQuickReplies.size < 2 || issues.isNotEmpty())) {
-            val repaired = repairQuickReplies(working, reply, userText, currentQuickReplies)
+            val repaired = repairQuickReplies(working, reply, userText, currentQuickReplies, mirror)
             working = updateReplyMessage(working, reply) { it.copy(quickReplyIssues = issues) }
             if (repaired.size >= 2 && repaired != currentQuickReplies) onQuickRepliesRepaired(repaired)
         }
@@ -2103,7 +2110,7 @@ class BackgroundTasks(
         const val PROSE_SYSTEM =
             "你是「对话记录整理助手」。下面是一次角色扮演交互（用户消息 + 角色回复），请整理成与主对话一致的标准 JSON，包含全部字段：" +
                 "{\"reply\":\"角色回复原文（一字不改）\",\"quickReplies\":[\"用户下一句1\",\"用户下一句2\"],\"shortTerm\":[{\"content\":\"从交互提取的本轮事件摘要，写明谁做了什么\",\"sourceMessageIds\":[\"<用户消息id>\"]}],\"longTerm\":[{\"category\":\"userProfile|relationship|events|promises|habits\",\"subject\":\"user|relationship|world\",\"key\":\"稳定标识\",\"value\":\"用户的具体事实（写明主体）\",\"tags\":[],\"importance\":1-10,\"sourceMessageIds\":[\"<用户消息id>\"],\"evidence\":\"用户原话\",\"promisor\":\"可选，约定的承诺方 user|character\",\"promisee\":\"可选，约定的受约方 user|character\"}],\"dynamicState\":{\"currentSituation\":{\"value\":\"当前处境\",\"sourceMessageIds\":[\"current_response\"],\"evidence\":\"回复中引原句\"},\"currentMood\":{\"value\":\"当前情绪\",\"sourceMessageIds\":[\"current_response\"],\"evidence\":\"概括回复原句\"},\"currentGoal\":{\"value\":\"当前目标\",\"sourceMessageIds\":[\"current_response\"],\"evidence\":\"回复中引原句\"}},\"staticFields\":{},\"memberDynamicState\":[],\"promiseUpdates\":[]}" +
-                "。规则：reply必须一字不改保留角色回复原文；quickReplies必须恰好两条用户可直接发送给角色的短句；所有记忆只能从这次交互中明确提取，不得凭空编造；dynamicState来源用current_response、evidence引用回复原句；shortTerm和longTerm的sourceMessageIds引用用户消息id；用户未明确陈述或表现的内容不要写入；无合格记忆返回空数组。记忆字段（shortTerm的content、longTerm的key与value）必须写明主体：涉及用户写“用户”，涉及角色写角色名，禁止“我/你/TA”这类指代不清的代词；时间一律写绝对日期（YYYY-MM-DD 或 YYYY-MM-DD 时段），禁止“明天/明晚/上周/上个月/三天后”这类相对时间词，用户用相对时间说法时改用timeRef：anchor 取 today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year（拿不准就省略它、直接写绝对日期），offsetDays 为相对 anchor 的天数（-60~60），weekday 取 mon/tue/wed/thu/fri/sat/sun，slot 取 深夜/凌晨/清晨/早晨/上午/中午/下午/傍晚/晚上/夜里，explicit 为绝对时间（填了它则忽略其余）。日期按事件真实发生的本地日历日写：00:00-02:00 发生的事写当天日期+“凌晨”（不要归到前一天晚上），也不要用“昨晚/昨天/今晚/刚刚”这类相对说法。staticFields 的 value 长度上限：短字段 40 字、叙述字段 120 字、背景故事 250 字（超长会被截断）。dynamicState与staticFields的值以段落式的陈述句书写（自然完整陈述句，简短段落），禁止括号注释或理由。key与value涉及群组成员时写具体成员名。只返回JSON对象，不要其他任何文字。"
+                "。规则：reply必须一字不改保留角色回复原文；quickReplies必须恰好两条用户可直接发送给角色的短句；所有记忆只能从这次交互中明确提取，不得凭空编造；dynamicState来源用current_response、evidence引用回复原句；shortTerm和longTerm的sourceMessageIds引用用户消息id；用户未明确陈述或表现的内容不要写入；无合格记忆返回空数组。记忆字段（shortTerm的content、longTerm的key与value）必须写明主体：涉及用户写“用户”，涉及角色写角色名，禁止“我/你/TA”这类指代不清的代词；时间一律写绝对日期（YYYY-MM-DD 或 YYYY-MM-DD 时段），禁止“明天/明晚/上周/上个月/三天后”这类相对时间词，用户用相对时间说法时改用timeRef：anchor 取 today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year（拿不准就省略它、直接写绝对日期），offsetDays 为相对 anchor 的天数（-60~60），weekday 取 mon/tue/wed/thu/fri/sat/sun，slot 取 深夜/凌晨/清晨/早晨/上午/中午/下午/傍晚/晚上/夜里，explicit 为绝对时间（填了它则忽略其余）。日期与时段按一天从 02:00 起算写（00:00-02:00 属于前一天的深夜），也不要用“昨晚/昨天/今晚/刚刚”这类相对说法。staticFields 的 value 长度上限：短字段 40 字、叙述字段 120 字、背景故事 250 字（超长会被截断）。dynamicState与staticFields的值以段落式的陈述句书写（自然完整陈述句，简短段落），禁止括号注释或理由。key与value涉及群组成员时写具体成员名。只返回JSON对象，不要其他任何文字。"
 
         const val SCENE_SYSTEM = "你是对话记录整理助手。只输出场景摘要正文，不要任何额外文字。"
 

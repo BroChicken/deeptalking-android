@@ -362,6 +362,16 @@ class StyleGuardTest {
     }
 
     @Test
+    fun aSingleQuotePairIsProtectedEvenWhenItSpansSentences() {
+        // 整段只有一对半角引号：那就是一段完整的引用，跨句（“。” 之后还有话）也要整段保护。
+        val original = "他说\"我来了。你等我。\"然后挂了电话。"
+        assertEquals(listOf("\"我来了。你等我。\""), quotedSpans(original))
+
+        assertFalse(keepsProtectedContent(original, "他说他要来，让我等他。然后挂了电话。", emptyList()))
+        assertTrue(keepsProtectedContent(original, "他只说了一句\"我来了。你等我。\"就挂了电话。", emptyList()))
+    }
+
+    @Test
     fun critiqueIsAcceptedWhenOnlyAnUnpairedQuoteRegionIsRewritten() {
         val original = "我回了一句\"好。 他把灯拧暗：\"早点睡。\""
         // 两处极小改写都落在孤立引号与下一个引号之间：不再整条回退。

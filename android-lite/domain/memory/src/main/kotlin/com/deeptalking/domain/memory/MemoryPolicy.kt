@@ -610,9 +610,10 @@ private const val MIN_SAME_EVENT_GRAMS = 16
  * field means "unknown", and unknown never blocks the merge, so entries imported without
  * `participants` / `location` keep the previous behaviour exactly.
  *
- * - **Place**: both locations are known and neither contains the other (so "卧室" vs
- *   "主卧" — one name inside the other — is still the same place). Different places in a
- *   single slot are different scenes.
+ * - **Place**: both locations are known and neither contains the other → different places.
+ *   (Note the containment test is literal: "主卧" vs "卧室" share no substring, so that pair
+ *   counts as *different* places and just keeps the two entries apart — the conservative
+ *   direction, no merge happens.) Different places in a single slot are different scenes.
  * - **People**: both casts are known and share nobody. Shared people mean the same scene
  *   kept going; a fully disjoint cast means a different moment. A shorter cast that is a
  *   subset of the longer one is *not* a difference — that is exactly the shape of a beat

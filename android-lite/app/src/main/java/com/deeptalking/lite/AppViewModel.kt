@@ -740,8 +740,13 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 // Background tasks own each member's world book; the card editor does not
                 // expose member books, so keep the live lists — a whole-list write would
                 // roll back an archive/consolidation that ran while the dialog was open.
+                // 成员按 **非空 id** 定位：id 为空（历史数据）时无法对应到实时行，原样保留
+                // 草稿——否则每个空 id 成员都会匹配到 `members[0]`，把第一个成员的世界书
+                // 复制到所有人身上。
                 members = draft.members.map { member ->
-                    val liveMember = live.members.firstOrNull { it.id == member.id } ?: return@map member
+                    val liveMember = member.id.takeIf { it.isNotBlank() }
+                        ?.let { id -> live.members.firstOrNull { it.id == id } }
+                        ?: return@map member
                     member.copy(
                         lorebook = liveMember.lorebook,
                         lorebookArchive = liveMember.lorebookArchive,
@@ -999,6 +1004,10 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     /** Restores an archived entry; if that overflows, the same capacity rule frees room. */
     fun restoreLorebookEntry(characterId: String, entryId: String) {
         patchCharacter(characterId) { live ->
+            // 本体页签只恢复**共享归档**里的条目：成员归档归成员那条路径
+            // （[restoreMemberLorebookEntry] 会先确认该成员确实拥有它），免得一个过期的
+            // 编辑器列表把成员条目悄悄恢复到本体的世界书里。
+            if (live.lorebookArchive.none { it.id == entryId }) return@patchCharacter live
             val restored = live.restoreArchivedLorebookEntry(entryId)
             if (restored == live) return@patchCharacter live
             val overflow = lorebookOverflow(restored)

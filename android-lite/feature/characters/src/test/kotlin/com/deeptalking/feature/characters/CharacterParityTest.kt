@@ -522,6 +522,25 @@ class CharacterParityTest {
     }
 
     @Test
+    fun restoringASharedEntryNeverEvictsTheRestoredEntryItself() {
+        val limit = AppLimits.Lorebook.ENTRIES
+        val idle = "2020-01-01T00:00:00Z"
+        // 共享书正好占满全局名额，归档里那条同样"最久未活跃"（id 排序还最靠前）。
+        val group = group(shared = (1..limit).map { entry("e$it", createdAt = idle) })
+            .copy(lorebookArchive = listOf(entry("back", createdAt = idle)))
+
+        val restored = CharacterParity.restoreLorebookEntry(group, "back")
+
+        // 恢复的条目留在书里，被淘汰的是 id 最小的 e1——不排除自身就会被立刻打回归档，
+        // 编辑器里表现为"点了恢复没反应"。
+        assertTrue(restored.lorebook.any { it.id == "back" })
+        assertEquals(listOf("e1"), restored.lorebookArchive.map { it.id })
+        assertEquals(limit, restored.lorebookCapacityCount())
+        // 共享归档里没有的 id 一律不动（成员归档走成员那条路径）。
+        assertEquals(group, CharacterParity.restoreLorebookEntry(group, "nope"))
+    }
+
+    @Test
     fun addingToAMemberBookArchivesTheGloballyOldestIntoItsOwnBook() {
         val limit = AppLimits.Lorebook.ENTRIES
         val group = group(

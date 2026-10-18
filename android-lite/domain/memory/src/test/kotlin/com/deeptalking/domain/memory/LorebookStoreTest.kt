@@ -287,6 +287,28 @@ class LorebookStoreTest {
     }
 
     @Test
+    fun replacingAnExistingEntryIsStillAllowedAtTheGlobalCeiling() {
+        // 满额时"新增"要拒收，但**改写一条已有条目**不增长条目数，必须照常放行。
+        val model = (1..AppLimits.Lorebook.ENTRIES).map {
+            LorebookEntry(id = "e$it", name = "n$it", content = "c", origin = LorebookOrigin.Model)
+        }
+        val character = Character(
+            id = "c1",
+            lorebook = model,
+            shortTerm = listOf(ShortTermMemory(id = "s1", content = "新增 内容")),
+        )
+        val (updated, result) = upsertLorebookEntryForCharacter(
+            character,
+            LorebookProposal("n1", "改过的内容"),
+            sourceShortTermIds = listOf("s1"),
+        )
+
+        assertTrue(result.ok)
+        assertEquals(AppLimits.Lorebook.ENTRIES, updated.lorebookCapacityCount())
+        assertEquals("改过的内容", updated.lorebook.first { it.id == "e1" }.content)
+    }
+
+    @Test
     fun manualEntriesDoNotCountTowardTheGlobalCapacity() {
         val manual = (1..AppLimits.Lorebook.ENTRIES).map {
             LorebookEntry(id = "u$it", name = "手工$it", content = "c", origin = LorebookOrigin.User)

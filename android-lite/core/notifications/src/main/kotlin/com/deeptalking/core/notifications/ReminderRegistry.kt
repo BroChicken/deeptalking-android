@@ -16,6 +16,13 @@ fun reminderWorkName(id: String): String = "deeptalking_reminder_$id"
 fun reminderNotificationTag(id: String): Int = id.hashCode()
 
 /**
+ * Tag carried by **every** reminder job. WorkManager itself is the only durable record of what
+ * is pending (the in-process [ReminderRegistry] is empty after a restart), so the tag is what
+ * lets [Reminders.cancelAll] retract jobs enqueued by an earlier run.
+ */
+const val REMINDER_WORK_TAG = "deeptalking_reminder_job"
+
+/**
  * In-process bookkeeping of the reminder ids that are currently *pending*: [Reminders.schedule]
  * registers, [Reminders.cancel] clears.
  *

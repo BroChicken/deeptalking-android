@@ -601,6 +601,11 @@ class LegacyMapperTest {
         assertEquals(listOf("arc1", "arc2"), restored.lorebookArchive.map { it.id })
         // Ownership (manual vs model) survives the round trip.
         assertEquals(LorebookOrigin.User, restored.lorebookArchive.first { it.id == "arc2" }.origin)
+        // `createdAt` is the eviction ranking key when `lastMentionedAt` is absent: an export that
+        // writes it but an import that drops it makes old entries sort as the newest.
+        assertEquals("2026-02-01T00:00:00Z", restored.lorebook.single().createdAt)
+        assertEquals("2020-01-01T00:00:00Z", restored.lorebookArchive.first { it.id == "arc1" }.createdAt)
+        assertNull(restored.lorebookArchive.first { it.id == "arc2" }.createdAt)
     }
 
     @Test
