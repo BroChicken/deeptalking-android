@@ -74,6 +74,10 @@ data class PromiseTodo(
     val dueAtMillis: Long?,
     /** The model's unconfirmed `dueAt`, ISO — shown only when [dueAtMillis] is null. */
     val unconfirmedDueAt: String?,
+    /** Owning character id, so a cross-character row can be resolved back to its store. */
+    val characterId: String = "",
+    /** Owning character name, shown only when the list spans more than one character. */
+    val characterName: String = "",
 )
 
 /**
@@ -102,7 +106,26 @@ fun isRecurringPromise(memory: LongTermMemory): Boolean {
 fun promiseTodos(character: Character, nowMillis: Long = System.currentTimeMillis()): List<PromiseTodo> =
     character.longTerm
         .mapNotNull { memory -> todoOf(character, memory, nowMillis) }
-        .sortedWith(compareBy({ it.section.ordinal }, { it.dueAtMillis ?: Long.MAX_VALUE }, { it.key }))
+        .sortedWith(TODO_ORDER)
+
+/**
+ * The 待办 view across **every** character: each character's rows concatenated, then ordered by
+ * the same rule as [promiseTodos] (section → due → key), with the owning character name/id as a
+ * final, stable tie-breaker. A single-character list is byte-for-byte the same order as before.
+ */
+fun promiseTodos(characters: List<Character>, nowMillis: Long = System.currentTimeMillis()): List<PromiseTodo> =
+    characters
+        .flatMap { character -> promiseTodos(character, nowMillis) }
+        .sortedWith(TODO_ORDER)
+
+private val TODO_ORDER: Comparator<PromiseTodo> = compareBy(
+    { it.section.ordinal },
+    { it.dueAtMillis ?: Long.MAX_VALUE },
+    { it.key },
+    { it.characterName },
+    { it.characterId },
+    { it.id },
+)
 
 private fun todoOf(character: Character, memory: LongTermMemory, nowMillis: Long): PromiseTodo? {
     if (memory.category != MemoryCategory.Promises || memory.status != PromiseStatus.Active) return null
@@ -119,6 +142,33 @@ private fun todoOf(character: Character, memory: LongTermMemory, nowMillis: Long
             memory.dueAt?.trim()?.takeIf { it.isNotEmpty() }
         } else {
             null
+        },
+        characterId = character.id,
+        characterName = character.name,
+    )
+}
+
+/**
+ * Flips [promiseId] out of `Active` on [character] (完成/关闭 from the 待办 list), returning the
+ * updated character — or null when it is not an active promise of that character. Pure: the
+ * caller resolves the row's owning character and persists the result, so a flip on one character
+ * can never touch another's promises.
+ */
+fun resolvePromiseIn(
+    character: Character,
+    promiseId: String,
+    status: PromiseStatus,
+    nowIso: String,
+): Character? {
+    if (promiseId.isBlank() || status == PromiseStatus.Active) return null
+    if (character.longTerm.none { it.id == promiseId && it.status == PromiseStatus.Active }) return null
+    return character.copy(
+        longTerm = character.longTerm.map { memory ->
+            if (memory.id != promiseId) {
+                memory
+            } else {
+                memory.copy(status = status, updatedAt = nowIso, notifiedAt = null)
+            }
         },
     )
 }

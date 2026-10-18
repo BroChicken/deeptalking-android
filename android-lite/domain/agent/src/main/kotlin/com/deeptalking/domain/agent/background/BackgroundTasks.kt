@@ -127,62 +127,32 @@ private data class PreparedPoint(
     val location: String,
 )
 
-private val META_TALK_REGEX = Regex(
-    "(好的|收到|明白|知道了)[，,。、]?\\s*(我)?(会|改成|改用|调整|照做|注意|这样(说话|说))|以后我(就)?(用|按)这(种|个)(方式|语气)|我(会)?照你说的(来|说|做)",
-)
+/**
+ * Non-null overload kept for its callers (the class shim and `Prompts.kt`); it forwards
+ * to the single implementation in `StyleGuard.kt`. Both used to carry their own copy of
+ * the checks, so a rule added to one of them silently did not apply to the other path.
+ */
+fun detectStyleViolations(reply: String, character: Character, previousReplies: List<String>): List<String> =
+    detectStyleViolationsFor(reply, character, previousReplies)
 
-fun detectStyleViolations(reply: String, character: Character, previousReplies: List<String>): List<String> {
-    val text = reply
-    val hits = mutableListOf<String>()
-    if (text.trim().isEmpty()) return hits
-    val address = com.deeptalking.domain.agent.prompts.normalizeUserAddress(character.staticProfile.userAddress)
-
-    if (META_TALK_REGEX.containsMatchIn(text)) hits += "metaTalk"
-
-    val safeAddress = address.replace(Regex("[^0-9A-Za-z\\u4e00-\\u9fff]"), "")
-    val quotedLine = if (safeAddress.isNotEmpty()) {
-        Regex("(^|\\n)\\s*(用户|$safeAddress|你)\\s*[：:]\\s*[「『“\"]")
-    } else {
-        Regex("(^|\\n)\\s*(用户|你)\\s*[：:]\\s*[「『“\"]")
-    }
-    if (quotedLine.containsMatchIn(text)) hits += "speaksForUser"
-
-    if (STYLE_CLICHES.any { text.contains(it) }) hits += "cliche"
-
-    val priors = previousReplies.filter { it.isNotEmpty() }
-    if (priors.isNotEmpty()) {
-        val currentEnding = extractReplyEnding(text)
-        if (currentEnding.isNotEmpty() && priors.any { extractReplyEnding(it) == currentEnding }) {
-            hits += "reusedImagery"
-        } else {
-            val names = listOf(address, character.name).filter { it.isNotEmpty() }
-            val strippedCurrent = names.fold(text) { value, name -> value.replace(name, " ") }
-            val strippedPriors = priors.map { prior -> names.fold(prior) { value, name -> value.replace(name, " ") } }
-            if (sharesDistinctivePhrase(strippedCurrent, strippedPriors)) hits += "reusedImagery"
-        }
-    }
-
-    if (isSentenceLengthUniform(text)) hits += "toneDrift"
-
-    val recitedLore = character.lorebook.any { entry ->
-        val name = entry.name.trim()
-        if (name.length < 2 || !text.contains(name)) {
-            false
-        } else {
-            val content = entry.content.trim()
-            content.length >= 12 && text.contains(content.take(12))
-        }
-    }
-    if (recitedLore) hits += "recitedLore"
-
-    return hits.distinct()
-}
-
-fun detectQuickReplyIssues(replies: List<String>, character: Character, replyText: String): List<String> {
+fun detectQuickReplyIssues(
+    replies: List<String>,
+    character: Character,
+    replyText: String,
+    /**
+     * The character's own recent replies. `mirrored` compares against **this turn's reply
+     * and these** — a quick reply that echoes what the character said a turn ago is the
+     * character's line, not the user's, and seeing only the current reply missed it.
+     */
+    previousReplies: List<String> = emptyList(),
+): List<String> {
     val list = replies.map { it.trim() }.filter { it.isNotEmpty() }
     val hits = mutableListOf<String>()
     if (list.size < 2) hits += "missing"
-    val spoken = replyText.replace(Regex("\\s+"), "")
+    // 比对源：本轮回复 + 角色最近几轮回复（都去掉空白，按"整段包含 + 8 字中文 n-gram"判）。
+    val spoken = (listOf(replyText) + previousReplies)
+        .map { it.replace(Regex("\\s+"), "") }
+        .filter { it.isNotEmpty() }
     val charName = character.name.trim()
     list.forEach { line ->
         val compact = line.replace(Regex("\\s+"), "")
@@ -199,7 +169,7 @@ fun detectQuickReplyIssues(replies: List<String>, character: Character, replyTex
             charName.length >= 2 && line.contains(charName) ->
                 hits += "characterName"
 
-            compact.length >= 4 && spoken.contains(compact) ->
+            compact.length >= 4 && spoken.any { it.contains(compact) } ->
                 hits += "mirrored"
 
             else -> {
@@ -208,7 +178,7 @@ fun detectQuickReplyIssues(replies: List<String>, character: Character, replyTex
                     var found = false
                     while (i + QUICK_REPLY_GUARD.mirrorChars <= compact.length && !found) {
                         val chunk = compact.substring(i, i + QUICK_REPLY_GUARD.mirrorChars)
-                        if (chunk.all { it in '\u4e00'..'\u9fff' } && spoken.contains(chunk)) found = true
+                        if (chunk.all { it in '\u4e00'..'\u9fff' } && spoken.any { it.contains(chunk) }) found = true
                         i += 2
                     }
                     if (found) hits += "mirrored"
@@ -400,8 +370,9 @@ class BackgroundTasks(
         replies: List<String>,
         character: Character,
         replyText: String,
+        previousReplies: List<String> = emptyList(),
     ): List<String> =
-        com.deeptalking.domain.agent.background.detectQuickReplyIssues(replies, character, replyText)
+        com.deeptalking.domain.agent.background.detectQuickReplyIssues(replies, character, replyText, previousReplies)
 
     /**
      * Extracts new short-term events from the live instant window (legacy
@@ -1713,10 +1684,12 @@ class BackgroundTasks(
         onStatus("正在校正文风…")
         val original = reply
         if (original.trim().isEmpty()) return original
-        val violations = detectStyleViolations(
-            original,
-            character,
-            recentReplyTexts(character, STYLE_GUARD.lookbackReplies),
+        val violations = actionableStyleViolations(
+            detectStyleViolations(
+                original,
+                character,
+                recentReplyTexts(character, STYLE_GUARD.lookbackReplies),
+            ),
         )
         if (violations.isEmpty()) return original
         return critiqueWithViolations(character, original, violations)
@@ -1803,7 +1776,13 @@ class BackgroundTasks(
         if (styleViolations.isNotEmpty()) {
             working = updateReplyMessage(working, reply) { it.copy(styleViolations = styleViolations) }
         }
-        val issues = detectQuickReplyIssues(currentQuickReplies, working, reply)
+        val issues = detectQuickReplyIssues(
+            currentQuickReplies,
+            working,
+            reply,
+            // 角色最近几轮自己说过的话：快速回应若在复述它们，就是在用角色的口吻说话。
+            recentReplyTexts(working, QUICK_REPLY_GUARD.mirrorLookback),
+        )
         if (quickReplyRepairEnabled && (currentQuickReplies.size < 2 || issues.isNotEmpty())) {
             val repaired = repairQuickReplies(working, reply, userText, currentQuickReplies)
             working = updateReplyMessage(working, reply) { it.copy(quickReplyIssues = issues) }

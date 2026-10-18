@@ -54,6 +54,16 @@ object Reminders {
         ReminderRegistry.unregister(id)
     }
 
+    /**
+     * Retracts **every** reminder this process knows about (a snapshot of [ReminderRegistry]).
+     * Used after an import/restore *replaces* the whole data set: without it, a reminder
+     * scheduled for a promise that no longer exists would still fire ("数据里没这条承诺，
+     * 通知却响了"). Iterating a copy is deliberate — [cancel] mutates the registry.
+     */
+    fun cancelAll(context: Context) {
+        ReminderRegistry.scheduledIds().forEach { cancel(context, it) }
+    }
+
     fun post(context: Context, id: String, title: String, text: String) {
         NotificationChannels.ensure(context)
 

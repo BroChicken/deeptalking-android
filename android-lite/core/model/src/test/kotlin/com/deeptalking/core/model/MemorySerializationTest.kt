@@ -1,8 +1,10 @@
 package com.deeptalking.core.model
 
 import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -39,5 +41,56 @@ class MemorySerializationTest {
         val item = json.decodeFromString(ShortTermMemory.serializer(), payload)
         assertEquals(1, item.userEvidence.size)
         assertEquals("用户喜欢咖啡", item.userEvidence.first().text)
+    }
+
+    @Test
+    fun `legacy object-shaped correction before parses to the old value text`() {
+        // The WebView wrote `before` as the whole pre-correction field object; reading it as a
+        // primitive used to throw and drop the character on import.
+        val payload = """
+            {"id":"m1","category":"userProfile","key":"k","value":"v",
+             "corrections":[{"at":"2026-01-01T00:00:00Z","evidence":"用户纠正",
+               "before":{"value":"旧内容","subject":"user","key":"k","promisor":"user",
+                         "promisee":"character","eventTime":null,"dueAt":null}}]}
+        """.trimIndent()
+        val item = json.decodeFromString(LongTermMemory.serializer(), payload)
+        assertEquals(1, item.corrections.size)
+        assertEquals("旧内容", item.corrections.single().before)
+        assertEquals("用户纠正", item.corrections.single().evidence)
+    }
+
+    @Test
+    fun `bare string correction before still parses and round-trips`() {
+        val payload = """{"id":"m1","category":"userProfile","key":"k","value":"v","corrections":[{"before":"旧文本"}]}"""
+        val item = json.decodeFromString(LongTermMemory.serializer(), payload)
+        assertEquals("旧文本", item.corrections.single().before)
+
+        val encoded = Json.encodeToString(LongTermMemory.serializer(), item)
+        val back = json.decodeFromString(LongTermMemory.serializer(), encoded)
+        assertEquals("旧文本", back.corrections.single().before)
+    }
+
+    @Test
+    fun `object-shaped before without a value keeps the raw object text`() {
+        val payload = """{"id":"m1","corrections":[{"before":{"subject":"user"}}]}"""
+        val item = json.decodeFromString(LongTermMemory.serializer(), payload)
+        assertTrue(item.corrections.single().before!!.contains("subject"))
+    }
+
+    @Test
+    fun `corrections serialize before as a plain string`() {
+        val item = LongTermMemory(
+            id = "m1",
+            corrections = listOf(MemoryCorrection(at = "t", evidence = "e", before = "旧值")),
+        )
+        val encoded = Json.encodeToString(LongTermMemory.serializer(), item)
+        assertTrue(encoded.contains("\"before\":\"旧值\""))
+    }
+
+    @Test
+    fun `missing before decodes to null and legacy without the field keeps working`() {
+        val payload = """{"id":"m1","corrections":[{"at":"t","evidence":"e"}]}"""
+        val item = json.decodeFromString(LongTermMemory.serializer(), payload)
+        assertNull(item.corrections.single().before)
     }
 }

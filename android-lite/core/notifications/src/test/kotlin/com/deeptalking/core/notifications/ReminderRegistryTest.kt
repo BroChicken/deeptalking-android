@@ -46,6 +46,25 @@ class ReminderRegistryTest {
     }
 
     @Test
+    fun `cancel-all style sweep empties the registry and keeps it reusable`() {
+        ReminderRegistry.register("bulk-1")
+        ReminderRegistry.register("bulk-2")
+        ReminderRegistry.register("bulk-3")
+        assertEquals(3, ReminderRegistry.scheduledIds().size)
+
+        // Exactly what Reminders.cancelAll does: iterate a snapshot and cancel each id
+        // (unregistering while iterating must not disturb the iteration).
+        ReminderRegistry.scheduledIds().toList().forEach { ReminderRegistry.unregister(it) }
+        assertTrue("导入替换数据后不得留下任何旧提醒", ReminderRegistry.scheduledIds().isEmpty())
+
+        // The registry stays usable: new reminders schedule normally afterwards.
+        ReminderRegistry.register("after-import")
+        assertEquals(setOf("after-import"), ReminderRegistry.scheduledIds())
+        ReminderRegistry.unregister("after-import")
+        assertTrue(ReminderRegistry.scheduledIds().isEmpty())
+    }
+
+    @Test
     fun `blank ids are ignored`() {
         ReminderRegistry.register("   ")
         assertFalse(ReminderRegistry.isScheduled(""))

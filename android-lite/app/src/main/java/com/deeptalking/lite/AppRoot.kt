@@ -287,8 +287,12 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                         onDiscoverTtsRemote = vm::discoverTtsServer,
                         onUploadTtsVoices = vm::uploadVoicesToRemote,
                         promiseTodos = promiseTodos,
-                        onCompletePromise = { vm.resolvePromise(it, com.deeptalking.core.model.PromiseStatus.Resolved) },
-                        onClosePromise = { vm.resolvePromise(it, com.deeptalking.core.model.PromiseStatus.Cancelled) },
+                        onCompletePromise = { characterId, promiseId ->
+                            vm.resolvePromise(characterId, promiseId, com.deeptalking.core.model.PromiseStatus.Resolved)
+                        },
+                        onClosePromise = { characterId, promiseId ->
+                            vm.resolvePromise(characterId, promiseId, com.deeptalking.core.model.PromiseStatus.Cancelled)
+                        },
                     )
                 }
             }

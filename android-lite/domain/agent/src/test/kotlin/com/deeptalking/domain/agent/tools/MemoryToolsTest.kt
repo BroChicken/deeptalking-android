@@ -88,6 +88,44 @@ class MemoryToolsTest {
     }
 
     @Test
+    fun `update_memory records the previous value text as the correction before`() = runBlocking {
+        val character = Character(
+            id = "c1",
+            instant = listOf(userTurn("m1", "我叫阿哲")),
+            longTerm = listOf(mem("m1", key = "名字", value = "用户叫小明")),
+        )
+        val args = """{"id":"m1","value":"用户叫阿哲","sourceMessageIds":["m1"],"evidence":"我叫阿哲"}"""
+        val result = UpdateMemoryTool(memory).execute(call("update_memory", args), context(character))
+
+        assertTrue(result.contentJson.contains("\"ok\":true"))
+        val correction = result.updatedCharacter!!.longTerm.first { it.id == "m1" }.corrections.single()
+        // `before` is the old *text*, not a JSON blob.
+        assertEquals("用户叫小明", correction.before)
+        assertEquals("我叫阿哲", correction.evidence)
+        assertTrue("不能再写整条 JSON blob", !correction.before!!.contains("{"))
+    }
+
+    @Test
+    fun `update_memory keeps only the last three corrections`() = runBlocking {
+        var current = Character(
+            id = "c1",
+            instant = listOf(userTurn("m1", "我叫阿哲")),
+            longTerm = listOf(mem("m1", key = "名字", value = "用户叫小明")),
+        )
+        val tool = UpdateMemoryTool(memory)
+        val args = """{"id":"m1","value":"用户叫阿哲","sourceMessageIds":["m1"],"evidence":"我叫阿哲"}"""
+        repeat(4) {
+            current = tool.execute(call("update_memory", args), context(current)).updatedCharacter!!
+            assertTrue(current.longTerm.first { it.id == "m1" }.corrections.size <= 3)
+        }
+        val corrections = current.longTerm.first { it.id == "m1" }.corrections
+        assertEquals(3, corrections.size)
+        // The oldest correction (the original 用户叫小明) fell off; the last three kept the
+        // value that was current when each of them was written.
+        assertEquals("用户叫阿哲", corrections.first().before)
+    }
+
+    @Test
     fun `update_memory rejects evidence that is not verbatim in the user message`() = runBlocking {
         val character = Character(
             id = "c1",

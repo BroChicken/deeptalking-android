@@ -27,26 +27,30 @@ import androidx.compose.ui.unit.sp
 import com.deeptalking.core.designsystem.legacy
 
 /**
- * The 待办 list: the active character's promises, bucketed by [PromiseTodoSection].
+ * The 待办 list: **every** character's promises, bucketed by [PromiseTodoSection].
  *
- * It is a *view* only — 完成/关闭 are handed back through [onComplete]/[onClose], which flip the
- * promise's status and retract its reminder. No section removes anything: a 已超时 or 不提醒
- * agreement stays visible in its own bucket and stays stored in memory.
+ * It is a *view* only — 完成/关闭 are handed back through [onComplete]/[onClose] as
+ * `(characterId, promiseId)`, which flip the promise's status and retract its reminder. No
+ * section removes anything: a 已超时 or 不提醒 agreement stays visible in its own bucket and
+ * stays stored in memory.
  *
  * The two trailing buckets (已超时, 不提醒) start collapsed so the page stays scannable; the live
- * buckets (进行中 / 待确认期限 / 周期性) are always shown.
+ * buckets (进行中 / 待确认期限 / 周期性) are always shown. When the list spans more than one
+ * character each row also shows its owning character name (muted, small).
  */
 @Composable
 fun PromiseTodoList(
     todos: List<PromiseTodo>,
-    onComplete: (String) -> Unit,
-    onClose: (String) -> Unit,
+    onComplete: (characterId: String, promiseId: String) -> Unit,
+    onClose: (characterId: String, promiseId: String) -> Unit,
 ) {
     val legacy = MaterialTheme.legacy
     // Hoisted out of the loop: a `remember` inside it would be recycled onto whichever bucket
     // lands in that slot when a bucket empties (overdue items appearing/disappearing).
     var overdueExpanded by remember { mutableStateOf(false) }
     var notPushableExpanded by remember { mutableStateOf(false) }
+    // Only disambiguate by character when there is more than one to disambiguate.
+    val showCharacter = todos.map { it.characterId }.distinct().size > 1
 
     Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text("待办约定", fontSize = 12.sp, color = legacy.textMuted)
@@ -87,14 +91,24 @@ fun PromiseTodoList(
             }
             if (!expanded) return@forEach
             items.forEach { todo ->
-                PromiseTodoRow(todo, onComplete = { onComplete(todo.id) }, onClose = { onClose(todo.id) })
+                PromiseTodoRow(
+                    todo = todo,
+                    showCharacter = showCharacter,
+                    onComplete = { onComplete(todo.characterId, todo.id) },
+                    onClose = { onClose(todo.characterId, todo.id) },
+                )
             }
         }
     }
 }
 
 @Composable
-private fun PromiseTodoRow(todo: PromiseTodo, onComplete: () -> Unit, onClose: () -> Unit) {
+private fun PromiseTodoRow(
+    todo: PromiseTodo,
+    showCharacter: Boolean,
+    onComplete: () -> Unit,
+    onClose: () -> Unit,
+) {
     val legacy = MaterialTheme.legacy
     Column(
         modifier = Modifier
@@ -105,6 +119,9 @@ private fun PromiseTodoRow(todo: PromiseTodo, onComplete: () -> Unit, onClose: (
             .padding(horizontal = 8.dp, vertical = 6.dp),
         verticalArrangement = Arrangement.spacedBy(2.dp),
     ) {
+        if (showCharacter && todo.characterName.isNotBlank()) {
+            Text(todo.characterName, fontSize = 10.sp, color = legacy.textMuted)
+        }
         Text(todo.key.ifBlank { "（无标题）" }, fontSize = 13.sp, color = legacy.text)
         if (todo.value.isNotBlank()) {
             Text(todo.value, fontSize = 11.sp, color = legacy.textMuted, maxLines = 3)

@@ -402,6 +402,10 @@ class BackupService(
         memory.updatedAt?.let { put("updatedAt", it) }
         memory.lastRecalled?.let { put("lastRecalled", it) }
         put("recallCount", memory.recallCount)
+        // Native-only confirmation marker: round-trips so a restore keeps a promise out of
+        // 「不提醒」 without needing the (possibly long-gone) citing messages.
+        memory.pushConfirmedAt?.let { put("pushConfirmedAt", it) }
+        memory.pushConfirmedDueAt?.let { put("pushConfirmedDueAt", it) }
         if (memory.participants.isNotEmpty()) {
             putJsonArray("participants") { memory.participants.forEach { add(it) } }
         }

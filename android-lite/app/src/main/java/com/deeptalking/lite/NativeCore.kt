@@ -1166,6 +1166,14 @@ class NativeCore(context: Context) {
     }
 
     /**
+     * Retracts every pending reminder. Called after an import/restore replaces the whole
+     * data set, so a reminder for a promise that no longer exists cannot still fire.
+     */
+    fun cancelAllReminders() {
+        com.deeptalking.core.notifications.Reminders.cancelAll(appContext)
+    }
+
+    /**
      * Builds a per-turn orchestrator using the current config snapshot so model,
      * base URL, temperature and stream settings always reflect the latest
      * choices from Settings. Background tasks (prose memory extraction, style

@@ -250,12 +250,25 @@ internal fun parseCorrections(element: JsonElement): List<MemoryCorrection> = wh
             is JsonObject -> MemoryCorrection(
                 at = item["at"]?.jsonPrimitive?.contentOrNull,
                 evidence = item["evidence"]?.jsonPrimitive?.contentOrNull.orEmpty(),
-                before = item["before"]?.jsonPrimitive?.contentOrNull,
+                before = parseCorrectionBefore(item["before"]),
             )
             else -> null
         }
     }
     else -> emptyList()
+}
+
+/**
+ * Reads one `corrections[].before` value. The WebView wrote the **pre-correction field
+ * object** (`{value,subject,key,promisor,promisee,eventTime,dueAt}`), while native exports
+ * wrote the plain old text. A `JsonObject` therefore degrades to its `value` (the old text),
+ * falling back to the raw object text when there is no `value`.
+ */
+private fun parseCorrectionBefore(element: JsonElement?): String? = when (element) {
+    null, is JsonNull -> null
+    is JsonPrimitive -> element.contentOrNull
+    is JsonObject -> (element["value"] as? JsonPrimitive)?.contentOrNull ?: element.toString()
+    else -> element.toString()
 }
 
 /** Per-field dynamic-state bookkeeping (legacy `dynamicStateMeta[key] = { updatedAt }`). */
@@ -407,6 +420,17 @@ data class LongTermMemory(
     val recallCount: Int = 0,
     /** When a due-reminder notification was posted for this promise (native `set_reminder` firing). */
     val notifiedAt: String? = null,
+    /**
+     * When the strict push gate ([com.deeptalking.domain.memory.promisePushDecision]) last passed
+     * for this promise, ISO. The confirmation conclusion is persisted so that once the citing
+     * messages slide out of the live window the promise does not degrade into 「不提醒」.
+     */
+    val pushConfirmedAt: String? = null,
+    /**
+     * The `dueAt` string that was confirmed alongside [pushConfirmedAt]. A change to [dueAt]
+     * invalidates the confirmation (the marker is ignored and the strict gate re-runs).
+     */
+    val pushConfirmedDueAt: String? = null,
     /** Event participants, for identity/merge (legacy `participants`). */
     val participants: List<String> = emptyList(),
     /** Event location, for identity/merge (legacy `location`). */

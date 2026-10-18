@@ -236,6 +236,10 @@ data class LegacyLongTerm(
     @SerialName("updatedAt") val updatedAt: String? = null,
     @SerialName("lastRecalled") val lastRecalled: String? = null,
     @SerialName("recallCount") val recallCount: Int? = null,
+    /** Native-only: when the strict push gate last passed for this promise (oracle for 待办). */
+    @SerialName("pushConfirmedAt") val pushConfirmedAt: String? = null,
+    /** Native-only: the `dueAt` string confirmed together with `pushConfirmedAt`. */
+    @SerialName("pushConfirmedDueAt") val pushConfirmedDueAt: String? = null,
     @SerialName("participants") val participants: List<String>? = null,
     @SerialName("location") val location: String? = null,
     @SerialName("learnedBonus") val learnedBonus: Double? = null,

@@ -276,4 +276,70 @@ class PromiseTodoTest {
 
         assertEquals(listOf("a", "c"), activePromiseIds(character))
     }
+
+    // ---- confirmed promises whose sources are gone, and the cross-character list ----------
+
+    @Test
+    fun confirmedPromiseWhoseSourcesAreGoneStaysOngoing() {
+        // The citing messages have slid out of the window: nothing resolves the sources any more.
+        val gone = Character(id = "c1", name = "小夏")
+        val memory = userPromise().copy(
+            pushConfirmedAt = "2026-08-09T12:00:00Z",
+            pushConfirmedDueAt = dueAt,
+        )
+
+        val todo = promiseTodos(gone.copy(longTerm = listOf(memory)), beforeDue).single()
+
+        assertEquals(PromiseTodoSection.ONGOING, todo.section)
+        assertEquals(at(dueAt), todo.dueAtMillis)
+    }
+
+    @Test
+    fun crossCharacterListAggregatesAllCharactersWithStableOrdering() {
+        val a = character.copy(
+            id = "cA",
+            name = "甲",
+            longTerm = listOf(
+                userPromise(id = "a-future", key = "b任务"),
+                userPromise(id = "a-nodue", key = "c任务", due = null),
+            ),
+        )
+        val b = character.copy(
+            id = "cB",
+            name = "乙",
+            longTerm = listOf(userPromise(id = "b-nodue", key = "a任务", due = null)),
+        )
+
+        val todos = promiseTodos(listOf(a, b), beforeDue)
+
+        // 同一分区内：先按期限（有期限在前），再按 key。
+        assertEquals(listOf("a-future", "b-nodue", "a-nodue"), todos.map { it.id })
+        assertEquals(listOf("cA", "cB", "cA"), todos.map { it.characterId })
+        assertEquals(listOf("甲", "乙", "甲"), todos.map { it.characterName })
+    }
+
+    @Test
+    fun singleCharacterListStillCarriesItsOwningCharacter() {
+        val todo = promiseTodos(character.copy(longTerm = listOf(userPromise())), beforeDue).single()
+        assertEquals("c1", todo.characterId)
+        assertEquals("小夏", todo.characterName)
+    }
+
+    @Test
+    fun resolvingOnOneCharacterLeavesTheOtherUntouched() {
+        val before = character.copy(id = "cA", name = "甲", longTerm = listOf(userPromise(id = "p1")))
+        // Same promise id on a different character: must not be affected by the flip.
+        val other = character.copy(id = "cB", name = "乙", longTerm = listOf(userPromise(id = "p1")))
+
+        val after = resolvePromiseIn(before, "p1", PromiseStatus.Resolved, "2026-08-09T13:00:00Z")!!
+        assertEquals(PromiseStatus.Resolved, after.longTerm.single().status)
+        assertEquals("2026-08-09T13:00:00Z", after.longTerm.single().updatedAt)
+        assertNull(after.longTerm.single().notifiedAt)
+        assertEquals(PromiseStatus.Active, other.longTerm.single().status)
+
+        // No-ops: unknown id, an already-non-active promise, or a flip to Active.
+        assertNull(resolvePromiseIn(other, "nope", PromiseStatus.Resolved, "t"))
+        assertNull(resolvePromiseIn(other, "p1", PromiseStatus.Active, "t"))
+        assertNull(resolvePromiseIn(before.copy(longTerm = listOf(userPromise(id = "p1", status = PromiseStatus.Cancelled))), "p1", PromiseStatus.Resolved, "t"))
+    }
 }

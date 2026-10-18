@@ -184,10 +184,12 @@ class UpdateMemoryTool(private val memory: MemoryService) : AgentTool {
                 // replaced value in the corrections history (legacy `applyMemoryUpdate`).
                 conflicts = emptyList(),
                 conflictedAt = null,
-                corrections = (old.corrections.takeLast(2) + com.deeptalking.core.model.MemoryCorrection(
+                corrections = (old.corrections.takeLast(3) + com.deeptalking.core.model.MemoryCorrection(
                     at = updatedAt,
                     evidence = evidence,
-                    before = beforeSnapshotJson(old),
+                    // 改写前那条记忆的旧内容（旧 WebView 这里存的是整条字段对象，
+                    // 原生只保留"旧值文本"，与 MemoryCorrection.before 的语义一致）。
+                    before = old.value,
                 )).takeLast(3),
             )
             next
@@ -217,15 +219,4 @@ class UpdateMemoryTool(private val memory: MemoryService) : AgentTool {
         "world" -> MemorySubject.World
         else -> null
     }
-
-    /** Legacy `beforeSnapshot`: the pre-correction field values as JSON. */
-    private fun beforeSnapshotJson(old: LongTermMemory): String = buildJsonObject {
-        put("value", old.value)
-        put("subject", old.subject.name.lowercase())
-        put("key", old.key)
-        if (old.promisor != null) put("promisor", old.promisor) else put("promisor", kotlinx.serialization.json.JsonNull)
-        if (old.promisee != null) put("promisee", old.promisee) else put("promisee", kotlinx.serialization.json.JsonNull)
-        if (old.eventTime != null) put("eventTime", old.eventTime) else put("eventTime", kotlinx.serialization.json.JsonNull)
-        if (old.dueAt != null) put("dueAt", old.dueAt) else put("dueAt", kotlinx.serialization.json.JsonNull)
-    }.toString()
 }

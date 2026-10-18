@@ -687,6 +687,52 @@ class LegacyMapperTest {
     }
 
     @Test
+    fun legacyObjectShapedCorrectionBeforeDoesNotDropTheCharacter() = runTest {
+        // A real old-WebView shape: `corrections[].before` is the pre-correction *field object*.
+        // Reading it as a primitive used to throw, so the whole character was skipped silently.
+        val legacy = """
+        {
+          "characters": {
+            "c1": {
+              "id": "c1",
+              "entityType": "character",
+              "basicInfo": { "name": "Aria" },
+              "memory": {
+                "longTerm": {
+                  "promises": [
+                    { "id": "lt1", "key": "k", "value": "v", "promisor": "user",
+                      "corrections": [
+                        { "at": "2026-01-01T00:00:00.000Z", "evidence": "用户纠正",
+                          "before": { "value": "旧值", "subject": "user", "key": "k",
+                                      "promisor": "user", "promisee": "character",
+                                      "eventTime": null, "dueAt": null } }
+                      ] }
+                  ]
+                }
+              }
+            }
+          }
+        }
+        """.trimIndent()
+
+        val dao = FakeCharacterDao()
+        val summary = LegacyImportService(
+            CharacterRepository(dao),
+            ChatRepository(FakeMessageDao()),
+            ConfigRepository(FakeConfigDao()),
+            null,
+        ).importJson(legacy)
+
+        assertEquals("整只角色不能被静默丢弃", 0, summary.skipped)
+        assertEquals(1, summary.characters)
+        val stored = CharacterRepository(dao).get("c1")!!
+        assertEquals("Aria", stored.name)
+        val correction = stored.longTerm.single().corrections.single()
+        assertEquals("旧值", correction.before)
+        assertEquals("用户纠正", correction.evidence)
+    }
+
+    @Test
     fun legacyStringUserEvidenceStillDecodes() {
         val dto = parse(
             """{ "characters": { "c1": { "memory": { "shortTerm": [ { "id": "st1", "userEvidence": "legacy string" } ] } } } }""",

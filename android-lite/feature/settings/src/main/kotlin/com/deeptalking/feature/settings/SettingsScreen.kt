@@ -144,8 +144,8 @@ fun SettingsScreen(
     onDiscoverTtsRemote: () -> Unit = {},
     onUploadTtsVoices: () -> Unit = {},
     promiseTodos: List<PromiseTodo> = emptyList(),
-    onCompletePromise: (String) -> Unit = {},
-    onClosePromise: (String) -> Unit = {},
+    onCompletePromise: (characterId: String, promiseId: String) -> Unit = { _, _ -> },
+    onClosePromise: (characterId: String, promiseId: String) -> Unit = { _, _ -> },
 ) {
     val context = LocalContext.current
     val legacy = MaterialTheme.legacy

@@ -21,6 +21,13 @@ object QUICK_REPLY_GUARD {
     const val maxChars = 60
     const val mirrorChars = 8
     const val repairMaxChars = 40
+    /**
+     * How many of the character's own previous replies the `mirrored` check compares
+     * against. A quick reply that echoes anything the character just said is the
+     * character's line, not the user's — seeing only this turn's reply missed the
+     * common case of parroting the turn before.
+     */
+    const val mirrorLookback = 3
 }
 
 val STYLE_CLICHES: List<String> = listOf(
@@ -46,11 +53,26 @@ val STYLE_VIOLATION_LABELS: Map<String, String> = mapOf(
     "recitedLore" to "复述了世界书或设定条目本身，应当只在需要时自然引用",
 )
 
+/**
+ * 「只记录、不处置」的正文格式观察项：命中后照样写进 `ChatMessage.styleViolations`（统计与
+ * 排查用），但**不**进入文风修订（`critiqueStyle` 会为它多打一次模型调用，而引用保护常把那次
+ * 修订整体回退成白跑），也不进"上一轮需要纠正"的提醒。要把它提成"可执行"的问题时，移回
+ * [STYLE_VIOLATION_LABELS] 即可（[actionableStyleViolations] 会自动带上它）。
+ */
+val STYLE_ADVISORY_LABELS: Map<String, String> = mapOf(
+    "halfwidthQuote" to "引用别人的话语请用「」『』《》，不要用成对的半角引号（\" \" 或 ' '）——半角引号会和正文的标点、缩写混在一起，读起来分不清哪句是引用",
+    "thirdPersonSelf" to "用第一人称说话：直接说\"我\"，不要用第三人称提到自己（如\"小雨皱了皱眉\"），也不要在对白之外写旁白叙述自己——那是在替别人介绍你，不是你本人在说话",
+)
+
+/** 只保留"可执行"（[STYLE_VIOLATION_LABELS]）的问题：观察项不得触发文风修订调用。 */
+fun actionableStyleViolations(violations: List<String>): List<String> =
+    violations.filter { STYLE_VIOLATION_LABELS.containsKey(it) }
+
 val QUICK_REPLY_ISSUE_LABELS: Map<String, String> = mapOf(
     "missing" to "没有给出两条可用短句",
     "placeholder" to "把示例占位文字（如\"短句一/短句二\"）当成了真内容",
     "action" to "带了括号动作或旁白（快速回应只写用户会打的字）",
-    "mirrored" to "复述或镜像了角色刚说过的话",
+    "mirrored" to "复述或镜像了角色刚说过的话（比对本轮回复与角色最近几轮回复）",
     "characterName" to "出现了角色自己的名字，像是在用角色口吻说话",
     "tooLong" to "单条过长，不像用户随手打的一句话",
 )
@@ -291,10 +313,51 @@ fun buildQuickReplyPerspectiveReminder(character: Character?): String {
 }
 
 /**
+ * 成对的半角引号：同一个引号字符出现 ≥2 次。单个不配对的不算（避免 `don't` 这类缩写
+ * 只有一个 `'` 时被误报）。成对的半角引号是"引用话语"的写法问题（该用 `「」《》`）；
+ * 这里只统计，绝不改写回复。
+ */
+private fun hasPairedHalfwidthQuotes(text: String): Boolean =
+    text.count { it == '"' } >= 2 || text.count { it == '\'' } >= 2
+
+/**
+ * 包裹「引用/说明」的成对符号：直角引号、书名号、弯引号，以及圆括号（全角与半角）。
+ * 与 [PAIRED_SPANS] 的区别只在于这里还要算上圆括号（舞台说明）。
+ */
+private val WRAPPED_SPANS = Regex("「[^」]*」|『[^』]*』|《[^》]*》|〈[^〉]*〉|“[^”]*”|‘[^’]*’|（[^）]*）|\\([^)]*\\)")
+
+/**
+ * [name] 是否在 [text] 里出现过，且至少有一次出现在所有引号/书名号/括号**之外**。
+ *
+ * 被包裹的名字是在引用别人的话（`他说「小雨，你先坐」`）或写舞台说明，不算第三人称自称；
+ * 只有"光天化日之下"以第三人称提到自己（`小雨把外套搭在椅背上`）才命中。
+ */
+private fun mentionsNameOutsideWrapping(text: String, name: String): Boolean {
+    val spans = WRAPPED_SPANS.findAll(text).map { it.range }.toList()
+    var index = text.indexOf(name)
+    while (index >= 0) {
+        val end = index + name.length - 1
+        if (spans.none { index >= it.first && end <= it.last }) return true
+        index = text.indexOf(name, index + 1)
+    }
+    return false
+}
+
+/**
  * Client-side style violation detection (port of detectStyleViolations in style.js).
  * Only the high-signal checks are kept; every hit has a low false-positive cost.
+ *
+ * The reply is **never** rewritten or dropped here: a hit is only recorded on the
+ * assistant turn (`styleViolations`) and reported by the review / correction reminder.
+ *
+ * This is the single implementation — the non-null overload in `BackgroundTasks.kt`
+ * delegates to [detectStyleViolationsFor], so both entry points record the same keys.
  */
-fun detectStyleViolations(reply: String?, character: Character?, prevReplies: List<String>): List<String> {
+fun detectStyleViolations(reply: String?, character: Character?, prevReplies: List<String>): List<String> =
+    detectStyleViolationsFor(reply, character, prevReplies)
+
+/** Shared body of [detectStyleViolations]. */
+internal fun detectStyleViolationsFor(reply: String?, character: Character?, prevReplies: List<String>): List<String> {
     val text = reply.orEmpty()
     if (text.isBlank()) return emptyList()
     val address = normalizeUserAddress(character?.staticProfile?.userAddress)
@@ -321,6 +384,16 @@ fun detectStyleViolations(reply: String?, character: Character?, prevReplies: Li
     }
 
     if (isSentenceLengthUniform(text)) hits += "toneDrift"
+
+    // 正文格式（只统计，不改写）：成对的半角引号不算"引用话术"，第三人称自称/旁白
+    // 会让角色听起来像是在介绍自己而不是在说话。
+    if (hasPairedHalfwidthQuotes(text)) hits += "halfwidthQuote"
+    val selfName = character?.name?.trim().orEmpty()
+    if (character?.isGroup == false && selfName.length >= 2 &&
+        mentionsNameOutsideWrapping(text, selfName)
+    ) {
+        hits += "thirdPersonSelf"
+    }
 
     val entries = character?.lorebook.orEmpty()
     if (entries.any { entry ->

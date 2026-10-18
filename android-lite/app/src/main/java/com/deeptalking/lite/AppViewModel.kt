@@ -28,12 +28,14 @@ import com.deeptalking.domain.agent.HotTopicPolicy
 import com.deeptalking.domain.agent.OrchestratorResult
 import com.deeptalking.domain.agent.prompts.buildShortTermBlock
 import com.deeptalking.domain.memory.archiveToFit
+import com.deeptalking.domain.memory.hasValidPushConfirmation
 import com.deeptalking.domain.memory.lorebookOverflow
 import com.deeptalking.domain.memory.promisePushDecision
 import com.deeptalking.feature.settings.PromiseTodo
 import com.deeptalking.feature.settings.activePromiseIds
 import com.deeptalking.feature.settings.promiseTodos
 import com.deeptalking.feature.settings.promisesLosingActiveStatus
+import com.deeptalking.feature.settings.resolvePromiseIn
 import com.deeptalking.engine.ondevice.TtsSpeaker
 import com.deeptalking.engine.ondevice.TtsTurn
 import com.deeptalking.engine.remote.RemoteTtsProbe
@@ -58,7 +60,6 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
-import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -779,35 +780,25 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     }
 
     /**
-     * The 待办 view of the active character's promises. Derived, never stored: the bucket comes
-     * from the push decision plus "now vs the confirmed due time", so 已超时 needs no new field.
-     * [promiseTodoTicker] re-samples `now` once a minute so an item crosses into 已超时 while the
-     * list is on screen (nothing else would re-emit for a static character row).
+     * The 待办 view across **all** characters (not just the active one). Derived, never stored:
+     * the bucket comes from the push decision plus "now vs the confirmed due time", so 已超时
+     * needs no new field. [promiseTodoTicker] re-samples `now` once a minute so an item crosses
+     * into 已超时 while the list is on screen (nothing else would re-emit for a static row).
      */
     val promiseTodos: StateFlow<List<PromiseTodo>> =
-        combine(characters, activeIdState, promiseTodoTicker) { list, id, _ ->
-            list.firstOrNull { it.id == id }
-        }.map { character ->
-            character?.let { promiseTodos(it) }.orEmpty()
-        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+        combine(characters, promiseTodoTicker) { list, _ -> promiseTodos(list) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
-    /** Flips one promise out of `Active` and retracts its reminder (完成 / 关闭 from the list). */
-    fun resolvePromise(promiseId: String, status: PromiseStatus) {
-        val id = activeIdState.value ?: return
-        if (promiseId.isBlank() || status == PromiseStatus.Active) return
+    /**
+     * Flips one promise out of `Active` and retracts its reminder (完成 / 关闭 from the list).
+     * The owning [characterId] comes from the row, so a flip lands on its own character and
+     * never touches another's promises.
+     */
+    fun resolvePromise(characterId: String, promiseId: String, status: PromiseStatus) {
+        if (characterId.isBlank()) return
         viewModelScope.launch {
-            val before = core.data.characters.get(id) ?: return@launch
-            if (before.longTerm.none { it.id == promiseId && it.status == PromiseStatus.Active }) return@launch
-            val now = Instant.now().toString()
-            val after = before.copy(
-                longTerm = before.longTerm.map { memory ->
-                    if (memory.id != promiseId) {
-                        memory
-                    } else {
-                        memory.copy(status = status, updatedAt = now, notifiedAt = null)
-                    }
-                },
-            )
+            val before = core.data.characters.get(characterId) ?: return@launch
+            val after = resolvePromiseIn(before, promiseId, status, Instant.now().toString()) ?: return@launch
             // `writeCharacterChanges` is the funnel that retracts the reminder for the flip.
             writeCharacterChanges(before, after)
         }
@@ -1563,23 +1554,41 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         var changed = false
         val longTerm = character.longTerm.map { memory ->
             val decision = promisePushDecision(character, memory)
-            // `confirmedDueAtMillis` already implies `pushable` + a user-located due time.
-            val due = decision.confirmedDueAtMillis ?: return@map memory
             if (!decision.pushable) return@map memory
-            val text = "${memory.key}：${memory.value}"
+            // Persist the confirmation conclusion: the citing sources are still live on this very
+            // pass, so record it now. Later, when those messages slide out of the window and the
+            // sources no longer resolve, the promise must not drop to 「不提醒」. Idempotent: an
+            // already-valid confirmation is never rewritten.
+            //
+            // A due time the user's own words do **not** locate is deliberately never stamped
+            // (`dueAtNeedsConfirmation`): stamping it would later promote the model's unconfirmed
+            // date into a confirmed one. A promise with no due time at all **is** stamped — it is
+            // a real user-agreed agreement, it just has no date to remind on.
+            val confirmed = if (!decision.dueAtNeedsConfirmation && !hasValidPushConfirmation(memory)) {
+                changed = true
+                memory.copy(
+                    pushConfirmedAt = Instant.now().toString(),
+                    pushConfirmedDueAt = decision.confirmedDueAt,
+                )
+            } else {
+                memory
+            }
+            // `confirmedDueAtMillis` already implies `pushable` + a user-located due time.
+            val due = decision.confirmedDueAtMillis ?: return@map confirmed
+            val text = "${confirmed.key}：${confirmed.value}"
             when {
-                memory.notifiedAt != null -> {
-                    if (due > now) core.scheduleReminder(memory.id, due, text)
-                    memory
+                confirmed.notifiedAt != null -> {
+                    if (due > now) core.scheduleReminder(confirmed.id, due, text)
+                    confirmed
                 }
                 due <= now -> {
-                    core.postReminder(memory.id, text)
+                    core.postReminder(confirmed.id, text)
                     changed = true
-                    memory.copy(notifiedAt = Instant.now().toString())
+                    confirmed.copy(notifiedAt = Instant.now().toString())
                 }
                 else -> {
-                    core.scheduleReminder(memory.id, due, text)
-                    memory
+                    core.scheduleReminder(confirmed.id, due, text)
+                    confirmed
                 }
             }
         }
@@ -1908,6 +1917,9 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 eventsState.tryEmit(UiEvent("导入失败：${error.message ?: error}"))
                 return@launch
             }
+            // The import replaced the whole store, so every reminder scheduled for the old
+            // data must be retracted ("数据里没这条承诺，通知却响了").
+            runCatching { core.cancelAllReminders() }.onFailure { DeepTalkingApp.recordError(it) }
             val all = core.data.characters.observeAll().first()
             val restored = summary.activeCharacterId?.takeIf { id -> all.any { it.id == id } }
             activeIdState.value = restored ?: all.firstOrNull()?.id

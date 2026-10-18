@@ -302,6 +302,19 @@ fun promisePushDecision(
     if (promisor != PROMISOR_USER && promisor != PROMISOR_RELATIONSHIP) {
         return PromisePushDecision(pushable = false, reason = PromisePushReason.NOT_USER_PROMISOR)
     }
+    // 已有有效确认（最近一次严格闸门通过时落盘）：引用消息滑出窗口后，来源可能再也
+    // 解析不出来，但"用户当时确实确认过这条约定"是既成事实，不应退化成「不提醒」。
+    // 确认按 `dueAt` 失效：一旦期限被改写（或删除），标记即作废，回到下面的严格判定。
+    if (hasValidPushConfirmation(item)) {
+        val dueIso = item.dueAt?.trim()?.takeIf { it.isNotEmpty() }
+        return PromisePushDecision(
+            pushable = true,
+            reason = PromisePushReason.USER_CONFIRMED,
+            confirmedDueAt = dueIso,
+            confirmedDueAtMillis = dueIso?.let { parseZoned(it)?.toInstant()?.toEpochMilli() },
+            dueAtNeedsConfirmation = false,
+        )
+    }
     val evidence = item.evidence.trimTo(300)
     if (evidence.length < 2) {
         return PromisePushDecision(pushable = false, reason = PromisePushReason.NO_USER_EVIDENCE)
@@ -341,6 +354,14 @@ fun promisePushDecision(
         dueAtNeedsConfirmation = false,
     )
 }
+
+/**
+ * True when [item] carries a persisted, still-valid push confirmation: a strict-gate pass was
+ * recorded ([LongTermMemory.pushConfirmedAt]) and the confirmed due time still matches the
+ * current [LongTermMemory.dueAt] (a rewritten/removed due invalidates the marker).
+ */
+fun hasValidPushConfirmation(item: LongTermMemory): Boolean =
+    item.pushConfirmedAt != null && item.dueAt?.trim() == item.pushConfirmedDueAt?.trim()
 
 // ---- due-time locatability (期限必须落在用户原话里) --------------------------------------
 

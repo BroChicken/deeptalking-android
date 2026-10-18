@@ -405,4 +405,95 @@ class MemoryEvidenceTest {
         assertFalse("‘周围’不是时间词", containsTemporalExpression("周围的人都回来了"))
         assertFalse("模糊说法不算可定位期限", containsTemporalExpression("以后再说吧"))
     }
+
+    @Test
+    fun persistedConfirmationSurvivesAnUnresolvableSource() {
+        // The citing messages have slid out of the window: no source resolves any more.
+        val character = Character(id = "c1")
+        val item = promise(dueAt = "2026-08-10T09:00:00").copy(
+            pushConfirmedAt = "2026-08-09T12:00:00Z",
+            pushConfirmedDueAt = "2026-08-10T09:00:00",
+        )
+
+        val decision = promisePushDecision(character, item)
+
+        assertTrue("已确认的承诺不得因来源消失而退化", decision.pushable)
+        assertEquals(PromisePushReason.USER_CONFIRMED, decision.reason)
+        assertEquals("2026-08-10T09:00:00", decision.confirmedDueAt)
+        assertNotNull(decision.confirmedDueAtMillis)
+        assertFalse(decision.dueAtNeedsConfirmation)
+    }
+
+    @Test
+    fun persistedConfirmationIsInvalidatedWhenTheDueTimeChanges() {
+        val character = Character(id = "c1")
+        val confirmed = promise(dueAt = "2026-08-10T09:00:00").copy(
+            pushConfirmedAt = "2026-08-09T12:00:00Z",
+            pushConfirmedDueAt = "2026-08-10T09:00:00",
+        )
+
+        // The due time was rewritten: the marker no longer applies, so the strict gate re-runs
+        // and — with no resolvable source — the promise is not pushable.
+        val decision = promisePushDecision(character, confirmed.copy(dueAt = "2026-08-11T09:00:00"))
+
+        assertFalse(decision.pushable)
+        assertEquals(PromisePushReason.NO_USER_EVIDENCE, decision.reason)
+    }
+
+    @Test
+    fun persistedConfirmationCannotReviveANonActivePromise() {
+        val character = Character(id = "c1")
+        val resolved = promise(dueAt = "2026-08-10T09:00:00", status = PromiseStatus.Resolved).copy(
+            pushConfirmedAt = "2026-08-09T12:00:00Z",
+            pushConfirmedDueAt = "2026-08-10T09:00:00",
+        )
+
+        assertEquals(
+            PromisePushReason.NOT_ACTIVE_PROMISE,
+            promisePushDecision(character, resolved).reason,
+        )
+    }
+
+    @Test
+    fun unmarkedPromisesStillUseTheStrictGate() {
+        // No confirmation marker → identical to the pre-existing strict behaviour.
+        val decision = promisePushDecision(Character(id = "c1"), promise(dueAt = "2026-08-10T09:00:00"))
+        assertFalse("没有确认标记时必须回到严格判定", decision.pushable)
+        assertEquals(PromisePushReason.NO_USER_EVIDENCE, decision.reason)
+
+        assertFalse(hasValidPushConfirmation(promise()))
+        assertTrue(
+            hasValidPushConfirmation(
+                promise(dueAt = "2026-08-10T09:00:00")
+                    .copy(pushConfirmedAt = "t", pushConfirmedDueAt = "2026-08-10T09:00:00"),
+            ),
+        )
+    }
+
+    @Test
+    fun persistedConfirmationCoversAUserAgreedPromiseWithoutADueTime() {
+        // No due time at all: the agreement is real, there is simply no date to remind on. The
+        // marker (a null due confirmed as null) must still hold once the sources are gone —
+        // otherwise the row silently slides into 「不提醒」.
+        val character = Character(id = "c1")
+        val item = promise().copy(pushConfirmedAt = "t", pushConfirmedDueAt = null)
+
+        assertTrue(hasValidPushConfirmation(item))
+        val decision = promisePushDecision(character, item)
+        assertTrue(decision.pushable)
+        assertTrue(decision.confirmedDueAt == null)
+        assertFalse(decision.dueAtNeedsConfirmation)
+    }
+
+    @Test
+    fun anUnlocatedDueTimeIsNeverTreatedAsAConfirmation() {
+        // A stamp whose due no longer matches (here: stamped as "no due", now carrying one) must
+        // never promote the model's own date into a confirmed one.
+        val character = Character(id = "c1")
+        val stamped = promise(dueAt = "2026-08-10T09:00:00")
+            .copy(pushConfirmedAt = "t", pushConfirmedDueAt = null)
+
+        assertFalse(hasValidPushConfirmation(stamped))
+        assertFalse(promisePushDecision(character, stamped).pushable)
+    }
 }

@@ -61,6 +61,83 @@ class StyleGuardTest {
     }
 
     @Test
+    fun detectStyleViolationsCatchesPairedHalfwidthQuotes() {
+        val hits = detectStyleViolations("他说\"早点睡\"，我没接话。", character, emptyList())
+        assertTrue(hits.contains("halfwidthQuote"))
+    }
+
+    @Test
+    fun detectStyleViolationsIgnoresASingleHalfwidthQuote() {
+        // 单个不配对的引号（英文缩写、敲了一半的引号）不算，否则会天天误报。
+        assertFalse(
+            detectStyleViolations("他敲了敲桌子，只说了句\"好，我这就去。", character, emptyList())
+                .contains("halfwidthQuote"),
+        )
+    }
+
+    @Test
+    fun detectStyleViolationsCatchesThirdPersonSelf() {
+        assertTrue(
+            detectStyleViolations("小雨把外套搭在椅背上，没说话。", character, emptyList())
+                .contains("thirdPersonSelf"),
+        )
+        // 名字在引号里出现过、同时也在括号外出现过一次 → 仍命中（判的是括号外那次）。
+        assertTrue(
+            detectStyleViolations("他说「小雨」，小雨没接话。", character, emptyList())
+                .contains("thirdPersonSelf"),
+        )
+    }
+
+    @Test
+    fun detectStyleViolationsIgnoresSelfNameInsideQuotesOrBrackets() {
+        assertFalse(
+            detectStyleViolations("他说「小雨，你先坐」。", character, emptyList()).contains("thirdPersonSelf"),
+        )
+        assertFalse(
+            detectStyleViolations("（小雨把外套搭在椅背上）我先走了。", character, emptyList())
+                .contains("thirdPersonSelf"),
+        )
+        assertFalse(
+            detectStyleViolations("纸条上写着“小雨别熬夜”。", character, emptyList()).contains("thirdPersonSelf"),
+        )
+    }
+
+    @Test
+    fun detectStyleViolationsSkipsThirdPersonSelfForGroups() {
+        // 群里本来就要写"成员名：内容"，这条只在单角色卡上判。
+        val group = Character(id = "g1", name = "小雨", isGroup = true)
+        assertFalse(
+            detectStyleViolations("小雨：我先走了。", group, emptyList()).contains("thirdPersonSelf"),
+        )
+    }
+
+    @Test
+    fun detectStyleViolationsLeavesACleanReplyAlone() {
+        assertTrue(detectStyleViolations("今天风有点大，我们进去坐会儿吧。", character, emptyList()).isEmpty())
+    }
+
+    @Test
+    fun newStyleViolationLabelsTellHowToWrite() {
+        // 标签文案是给模型/用户看的"该怎么写"，不是"哪里错了"。
+        assertTrue(STYLE_ADVISORY_LABELS.getValue("halfwidthQuote").contains("「」"))
+        assertTrue(STYLE_ADVISORY_LABELS.getValue("thirdPersonSelf").contains("第一人称"))
+    }
+
+    @Test
+    fun advisoryFormatLabelsAreRecordedButNeverTriggerAStyleCritique() {
+        // 观察项照样记进 styleViolations（统计用）……
+        val recorded = detectStyleViolations("小雨把外套搭在椅背上，没说话。", character, emptyList())
+        assertTrue(recorded.contains("thirdPersonSelf"))
+        // ……但送去文风修订的只有"可执行"的问题，否则会白打一次模型调用。
+        assertTrue(actionableStyleViolations(recorded).isEmpty())
+        assertTrue(
+            actionableStyleViolations(
+                listOf("halfwidthQuote", "cliche", "thirdPersonSelf", "metaTalk", "bogus"),
+            ) == listOf("cliche", "metaTalk"),
+        )
+    }
+
+    @Test
     fun detectQuickReplyIssuesCatchesTooLongReply() {
         val tooLong = "测试文本".repeat(20)
         val hits = detectQuickReplyIssues(listOf(tooLong, "嗯"), character, "")
@@ -89,6 +166,43 @@ class StyleGuardTest {
         val named = Character(id = "c2", name = "阿甲")
         assertTrue(
             detectQuickReplyIssues(listOf("阿甲：你先坐下。", "随便聊聊。"), named, reply).contains("characterName"),
+        )
+    }
+
+    @Test
+    fun detectQuickReplyIssuesMirrorsTheCharactersRecentReplies() {
+        val history = character.copy(
+            instant = listOf(
+                ChatMessage(id = "u1", role = Role.User, content = "你到了吗？"),
+                ChatMessage(id = "a1", role = Role.Assistant, content = "外面风大，我绕了两条街才找到这家店。"),
+            ),
+        )
+        val previousReplies = recentReplyTexts(history, QUICK_REPLY_GUARD.mirrorLookback)
+        // 套用上一轮角色的台词：本轮回复里没有这句话，只有历史里有 → 现在也命中。
+        assertTrue(
+            detectQuickReplyIssues(
+                listOf("我绕了两条街才找到这家店。", "随便聊聊。"),
+                history,
+                "（把外套搭在椅背上）坐吧，风是挺大。",
+                previousReplies,
+            ).contains("mirrored"),
+        )
+        // 与角色历史台词无关的正常用户短句 → 不命中。
+        assertFalse(
+            detectQuickReplyIssues(
+                listOf("那我们进去坐会儿吧。", "顺便看看菜单。"),
+                history,
+                "（把外套搭在椅背上）坐吧，风是挺大。",
+                previousReplies,
+            ).contains("mirrored"),
+        )
+        // 回归：不传历史时只看本轮回复，与旧行为一致。
+        assertFalse(
+            detectQuickReplyIssues(
+                listOf("我绕了两条街才找到这家店。", "随便聊聊。"),
+                history,
+                "（把外套搭在椅背上）坐吧，风是挺大。",
+            ).contains("mirrored"),
         )
     }
 

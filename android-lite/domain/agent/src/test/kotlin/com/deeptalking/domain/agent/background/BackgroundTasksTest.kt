@@ -1098,6 +1098,45 @@ class BackgroundTasksTest {
     )
 
     @Test
+    fun quickRepliesThatEchoAnEarlierTurnAreRecordedAsMirrored() = runBlocking {
+        // 运行时守卫过去只拿"本轮回复"比对，复述**上一轮**角色台词的快速回应会漏报。
+        val previous = "外面风大，我绕了两条街才找到这家店。"
+        val reply = "（把外套搭在椅背上）坐吧，风是挺大。"
+        val character = Character(
+            id = "c1",
+            name = "小雨",
+            instant = listOf(
+                ChatMessage(id = "u1", role = Role.User, content = "你到了吗？"),
+                ChatMessage(id = "a1", role = Role.Assistant, content = previous),
+                ChatMessage(id = "u2", role = Role.User, content = "到了。"),
+                ChatMessage(id = "a2", role = Role.Assistant, content = reply),
+            ),
+            // 场景游标已在窗口之外：这一轮不触发场景概要调用。
+            sceneState = SceneState(key = "未说明", startSequence = Int.MAX_VALUE),
+        )
+        val llm = ScriptedLlm(mutableListOf("""{"quickReplies":["那我先点单","你喝什么"]}"""))
+        val background = BackgroundTasks(llm, MemoryServiceImpl())
+        val updated = mutableListOf<Character>()
+
+        background.scheduleTurn(
+            character = character,
+            reply = reply,
+            userText = "到了。",
+            currentQuickReplies = listOf("我绕了两条街才找到这家店。", "外面风真大。"),
+            messages = character.instant,
+            critiqueEnabled = false,
+            quickReplyRepairEnabled = true,
+            onCharacterUpdated = { after -> updated += after },
+        ).join()
+
+        assertTrue("scheduleTurn 没有回报更新后的角色", updated.isNotEmpty())
+        assertTrue(
+            "复述上一轮角色台词的快速回应没有被记成 mirrored",
+            updated.last().instant.any { it.quickReplyIssues.contains("mirrored") },
+        )
+    }
+
+    @Test
     fun theExtractionBatchIsWorldBookedInTheSameTurn() = runBlocking {
         // The world-book pass used to wait for the long→term analysis batch, which needs the
         // short-term window to pile up first. It now reads what the fold just produced — and
