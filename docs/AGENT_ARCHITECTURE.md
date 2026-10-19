@@ -81,7 +81,7 @@ BackgroundTasks.scheduleTurn  后台串行维护：文风校对、快速回应�
 | `search_memory` | 按关键词检索长期记忆（可指定成员私人记忆）；**支持按日期召回**（`date`/`timeRef`/`slot`，返回那天的原始对话+摘要+长期记忆） | `SearchMemoryTool` |
 | `list_memories` | 按分类盘点记忆清单（不含详情） | `ListMemoriesTool` |
 | `delete_memory` | 按 ID 删除记忆（`short_` 前缀可删短期条目） | `DeleteMemoryTool` |
-| `set_reminder` | 记录待办/约定（promises，须用户发起 + 原话证据） | `SetReminderTool` |
+| `add_todo` | 新增独立待办（须「明确日期 + 双方同意」；用户发起→用户原话，角色发起→用户应答原话，期限须能定位） | `AddTodoTool` |
 | `ask_user` | 向用户提出澄清问题 | `AskUserTool` |
 | `update_character_field` | 精准修改基础设定字段（说话风格、称呼等） | `UpdateCharacterFieldTool` |
 | `upsert_lorebook_entry` | 写入/更新世界书条目（世界层设定唯一入口，保护人工维护条目） | `UpsertLorebookEntryTool` |
@@ -142,7 +142,8 @@ BackgroundTasks.scheduleTurn  后台串行维护：文风校对、快速回应�
 | `longTerm` | 未来仍有价值的稳定事实（category∈userProfile/relationship/events/promises/habits） |
 | `dynamicState` | 角色动态状态（6 字段） |
 | `memberDynamicState` | 群组成员动态状态（仅群组） |
-| `promiseUpdates` | 用户明确完成/取消的承诺（resolved/cancelled） |
+| `promiseUpdates` | 用户明确完成/取消的**承诺**（resolved/cancelled，属 `promises` 叙事记忆） |
+| `todoUpdates` | 用户明确**完成/取消/改期**的**待办**（done/cancelled，或改 `dueAt`；须引用户原话） |
 | `recall` | 主动召回记忆的请求 |
 
 这是"回复 + 写记忆"合一的契约，保证每轮回复结构合法。**没有 `shortTerm` 字段**：短期窗口只由整窗抽取写入（见"记忆子任务"）。
@@ -158,7 +159,7 @@ BackgroundTasks.scheduleTurn  后台串行维护：文风校对、快速回应�
 | `submit-retry` | 阶段二兜底仍未拿到合法 `submit_response` | retry-submit | 正在重新整理 |
 | `empty` | 无可用正文 | regenerate / fail | 有额度 → `正在重新生成（第2次）…`；否则提示失败并保留用户消息 |
 
-工具提示（`AgentLoop.toolActivityHint`）：`get_current_time`→`正在确认时间…`、`search_memory`→`正在回忆…`、`list_memories`→`正在整理记忆…`、`delete_memory`→`正在清理记忆…`、`set_reminder`→`已记下，正在回应…`、`update_character_field`→`已按你的要求调整设定…`、`upsert_lorebook_entry`→`已更新世界书…`、`web_search`→`正在搜索…`、`web_fetch`→`正在读取网页…`、`search_video`→`正在搜B站视频…`、`search_music`→`正在搜歌…`、`search_posts`→`正在搜虎扑帖子…`、`baidu_hot`/`toutiao_hot`/`douyin_hot`/`zhihu_hot`→`正在看热榜…`、`send_sticker`→`正在挑表情…`，未知工具回退 `正在处理…`。
+工具提示（`AgentLoop.toolActivityHint`）：`get_current_time`→`正在确认时间…`、`search_memory`→`正在回忆…`、`list_memories`→`正在整理记忆…`、`delete_memory`→`正在清理记忆…`、`add_todo`→`已记下，正在回应…`、`update_character_field`→`已按你的要求调整设定…`、`upsert_lorebook_entry`→`已更新世界书…`、`web_search`→`正在搜索…`、`web_fetch`→`正在读取网页…`、`search_video`→`正在搜B站视频…`、`search_music`→`正在搜歌…`、`search_posts`→`正在搜虎扑帖子…`、`baidu_hot`/`toutiao_hot`/`douyin_hot`/`zhihu_hot`→`正在看热榜…`、`send_sticker`→`正在挑表情…`，未知工具回退 `正在处理…`。
 
 > 主提示词的 0/7/8 与【输出格式】都要求"以结构化方式收尾"（调用 `submit_response` 或输出单个 JSON 对象）且 `quickReplies` 恒为两条用户视角短句；但**客户端不把 `quickReplies` 当收尾门槛**——散文/缺 quickReplies 的收尾一律直接采用。
 
@@ -207,7 +208,7 @@ BackgroundTasks.scheduleTurn  后台串行维护：文风校对、快速回应�
 
 ### 注入与衰减
 
-- `buildVolatileContext(character, query, memory, now, proactiveTurn, hotTopicTurn, recentAssistantReplies)` — 把最相关的记忆与本轮动态上下文注入本轮 prompt（只注入 `AppLimits.Agent.TOOL_MEMORY_INJECT_LIMIT = 5` 条长期记忆，其余提示模型用 `search_memory` 检索）。**没有任何区块预算**：这是主对话请求体，所有块整块注入（只保留"每条条目"级别的兜底上限，靠提示词的软限制让它尽量不触发）。区块顺序按"越靠后越近"排列：可选话题库 → 角色当前状态 → 长期约定提醒 → 待跟进承诺 → 世界书 → 群成员私人记忆 → 用户最新纠正 → 互动节奏 → 场景概要 → 长期召回 + 取用说明/主体约定 → 时间基准 → 消息时间元数据 → 风格尾块 + 本轮指令。**最末尾两条系统触发的本轮指令**：`proactiveTurn`（主动开场）与 `hotTopicTurn`（热榜开场，见 `HotTopicPolicy`：每角色每逻辑日掷一次、10%、每天 1 次/每周 2 次；命中时要求先调一个热榜工具——`zhihu_hot` 优先——再挑一条话题带入）。两条都只加在 volatile 上下文尾部，**不进 system prompt**，所以不会打乱缓存前缀。`metadata` 回传本轮真正注入的召回 ID 与世界书条目，供主线在回复落盘后精确清除 `pendingRecall` 与累计 `mentions`。检索查询经 `buildMemoryQuery()` 扩展：用户明显指代前文时附加最近对话，避免短指代召回不到正确记忆。
+- `buildVolatileContext(character, query, memory, now, proactiveTurn, hotTopicTurn, recentAssistantReplies)` — 把最相关的记忆与本轮动态上下文注入本轮 prompt（只注入 `AppLimits.Agent.TOOL_MEMORY_INJECT_LIMIT = 5` 条长期记忆，其余提示模型用 `search_memory` 检索）。**没有任何区块预算**：这是主对话请求体，所有块整块注入（只保留"每条条目"级别的兜底上限，靠提示词的软限制让它尽量不触发）。区块顺序按"越靠后越近"排列：可选话题库 → 角色当前状态 → 长期约定提醒 → 待跟进承诺 → **待办约定** → 世界书 → 群成员私人记忆 → 用户最新纠正 → 互动节奏 → 场景概要 → 长期召回 + 取用说明/主体约定 → 时间基准 → 消息时间元数据 → 风格尾块 + 本轮指令。**最末尾两条系统触发的本轮指令**：`proactiveTurn`（主动开场）与 `hotTopicTurn`（热榜开场，见 `HotTopicPolicy`：每角色每逻辑日掷一次、10%、每天 1 次/每周 2 次；命中时要求先调一个热榜工具——`zhihu_hot` 优先——再挑一条话题带入）。两条都只加在 volatile 上下文尾部，**不进 system prompt**，所以不会打乱缓存前缀。`metadata` 回传本轮真正注入的召回 ID 与世界书条目，供主线在回复落盘后精确清除 `pendingRecall` 与累计 `mentions`。检索查询经 `buildMemoryQuery()` 扩展：用户明显指代前文时附加最近对话，避免短指代召回不到正确记忆。
 - `MemoryPolicy.applyMemoryDecay()`：按时间衰减 events/promises 的重要性与状态。
 - `MemoryPolicy.computeEffectiveImportance()`：`(importance + learnedBonus) × decay`（0-10 封顶）。
 
@@ -307,14 +308,16 @@ BackgroundTasks.scheduleTurn  后台串行维护：文风校对、快速回应�
 - 游标存 `character.sceneState`（`key`/`startCount`/`startSequence`/`messageCount`，按消息 `sequence` 推进）。
 - 注入：最近 2 条渲染为 `【场景概要（较早情节的压缩记录…）】`。
 
-### 用户约定与待办（promises）
+### 用户约定（promises，纯叙事记忆）与独立待办（todo）
 
-- **准入闸门** `MemoryEvidence.promisePushDecision()`：只有**用户本人同意**的约定才算"已确认"。`promisor=character`（角色单方承诺）照常存进记忆，但**永不计入已确认**；`promisor=user` 要求 `sourceMessageIds` 解析得出且全是用户原话（`evidence` 必须逐字对上）；`promisor=relationship`（双方约定）还必须有另一方原话佐证；其余（群组成员名 / 空 / 旧数据）一律不计入。**确认结论会落盘**：严格闸门通过的那一刻把 `pushConfirmedAt`（时间）与 `pushConfirmedDueAt`（当时被确认的 `dueAt`）写进记忆；之后即使引用消息滑出即时/短期窗口、来源再也解析不出来，这条约定也**不会退化成「不提醒」**——闸门在来源还活着时判过一次就是既成事实。标记按 `dueAt` 失效（期限被改写或删除即回到严格判定）；**期限定位不到**（`dueAtNeedsConfirmation`）的条目**不打标**，否则等于把模型自己给的日期追认成"用户确认过的期限"。
-- **期限必须落在用户原话里**：模型给的 `dueAt` 还要能被用户原话定位（`dueAtBackedByUserEvidence`）；定位不到时返回 `dueAtNeedsConfirmation=true`、`confirmedDueAt=null`，待办列表显示「待确认期限」并回头问用户。
-- **确认结论落盘（无通知投递）**（app 层）：`AppViewModel.recordPromiseConfirmations` 只扫**刚回过一轮的那个角色**，把"用户本人确认、且期限能在他原话里定位"的结论写进 `pushConfirmedAt`/`pushConfirmedDueAt`（幂等；无期限的已确认约定也打标），供设置页待办分桶使用。用户侧**没有任何通知通道**：约定既不排期也不出现在通知栏/消息栏，应用不持有通知权限，也没有 WorkManager 任务；`LongTermMemory` 只有上面两个确认标记，没有"已通知"时间。完成 / 关闭 / 删除角色只是改记忆状态（列表随即重算）。
-- **设置页待办列表**（`:feature:settings` 的 `promiseTodos(characters)` + `PromiseTodoList`）：**跨全部角色**聚合（每行带所属角色 id/name，角色多于一个时行首显示角色名；单角色的顺序与旧版逐字节一致，`TODO_ORDER` = 分区 → 期限 → key → 角色名 → 角色 id → 条目 id）。纯**派生视图**，不改任何记忆字段。分桶（`PromiseTodoSection`）：进行中 / 待确认期限 / 周期性约定 / 已超时（可折叠）/ 不提醒（可折叠），每行可「完成 / 关闭」（`AppViewModel.resolvePromise(characterId, promiseId, status)` → 纯函数 `resolvePromiseIn`，只落到该行所属角色）。`promiseTodos` 用每分钟 ticker 重新采样 `now`，所以「已超时」由 `dueAt < now` 推导、不是新字段（列表在屏幕上时也能看到条目越过期限）。
-- **周期性约定永不进超时**：`isRecurringPromise` 命中「每 / 一直 / 永远」即单独一桶——"每晚十点"不会在第一个期限就被判成过期。
-- **不提醒桶只展示不删除**：角色单方承诺 / 缺用户原话的条目仍留在记忆里（用户可以自己「关闭」它），它们只是不会计入"已确认"。
+**长期记忆与待办互相独立**：`promises` 只是被角色记住的叙事记忆（角色记得你们之间有过什么约定/承诺），
+**永远不会变成待办**；待办是单独的实体 `Character.todos`（见下），二者互不派生。
+
+- **约定确认（仅记忆元信息）** `MemoryEvidence.promisePushDecision()`：判定一条 `promisor=user/relationship` 的约定是否是**用户本人同意**过的。`promisor=character`（角色单方承诺）照常存进记忆，但不计入"已确认"；`promisor=user` 要求 `sourceMessageIds` 解析得出且全是用户原话（`evidence` 必须逐字对上）；`promisor=relationship`（双方约定）还必须有另一方原话佐证；其余（群组成员名 / 空 / 旧数据）一律不计入。**结论会落盘**：严格闸门通过的那一刻把 `pushConfirmedAt`（时间）与 `pushConfirmedDueAt`（当时被确认的 `dueAt`）写进记忆（`AppViewModel.recordPromiseConfirmations` 只扫刚回过一轮的角色，幂等；无期限的已确认约定也打标），标记按 `dueAt` 失效。**它只是记忆元信息，不再服务任何列表**：设置页那份待办列表已删除，应用也不做通知投递（无通知权限、无 WorkManager）。
+- **期限定位**：`dueAtBackedByEvidence(sources, dueAt)`（原 `dueAtBackedByUserEvidence`，泛化后按传入来源判断）要求期限能在给定原话里定位（相对词按消息时间换算后核对日期；绝对日期直接比对；只有粗粒度时间词时"出现过时间词"即可）。`promisePushDecision` 用它判定 `dueAtNeedsConfirmation`。
+- **周期性约定注入**：`Prompts.buildStandingCommitmentBlock()` 确定性挑周期性 promises/habits（见"上下文与预算"表），只注入一行摘要；这是叙事记忆的补丁，与待办无关。
+- **独立待办（todo）**：模型 `Character.todos: List<Todo>`（`id/title/detail/dueAt/status/proposer/sourceMessageIds/evidence/createdAt/updatedAt/closedAt`，`TodoStatus` = active/done/cancelled，`TodoProposer` = user/character）。**新增只有一条闸门** `TodoPolicy.validateTodoCreation()`：①期限必填且能在对话原话里定位；②`proposer=user` 时用户原话含期限与提议；③`proposer=character` 时必须附**用户应答的原话**，且该原话不得是明确拒绝（`TodoPolicy.isUserRefusal`）；**同意与否以模型的判断为主，关键词只做其中一环**（`isUserAgreement` 只作正向确认信号，覆盖不到的说法一律不否决），期限落在双方任一方的原话里即可。写入走 `add_todo` 工具；改期/完成/取消走 `submit_response.todoUpdates`（须引用户原话，且改期也要能定位）。**关闭条目保留 `AppLimits.Todo.CLOSED_RETENTION_DAYS`(30) 天**：`TodoPolicy.pruneClosedTodos()` 在启动维护时真删更老的，列表（`TodoBuckets`）再防御性过滤一次。对话中未结束的待办由 `Prompts.buildTodoBlock()` 注入 volatile（固定顺序，无命中不出段），角色可自然提起。
+- **待办 UI**：角色编辑弹窗的「待办」页签（`:feature:characters`，仅角色本体；成员页签不显示），分 `进行中 / 已超时（由 dueAt < now 派生）/ 已完成 / 已取消`，后两组默认折叠；进行中/已超时行「完成 / 取消」，关闭行「删除」——都只是**手动兜底**，正常生命周期由模型处理。
 
 ## 六、上下文与预算
 
@@ -329,6 +332,7 @@ BackgroundTasks.scheduleTurn  后台串行维护：文风校对、快速回应�
 | 世界书注入 | `Lorebook.INJECT_ENTRIES`(6) 条 | 预算 `INJECT_CHARS`(1400) 装不下的条目**跳过、继续装后面的** |
 | 场景概要 | `Scene.SUMMARIES`(2) 条 | 整条注入（写入时已受 300/400 字约束） |
 | 长期约定提醒 | `STANDING_COMMITMENT_LIMIT`(4) 条 / 每行 `LINE_CHARS`(100) / 整段 `BLOCK_CHARS`(420) | 确定性挑周期性 promises/habits；**无命中时整段不出现** |
+| 待办约定 | `Todo.INJECT_LIMIT`(4) 条 / 每行 `LINE_CHARS`(100) / 整段 `BLOCK_CHARS`(420) | `Prompts.buildTodoBlock()`：只注入 `Character.todos` 里仍未结束的（按期限升序）；**无命中时整段不出现** |
 | 每条兜底上限 | 短期正文/长期 value/群私人 1200、长期 key 120 | 仅为兜底；提示词软限制让它尽量不触发 |
 
 ### 请求装配与缓存前缀
@@ -386,7 +390,8 @@ tools: AUTO 阶段全部工具 / SUBMIT 阶段只有 submit_response
 | `3.7` | 记忆字段必须写明主体（禁止"我/你/TA"这类代词） |
 | `3.8` | 时间一律写绝对日期，相对说法填 `timeRef` |
 | `3.9` | 用户提"说话方式类"要求时，本轮 reply 直接演出、禁止元话术 |
-| `4`–`6` | 只记录未来有价值的信息；`subject` 取值约束；promises 的承诺方/受约方与状态流转 |
+| `4`–`6` | 只记录未来有价值的信息；`subject` 取值约束；promises（叙事记忆）的承诺方/受约方与状态流转 |
+| `6.5` | 待办（todo）与长期记忆独立：新增须「明确日期 + 双方同意」，用 `add_todo`；完成/取消/改期走 `todoUpdates` 并引用用户原话 |
 | `7` | `quickReplies` 恰好两条且必须是**用户视角**（禁止角色口吻、**禁止角色对用户的提问**、禁止复述角色台词） |
 | `8` | JSON 字段结构精简示例（字段完整定义见 `submit_response` 工具 schema） |
 | `9` | `longTerm.category` 取值与 `importance` 范围 |
@@ -404,7 +409,7 @@ tools: AUTO 阶段全部工具 / SUBMIT 阶段只有 submit_response
 
 ### volatile 段落（按顺序）
 
-可选话题库 → 角色当前状态（+群成员状态）→ **长期约定提醒** → **待跟进承诺** → **世界书资料** → 成员私人记忆 → 用户最新纠正 → 互动节奏（重连/久别）→ **场景概要** → 本轮主动召回的相关长期记忆 + 记忆取用说明 + 记忆主体约定 → 时间基准 → 消息时间元数据 → 结尾多样性 → **本轮节奏骨架** → 冷场/话题切换指令 →（主动开场时）角色主动开场 →（热榜开场时）热榜指令 → **快速回应视角提醒** → **违规纠正提醒** → **每 N 轮语气回顾** → **声音契约（单角色）/群聊声音锁定（群聊）**。
+可选话题库 → 角色当前状态（+群成员状态）→ **长期约定提醒** → **待跟进承诺** → **待办约定** → **世界书资料** → 成员私人记忆 → 用户最新纠正 → 互动节奏（重连/久别）→ **场景概要** → 本轮主动召回的相关长期记忆 + 记忆取用说明 + 记忆主体约定 → 时间基准 → 消息时间元数据 → 结尾多样性 → **本轮节奏骨架** → 冷场/话题切换指令 →（主动开场时）角色主动开场 →（热榜开场时）热榜指令 → **快速回应视角提醒** → **违规纠正提醒** → **每 N 轮语气回顾** → **声音契约（单角色）/群聊声音锁定（群聊）**。
 
 > 顺序原则是"越靠后越近"：更早的背景（话题库/状态/承诺/世界书）在前，较早情节（场景）→ 较早记忆（长期召回）→ 现在（时间基准/时间线）→ 本轮指令（尾块）在后。**短期窗口不在这里**：它整窗注入到历史之前（见"请求装配与缓存前缀"）。
 >
@@ -509,5 +514,6 @@ tools: AUTO 阶段全部工具 / SUBMIT 阶段只有 submit_response
 | `DYNAMIC_STATE_FIELDS` | 6 | `Prompts`（`currentTone` 取代旧关系两字段） |
 | `STATIC_PROFILE_FIELDS` | 12 | `Prompts` |
 | `STANDING_COMMITMENT_LIMIT` / `STANDING_COMMITMENT_LINE_CHARS` / `STANDING_COMMITMENT_BLOCK_CHARS` | 4 / 100 / 420 | `Prompts`：长期约定提醒的条数 / 每行 / 整段上限（无命中不出段） |
+| `Todo.CLOSED_RETENTION_DAYS` / `INJECT_LIMIT` / `LINE_CHARS` / `BLOCK_CHARS` | 30 / 4 / 100 / 420 | `AppLimits`：已完成/已取消待办保留天数；待办注入的条数 / 每行 / 整段上限（无命中不出段） |
 | JSON 示例 | 固定一份精简示例 | system 前缀从首轮起稳定 |
 | 请求追踪字段 | `RequestMetric[]` | taskType/platform/phase/status/tokens/hitRate/durationMs/prefixChange/commonHistoryMessages/hashes |

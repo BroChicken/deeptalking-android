@@ -543,6 +543,10 @@ fun CharacterEditorDialog(
                     ModalTab("基础设定", tab == 0, Modifier.weight(1f)) { tab = 0 }
                     ModalTab("当前状态", tab == 1, Modifier.weight(1f)) { tab = 1 }
                     ModalTab("世界书", tab == 2, Modifier.weight(1f)) { tab = 2 }
+                    // 待办只挂在角色本体上（成员页签不显示）。
+                    if (editingMember == null) {
+                        ModalTab("待办", tab == 3, Modifier.weight(1f)) { tab = 3 }
+                    }
                 }
                 Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(legacy.border))
                 Spacer(Modifier.height(10.dp))
@@ -550,7 +554,9 @@ fun CharacterEditorDialog(
                     modifier = Modifier.verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    when (tab) {
+                    // 成员页签没有「待办」：停在 tab 3 时回落到基础设定。
+                    val shownTab = if (editingMember == null) tab else minOf(tab, 2)
+                    when (shownTab) {
                         0 -> BasicTab(
                             draft = draft,
                             memberIndex = memberIndex,
@@ -621,6 +627,7 @@ fun CharacterEditorDialog(
                                 onRestoreLorebook(draft.id, target, entryId)
                             },
                         )
+                        3 -> TodoTab(draft = draft, onDraft = ::applyDraft)
                     }
                     if (pendingNotices.isNotEmpty()) {
                         SaveNoticesPanel(pendingNotices)
@@ -643,6 +650,114 @@ fun CharacterEditorDialog(
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
     )
+}
+
+@Composable
+private fun TodoTab(draft: Character, onDraft: (Character) -> Unit) {
+    val legacy = MaterialTheme.legacy
+    val nowMillis = System.currentTimeMillis()
+    val rows = TodoBuckets.rows(draft, nowMillis)
+    var closedExpanded by remember { mutableStateOf(false) }
+
+    fun patchTodo(id: String, transform: (com.deeptalking.core.model.Todo) -> com.deeptalking.core.model.Todo) {
+        onDraft(draft.copy(todos = draft.todos.map { if (it.id == id) transform(it) else it }))
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text(
+            "待办与长期记忆相互独立：只在对话里出现明确日期、且双方同意时由 AI 记录（完成 / 取消 / 删除可在这里手动兜底）。",
+            fontSize = 12.sp,
+            color = legacy.textMuted,
+        )
+        if (rows.isEmpty()) {
+            Text("暂无待办约定", fontSize = 12.sp, color = legacy.textMuted)
+            return@Column
+        }
+        TodoBuckets.TodoSection.entries.forEach { section ->
+            val items = rows.filter { it.section == section }
+            if (items.isEmpty()) return@forEach
+            val collapsible = section == TodoBuckets.TodoSection.DONE ||
+                section == TodoBuckets.TodoSection.CANCELLED
+            if (collapsible) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().clickable { closedExpanded = !closedExpanded },
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(if (closedExpanded) "▾" else "▸", fontSize = 12.sp, color = legacy.textMuted)
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        "${sectionLabel(section)}（${items.size}）",
+                        fontSize = 12.sp,
+                        color = legacy.textMuted,
+                    )
+                }
+                if (closedExpanded) items.forEach { TodoRowView(it.todo, section, ::patchTodo, onDraft, draft) }
+            } else {
+                Text("${sectionLabel(section)}（${items.size}）", fontSize = 12.sp, color = legacy.textSecondary)
+                items.forEach { TodoRowView(it.todo, section, ::patchTodo, onDraft, draft) }
+            }
+        }
+    }
+}
+
+private fun sectionLabel(section: TodoBuckets.TodoSection): String = when (section) {
+    TodoBuckets.TodoSection.ONGOING -> "进行中"
+    TodoBuckets.TodoSection.OVERDUE -> "已超时"
+    TodoBuckets.TodoSection.DONE -> "已完成"
+    TodoBuckets.TodoSection.CANCELLED -> "已取消"
+}
+
+@Composable
+private fun TodoRowView(
+    todo: com.deeptalking.core.model.Todo,
+    section: TodoBuckets.TodoSection,
+    patchTodo: (String, (com.deeptalking.core.model.Todo) -> com.deeptalking.core.model.Todo) -> Unit,
+    onDraft: (Character) -> Unit,
+    draft: Character,
+) {
+    val legacy = MaterialTheme.legacy
+    val closed = section == TodoBuckets.TodoSection.DONE || section == TodoBuckets.TodoSection.CANCELLED
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(legacy.input)
+            .border(1.dp, legacy.inputBorder, RoundedCornerShape(8.dp))
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(todo.title.ifBlank { "（未命名）" }, fontSize = 13.sp, color = legacy.text)
+            if (todo.detail.isNotBlank()) {
+                Text(todo.detail, fontSize = 12.sp, color = legacy.textMuted)
+            }
+            val stamp = if (closed) {
+                val whenText = TodoBuckets.closedLabel(todo)
+                if (whenText.isBlank()) "" else (if (section == TodoBuckets.TodoSection.DONE) "完成于 " else "取消于 ") + whenText
+            } else {
+                "期限 " + TodoBuckets.dueLabel(todo)
+            }
+            Text(
+                stamp,
+                fontSize = 12.sp,
+                color = if (section == TodoBuckets.TodoSection.OVERDUE) legacy.warning else legacy.textMuted,
+            )
+        }
+        if (closed) {
+            TextButton(onClick = { onDraft(draft.copy(todos = draft.todos.filterNot { it.id == todo.id })) }) {
+                Text("删除", fontSize = 12.sp, color = legacy.textSecondary)
+            }
+        } else {
+            TextButton(onClick = {
+                val now = java.time.Instant.now().toString()
+                patchTodo(todo.id) { it.copy(status = com.deeptalking.core.model.TodoStatus.Done, closedAt = now, updatedAt = now) }
+            }) { Text("完成", fontSize = 12.sp, color = legacy.textSecondary) }
+            TextButton(onClick = {
+                val now = java.time.Instant.now().toString()
+                patchTodo(todo.id) { it.copy(status = com.deeptalking.core.model.TodoStatus.Cancelled, closedAt = now, updatedAt = now) }
+            }) { Text("取消", fontSize = 12.sp, color = legacy.textSecondary) }
+        }
+    }
 }
 
 @Composable

@@ -10,7 +10,7 @@
 - **INV-3 不改字段名集合**（`Prompts.DYNAMIC_STATE_FIELDS` / `STATIC_PROFILE_FIELDS`）而不检查下游：工具 schema、清洗、迁移、UI、提示词全部由这两个常量驱动。
 - **INV-4 前缀缓存稳定**：system 固定在前、历史原样递增、volatile 只挂当前用户消息；任何"每轮变化的文本塞进 system 前缀"都会击穿缓存。
 - **INV-5 阶段二只用于兜底**：阶段一（含 `submit_response` 工具）拿到正文就直接收尾；只有"连正文都没有"才进阶段二锁定 `submit_response`。
-- **INV-6 待办必须用户原话证据**（promises 准入）。
+- **INV-6 待办与长期记忆独立，准入须「明确日期 + 双方同意」**（`TodoPolicy` / `add_todo`）；`promises` 是叙事记忆、仍需用户原话证据（`isValidAutomaticMemory`）。
 - **INV-7 正文优先，不为 quickReplies 重发**：合法 JSON（即使缺 quickReplies）或散文都直接采用；快速回应由后台补齐，绝不再为它多发一轮。
 - **INV-8 快速回应必须是用户视角**：`StyleGuard.detectQuickReplyIssues` 校验，失败由 `BackgroundTasks.repairQuickReplies`（换位生成）重写；不得覆盖已显示的正文。
 
@@ -125,12 +125,13 @@ STATIC_PROFILE_FIELDS ─┬─► submit_response schema (staticFieldProperties
 - quickReplies 由 `StyleGuard.detectQuickReplyIssues`（视角校验）+ `BackgroundTasks.repairQuickReplies`（后台换位生成）补齐；换位生成也失败才回退兜底短句。
 - 空回复在 `AgentLoop` 同一循环内最多重试 2 次，保留已累计的工具往返。
 
-## 4.6 待办（promises）准入原则
+## 4.6 待办（todo）准入原则
 
-- **定义**：待办 = 需要用户参与的事。
-- **准入**：只有**用户自己明确提出/同意**才可入库（`set_reminder` 必须带 `sourceMessageIds`+`evidence`，经 `MemoryEvidence.hasValidUserEvidence` 校验）。
-- **禁止**：角色要求用户去做的事、角色的建议/叮嘱，不得记为待办（缺用户原话 → 工具返回 `ok:false`，引导模型先征询用户）。
-- **既有保护**：`longTerm` 的 promises 走 `isValidAutomaticMemory`，要求来源全为用户消息。
+- **定义**：待办 = 用户与角色之间、**有明确日期**且**双方同意**的一件待办；是**独立实体**（`Character.todos`），与长期记忆互相独立。
+- **准入**（`TodoPolicy.validateTodoCreation`，唯一入口 `add_todo` 工具）：①期限必填且能在对话原话里定位；②用户发起→用户原话含期限与提议；③角色发起→必须附**用户应答的原话**，且该原话不得是明确拒绝（`isUserRefusal` 否决，`isUserAgreement` 只作正向信号；**同意与否以模型的判断为主，关键词只做一环**）。`sourceMessageIds`+`evidence` 经 `MemoryEvidence.hasValidUserEvidence` 校验。
+- **禁止**：没有明确日期、期限定位不到、或角色单方叮嘱而用户没答应的，一律拒绝（工具返回 `ok:false` 并说明原因）。
+- **生命周期**：改期/完成/取消由 `submit_response.todoUpdates` 处理（须引用户原话，改期还要能定位）；角色编辑页待办 tab 提供「完成 / 取消 / 删除」手动兜底。
+- **与 promises 区分**：`longTerm` 的 `promises` 是叙事记忆，走 `isValidAutomaticMemory`（来源须为用户消息），**不再产生待办**。
 
 ## 5. 改动检查清单（每次改前必读）
 
@@ -140,7 +141,7 @@ STATIC_PROFILE_FIELDS ─┬─► submit_response schema (staticFieldProperties
 - [ ] 是否改 `versionName`？→ 同步 `versionCode`，跑 `tools/native-verify.ps1`。
 - [ ] 是否新增 `parseJsonLenient` 调用？→ 检查返回类型守卫。
 - [ ] 是否改请求体阶段（`RequestBuilder`/`ResponsesLlmBackend`）？→ 核对阶段二 tools/tool_choice（INV-5）。
-- [ ] 是否改待办（promises）准入？→ 必须保留"用户原话证据"约束（INV-6）。
+- [ ] 是否改待办（todo）准入？→ 必须保留「明确日期 + 双方同意」约束（INV-6）；改 promises 自动写入则保留"用户原话证据"约束。
 
 ## 6. GRAPH（YAML 镜像）
 
@@ -151,7 +152,7 @@ invariants:
   INV-3: {rule: field-set-change-requires-downstream-audit, keys: [DYNAMIC_STATE_FIELDS, STATIC_PROFILE_FIELDS]}
   INV-4: {rule: prefix-cache-stability}
   INV-5: {rule: submit-phase-tools-only-submit_response, why: 'full tools dilute strict schema -> quickReplies dropped; phase 2 is fallback-only'}
-  INV-6: {rule: promises-require-user-evidence, why: 'to-do = needs-user; character instructions must not become to-dos'}
+  INV-6: {rule: todo-requires-date-and-mutual-agreement, why: 'todo is independent of long-term memory; a character instruction with no user agreement must not become a to-do'}
   INV-7: {rule: body-first-never-refetch-for-quickReplies, why: 'accepting prose/JSON-without-quickReplies avoids the per-turn forced submit round; quick replies are repaired in the background'}
   INV-8: {rule: quickReplies-must-be-user-viewpoint, guard: StyleGuard.detectQuickReplyIssues, repair: BackgroundTasks.repairQuickReplies}
 

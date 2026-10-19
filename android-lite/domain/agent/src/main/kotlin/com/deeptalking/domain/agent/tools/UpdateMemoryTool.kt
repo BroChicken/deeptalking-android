@@ -28,7 +28,7 @@ class UpdateMemoryTool(private val memory: MemoryService) : AgentTool {
 
     override val definition = ToolDefinition(
         name = "update_memory",
-        description = "修正一条已存在的记忆（长期或短期，按ID）。仅当用户明确否认或纠正某条记忆时使用，例如\"那件事是我做的不是你做的\"\"记反了\"\"我不是那个意思\"。必须先调用 search_memory 或 list_memories 找到目标ID，再用用户纠正的原话作为 evidence。ID 以 short_ 开头的是**短期记忆**（只支持 value 与 eventTime）：改正后会重新排到队尾，等待下一轮被整理进长期记忆。其他 ID 是长期记忆，可改 subject（主体：user=用户 / character=角色自己 / relationship=双方 / world=背景设定）、value（内容，必须写明主体）、key、importance、promisor/promisee（约定的承诺方/受约方）。不要用它新建记忆（新建请用 longTerm 字段或 set_reminder）。",
+        description = "修正一条已存在的记忆（长期或短期，按ID）。仅当用户明确否认或纠正某条记忆时使用，例如\"那件事是我做的不是你做的\"\"记反了\"\"我不是那个意思\"。必须先调用 search_memory 或 list_memories 找到目标ID，再用用户纠正的原话作为 evidence。ID 以 short_ 开头的是**短期记忆**（只支持 value 与 eventTime）：改正后会重新排到队尾，等待下一轮被整理进长期记忆。其他 ID 是长期记忆，可改 subject（主体：user=用户 / character=角色自己 / relationship=双方 / world=背景设定）、value（内容，必须写明主体）、key、importance、promisor/promisee（约定的承诺方/受约方）。不要用它新建记忆（新建长期记忆请用 longTerm 字段，新建待办请用 add_todo）。",
         parametersJson = buildJsonObject {
             put("type", "object")
             put("additionalProperties", false)

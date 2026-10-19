@@ -22,6 +22,15 @@ data class PromiseUpdate(
     val evidence: String = "",
 )
 
+/** A `todoUpdates` entry from `submit_response` (改期 / 完成 / 取消，须引用户原话). */
+data class TodoUpdate(
+    val todoId: String,
+    val status: String = "",
+    val dueAt: String? = null,
+    val sourceMessageIds: List<String> = emptyList(),
+    val evidence: String = "",
+)
+
 /** A `recall` request from `submit_response`. */
 data class RecallRequest(
     val category: String?,
@@ -48,6 +57,7 @@ data class ParsedTurn(
     val staticFields: JsonObject? = null,
     val memberDynamicState: List<MemberDynamicStateUpdate> = emptyList(),
     val promiseUpdates: List<PromiseUpdate> = emptyList(),
+    val todoUpdates: List<TodoUpdate> = emptyList(),
     val recall: RecallRequest? = null,
     val raw: JsonObject? = null,
 )
@@ -149,6 +159,18 @@ object ResponseParser {
         val recall = (root["recall"] as? JsonObject)?.let { obj ->
             RecallRequest(obj.string("category"), stringList(obj["tags"]))
         }
+        val todoUpdates = (root["todoUpdates"] as? JsonArray)?.mapNotNull { item ->
+            val obj = item as? JsonObject ?: return@mapNotNull null
+            val id = obj.string("todoId")
+            if (id.isNullOrBlank()) return@mapNotNull null
+            TodoUpdate(
+                todoId = id,
+                status = obj.string("status").orEmpty(),
+                dueAt = obj.string("dueAt")?.takeIf { it.isNotBlank() },
+                sourceMessageIds = stringList(obj["sourceMessageIds"]),
+                evidence = obj.string("evidence").orEmpty(),
+            )
+        }.orEmpty()
         return ParsedTurn(
             reply = reply,
             quickReplies = quickReplies,
@@ -160,6 +182,7 @@ object ResponseParser {
             staticFields = root["staticFields"] as? JsonObject,
             memberDynamicState = memberDynamicState,
             promiseUpdates = promiseUpdates,
+            todoUpdates = todoUpdates,
             recall = recall,
             raw = root,
         )

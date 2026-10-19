@@ -368,31 +368,31 @@ class MemoryEvidenceTest {
     }
 
     @Test
-    fun dueAtBackedByUserEvidenceChecksDatesAndTimeWords() {
+    fun dueAtBackedByEvidenceChecksDatesAndTimeWords() {
         val noTime = listOf(SourceRef("u1", "user", "记得帮我买药。", timestamp = "2026-08-01T12:00:00"))
-        assertFalse("用户原话里没有任何时间词", dueAtBackedByUserEvidence(noTime, "2026-08-10T09:00:00"))
-        assertFalse("没有期限就没有依据", dueAtBackedByUserEvidence(noTime, null))
-        assertFalse("没有用户来源", dueAtBackedByUserEvidence(emptyList(), "2026-08-10T09:00:00"))
+        assertFalse("用户原话里没有任何时间词", dueAtBackedByEvidence(noTime, "2026-08-10T09:00:00"))
+        assertFalse("没有期限就没有依据", dueAtBackedByEvidence(noTime, null))
+        assertFalse("没有用户来源", dueAtBackedByEvidence(emptyList(), "2026-08-10T09:00:00"))
 
         // 相对词按消息自身的时间换算：8-09 说“明天”就是 8-10。
         val tomorrow = listOf(SourceRef("u2", "user", "我明天要交报告。", timestamp = "2026-08-09T12:00:00"))
-        assertTrue(dueAtBackedByUserEvidence(tomorrow, "2026-08-10T09:00:00"))
-        assertFalse("挪到另一天就不算", dueAtBackedByUserEvidence(tomorrow, "2026-08-11T09:00:00"))
+        assertTrue(dueAtBackedByEvidence(tomorrow, "2026-08-10T09:00:00"))
+        assertFalse("挪到另一天就不算", dueAtBackedByEvidence(tomorrow, "2026-08-11T09:00:00"))
 
         // 绝对日期（ISO 与中文写法）。
         val absolute = listOf(SourceRef("u3", "user", "截止时间是 2026-08-10。", timestamp = "2026-08-01T12:00:00"))
-        assertTrue(dueAtBackedByUserEvidence(absolute, "2026-08-10T18:00:00"))
+        assertTrue(dueAtBackedByEvidence(absolute, "2026-08-10T18:00:00"))
         val chinese = listOf(SourceRef("u4", "user", "8月10号之前给他。", timestamp = "2026-08-01T12:00:00"))
-        assertTrue(dueAtBackedByUserEvidence(chinese, "2026-08-10T09:00:00"))
-        assertFalse(dueAtBackedByUserEvidence(chinese, "2026-08-12T09:00:00"))
+        assertTrue(dueAtBackedByEvidence(chinese, "2026-08-10T09:00:00"))
+        assertFalse(dueAtBackedByEvidence(chinese, "2026-08-12T09:00:00"))
 
         // 只有粗粒度时间词（没说是哪天）→ 可以接受；没有时间词 → 不行。
         val coarse = listOf(SourceRef("u5", "user", "我晚上去取。", timestamp = "2026-08-01T12:00:00"))
-        assertTrue(dueAtBackedByUserEvidence(coarse, "2026-08-10T20:00:00"))
+        assertTrue(dueAtBackedByEvidence(coarse, "2026-08-10T20:00:00"))
 
         // 消息本身没有时间戳时，相对词无法换算，只能要求"出现了时间词"。
         val undated = listOf(SourceRef("u6", "user", "我明天要交报告。"))
-        assertTrue(dueAtBackedByUserEvidence(undated, "2026-08-10T09:00:00"))
+        assertTrue(dueAtBackedByEvidence(undated, "2026-08-10T09:00:00"))
     }
 
     @Test

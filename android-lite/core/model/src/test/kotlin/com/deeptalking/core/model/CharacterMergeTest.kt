@@ -46,8 +46,7 @@ class CharacterMergeTest {
     }
 
     @Test
-    fun concurrentWorldBookAdditionsBothSurvive() {
-        val before = Character(id = "c1")
+    fun concurrentWorldBookAdditionsBothSurvive() {        val before = Character(id = "c1")
         val ours = before.copy(lorebook = listOf(entry("ours", "我们写的")))
         val live = before.copy(lorebook = listOf(entry("theirs", "别人写的")))
 
@@ -158,5 +157,19 @@ class CharacterMergeTest {
         val merged = mergeCharacterChanges(before, after, live)
 
         assertEquals(after.longTerm, merged.longTerm)
+    }
+
+    @Test
+    fun concurrentTodoAdditionsBothSurviveAndARemovalIsHonoured() {
+        val todo = { id: String -> Todo(id = id, title = id, detail = "", dueAt = "2026-08-10T09:00:00.000Z") }
+        val before = Character(id = "c1", todos = listOf(todo("a"), todo("b")))
+        // The card editor removes "b" and adds "c".
+        val after = before.copy(todos = listOf(todo("a"), todo("c")))
+        // A turn concurrently recorded "d".
+        val live = before.copy(todos = before.todos + todo("d"))
+
+        val merged = mergeCharacterChanges(before, after, live)
+
+        assertEquals(listOf("a", "c", "d"), merged.todos.map { it.id }.sorted())
     }
 }

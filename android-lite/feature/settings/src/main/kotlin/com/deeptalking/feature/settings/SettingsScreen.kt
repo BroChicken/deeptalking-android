@@ -142,9 +142,6 @@ fun SettingsScreen(
     onSaveTtsRemoteToken: (String?) -> Unit = {},
     onDiscoverTtsRemote: () -> Unit = {},
     onUploadTtsVoices: () -> Unit = {},
-    promiseTodos: List<PromiseTodo> = emptyList(),
-    onCompletePromise: (characterId: String, promiseId: String) -> Unit = { _, _ -> },
-    onClosePromise: (characterId: String, promiseId: String) -> Unit = { _, _ -> },
 ) {
     val context = LocalContext.current
     val legacy = MaterialTheme.legacy
@@ -285,12 +282,6 @@ fun SettingsScreen(
             edited.quickReplyRepair,
             hint = "快速回应不像用户会说的话时，后台用“用户本人”身份重写一次",
         ) { persist(edited.copy(quickReplyRepair = it)) }
-
-        PromiseTodoList(
-            todos = promiseTodos,
-            onComplete = onCompletePromise,
-            onClose = onClosePromise,
-        )
 
         VoiceSettingsSection(
             enabled = ttsEnabled,

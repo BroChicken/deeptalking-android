@@ -11,6 +11,7 @@ import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.StaticProfile
+import com.deeptalking.core.model.TodoStatus
 import com.deeptalking.domain.agent.prompts.DYNAMIC_STATE_FIELDS
 import com.deeptalking.domain.agent.prompts.PersonaInputs
 import com.deeptalking.domain.agent.prompts.RequestBuilder
@@ -33,6 +34,8 @@ import com.deeptalking.domain.memory.TimeRef
 import com.deeptalking.domain.memory.addShortTermMemory
 import com.deeptalking.domain.memory.consumeInjectedRecalls
 import com.deeptalking.domain.memory.SourceRef
+import com.deeptalking.domain.memory.TodoPolicy
+import com.deeptalking.domain.memory.dueAtBackedByEvidence
 import com.deeptalking.domain.memory.hasStaticEditIntent
 import com.deeptalking.domain.memory.hasValidUserEvidence
 import com.deeptalking.domain.memory.knownSources
@@ -201,6 +204,7 @@ class ChatOrchestrator(
                 staticFields = memUpdate.staticFields,
                 memberDynamicState = memUpdate.memberDynamicState,
                 promiseUpdates = memUpdate.promiseUpdates,
+                todoUpdates = memUpdate.todoUpdates,
                 recall = memUpdate.recall,
             )
         } else {
@@ -266,7 +270,7 @@ class ChatOrchestrator(
         )
 
         // Mirror the live conversation window into `character.instant` (legacy
-        // `memory.instant`): tools (set_reminder), the volatile context and the
+        // `memory.instant`): tools (add_todo), the volatile context and the
         // background tasks all read user/reply IDs and recent replies from here.
         val assistantMessage = ChatMessage(
             id = "assistant_" + character.id,
@@ -395,6 +399,10 @@ class ChatOrchestrator(
 
         parsed.promiseUpdates.forEach { update ->
             updated = applyPromiseUpdate(updated, update, sources)
+        }
+
+        parsed.todoUpdates.forEach { update ->
+            updated = applyTodoUpdate(updated, update, sources)
         }
 
         parsed.recall?.let { recall ->
@@ -577,6 +585,48 @@ class ChatOrchestrator(
                 updatedAt = now,
             )
         }
+    }
+
+    /**
+     * Validated todo reschedule / complete / cancel (`submit_response.todoUpdates`).
+     *
+     * Every change must cite the **user's own words** ([hasValidUserEvidence]); a due-time change
+     * must additionally be locatable in those words ([dueAtBackedByEvidence]). A todo is never
+     * completed just because its due time passed — completion and cancellation are explicit.
+     */
+    private fun applyTodoUpdate(
+        character: Character,
+        update: TodoUpdate,
+        sources: Map<String, SourceRef>,
+    ): Character {
+        val target = character.todos.firstOrNull {
+            it.id == update.todoId && it.status == TodoStatus.Active
+        } ?: return character
+        val resolved = hasValidUserEvidence(character, update.sourceMessageIds, update.evidence, sources)
+            ?: return character
+        val userSources = resolved.filter { it.role == "user" }
+        val status = TodoPolicy.todoStatusOf(update.status)
+        val newDue = update.dueAt?.let { MemoryToolSupport.normalizeTimestamp(it, null) }
+        if (status == null && newDue == null) return character
+        if (newDue != null && !dueAtBackedByEvidence(userSources, newDue)) return character
+        val now = Instant.now().toString()
+        val closing = status != null && status != TodoStatus.Active
+        return character.copy(
+            todos = character.todos.map { todo ->
+                if (todo.id != target.id) {
+                    todo
+                } else {
+                    todo.copy(
+                        status = status ?: todo.status,
+                        dueAt = newDue ?: todo.dueAt,
+                        sourceMessageIds = resolved.take(8).map { it.id },
+                        evidence = update.evidence.trimTo(300),
+                        updatedAt = now,
+                        closedAt = if (closing) now else todo.closedAt,
+                    )
+                }
+            },
+        )
     }
 
     private fun fieldObject(element: JsonElement): JsonObject? =

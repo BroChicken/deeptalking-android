@@ -8,7 +8,7 @@ import com.deeptalking.domain.agent.tools.HotBoardTool
 import com.deeptalking.domain.agent.tools.ListMemoriesTool
 import com.deeptalking.domain.agent.tools.SearchMemoryTool
 import com.deeptalking.domain.agent.tools.SendStickerTool
-import com.deeptalking.domain.agent.tools.SetReminderTool
+import com.deeptalking.domain.agent.tools.AddTodoTool
 import com.deeptalking.domain.agent.tools.SocialSearchTool
 import com.deeptalking.domain.agent.tools.SubmitResponseTool
 import com.deeptalking.domain.agent.tools.UpdateCharacterFieldTool
@@ -31,7 +31,7 @@ fun defaultTools(
     add(SearchMemoryTool(memory))
     add(ListMemoriesTool(memory))
     add(DeleteMemoryTool(memory))
-    add(SetReminderTool(memory))
+    add(AddTodoTool())
     add(AskUserTool())
     add(UpdateCharacterFieldTool())
     add(UpsertLorebookEntryTool())

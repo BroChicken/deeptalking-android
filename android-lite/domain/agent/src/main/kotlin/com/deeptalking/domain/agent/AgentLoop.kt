@@ -375,7 +375,7 @@ internal fun toolActivityHint(name: String): String = when (name) {
     "search_memory" -> "正在回忆…"
     "list_memories" -> "正在整理记忆…"
     "delete_memory" -> "正在清理记忆…"
-    "set_reminder" -> "已记下，正在回应…"
+    "add_todo" -> "已记下，正在回应…"
     "update_character_field" -> "已按你的要求调整设定…"
     "upsert_lorebook_entry" -> "已更新世界书…"
     "web_search" -> "正在搜索…"

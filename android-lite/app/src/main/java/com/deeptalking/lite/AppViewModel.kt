@@ -27,13 +27,11 @@ import com.deeptalking.domain.agent.HotTopicCounters
 import com.deeptalking.domain.agent.HotTopicPolicy
 import com.deeptalking.domain.agent.OrchestratorResult
 import com.deeptalking.domain.agent.prompts.buildShortTermBlock
+import com.deeptalking.domain.memory.TodoPolicy
 import com.deeptalking.domain.memory.archiveToFit
 import com.deeptalking.domain.memory.hasValidPushConfirmation
 import com.deeptalking.domain.memory.lorebookOverflow
 import com.deeptalking.domain.memory.promisePushDecision
-import com.deeptalking.feature.settings.PromiseTodo
-import com.deeptalking.feature.settings.promiseTodos
-import com.deeptalking.feature.settings.resolvePromiseIn
 import com.deeptalking.engine.ondevice.TtsSpeaker
 import com.deeptalking.engine.ondevice.TtsTurn
 import com.deeptalking.engine.remote.RemoteTtsProbe
@@ -726,6 +724,9 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 dynamicState = draft.dynamicState,
                 dynamicStateMeta = draft.dynamicStateMeta,
                 groupSharedDynamic = draft.groupSharedDynamic,
+                // 待办是独立的 `Character.todos`：编辑页拥有它（用户可完成/取消/删除），
+                // 与记忆窗口无关，随卡片一起落盘。
+                todos = draft.todos,
                 // Background tasks own each member's world book; the card editor does not
                 // expose member books, so keep the live lists — a whole-list write would
                 // roll back an archive/consolidation that ran while the dialog was open.
@@ -755,35 +756,16 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
 
     // ------------------------------------------------------------------ 待办
 
-    /** One `true` per minute, so the 待办 list re-evaluates 已超时 without a data change. */
-    private val promiseTodoTicker: Flow<Unit> = flow {
-        while (true) {
-            emit(Unit)
-            delay(PROMISE_TODO_TICK_MS)
-        }
-    }
-
     /**
-     * The 待办 view across **all** characters (not just the active one). Derived, never stored:
-     * the bucket comes from the push decision plus "now vs the confirmed due time", so 已超时
-     * needs no new field. [promiseTodoTicker] re-samples `now` once a minute so an item crosses
-     * into 已超时 while the list is on screen (nothing else would re-emit for a static row).
+     * 自动清理超过保留期（[AppLimits.Todo.CLOSED_RETENTION_DAYS] 天）的已完成 / 已取消待办。
+     * 待办与长期记忆无关（[Character.todos]）；列表本身也会防御性过滤，这里只是把数据收干净。
      */
-    val promiseTodos: StateFlow<List<PromiseTodo>> =
-        combine(characters, promiseTodoTicker) { list, _ -> promiseTodos(list) }
-            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
-
-    /**
-     * Flips one promise out of `Active` (完成 / 关闭 from the 待办 list), so it leaves the list.
-     * The owning [characterId] comes from the row, so a flip lands on its own character and
-     * never touches another's promises.
-     */
-    fun resolvePromise(characterId: String, promiseId: String, status: PromiseStatus) {
-        if (characterId.isBlank()) return
-        viewModelScope.launch {
-            val before = core.data.characters.get(characterId) ?: return@launch
-            val after = resolvePromiseIn(before, promiseId, status, Instant.now().toString()) ?: return@launch
-            writeCharacterChanges(before, after)
+    private suspend fun pruneClosedTodos() {
+        core.data.characters.observeAll().first().forEach { character ->
+            val pruned = TodoPolicy.pruneClosedTodos(character.todos)
+            if (pruned.size != character.todos.size) {
+                patchCharacter(character.id) { live -> live.copy(todos = TodoPolicy.pruneClosedTodos(live.todos)) }
+            }
         }
     }
 
@@ -1635,8 +1617,8 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
      * would later promote the model's unconfirmed date into a confirmed one. A promise with no
      * due time at all **is** stamped — it is a real user-agreed agreement, it just has no date.
      *
-     * Nothing is delivered to the user: the 待办 list in settings is the only surface (see
-     * `feature:settings`'s `PromiseTodo`), and it derives its buckets from this very decision.
+     * Nothing is delivered to the user and nothing is displayed any more: this only stamps the
+     * memory's own metadata (「用户本人确认过这条约定」), entirely independent of the 待办 list.
      */
     private fun recordPromiseConfirmations(character: Character): Character {
         var changed = false
@@ -2086,9 +2068,6 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         const val MEMORY_CLEANUP_PENDING_KEY = "deeptalking_memory_cleanup_pending_v1"
         /** How long the bubble shows the "done" tick before reverting to idle. */
         const val TTS_DONE_LINGER_MS = 1_000L
-
-        /** How often the 待办 list re-samples "now" to move an item into 已超时. */
-        const val PROMISE_TODO_TICK_MS = 60_000L
     }
 
     // ------------------------------------------------------------------- theme
@@ -2561,6 +2540,10 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 .onFailure { DeepTalkingApp.recordError(it) }
         }
         viewModelScope.launch { memoryCleanupLoop() }
+        // 自动清理超过保留期的已完成 / 已取消待办（与长期记忆无关）。
+        viewModelScope.launch {
+            runCatching { pruneClosedTodos() }.onFailure { DeepTalkingApp.recordError(it) }
+        }
         // Legacy one-time relative-time → absolute migration (no key required).
         viewModelScope.launch {
             runCatching { core.runStartupMigrations() }.onFailure { DeepTalkingApp.recordError(it) }

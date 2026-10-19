@@ -8,7 +8,7 @@ import kotlinx.serialization.json.put
 
 /**
  * Shared JSON-Schema fragment for `timeRef` (port of `buildTimeRefSchema` in
- * the legacy frontend). Used by submit_response, set_reminder and update_memory
+ * the legacy frontend). Used by submit_response, add_todo and update_memory
  * so the model sees one consistent relative-time contract.
  */
 internal fun timeRefSchema(): JsonElement = buildJsonObject {

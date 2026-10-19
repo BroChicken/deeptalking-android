@@ -169,6 +169,20 @@ object AppLimits {
         const val EVICT_MAX_PER_PASS = 4
     }
 
+    object Todo {
+        /** 已完成 / 已取消的条目在列表与存储里保留的天数，超过即自动清理。 */
+        const val CLOSED_RETENTION_DAYS = 30
+
+        /** 单条待办注入 volatile 上下文的条数上限（只注入仍未结束的）。 */
+        const val INJECT_LIMIT = 4
+
+        /** 注入摘要每行的字符上限。 */
+        const val LINE_CHARS = 100
+
+        /** 整个待办注入段的字符上限（含标题）。 */
+        const val BLOCK_CHARS = 420
+    }
+
     object Scene {
         /** Max scene summaries retained (legacy `slice(-8)`). */
         const val RETAIN = 8

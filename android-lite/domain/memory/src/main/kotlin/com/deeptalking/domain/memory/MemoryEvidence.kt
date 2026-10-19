@@ -211,7 +211,7 @@ fun resolveDynamicStateSources(
     return hasValidUserEvidence(character, ids, evidence, sources)
 }
 
-// ---- promise confirmation eligibility (待办分桶) ----------------------------------------
+// ---- promise confirmation eligibility (约定确认：记忆侧元信息，与待办无关) --------------
 
 /**
  * Promisor values used by the prompt contract (rule 5.5):
@@ -249,14 +249,15 @@ enum class PromisePushReason {
 
 /**
  * Verdict of [promisePushDecision]: whether a stored promise is a **user-confirmed agreement**,
- * and — when it is — which due time the *user's own words* actually support.
+ * and — when it is — which due time the *speaker's own words* actually support.
  *
  * [pushable] answers "did the user themself agree to this?", independently of the due time:
- * an eligible promise with [dueAtNeedsConfirmation] has no confirmed date yet (ask the user
- * first), while [confirmedDueAt] is the only due time a caller may show as confirmed.
+ * an eligible promise with [dueAtNeedsConfirmation] has no confirmed date yet, while
+ * [confirmedDueAt] is the only due time a caller may treat as confirmed.
  *
- * (The name is historical: this gate used to decide what to push as a notification. The app
- * has no notification channel any more — the verdict only feeds the 待办 list in settings.)
+ * (The name is historical: this gate used to decide what to push as a notification, then fed the
+ * settings 待办 list — both are gone. It now only classifies the promise **as memory metadata**;
+ * 待办 is a separate, independent entity. See [hasValidPushConfirmation].)
  */
 data class PromisePushDecision(
     /** True when the user (or both sides) agreed to this promise; false for a character self-promise. */
@@ -270,7 +271,7 @@ data class PromisePushDecision(
 )
 
 /**
- * The confirmation gate over one stored promise (待办分桶的数据闸门).
+ * The confirmation gate over one stored promise (约定确认，仅作记忆元信息).
  *
  * A promise counts as a user-confirmed agreement only when **the user themself agreed to it**:
  *
@@ -284,13 +285,12 @@ data class PromisePushDecision(
  *   model inferred from the user's line alone is therefore not confirmed.
  * - anything else → not confirmed.
  *
- * The due time is checked separately: [dueAtBackedByUserEvidence] must locate the model's
- * `dueAt` in the user's original words. When it cannot, the decision returns
- * `confirmedDueAt = null` and `dueAtNeedsConfirmation = true`, and the 待办 list shows
- * "待确认期限" instead.
+ * The due time is checked separately: [dueAtBackedByEvidence] must locate the model's `dueAt`
+ * in those original words. When it cannot, the decision returns `confirmedDueAt = null` and
+ * `dueAtNeedsConfirmation = true`.
  *
- * Callers (the 待办 view and the confirmation-stamping pass) read `pushable`,
- * `confirmedDueAtMillis` and `dueAtNeedsConfirmation`.
+ * Callers read `pushable`, `confirmedDueAtMillis` and `dueAtNeedsConfirmation` (the
+ * confirmation-stamping pass in `:app`); nothing is delivered to the user any more.
  */
 fun promisePushDecision(
     character: Character,
@@ -344,7 +344,7 @@ fun promisePushDecision(
 
     val dueIso = item.dueAt?.trim()?.takeIf { it.isNotEmpty() }
         ?: return PromisePushDecision(pushable = true, reason = PromisePushReason.USER_CONFIRMED)
-    if (!dueAtBackedByUserEvidence(userSources, dueIso)) {
+    if (!dueAtBackedByEvidence(userSources, dueIso)) {
         return PromisePushDecision(
             pushable = true,
             reason = PromisePushReason.USER_CONFIRMED,
@@ -445,35 +445,36 @@ private fun chineseDatesIn(text: String): List<Pair<Int?, MonthDay>> =
     }.toList()
 
 /**
- * True when the due time [dueAtIso] is locatable in the **user's own words**
- * ([userSources] = the user-role sources of the promise).
+ * True when the due time [dueAtIso] is locatable in the given [sources] — the original words of
+ * whoever stated the deadline (for a promise that is the user themself; a todo may be stated by
+ * either side, see `TodoPolicy`).
  *
  * The rule is deliberately asymmetric:
  *
- * - the user's words must carry a [containsTemporalExpression] anchor — a due time the user
- *   never mentioned is rejected outright (no schedule; the caller asks the user instead);
+ * - the words must carry a [containsTemporalExpression] anchor — a due time nobody mentioned is
+ *   rejected outright (no schedule; the caller asks the user instead);
  * - when those words also pin an absolute date, [dueAtIso] must fall on **that** date (a
  *   relative word like "明天" is resolved against [SourceRef.timestamp] — for a short-term
  *   source that is the recorded source-message time (`_sourceTs`) when present, otherwise the
  *   entry's event time — so a model-invented `dueAt` on a different day is rejected);
  * - when the anchor is only coarse ("下周" without a weekday, "晚上" without a day) the due
- *   time is accepted, because the user *did* name a time and nothing contradicts it;
+ *   time is accepted, because the speaker *did* name a time and nothing contradicts it;
  * - a source with no timestamp cannot resolve relative wording (it is deliberately **not**
  *   resolved against the wall clock, so the verdict does not depend on when it is evaluated),
  *   so the presence check is all that applies to it (absolute dates in the text still compare).
  */
-fun dueAtBackedByUserEvidence(
-    userSources: List<SourceRef>,
+fun dueAtBackedByEvidence(
+    sources: List<SourceRef>,
     dueAtIso: String?,
 ): Boolean {
     val dueAt = parseZoned(dueAtIso) ?: return false
-    if (userSources.isEmpty()) return false
+    if (sources.isEmpty()) return false
     val dueDate = dueAt.toLocalDate()
     val dueMonthDay = MonthDay.from(dueDate)
     var sawTemporalAnchor = false
     var sawDifferentDate = false
 
-    for (source in userSources) {
+    for (source in sources) {
         val text = source.text
         if (text.isEmpty()) continue
         val base = parseZoned(source.timestamp)

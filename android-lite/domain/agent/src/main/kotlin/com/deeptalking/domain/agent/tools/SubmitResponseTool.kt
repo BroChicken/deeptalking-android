@@ -130,6 +130,40 @@ class SubmitResponseTool : AgentTool {
                         },
                     )
                     put(
+                        "todoUpdates",
+                        buildJsonObject {
+                            put("type", "array")
+                            put("description", "用户明确完成 / 取消 / 改期的待办（须引用用户原话；不要因到期自动完成）")
+                            put(
+                                "items",
+                                buildJsonObject {
+                                    put("type", "object")
+                                    put("additionalProperties", false)
+                                    put(
+                                        "properties",
+                                        buildJsonObject {
+                                            put("todoId", buildJsonObject { put("type", "string") })
+                                            put(
+                                                "status",
+                                                buildJsonObject {
+                                                    put("type", "string")
+                                                    put("enum", buildJsonArray { add("done"); add("cancelled") })
+                                                },
+                                            )
+                                            put("dueAt", buildJsonObject {
+                                                put("type", "string")
+                                                put("description", "可选，改期后的新期限（ISO格式）")
+                                            })
+                                            put("sourceMessageIds", stringArraySchema())
+                                            put("evidence", buildJsonObject { put("type", "string") })
+                                        },
+                                    )
+                                    put("required", buildJsonArray { add("todoId") })
+                                },
+                            )
+                        },
+                    )
+                    put(
                         "recall",
                         buildJsonObject {
                             put("type", "object")
@@ -264,7 +298,7 @@ class SubmitResponseTool : AgentTool {
     }
 
     // timeRefSchema() is the single canonical definition (used by longTermSchema and
-    // set_reminder); every other site uses the compact timeRefPointerSchema().
+    // add_todo); every other site uses the compact timeRefPointerSchema().
 
     /** Group-only: per-member dynamic state; reuses the same field shape as `dynamicState`. */
     private fun memberDynamicStateSchema(dynProps: JsonElement): JsonElement = buildJsonObject {

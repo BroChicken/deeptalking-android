@@ -27,7 +27,7 @@
 | `submit_response` | **12,127**（单角色）/ **15,553**（群组） | `upsert_lorebook_entry` | 1,532 |
 | `update_memory` | 1,715 | `search_memory` | 1,481 |
 | `update_character_field` | 1,267 | 其余 14 个合计 | 3,986 |
-| `set_reminder` | 1,958 | | |
+| `add_todo` | ≈2,040 | | |
 
 **最大的重复已收敛**：`submit_response` 的 `timeRef` 子结构现在只有 **1 份完整定义**（1,168 字，落在 `longTerm.timeRef`），其余 **20 处**改成 250 字的短指针——那 20 处共用一个字段模板，逐处展开会把同一段 1,168 字的说明发 20 遍（改前合计 ≈24,528 字，占该 schema 七成）。逐字见附录 A-1。
 
@@ -101,8 +101,9 @@
 | `RULE_3_9` | 用户要求改说话方式时本轮直接演出，禁元话术 | 236 |
 | `RULE_4` | 只记未来有价值的信息；模型不写 `shortTerm`，只写 `longTerm` + `promiseUpdates` | 182 |
 | `RULE_5` | `subject` 只能 user / relationship / world 及其对应关系 | 148 |
-| `RULE_5_5` | 承诺必须写 `promisor` / `promisee`；时间绝对化 | 308 |
+| `RULE_5_5` | promises 是叙事记忆（与待办无关）；承诺必须写 `promisor` / `promisee`；时间绝对化 | ≈330 |
 | `RULE_6` | 新建承诺只能 `active`；完成/取消走 `promiseUpdates` 并引用原话 | 97 |
+| `RULE_6_5` | 待办（todo）与长期记忆独立：新增须「明确日期 + 双方同意」用 `add_todo`（同意以模型判断为主、关键词只做一环）；完成/取消/改期走 `todoUpdates` 并引用户原话 | 341 |
 | `RULE_7` | `quickReplies` 恰好两条、用户视角、三类禁止 | 255 |
 | `JSON_EXAMPLE_BRIEF(8.)` | JSON 字段结构示例 + 转义规则 | 471 |
 | `RULE_9` | `longTerm.category` 五选一；`importance` 1–10 | 87 |
@@ -135,13 +136,14 @@
 3.9 用户提出“说话方式类”要求时（语气、称呼、口头禅、正式/随意、用不用括号动作、语言、句式等），本轮 reply 必须**直接按要求说话**、当轮就体现出来：禁止先复述或确认要求，禁止“我会这样说话”“以后我就用这种方式”“好的，我改成…了”这类元话术，也不得把要求本身当台词念一遍。若该要求属于持久设定（说话风格、对用户的称呼、语言/方言等），按 3.5 同时用 update_character_field 更新；无论是否调用工具，reply 都只演出、不说明。
 4. 只记录未来仍有价值的信息。**短期记忆不由你写**：系统会在后台从原始对话整理事件摘要（submit_response 里没有 shortTerm 字段，写了也会被忽略）。你只负责 longTerm 与 promiseUpdates，它们的 evidence 必须逐字摘录用户原话；dynamicState按上一条动态状态规则引用。无法引用时不要记录或更新。
 5. subject只能是user、relationship、world（约定另见下条）。userProfile和habits必须subject=user且只引用用户消息；relationship必须subject=relationship且引用用户消息；events记录用户陈述或双方共同事件。
-5.5 约定(promises)要写明承诺方与受约方：promisor与promisee取值只能是 user、character、relationship。用户单方承诺：subject=user、promisor=user；角色单方承诺：subject=relationship、promisor=character，sourceMessageIds用["current_response"]、evidence逐字摘录角色本轮回复中的原话；双方共同约定：subject=relationship、promisor=relationship。约定的时间写绝对日期（dueAt用ISO，或把相对说法填进timeRef）。
+5.5 约定(promises)是**叙事记忆**（角色记得你们之间有过什么约定/承诺），与「待办事项」互相独立——promises 只是被记住，不会变成待办。要写明承诺方与受约方：promisor与promisee取值只能是 user、character、relationship。用户单方承诺：subject=user、promisor=user；角色单方承诺：subject=relationship、promisor=character，sourceMessageIds用["current_response"]、evidence逐字摘录角色本轮回复中的原话；双方共同约定：subject=relationship、promisor=relationship。约定的时间写绝对日期（dueAt用ISO，或把相对说法填进timeRef）。
 6. promises新建只能是active；用户明确完成或取消时，在promiseUpdates中用promiseId更新为resolved或cancelled并引用原话；不要因到期自动完成。
+6.5 待办事项(todo)与长期记忆**互相独立**（不是 promises）。新增必须同时满足：①对话里出现**明确日期**；②由用户提出或你提出；③**双方同意**。用户发起时以用户原话为准；你发起时，**由你结合上下文判断用户是否真的答应了**（不是被提了一嘴、也不是婉拒/敷衍），并附上用户回应的原话——**同意与否以你的判断为准，不要只看字面关键词**，但用户**明确拒绝/取消**过的一律不记。用 add_todo 记录并附 sourceMessageIds + evidence。缺日期或用户没答应就不要记。用户明确完成/取消/改期某条待办时，在 todoUpdates 中用 todoId 更新并引用用户原话；不要因到期自动完成，也不要把它塞进 longTerm。
 7. quickReplies 必须恰好两条（submit_response 里也一样；省略即视为没有，即使本轮不更新任何记忆也要给）。写法：**先把自己换成用户**，写出他此刻最可能发给角色的话（表明处境/感受、提出要求、或回问角色）；两条都必须是用户能**原样发送**的消息，其中的“我”只能指用户自己。再逐条默读为“用户：<短句>”确认通顺。禁止三类：①角色口吻（照搬角色的表态/承诺/关心）；②**角色视角的提问**（那是角色在问用户，不是用户要说的话）；③复述或换个人称重说角色刚说过的话。不得编造事实，不用 Markdown、括号动作、消息ID、时间元数据或隐藏标签。
 8. JSON 字段结构（未更新字段直接省略；无合格记忆返回空数组/空对象，但 quickReplies 仍两条）：{"reply":"...","quickReplies":["用户短句1","用户短句2"],"dynamicState":{"currentMood":{"value":"...","sourceMessageIds":["current_response"],"evidence":"..."}},"longTerm":[{"category":"userProfile","subject":"user","key":"...","value":"...","tags":["关键词"],"importance":5,"sourceMessageIds":["msg_id"],"evidence":"用户原话"}]}。字段完整定义见 submit_response 工具 schema；示例仅示范结构，**不得模仿其口吻或措辞**（口吻以角色设定为准）。JSON 转义：换行写 \n，反斜杠写 \\，双引号写 \"。
 9. longTerm.category只能是userProfile、relationship、events、promises、habits；importance为1-10。
 9.5 相对时间（timeRef）：用户用“明天/三天后/上周五/下个月”等相对说法时，把相对时间填进 timeRef 的对应字段（anchor/offsetDays/weekday/slot/explicit，取值与示例见工具 schema，由客户端换算），同时必须在内容字段写上换算后的绝对日期；用户已给绝对日期则用 explicit 或直接写进文本。时段只能用：深夜、凌晨、清晨、早晨、上午、中午、下午、傍晚、晚上、夜里。
-A. 本会话可用工具，何时用、怎么用见各工具描述（get_current_time / search_memory / list_memories / delete_memory / update_memory / set_reminder / update_character_field / upsert_lorebook_entry / web_search / web_fetch / search_video / search_music / search_posts / baidu_hot / toutiao_hot / douyin_hot / zhihu_hot / send_sticker / ask_user）。原则：回忆过往用 search_memory，检索不到再 list_memories 盘点；联网类：查资料用 web_search、读指定链接用 web_fetch、搜视频用 search_video（B站）、搜歌用 search_music（网易云音乐）、搜帖子用 search_posts（虎扑）、看热榜用 baidu_hot / toutiao_hot / douyin_hot / zhihu_hot——**这些工具每个只连一个平台，不需要你指定平台**，都免登录，失败或没搜到就直说不确定，不要编造；**用户提到某个具体日期/某天发生的事（如“九号晚上”“三号”“上周五”“那天记不记得”）时，用 search_memory 的 date/timeRef 按日期召回那天的原始对话与记忆，不要只凭摘要回忆**；记忆过期/重复/被用户纠正时先定位再用 delete_memory 或 update_memory 处理，用户明确否认或纠正时必须用 update_memory 带原话改正，不要只靠删除；待办只在**用户自己明确提出或同意**时用 set_reminder 记录（附 sourceMessageIds + evidence），你要求用户做或你叮嘱的事不记；工具结果属系统内部上下文，仅供理解，自然融入 reply，不得向用户透露检索过程或工具名，但工具返回的图片本身可直接展示。**断言前先核对**：说“第一次/从来没/总是/每次/以前也…”这类关于过去、次数或习惯的话之前，先用 search_memory 确认；查不到依据就别断言，改说不确定或反问用户，不要编造。
+A. 本会话可用工具，何时用、怎么用见各工具描述（get_current_time / search_memory / list_memories / delete_memory / update_memory / add_todo / update_character_field / upsert_lorebook_entry / web_search / web_fetch / search_video / search_music / search_posts / baidu_hot / toutiao_hot / douyin_hot / zhihu_hot / send_sticker / ask_user）。原则：回忆过往用 search_memory，检索不到再 list_memories 盘点；联网类：查资料用 web_search、读指定链接用 web_fetch、搜视频用 search_video（B站）、搜歌用 search_music（网易云音乐）、搜帖子用 search_posts（虎扑）、看热榜用 baidu_hot / toutiao_hot / douyin_hot / zhihu_hot——**这些工具每个只连一个平台，不需要你指定平台**，都免登录，失败或没搜到就直说不确定，不要编造；**用户提到某个具体日期/某天发生的事（如“九号晚上”“三号”“上周五”“那天记不记得”）时，用 search_memory 的 date/timeRef 按日期召回那天的原始对话与记忆，不要只凭摘要回忆**；记忆过期/重复/被用户纠正时先定位再用 delete_memory 或 update_memory 处理，用户明确否认或纠正时必须用 update_memory 带原话改正，不要只靠删除；待办用 add_todo：**必须在对话里出现明确日期、且由用户提出或你提出并双方同意**（你发起时须等用户应答同意），缺一不记，细则见规则 6.5；工具结果属系统内部上下文，仅供理解，自然融入 reply，不得向用户透露检索过程或工具名，但工具返回的图片本身可直接展示。**断言前先核对**：说“第一次/从来没/总是/每次/以前也…”这类关于过去、次数或习惯的话之前，先用 search_memory 确认；查不到依据就别断言，改说不确定或反问用户，不要编造。
 ```
 
 ### 1.3 ② 群组实体在规则 A 之后额外追加 674 字（规则 10/11/12：发言格式 / 记忆归属 / 三层设定）（逐字）
@@ -396,7 +398,7 @@ Role.Tool 消息 { content: 工具结果 JSON, toolCallId }                     
 | `search_memory` | 按日期/关键词检索记忆 | 1,481 |
 | `list_memories` | 盘点记忆清单 | 521 |
 | `delete_memory` | 按 ID 删记忆 | 380 |
-| `set_reminder` | 记待办（须用户发起） | 1,958 |
+| `add_todo` | 记待办（须明确日期 + 双方同意） | ≈2,040 |
 | `ask_user` | 向用户澄清 | 226 |
 | `update_character_field` | 改基础设定字段 | 1,267 |
 | `upsert_lorebook_entry` | 写世界书条目 | 1,532 |
@@ -456,12 +458,12 @@ Role.Tool 消息 { content: 工具结果 JSON, toolCallId }                     
 删除一条记忆（长期或短期，按ID）。仅用于：内容已被明确推翻或已过时失效、重复记录、或用户明确否认/纠正过的错误记忆。删除前建议先用 list_memories 或 search_memory 确认目标ID。ID 以 short_ 开头的是短期记忆（删除后不会再被整理进长期记忆）。群组对话中删除某位成员私人记忆时传入对应 memberName。
 ```
 
-#### `set_reminder`
+#### `add_todo`
 
 `strict`: `false`
 
 ```
-记录“需要用户参与”的待办/约定，且**必须由用户自己明确提出或同意**（如用户说“我明天要交报告”“记得提醒我买药”）。调用时必须附用户原话：sourceMessageIds 填用户消息ID、evidence 逐字摘录用户原话。角色要求用户去做的事、角色的建议或叮嘱，一律不得用本工具记录——应先自然征询用户，等用户自己答应后再记。到时间可在对话中温和提起。群组对话中若要记入某位成员的私人记忆可传 memberName。
+新增一条待办事项（与长期记忆无关，单独一份清单）。**必须同时满足三件事**：①对话里已经出现**明确的日期/时间**（“明天”“下周三”“十号晚八点”“2026-08-10”，不能是“以后/有空/最近”）；②这条待办是**用户提出**的、或**你（角色）提出**的；③**双方同意**——用户发起时以用户原话为准；你发起时必须由**你自己结合上下文判断用户真的答应了**（不是被提了一嘴、也不是婉拒/敷衍），并把用户**回应的原话**填进 sourceMessageIds 与 evidence。是否同意由你判断，不要只盯着字面关键词；但用户**明确拒绝/取消**过的，一律不要记。期限必须能在对话原话里定位，工具会拒绝核对不了的期限。到时间可在对话里自然提起，不要点明“这是待办”。
 ```
 
 #### `ask_user`
@@ -501,7 +503,7 @@ Role.Tool 消息 { content: 工具结果 JSON, toolCallId }                     
 `strict`: `false`
 
 ```
-修正一条已存在的记忆（长期或短期，按ID）。仅当用户明确否认或纠正某条记忆时使用，例如"那件事是我做的不是你做的""记反了""我不是那个意思"。必须先调用 search_memory 或 list_memories 找到目标ID，再用用户纠正的原话作为 evidence。ID 以 short_ 开头的是**短期记忆**（只支持 value 与 eventTime）：改正后会重新排到队尾，等待下一轮被整理进长期记忆。其他 ID 是长期记忆，可改 subject（主体：user=用户 / character=角色自己 / relationship=双方 / world=背景设定）、value（内容，必须写明主体）、key、importance、promisor/promisee（约定的承诺方/受约方）。不要用它新建记忆（新建请用 longTerm 字段或 set_reminder）。
+修正一条已存在的记忆（长期或短期，按ID）。仅当用户明确否认或纠正某条记忆时使用，例如"那件事是我做的不是你做的""记反了""我不是那个意思"。必须先调用 search_memory 或 list_memories 找到目标ID，再用用户纠正的原话作为 evidence。ID 以 short_ 开头的是**短期记忆**（只支持 value 与 eventTime）：改正后会重新排到队尾，等待下一轮被整理进长期记忆。其他 ID 是长期记忆，可改 subject（主体：user=用户 / character=角色自己 / relationship=双方 / world=背景设定）、value（内容，必须写明主体）、key、importance、promisor/promisee（约定的承诺方/受约方）。不要用它新建记忆（新建长期记忆请用 longTerm 字段，新建待办请用 add_todo）。
 ```
 
 #### `send_sticker`
@@ -2372,24 +2374,24 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
 }
 ```
 
-#### `set_reminder`
+#### `add_todo`
 
 ```json
 {
     "type": "object",
     "additionalProperties": false,
     "properties": {
-        "key": {
+        "title": {
             "type": "string",
-            "description": "约定/待办的简短标题"
+            "description": "待办的简短标题（如“交报告”）"
         },
-        "value": {
+        "detail": {
             "type": "string",
-            "description": "约定详情，写绝对日期，不要写“明天”这类相对词"
+            "description": "待办详情，写绝对日期，不要写“明天”这类相对词"
         },
         "dueAt": {
             "type": "string",
-            "description": "可选，约定的截止时间（ISO格式），如 2026-08-10T09:00:00"
+            "description": "约定的期限（ISO格式，如 2026-08-10T09:00:00）；也可用 timeRef 表达相对时间"
         },
         "timeRef": {
             "type": "object",
@@ -2457,25 +2459,30 @@ dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccu
                 }
             }
         },
+        "proposer": {
+            "type": "string",
+            "enum": [
+                "user",
+                "character"
+            ],
+            "description": "谁提出的：user=用户提出；character=你提出的、且用户已应答同意"
+        },
         "sourceMessageIds": {
             "type": "array",
             "items": {
                 "type": "string"
             },
-            "description": "用户明确提出该待办的消息ID（必须是真实用户消息）"
+            "description": "用户原话所在消息ID（角色发起时填用户应答同意的消息ID）"
         },
         "evidence": {
             "type": "string",
-            "description": "逐字摘录用户提出该待办的原话"
-        },
-        "memberName": {
-            "type": "string",
-            "description": "可选，群组对话中指定记入某位成员的私人记忆（不传则记入共享记忆）"
+            "description": "逐字摘录用户原话（用户发起=用户提出的话；角色发起=用户同意的话）"
         }
     },
     "required": [
-        "key",
-        "value",
+        "title",
+        "detail",
+        "proposer",
         "sourceMessageIds",
         "evidence"
     ]

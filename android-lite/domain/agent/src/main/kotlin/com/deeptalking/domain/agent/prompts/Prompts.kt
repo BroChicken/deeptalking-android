@@ -15,6 +15,8 @@ import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.ShortTermMemory
 import com.deeptalking.core.model.StaticProfile
+import com.deeptalking.core.model.Todo
+import com.deeptalking.core.model.TodoStatus
 import com.deeptalking.domain.agent.background.STYLE_GUARD
 import com.deeptalking.domain.agent.background.buildGroupVoiceContract
 import com.deeptalking.domain.agent.background.buildQuickReplyPerspectiveReminder
@@ -353,10 +355,13 @@ private const val RULE_5 =
     "5. subject只能是user、relationship、world（约定另见下条）。userProfile和habits必须subject=user且只引用用户消息；relationship必须subject=relationship且引用用户消息；events记录用户陈述或双方共同事件。"
 
 private const val RULE_5_5 =
-    "5.5 约定(promises)要写明承诺方与受约方：promisor与promisee取值只能是 user、character、relationship。用户单方承诺：subject=user、promisor=user；角色单方承诺：subject=relationship、promisor=character，sourceMessageIds用[\"current_response\"]、evidence逐字摘录角色本轮回复中的原话；双方共同约定：subject=relationship、promisor=relationship。约定的时间写绝对日期（dueAt用ISO，或把相对说法填进timeRef）。"
+    "5.5 约定(promises)是**叙事记忆**（角色记得你们之间有过什么约定/承诺），与「待办事项」互相独立——promises 只是被记住，不会变成待办。要写明承诺方与受约方：promisor与promisee取值只能是 user、character、relationship。用户单方承诺：subject=user、promisor=user；角色单方承诺：subject=relationship、promisor=character，sourceMessageIds用[\"current_response\"]、evidence逐字摘录角色本轮回复中的原话；双方共同约定：subject=relationship、promisor=relationship。约定的时间写绝对日期（dueAt用ISO，或把相对说法填进timeRef）。"
 
 private const val RULE_6 =
     "6. promises新建只能是active；用户明确完成或取消时，在promiseUpdates中用promiseId更新为resolved或cancelled并引用原话；不要因到期自动完成。"
+
+private const val RULE_6_5 =
+    "6.5 待办事项(todo)与长期记忆**互相独立**（不是 promises）。新增必须同时满足：①对话里出现**明确日期**；②由用户提出或你提出；③**双方同意**。用户发起时以用户原话为准；你发起时，**由你结合上下文判断用户是否真的答应了**（不是被提了一嘴、也不是婉拒/敷衍），并附上用户回应的原话——**同意与否以你的判断为准，不要只看字面关键词**，但用户**明确拒绝/取消**过的一律不记。用 add_todo 记录并附 sourceMessageIds + evidence。缺日期或用户没答应就不要记。用户明确完成/取消/改期某条待办时，在 todoUpdates 中用 todoId 更新并引用用户原话；不要因到期自动完成，也不要把它塞进 longTerm。"
 
 private const val RULE_7 =
     "7. quickReplies 必须恰好两条（submit_response 里也一样；省略即视为没有，即使本轮不更新任何记忆也要给）。写法：**先把自己换成用户**，写出他此刻最可能发给角色的话（表明处境/感受、提出要求、或回问角色）；两条都必须是用户能**原样发送**的消息，其中的“我”只能指用户自己。再逐条默读为“用户：<短句>”确认通顺。禁止三类：①角色口吻（照搬角色的表态/承诺/关心）；②**角色视角的提问**（那是角色在问用户，不是用户要说的话）；③复述或换个人称重说角色刚说过的话。不得编造事实，不用 Markdown、括号动作、消息ID、时间元数据或隐藏标签。"
@@ -384,7 +389,7 @@ private const val RULE_9_5 =
  * has to remember an implicit mapping like `netease` = music.
  */
 internal const val RULE_A =
-    "A. 本会话可用工具，何时用、怎么用见各工具描述（get_current_time / search_memory / list_memories / delete_memory / update_memory / set_reminder / update_character_field / upsert_lorebook_entry / web_search / web_fetch / search_video / search_music / search_posts / baidu_hot / toutiao_hot / douyin_hot / zhihu_hot / send_sticker / ask_user）。原则：回忆过往用 search_memory，检索不到再 list_memories 盘点；联网类：查资料用 web_search、读指定链接用 web_fetch、搜视频用 search_video（B站）、搜歌用 search_music（网易云音乐）、搜帖子用 search_posts（虎扑）、看热榜用 baidu_hot / toutiao_hot / douyin_hot / zhihu_hot——**这些工具每个只连一个平台，不需要你指定平台**，都免登录，失败或没搜到就直说不确定，不要编造；**用户提到某个具体日期/某天发生的事（如“九号晚上”“三号”“上周五”“那天记不记得”）时，用 search_memory 的 date/timeRef 按日期召回那天的原始对话与记忆，不要只凭摘要回忆**；记忆过期/重复/被用户纠正时先定位再用 delete_memory 或 update_memory 处理，用户明确否认或纠正时必须用 update_memory 带原话改正，不要只靠删除；待办只在**用户自己明确提出或同意**时用 set_reminder 记录（附 sourceMessageIds + evidence），你要求用户做或你叮嘱的事不记；工具结果属系统内部上下文，仅供理解，自然融入 reply，不得向用户透露检索过程或工具名，但工具返回的图片本身可直接展示。**断言前先核对**：说“第一次/从来没/总是/每次/以前也…”这类关于过去、次数或习惯的话之前，先用 search_memory 确认；查不到依据就别断言，改说不确定或反问用户，不要编造。"
+    "A. 本会话可用工具，何时用、怎么用见各工具描述（get_current_time / search_memory / list_memories / delete_memory / update_memory / add_todo / update_character_field / upsert_lorebook_entry / web_search / web_fetch / search_video / search_music / search_posts / baidu_hot / toutiao_hot / douyin_hot / zhihu_hot / send_sticker / ask_user）。原则：回忆过往用 search_memory，检索不到再 list_memories 盘点；联网类：查资料用 web_search、读指定链接用 web_fetch、搜视频用 search_video（B站）、搜歌用 search_music（网易云音乐）、搜帖子用 search_posts（虎扑）、看热榜用 baidu_hot / toutiao_hot / douyin_hot / zhihu_hot——**这些工具每个只连一个平台，不需要你指定平台**，都免登录，失败或没搜到就直说不确定，不要编造；**用户提到某个具体日期/某天发生的事（如“九号晚上”“三号”“上周五”“那天记不记得”）时，用 search_memory 的 date/timeRef 按日期召回那天的原始对话与记忆，不要只凭摘要回忆**；记忆过期/重复/被用户纠正时先定位再用 delete_memory 或 update_memory 处理，用户明确否认或纠正时必须用 update_memory 带原话改正，不要只靠删除；待办用 add_todo：**必须在对话里出现明确日期、且由用户提出或你提出并双方同意**（你发起时由你判断用户确已答应，并附用户回应原话），缺一不记，细则见规则 6.5；工具结果属系统内部上下文，仅供理解，自然融入 reply，不得向用户透露检索过程或工具名，但工具返回的图片本身可直接展示。**断言前先核对**：说“第一次/从来没/总是/每次/以前也…”这类关于过去、次数或习惯的话之前，先用 search_memory 确认；查不到依据就别断言，改说不确定或反问用户，不要编造。"
 
 private const val GROUP_RULE_10 =
     "10. 当前是群组对话：只能由已列出的成员发言（一人或多人）。reply 中用户可见回复必须用每人独立一行的“成员名：内容”格式（台词直接写、不加引号包裹；只有引用他人话语、歌词或书名时才用「」与《》），动作按第 2 条写进全角括号，例如“张三：（看了一眼纸）这件事我先说说我的看法。\n李四：我补充一点。”。每位成员按语义可自然分段；不要写旁白、不要加未列出的发言者；示例仅示范结构，不得模仿其口吻。quickReplies 同样两条、用户视角，不得写成成员台词/提问/承诺。成员状态用 memberDynamicState 更新，不要写入群组整体 dynamicState。群组整体只维护 currentSituation 与 currentLocation；群组不维护基础设定字段，成员的个人字段在其卡片上修改。"
@@ -425,6 +430,7 @@ fun buildSystemPrompt(inputs: PersonaInputs): String {
     sb.append(RULE_5).append('\n')
     sb.append(RULE_5_5).append('\n')
     sb.append(RULE_6).append('\n')
+    sb.append(RULE_6_5).append('\n')
     sb.append(RULE_7).append('\n')
     sb.append(JSON_EXAMPLE_BRIEF).append('\n')
     sb.append(RULE_9).append('\n')
@@ -686,6 +692,57 @@ internal fun buildStandingCommitmentBlock(character: Character): String {
     return STANDING_COMMITMENT_HEADER + body
 }
 
+// ---------------------------------------------------------------------------
+// 待办事项注入（与长期记忆无关；数据来自 Character.todos）
+// ---------------------------------------------------------------------------
+
+private const val TODO_HEADER =
+    "【待办约定（你与对方之间未结束的待办；系统给的内部提醒，到时间自然提起即可，" +
+        "不要在 reply 里点明这是“待办”，也不要逐条复述）】"
+
+/**
+ * 未结束的待办注入段，或 `""`（空则不出现，不出标题、不留空行）。
+ *
+ * 只注入 [TodoStatus.Active] 的条目，按期限升序（无期限的最后）、再按标题与 id，保证同一角色
+ * 输出恒定。数据是**独立**的 `Character.todos`，不是长期记忆。
+ */
+internal fun buildTodoBlock(character: Character, now: Instant = Instant.now()): String {
+    val nowMillis = now.toEpochMilli()
+    val active = character.todos
+        .filter { it.status == TodoStatus.Active }
+        .sortedWith(
+            compareBy<Todo>(
+                { parseZoned(it.dueAt)?.toInstant()?.toEpochMilli() ?: Long.MAX_VALUE },
+                { it.title },
+                { it.id },
+            ),
+        )
+        .take(AppLimits.Todo.INJECT_LIMIT)
+    if (active.isEmpty()) return ""
+    val body = StringBuilder()
+    for (todo in active) {
+        val dueMillis = parseZoned(todo.dueAt)?.toInstant()?.toEpochMilli()
+        val overdue = dueMillis != null && dueMillis < nowMillis
+        val due = if (todo.dueAt.isBlank()) {
+            ""
+        } else {
+            "（期限：" + localStampWithSlot(todo.dueAt) + (if (overdue) "，已过期" else "") + "）"
+        }
+        val detail = if (todo.detail.isBlank()) "" else ": " + maskUserWord(character, trimText(todo.detail, 80))
+        val line = "- " + maskUserWord(character, trimText(todo.title, 40)) + detail + due
+        val capped = if (line.length <= AppLimits.Todo.LINE_CHARS) {
+            line
+        } else {
+            val head = line.take(AppLimits.Todo.LINE_CHARS - 1)
+            (if (head.isNotEmpty() && head.last().isHighSurrogate()) head.dropLast(1) else head) + "…"
+        }
+        if (TODO_HEADER.length + body.length + 1 + capped.length > AppLimits.Todo.BLOCK_CHARS) break
+        body.append('\n').append(capped)
+    }
+    if (body.isEmpty()) return ""
+    return TODO_HEADER + body
+}
+
 /** Legacy `buildTopicSuggestions`. */
 private fun buildTopicSuggestions(character: Character): List<String> {
     val sources = mutableListOf<String>()
@@ -922,6 +979,9 @@ suspend fun buildVolatileContext(
 
     val promises = getPromiseContext(character, selectedPromiseIds)
     if (promises.isNotEmpty()) block("【待跟进承诺】\n$promises")
+
+    // 待办事项（独立于记忆）：把未结束的待办以固定顺序注入，角色可在对话里自然提前提起。
+    block(buildTodoBlock(character, now))
 
     val loreEntries = runCatching { memory.selectLorebook(character, query) }.getOrDefault(emptyList())
         .take(AppLimits.Lorebook.INJECT_ENTRIES)

@@ -51,6 +51,7 @@ fun mergeCharacterChanges(before: Character, after: Character, live: Character):
         lastInjectedRecallIds = pick(before.lastInjectedRecallIds, after.lastInjectedRecallIds, live.lastInjectedRecallIds),
         lorebook = mergeLorebook(before.lorebook, after.lorebook, live.lorebook),
         lorebookArchive = mergeLorebook(before.lorebookArchive, after.lorebookArchive, live.lorebookArchive),
+        todos = mergeTodos(before.todos, after.todos, live.todos),
         members = mergeMembers(before.members, after.members, live.members),
     )
 }
@@ -78,6 +79,33 @@ internal fun mergeLorebook(
         when {
             index < 0 -> if (previous == null && !live.any { it.id == id }) result += entry
             previous != entry -> result[index] = entry
+            else -> Unit
+        }
+    }
+    val removed = beforeById.keys - afterById.keys
+    if (removed.isNotEmpty()) result.removeAll { it.id in removed }
+    return result
+}
+
+/**
+ * Entry-wise merge of the todo list — the same rules as [mergeLorebook], keyed by id.
+ *
+ * Needed so the card editor (which holds a snapshot of the draft from when it opened) does not
+ * roll back a todo the turn or a background pass added in the meantime. A blank id (legacy rows
+ * that cannot be located) falls back to the writer's own list rather than guessing.
+ */
+internal fun mergeTodos(before: List<Todo>, after: List<Todo>, live: List<Todo>): List<Todo> {
+    if (before == after) return live
+    if (before.any { it.id.isBlank() } || after.any { it.id.isBlank() }) return after
+    val beforeById = before.associateBy { it.id }
+    val afterById = after.associateBy { it.id }
+    val result = live.toMutableList()
+    afterById.forEach { (id, item) ->
+        val index = result.indexOfFirst { it.id == id }
+        val previous = beforeById[id]
+        when {
+            index < 0 -> if (previous == null && !live.any { it.id == id }) result += item
+            previous != item -> result[index] = item
             else -> Unit
         }
     }
