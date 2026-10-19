@@ -259,7 +259,7 @@ fun VoiceSettingsSection(
             OutlinedTextField(
                 value = tokenDraft,
                 onValueChange = { raw -> tokenDraft = raw; onSaveRemoteToken(raw.ifBlank { null }) },
-                label = { Text("访问口令（服务器未设 --api-key 时留空）") },
+                label = { Text("访问口令") },
                 placeholder = { Text(if (remoteToken.isBlank()) "留空即可" else "已保存（留空则不改）") },
                 modifier = Modifier.fillMaxWidth(),
                 textStyle = MaterialTheme.typography.bodySmall,
@@ -283,17 +283,10 @@ fun VoiceSettingsSection(
             modifier = Modifier.fillMaxWidth(),
         ) { Text(if (busy) "查找中…" else "查找并测试电脑") }
 
-        Text(
-            "USB 网络共享 / 蓝牙网络共享 / 手机热点 都支持。自动找不到时，可手填电脑地址" +
-                "（电脑上运行 run-cosyvoice-server.bat diag 会打印该地址）",
-            fontSize = 12.sp,
-            color = legacy.textMuted,
-        )
-
         OutlinedTextField(
             value = remoteUrl,
             onValueChange = onChangeRemoteUrl,
-            label = { Text("服务器地址（可留空）") },
+            label = { Text("服务器地址") },
             placeholder = { Text("留空则用上面的按钮自动查找") },
             modifier = Modifier.fillMaxWidth(),
             textStyle = MaterialTheme.typography.bodySmall,
@@ -304,14 +297,14 @@ fun VoiceSettingsSection(
         OutlinedTextField(
             value = remoteModel,
             onValueChange = onChangeRemoteModel,
-            label = { Text("模型名（--served-model-name）") },
+            label = { Text("模型名") },
             placeholder = { Text("cosyvoice-3") },
             modifier = Modifier.fillMaxWidth(),
             textStyle = MaterialTheme.typography.bodySmall,
             singleLine = true,
         )
 
-        Text("音色（与端侧同一套；留空跟随端侧当前音色）", fontSize = 12.sp, color = legacy.textMuted)
+        Text("音色", fontSize = 12.sp, color = legacy.textMuted)
         LegacyDropdown(
             selected = voiceChoices.firstOrNull { it.second == remoteVoice }?.first ?: followLabel,
             options = voiceChoices.map { it.first },
@@ -366,7 +359,7 @@ fun VoiceSettingsSection(
             ) { Text(if (active?.builtin == true) "内置音色" else "删除", fontSize = 12.sp) }
         }
 
-        Text("导入新音色（支持 mp3 / m4a / wav 等，自动截取人声片段）", fontSize = 12.sp, color = legacy.textMuted)
+        Text("导入新音色", fontSize = 12.sp, color = legacy.textMuted)
         OutlinedTextField(
             value = voiceName,
             onValueChange = { voiceName = it },
@@ -399,7 +392,7 @@ fun VoiceSettingsSection(
             OutlinedTextField(
                 value = promptText,
                 onValueChange = { promptText = it },
-                label = { Text("参考音频文本（仅零样本克隆用，可留空）") },
+                label = { Text("参考文本") },
                 modifier = Modifier.fillMaxWidth(),
                 textStyle = MaterialTheme.typography.bodySmall,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text),

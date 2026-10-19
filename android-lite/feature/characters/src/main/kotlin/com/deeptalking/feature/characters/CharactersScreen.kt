@@ -568,7 +568,6 @@ fun CharacterEditorDialog(
                         2 -> LorebookTab(
                             draft = draft,
                             memberId = editingMemberId,
-                            memberName = editingMember?.name,
                             // A world-book edit is applied to the draft **and** patched onto
                             // the stored row: the dialog's draft is a snapshot from when it
                             // opened, so without the local update the checkbox/text the user
@@ -664,11 +663,6 @@ private fun TodoTab(draft: Character, onDraft: (Character) -> Unit) {
     }
 
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Text(
-            "待办与长期记忆相互独立：只在对话里出现明确日期、且双方同意时由 AI 记录（完成 / 取消 / 删除可在这里手动兜底）。",
-            fontSize = 12.sp,
-            color = legacy.textMuted,
-        )
         if (rows.isEmpty()) {
             Text("暂无待办约定", fontSize = 12.sp, color = legacy.textMuted)
             return@Column
@@ -821,7 +815,6 @@ private fun BasicTab(
                 Spacer(Modifier.width(6.dp))
                 LegacyButton("补全", primary = false, modifier = Modifier.width(64.dp), onClick = { onFillMember(draft, memberIndex, fillHint) })
             }
-            Text("只填充当前为空的字段，不覆盖已编辑内容。", fontSize = 12.sp, color = MaterialTheme.legacy.textMuted)
             Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(MaterialTheme.legacy.border))
         }
 
@@ -842,11 +835,6 @@ private fun BasicTab(
                     minLines = if (key == "background") 2 else 1,
                 )
             }
-            Text(
-                "你手写的字段保存时不会被截断，对比句也会原样保留。",
-                fontSize = 12.sp,
-                color = MaterialTheme.legacy.textMuted,
-            )
             if (member != null) {
                 LegacyField(
                     value = member.roleInGroup,
@@ -913,7 +901,6 @@ private fun StateTab(draft: Character, memberIndex: Int?, onDraft: (Character) -
 private fun LorebookTab(
     draft: Character,
     memberId: String?,
-    memberName: String?,
     onAddLorebook: () -> Unit,
     onRemoveLorebook: (String) -> Unit,
     onUpdateLorebook: (LorebookEntry) -> Unit,
@@ -928,11 +915,7 @@ private fun LorebookTab(
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         if (entries.isEmpty()) {
             Text(
-                if (memberId == null) {
-                    "还没有条目。可以让 AI 在建卡时生成，或在对话中自动补充。"
-                } else {
-                    "${memberName.orEmpty().ifBlank { "该成员" }}还没有世界书条目。对话中会被自动补充，也可以手动添加。"
-                },
+                "暂无条目，可在对话中自动补充或手动添加",
                 fontSize = 12.sp,
                 color = legacy.textMuted,
             )
@@ -1011,7 +994,7 @@ private fun LorebookTab(
             Spacer(Modifier.height(4.dp))
             if (memberId == null) {
                 Text(
-                    "归档（不注入、不计名额，可恢复）",
+                    "归档（可恢复）",
                     fontSize = 12.sp,
                     color = legacy.textMuted,
                 )
@@ -1028,7 +1011,7 @@ private fun LorebookTab(
                     Text(if (archiveExpanded) "▾" else "▸", fontSize = 12.sp, color = legacy.textMuted)
                     Spacer(Modifier.width(4.dp))
                     Text(
-                        "归档（不注入、不计名额，可恢复）",
+                        "归档（可恢复）",
                         fontSize = 12.sp,
                         color = legacy.textMuted,
                     )

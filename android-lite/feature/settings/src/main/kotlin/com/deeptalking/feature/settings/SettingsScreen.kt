@@ -219,11 +219,7 @@ fun SettingsScreen(
             Text(testResult, fontSize = 12.sp, color = legacy.textMuted)
         }
 
-        CheckRow(
-            "加密 DNS 解析（DoH）",
-            edited.dohEnabled,
-            hint = "部分运营商劫持域名解析（返回无法连接的假 IP）。开启后用 DoH 绕过，失败自动回退系统 DNS",
-        ) { persist(edited.copy(dohEnabled = it)) }
+        CheckRow("加密 DNS 解析（DoH）", edited.dohEnabled) { persist(edited.copy(dohEnabled = it)) }
         if (edited.dohEnabled) {
             FieldLabel("DoH 提供方")
             LegacyDropdown(
@@ -267,21 +263,9 @@ fun SettingsScreen(
             },
         )
 
-        CheckRow(
-            "角色主动开口",
-            edited.proactiveEnabled,
-            hint = "打开面板停留约 1 分钟未对话时，角色主动发起开场",
-        ) { persist(edited.copy(proactiveEnabled = it)) }
-        CheckRow(
-            "文风自动校对",
-            edited.styleCritique,
-            hint = "回复命中语气/风格问题时，追加一次只改文风的修订请求",
-        ) { persist(edited.copy(styleCritique = it)) }
-        CheckRow(
-            "快速回应视角校正",
-            edited.quickReplyRepair,
-            hint = "快速回应不像用户会说的话时，后台用“用户本人”身份重写一次",
-        ) { persist(edited.copy(quickReplyRepair = it)) }
+        CheckRow("角色主动开口", edited.proactiveEnabled) { persist(edited.copy(proactiveEnabled = it)) }
+        CheckRow("文风自动校对", edited.styleCritique) { persist(edited.copy(styleCritique = it)) }
+        CheckRow("快速回应视角校正", edited.quickReplyRepair) { persist(edited.copy(quickReplyRepair = it)) }
 
         VoiceSettingsSection(
             enabled = ttsEnabled,
