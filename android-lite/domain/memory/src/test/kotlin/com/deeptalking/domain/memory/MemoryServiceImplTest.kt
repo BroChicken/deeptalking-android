@@ -148,6 +148,21 @@ class MemoryServiceImplTest {
     }
 
     @Test
+    fun selectLorebookKeepsBlankEntriesWhenTheirKeywordHits() {
+        val service = MemoryServiceImpl()
+        val placeholder = LorebookEntry(
+            id = "blank",
+            name = "雾港",
+            content = "",
+            keywords = listOf("雾港"),
+        )
+        val character = Character(id = "c1", lorebook = listOf(placeholder))
+
+        assertEquals(listOf("blank"), service.selectLorebook(character, "我们到了雾港").map { it.id })
+        assertTrue(service.selectLorebook(character, "无关话题").isEmpty())
+    }
+
+    @Test
     fun listMemoriesFiltersByCategoryAndKeyword() {
         val service = MemoryServiceImpl()
         val profile = LongTermMemory(

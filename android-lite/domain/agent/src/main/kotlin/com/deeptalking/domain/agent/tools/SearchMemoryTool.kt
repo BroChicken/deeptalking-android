@@ -1,5 +1,6 @@
 package com.deeptalking.domain.agent.tools
 
+import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.LongTermMemory
 import com.deeptalking.core.model.ShortTermMemory
 import com.deeptalking.domain.agent.AgentContext
@@ -28,56 +29,113 @@ import java.time.ZonedDateTime
 import kotlin.math.round
 
 /**
- * Port of the `search_memory` branch in tool-execution.js, extended (deliberate
- * deviation) so the model can recall by **date** as well as by keyword.
+ * Memory recall. Three modes, in priority order:
  *
- * Keyword recall is the legacy path. Date recall exists because a spoken date
- * ("九号晚上") cannot match the stored absolute date (`2026-10-09`) through the
- * client's character-bigram keyword scorer — the model detects the date, normalizes
- * it to `YYYY-MM-DD` (using the system time base it is given), and calls this tool
- * to pull that day's raw messages plus its summaries and long-term memories.
+ * 1. **inventory** (`category`) — only ids, keys and update times of that category; the
+ *    model uses it to spot stale/duplicate/wrong entries before `memory_write`;
+ * 2. **date recall** (`date` / `timeRef`) — that day's raw messages, summaries and
+ *    long-term memories (a spoken date cannot match a stored absolute date through the
+ *    keyword scorer, so the model normalizes it and asks here);
+ * 3. **keyword recall** (`query`) — ranked long-term hits plus recent short-term hits.
  */
 class SearchMemoryTool(private val memory: MemoryService) : AgentTool {
 
     override val definition = ToolDefinition(
         name = "search_memory",
-        description = "检索记忆库。两种用法：①**按日期召回**——用户问起某个具体日期/某天发生的事时（如“九号晚上”“三号”“上周五”“那天记不记得”），用 date 或 timeRef 按日期召回，会返回那天的**原始对话**、当天摘要与当天长期记忆，比凭摘要回忆更准确；date 写 YYYY-MM-DD，请依据系统给的时间基准把用户的口语日期换算成绝对日期，相对说法（昨天/上周五/三天前）改用 timeRef。②**按关键词检索**——回忆过往约定、用户喜好与习惯、共同经历、关系事实，或**刚滑出近期摘要窗口的事**时用 query；返回 results（长期记忆）与 shortTerm（短期摘要，id 以 short_ 开头，可直接交给 update_memory / delete_memory 修正）。query/date/timeRef 至少给一个。默认检索全员共享记忆；群组对话中若想检索某位成员的私人记忆，可传入 memberName（该成员自己的记忆，如\"张三\"。注意：若该成员的私人记忆里没有，也可能是共享记忆，必要时可再不带 memberName 检索一次）。",
-        parametersJson = """{"type":"object","properties":{"query":{"type":"string","description":"要检索的关键词或短语（按主题检索时使用）"},"date":{"type":"string","description":"按日期召回：YYYY-MM-DD，须依据时间基准把口语日期换算成绝对日期"},"timeRef":{"type":"object","description":"按日期召回：相对时间词元（昨天/上周五/三天前等），由客户端换算成绝对日期","additionalProperties":false,"properties":{"anchor":{"type":"string","description":"相对基准：today/tomorrow/yesterday/day_after_tomorrow/day_before_yesterday/this_week/next_week/last_week/this_month/next_month/last_month/this_year/next_year/last_year"},"offsetDays":{"type":"integer","description":"在anchor基础上的天数偏移(-60~60)"},"weekday":{"type":"string","description":"星期：mon/tue/wed/thu/fri/sat/sun"},"slot":{"type":"string","description":"时段：深夜/凌晨/清晨/早晨/上午/中午/下午/傍晚/晚上/夜里"},"explicit":{"type":"string","description":"已是绝对时间（ISO 或 YYYY-MM-DD），填了则忽略其余"}}},"slot":{"type":"string","description":"可选，限定当天的时段：深夜/凌晨/清晨/早晨/上午/中午/下午/傍晚/晚上/夜里"},"memberName":{"type":"string","description":"可选，群组对话中指定检索某位成员的私人记忆（不传则检索共享记忆）"}},"additionalProperties":false}""",
+        description = "检索记忆库。①**按日期召回**——用户问起某个具体日期/某天发生的事时（如“九号晚上”“三号”“上周五”“那天记不记得”），用 date 或 timeRef 按日期召回，会返回那天的**原始对话**、当天摘要与当天长期记忆；date 写 YYYY-MM-DD（依据系统给的时间基准把口语日期换算成绝对日期），相对说法（昨天/上周五/三天前）用 timeRef。②**按关键词检索**——回忆过往约定、用户喜好与习惯、共同经历、关系事实，或**刚滑出近期摘要窗口的事**时用 query；返回 results（长期记忆）与 shortTerm（短期摘要）。③**盘点**——给 category 时只返回该分类条目的 id、关键词与更新时间（不含详情），用于发现过期、重复或错误的记忆，再交给 memory_write 修正。query/date/timeRef/category 至少给一个。默认检索全员共享记忆；群组对话中若想检索某位成员的私人记忆，可传入 memberName（不传则检索共享记忆，必要时可再带 memberName 检索一次）。",
+        parametersJson = """{"type":"object","properties":{"query":{"type":"string","description":"要检索的关键词或短语（按主题检索时使用）"},"date":{"type":"string","description":"按日期召回：YYYY-MM-DD，须依据时间基准把口语日期换算成绝对日期"},"timeRef":{"type":"object","additionalProperties":false,"description":"相对时间词元：anchor/offsetDays/weekday/slot/explicit；explicit 已是绝对时间时填它，其余忽略","properties":{"anchor":{"type":"string"},"offsetDays":{"type":"integer"},"weekday":{"type":"string"},"slot":{"type":"string","description":"时段：深夜/凌晨/清晨/早晨/上午/中午/下午/傍晚/晚上/夜里"},"explicit":{"type":"string"}}},"category":{"type":"string","enum":["userProfile","relationship","events","promises","habits"],"description":"盘点模式：只返回该分类条目的ID、关键词与更新时间"},"limit":{"type":"integer","minimum":1,"maximum":50,"description":"返回条数，默认 10"},"memberName":{"type":"string","description":"可选，群组对话中指定检索某位成员的私人记忆（不传则检索共享记忆）"}},"additionalProperties":false}""",
     )
 
     override suspend fun execute(call: ToolCall, context: AgentContext): AgentToolResult {
         val args = ToolArgs.parse(call.arguments)
         val query = ToolArgs.string(args, "query").trim()
         val dateArg = ToolArgs.string(args, "date").trim()
+        val category = ToolArgs.string(args, "category").trim()
         val memberName = ToolArgs.string(args, "memberName").trim()
+        val timeRef = ToolArgs.timeRef(args, "timeRef")
+        val limit = (ToolArgs.int(args, "limit") ?: DEFAULT_LIMIT).coerceIn(1, MAX_LIMIT)
+
+        if (query.isEmpty() && dateArg.isEmpty() && timeRef == null && category.isEmpty()) {
+            return AgentToolResult(errorJson("请至少给出 query、date、timeRef 或 category 之一"))
+        }
+
+        if (category.isNotEmpty()) {
+            if (category !in CATEGORIES) {
+                return AgentToolResult(errorJson("category 只能是 userProfile / relationship / events / promises / habits"))
+            }
+            return inventory(context.character, category, query, memberName, limit)
+        }
 
         val nowZoned = ZonedDateTime.now()
-        val resolved = resolveTimeRef(ToolArgs.timeRef(args, "timeRef"), nowZoned)
+        val resolved = resolveTimeRef(timeRef, nowZoned)
+        val slotArg = ToolArgs.string(args, "slot").trim()
         val requestedDate = requestedDate(dateArg, resolved)
-        val requestedSlot = normalizeTimeSlot(ToolArgs.string(args, "slot").trim().ifEmpty { resolved?.slot.orEmpty() })
+        if (dateArg.isNotEmpty() && requestedDate == null) {
+            return AgentToolResult(errorJson("date 必须是 YYYY-MM-DD（如 2026-10-09），相对说法请改用 timeRef"))
+        }
+        if (requestedDate == null && query.isEmpty()) {
+            return AgentToolResult(errorJson("timeRef 无法换算成具体日期，请改用 date（YYYY-MM-DD）或补充 query"))
+        }
+        val requestedSlot = normalizeTimeSlot(
+            slotArg.ifEmpty { resolved?.slot.orEmpty() },
+        )
 
         val character = context.character
         val member = if (memberName.isNotEmpty()) MemoryToolSupport.resolveMember(character, memberName) else null
         val host = if (member != null) MemoryToolSupport.memberAsCharacter(character, member) else character
 
         return if (requestedDate != null) {
-            recallByDate(character, host, member, requestedDate, requestedSlot, query)
+            recallByDate(character, host, member, requestedDate, requestedSlot, query, limit)
         } else {
-            keywordSearch(character, host, member, query)
+            keywordSearch(character, host, member, query, limit)
         }
+    }
+
+    // ---- inventory -------------------------------------------------------------------
+
+    private fun inventory(
+        character: Character,
+        category: String,
+        keyword: String,
+        memberName: String,
+        limit: Int,
+    ): AgentToolResult {
+        val listed = memory
+            .listMemories(character, category, keyword, memberName.ifEmpty { null }, limit)
+            .sortedByDescending { it.importance }
+            .take(limit)
+        val items = buildJsonArray {
+            listed.forEach { item ->
+                add(
+                    buildJsonObject {
+                        put("id", item.id)
+                        put("category", item.category.legacyKey)
+                        put("key", trimText(item.key, 100))
+                        put("updatedAt", MemoryToolSupport.formatContextTime(item.updatedAt ?: item.createdAt))
+                    },
+                )
+            }
+        }
+        val payload = buildJsonObject {
+            put("ok", true)
+            put("mode", "inventory")
+            put("category", category)
+            if (keyword.isNotEmpty()) put("keyword", keyword)
+            put("count", listed.size)
+            put("items", items)
+        }
+        return AgentToolResult(payload.toString())
     }
 
     // ---- keyword recall (legacy path) -------------------------------------------------
 
     private fun keywordSearch(
-        character: com.deeptalking.core.model.Character,
-        host: com.deeptalking.core.model.Character,
+        character: Character,
+        host: Character,
         member: com.deeptalking.core.model.GroupMember?,
         query: String,
+        limit: Int,
     ): AgentToolResult {
-        if (query.isEmpty()) {
-            return AgentToolResult(errorJson("缺少检索内容：请提供 query 关键词，或提供 date/timeRef 按日期召回"))
-        }
         val now = System.currentTimeMillis()
         // Legacy `retrieveRelevantMemories`: persisted pending-recall items are
         // force-included first (score 999) before ordinary keyword hits.
@@ -90,7 +148,7 @@ class SearchMemoryTool(private val memory: MemoryService) : AgentTool {
                     .map { it.memory to it.score }
             )
             .sortedByDescending { it.second }
-            .take(MAX_CANDIDATES)
+            .take(maxOf(MAX_CANDIDATES, limit))
 
         // Legacy bumps usage for every retrieved candidate (before the relevance filter).
         val nowIso = Instant.now().toString()
@@ -98,7 +156,7 @@ class SearchMemoryTool(private val memory: MemoryService) : AgentTool {
         val updated = bumpUsage(character, member, bumpIds, nowIso)
 
         val items = buildJsonArray {
-            candidates.take(MAX_RESULTS).forEach { (item, score) -> add(longTermJson(host, item, score)) }
+            candidates.take(limit).forEach { (item, score) -> add(longTermJson(host, item, score)) }
         }
         // The recent window is injected in full every turn, but anything that slid out of
         // it is otherwise unreachable without a date: keyword recall used to search
@@ -107,7 +165,7 @@ class SearchMemoryTool(private val memory: MemoryService) : AgentTool {
             .map { it to shortTermScore(query, it.content) }
             .filter { it.second >= MIN_SHORT_TERM_MATCH_SCORE }
             .sortedByDescending { it.second }
-            .take(MAX_SHORT)
+            .take(minOf(MAX_SHORT, limit))
         val shortItems = buildJsonArray {
             shorts.forEach { (item, score) -> add(shortTermJson(host, item, score)) }
         }
@@ -124,12 +182,13 @@ class SearchMemoryTool(private val memory: MemoryService) : AgentTool {
     // ---- date recall ------------------------------------------------------------------
 
     private fun recallByDate(
-        character: com.deeptalking.core.model.Character,
-        host: com.deeptalking.core.model.Character,
+        character: Character,
+        host: Character,
         member: com.deeptalking.core.model.GroupMember?,
         date: String,
         slot: String,
         keyword: String,
+        limit: Int,
     ): AgentToolResult {
         val needle = keyword.trim().lowercase()
 
@@ -154,13 +213,13 @@ class SearchMemoryTool(private val memory: MemoryService) : AgentTool {
         val shorts = host.shortTerm
             .filter { isoMatches(it.eventTime ?: it.createdAt, date, slot) }
             .filter { needle.isEmpty() || it.content.lowercase().contains(needle) }
-            .takeLast(MAX_SHORT)
+            .takeLast(minOf(MAX_SHORT, limit))
         val shortItems = buildJsonArray { shorts.forEach { add(shortTermJson(host, it, 0.0)) } }
 
         val longs = host.longTerm
             .filter { isoMatches(it.eventTime ?: it.createdAt, date, slot) }
             .filter { needle.isEmpty() || searchableText(it).contains(needle) }
-            .take(MAX_LONG)
+            .take(minOf(MAX_LONG, limit))
         val longItems = buildJsonArray { longs.forEach { add(longTermJson(host, it, 0.0)) } }
 
         val nowIso = Instant.now().toString()
@@ -182,7 +241,7 @@ class SearchMemoryTool(private val memory: MemoryService) : AgentTool {
 
     // ---- helpers ----------------------------------------------------------------------
 
-    private fun longTermJson(host: com.deeptalking.core.model.Character, item: LongTermMemory, score: Double) = buildJsonObject {
+    private fun longTermJson(host: Character, item: LongTermMemory, score: Double) = buildJsonObject {
         put("id", item.id)
         put("category", item.category.legacyKey)
         put("subject", item.subject.name.lowercase())
@@ -194,7 +253,7 @@ class SearchMemoryTool(private val memory: MemoryService) : AgentTool {
         if (score > 0.0) put("relevance", round(score * 100) / 100)
     }
 
-    private fun shortTermJson(host: com.deeptalking.core.model.Character, item: ShortTermMemory, score: Double) = buildJsonObject {
+    private fun shortTermJson(host: Character, item: ShortTermMemory, score: Double) = buildJsonObject {
         put("id", item.id)
         put("store", "shortTerm")
         put("time", MemoryToolSupport.formatContextTime(item.eventTime ?: item.createdAt))
@@ -222,11 +281,11 @@ class SearchMemoryTool(private val memory: MemoryService) : AgentTool {
         (item.key + " " + item.value + " " + item.tags.joinToString(" ")).lowercase()
 
     private fun bumpUsage(
-        character: com.deeptalking.core.model.Character,
+        character: Character,
         member: com.deeptalking.core.model.GroupMember?,
         ids: Set<String>,
         nowIso: String,
-    ): com.deeptalking.core.model.Character {
+    ): Character {
         fun bump(item: LongTermMemory) =
             if (item.id in ids) item.copy(usageCount = item.usageCount + 1, lastUsageAt = nowIso) else item
         if (ids.isEmpty()) return character
@@ -273,11 +332,14 @@ class SearchMemoryTool(private val memory: MemoryService) : AgentTool {
     }
 
     private companion object {
+        const val DEFAULT_LIMIT = 10
+        const val MAX_LIMIT = 50
         const val MAX_CANDIDATES = 12
-        const val MAX_RESULTS = 6
         const val MAX_RAW_MESSAGES = 12
         const val MAX_SHORT = 8
         const val MAX_LONG = 12
+        val CATEGORIES = setOf("userProfile", "relationship", "events", "promises", "habits")
+
         /**
          * Short-term relevance is scored on a 0..1 scale (bigram overlap), while the
          * long-term ranker uses the legacy >1 scale — so it needs its own floor.

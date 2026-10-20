@@ -8,6 +8,8 @@ import com.deeptalking.core.model.AppConfig
 import com.deeptalking.core.model.CacheStats
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
+import com.deeptalking.core.model.DynamicState
+import com.deeptalking.core.model.DynamicStateMeta
 import com.deeptalking.core.model.GroupMember
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.MessageAttachment
@@ -15,6 +17,8 @@ import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.RequestMetric
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.StaticProfile
+import com.deeptalking.core.model.TASK_CHAT_MAIN
+import com.deeptalking.core.model.TASK_CHAT_WORKER
 import com.deeptalking.core.model.TTS_BACKEND_REMOTE
 import com.deeptalking.core.model.TtsPhase
 import com.deeptalking.core.model.SpeechSegment
@@ -23,6 +27,7 @@ import com.deeptalking.core.model.extractSpeechText
 import com.deeptalking.core.model.convergeLorebookCapacity
 import com.deeptalking.core.model.mergeCharacterChanges
 import com.deeptalking.core.model.restoreArchivedLorebookEntry
+import com.deeptalking.core.model.trimMetricsPerTaskType
 import com.deeptalking.domain.agent.HotTopicCounters
 import com.deeptalking.domain.agent.HotTopicPolicy
 import com.deeptalking.domain.agent.OrchestratorResult
@@ -32,6 +37,7 @@ import com.deeptalking.domain.memory.archiveToFit
 import com.deeptalking.domain.memory.hasValidPushConfirmation
 import com.deeptalking.domain.memory.lorebookOverflow
 import com.deeptalking.domain.memory.promisePushDecision
+import com.deeptalking.engine.ondevice.TokenUsage
 import com.deeptalking.engine.ondevice.TtsSpeaker
 import com.deeptalking.engine.ondevice.TtsTurn
 import com.deeptalking.engine.remote.RemoteTtsProbe
@@ -84,13 +90,6 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
 
     private val activeIdState = MutableStateFlow<String?>(null)
     val activeId: StateFlow<String?> = activeIdState
-
-    /**
-     * Serializes read-modify-write patches on a character row. Without it two quick edits
-     * (toggling two world-book options, typing fast) both read the row before either write
-     * lands, and the later write silently drops the earlier change.
-     */
-    private val characterWriteMutex = Mutex()
 
     private val storedMessages: StateFlow<List<ChatMessage>> =
         activeIdState.flatMapLatest { id ->
@@ -675,7 +674,9 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     }
 
     fun updateCharacter(character: Character) {
-        viewModelScope.launch { core.data.characters.upsert(character.copy(updatedAt = Instant.now().toString())) }
+        // Whole-object writes stay for legacy call sites; route them through the per-id lock
+        // so they cannot interleave with a scoped patch.
+        patchCharacter(character.id) { character }
     }
 
     /**
@@ -683,28 +684,48 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
      * writes it back. A card editor holds a copy taken when it opened; writing that copy
      * back would revert whatever a background task wrote in the meantime (analyzed memories,
      * dynamic state), so every partial edit from the UI goes through here instead.
+     *
+     * The per-id lock lives in [com.deeptalking.core.data.CharacterRepository.mutate].
      */
     private fun patchCharacter(characterId: String, transform: (Character) -> Character) {
-        viewModelScope.launch {
-            characterWriteMutex.withLock {
-                val live = core.data.characters.get(characterId) ?: return@withLock
-                core.data.characters.upsert(transform(live).copy(updatedAt = Instant.now().toString()))
-            }
-        }
+        viewModelScope.launch { core.data.characters.mutate(characterId, transform) }
     }
 
     /**
      * Persists only what [after] changed relative to [before], merged onto the freshest
-     * stored row (see [mergeCharacterChanges]). A whole-row write would roll back anything
+     * stored row (see `mergeCharacterChanges`). A whole-row write would roll back anything
      * a concurrent writer changed while this writer was working — a world-book entry, a
      * memory, the user's own edit — which is exactly the bug the scoped write fixes.
+     *
+     * Dynamic state is applied per key and the matching `dynamicStateMeta` entries get a
+     * fresh `updatedAt`, so the next writer can tell *when* each field last moved.
      */
     private suspend fun writeCharacterChanges(before: Character, after: Character) {
-        characterWriteMutex.withLock {
-            val live = core.data.characters.get(after.id) ?: after
-            core.data.characters.upsert(mergeCharacterChanges(before, after, live))
+        val now = Instant.now().toString()
+        val keys = changedDynamicKeys(before.dynamicState, after.dynamicState)
+        val sharedKeys = changedDynamicKeys(before.groupSharedDynamic, after.groupSharedDynamic)
+        core.data.characters.mutate(after.id) { live ->
+            var merged = mergeCharacterChanges(before, after, live)
+            if (after.isGroup && sharedKeys.isNotEmpty()) {
+                merged = merged.copy(
+                    groupSharedDynamic = mergeDynamicState(merged.groupSharedDynamic, after.groupSharedDynamic, sharedKeys),
+                )
+            }
+            merged = merged.copy(
+                dynamicStateMeta = mergeDynamicStateMeta(
+                    live = live.dynamicStateMeta,
+                    source = merged.dynamicStateMeta,
+                    keys = emptySet(),
+                    now = now,
+                ),
+            )
+            withDynamicStateMeta(merged, keys + sharedKeys, now)
         }
     }
+
+    /** Stamps [keys] on a whole character; other keys keep their existing/turned value. */
+    private fun withDynamicStateMeta(character: Character, keys: Set<String>, now: String): Character =
+        character.copy(dynamicStateMeta = mergeDynamicStateMeta(character.dynamicStateMeta, emptyMap(), keys, now))
 
     /**
      * Saves the character-card editor. Only the fields the editor owns are copied onto the
@@ -712,38 +733,102 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
      * older than the store (background tasks and the per-entry world-book patches write
      * them), and a whole-row write silently rolled those back — including the user's own
      * world-book edits made in the same dialog.
+     *
+     * Dynamic state is merged **per changed key**; `dynamicStateMeta` is only ever added to
+     * (never cleared), and each changed key is stamped with the save time.
      */
     fun saveCharacterEdit(draft: Character) {
-        patchCharacter(draft.id) { live ->
-            live.copy(
-                name = draft.name,
-                emoji = draft.emoji,
-                description = draft.description,
-                interactionRules = draft.interactionRules,
-                staticProfile = draft.staticProfile,
-                dynamicState = draft.dynamicState,
-                dynamicStateMeta = draft.dynamicStateMeta,
-                groupSharedDynamic = draft.groupSharedDynamic,
-                // 待办是独立的 `Character.todos`：编辑页拥有它（用户可完成/取消/删除），
-                // 与记忆窗口无关，随卡片一起落盘。
-                todos = draft.todos,
-                // Background tasks own each member's world book; the card editor does not
-                // expose member books, so keep the live lists — a whole-list write would
-                // roll back an archive/consolidation that ran while the dialog was open.
-                // 成员按 **非空 id** 定位：id 为空（历史数据）时无法对应到实时行，原样保留
-                // 草稿——否则每个空 id 成员都会匹配到 `members[0]`，把第一个成员的世界书
-                // 复制到所有人身上。
-                members = draft.members.map { member ->
-                    val liveMember = member.id.takeIf { it.isNotBlank() }
-                        ?.let { id -> live.members.firstOrNull { it.id == id } }
-                        ?: return@map member
-                    member.copy(
-                        lorebook = liveMember.lorebook,
-                        lorebookArchive = liveMember.lorebookArchive,
+        val now = Instant.now().toString()
+        viewModelScope.launch {
+            core.data.characters.mutate(draft.id) { live ->
+                val next = live.copy(
+                    name = draft.name,
+                    emoji = draft.emoji,
+                    description = draft.description,
+                    interactionRules = draft.interactionRules,
+                    staticProfile = draft.staticProfile,
+                    // 待办是独立的 `Character.todos`：编辑页拥有它（用户可完成/取消/删除），
+                    // 与记忆窗口无关，随卡片一起落盘。
+                    todos = draft.todos,
+                    // Background tasks own each member's world book; the card editor does not
+                    // expose member books, so keep the live lists — a whole-list write would
+                    // roll back an archive/consolidation that ran while the dialog was open.
+                    // 成员按 **非空 id** 定位：id 为空（历史数据）时无法对应到实时行，原样保留
+                    // 草稿——否则每个空 id 成员都会匹配到 `members[0]`，把第一个成员的世界书
+                    // 复制到所有人身上。
+                    members = draft.members.map { member ->
+                        val liveMember = member.id.takeIf { it.isNotBlank() }
+                            ?.let { id -> live.members.firstOrNull { it.id == id } }
+                            ?: return@map member
+                        val keys = changedDynamicKeys(liveMember.dynamicState, member.dynamicState)
+                        member.copy(
+                            lorebook = liveMember.lorebook,
+                            lorebookArchive = liveMember.lorebookArchive,
+                            dynamicState = mergeDynamicState(liveMember.dynamicState, member.dynamicState, keys),
+                            dynamicStateMeta = mergeDynamicStateMeta(
+                                live = liveMember.dynamicStateMeta,
+                                source = member.dynamicStateMeta,
+                                keys = keys,
+                                now = now,
+                            ),
+                        )
+                    },
+                )
+                if (draft.isGroup) {
+                    val keys = changedDynamicKeys(live.groupSharedDynamic, draft.groupSharedDynamic)
+                    next.copy(
+                        groupSharedDynamic = mergeDynamicState(live.groupSharedDynamic, draft.groupSharedDynamic, keys),
+                        dynamicStateMeta = mergeDynamicStateMeta(live.dynamicStateMeta, draft.dynamicStateMeta, keys, now),
                     )
-                },
-            )
+                } else {
+                    val keys = changedDynamicKeys(live.dynamicState, draft.dynamicState)
+                    next.copy(
+                        dynamicState = mergeDynamicState(live.dynamicState, draft.dynamicState, keys),
+                        dynamicStateMeta = mergeDynamicStateMeta(live.dynamicStateMeta, draft.dynamicStateMeta, keys, now),
+                    )
+                }
+            }
         }
+    }
+
+    /** Dynamic-state keys whose value differs between [before] and [after]. */
+    private fun changedDynamicKeys(before: DynamicState, after: DynamicState): Set<String> = buildSet {
+        if (before.currentSituation != after.currentSituation) add("currentSituation")
+        if (before.currentLocation != after.currentLocation) add("currentLocation")
+        if (before.currentMood != after.currentMood) add("currentMood")
+        if (before.currentOccupation != after.currentOccupation) add("currentOccupation")
+        if (before.currentGoal != after.currentGoal) add("currentGoal")
+        if (before.currentTone != after.currentTone) add("currentTone")
+    }
+
+    /** Takes [source]'s values for [keys] only; every other field keeps [this]'s live value. */
+    private fun mergeDynamicState(live: DynamicState, source: DynamicState, keys: Set<String>): DynamicState {
+        if (keys.isEmpty()) return live
+        return live.copy(
+            currentSituation = if ("currentSituation" in keys) source.currentSituation else live.currentSituation,
+            currentLocation = if ("currentLocation" in keys) source.currentLocation else live.currentLocation,
+            currentMood = if ("currentMood" in keys) source.currentMood else live.currentMood,
+            currentOccupation = if ("currentOccupation" in keys) source.currentOccupation else live.currentOccupation,
+            currentGoal = if ("currentGoal" in keys) source.currentGoal else live.currentGoal,
+            currentTone = if ("currentTone" in keys) source.currentTone else live.currentTone,
+        )
+    }
+
+    /**
+     * Add-only merge of the per-field bookkeeping: live entries are kept, the writer's
+     * entries may fill gaps, and every key the writer changed is stamped with [now].
+     */
+    private fun mergeDynamicStateMeta(
+        live: Map<String, DynamicStateMeta>,
+        source: Map<String, DynamicStateMeta>,
+        keys: Set<String>,
+        now: String,
+    ): Map<String, DynamicStateMeta> {
+        if (keys.isEmpty() && source.isEmpty()) return live
+        val merged = live.toMutableMap()
+        merged.putAll(source)
+        keys.forEach { merged[it] = DynamicStateMeta(updatedAt = now) }
+        return merged
     }
 
     fun deleteCharacter(id: String) {
@@ -772,10 +857,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     /** Applies a transform to the current character and persists it. */
     fun editActiveCharacter(transform: (Character) -> Character) {
         val id = activeIdState.value ?: return
-        viewModelScope.launch {
-            val current = core.data.characters.get(id) ?: return@launch
-            core.data.characters.upsert(transform(current))
-        }
+        viewModelScope.launch { core.data.characters.mutate(id, transform) }
     }
 
     /** Replaces a group member (by index) on [character]. */
@@ -1123,34 +1205,33 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 fileRef = path,
                 createdAt = Instant.now().toString(),
             )
-            core.data.characters.upsert(character.copy(stickers = character.stickers + sticker))
+            patchCharacter(id) { live -> live.copy(stickers = live.stickers + sticker) }
             // Legacy `tagStickerInBackground`: vision-classify, fill only while untagged.
             viewModelScope.launch {
                 val cfg = runCatching { core.currentConfig() }.getOrNull() ?: return@launch
                 if (!core.hasApiKey(cfg.apiPlatform)) return@launch
                 val tag = runCatching { core.tagSticker(cfg, path) }.getOrNull() ?: return@launch
-                val latest = core.data.characters.get(id) ?: return@launch
-                core.data.characters.upsert(
-                    latest.copy(
-                        stickers = latest.stickers.map {
+                patchCharacter(id) { live ->
+                    live.copy(
+                        stickers = live.stickers.map {
                             if (it.fileRef == path && it.tag == "未分类") it.copy(tag = tag) else it
                         },
-                    ),
-                )
+                    )
+                }
             }
         }
     }
 
     fun deleteSticker(character: Character, stickerId: String) {
-        updateCharacter(character.copy(stickers = character.stickers.filterNot { it.id == stickerId }))
+        patchCharacter(character.id) { live ->
+            live.copy(stickers = live.stickers.filterNot { it.id == stickerId })
+        }
     }
 
     fun setStickerTag(character: Character, stickerId: String, tag: String) {
-        updateCharacter(
-            character.copy(
-                stickers = character.stickers.map { if (it.id == stickerId) it.copy(tag = tag) else it },
-            ),
-        )
+        patchCharacter(character.id) { live ->
+            live.copy(stickers = live.stickers.map { if (it.id == stickerId) it.copy(tag = tag) else it })
+        }
     }
 
     /**
@@ -1409,6 +1490,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         return viewModelScope.launch {
             sendingState.value = true
             statusState.value = "思考中…"
+            quickRepliesState.value = emptyList()
             lastUserActivityAt.value = System.currentTimeMillis()
             // Captured before the request body is assembled so the failure metric can
             // still report a duration (its scope must outlive `cfg`/`requestStartedAt`).
@@ -1462,42 +1544,51 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 val priorCache = cfg.cacheStats
                 val hadCacheMiss = priorCache != null && priorCache.hitTokens == 0 && (priorCache.promptTokens ?: 0) > 0
                 val requestStartedAt = System.currentTimeMillis()
-                // Legacy `chatStageDecision('empty')`: an empty turn is retried twice
-                // (attemptsLeft=2 → up to 3 requests) before failing.
+                // The empty-round retry now lives in AgentLoop's FINAL phase (2 retries).
+                // A second retry loop here would multiply the request count (3 × 3), so the
+                // app runs exactly one turn; a still-empty reply is surfaced as an error.
                 var result: OrchestratorResult? = null
-                var attempt = 0
+                val attemptResults = mutableListOf<OrchestratorResult>()
                 var receiveLogged = false
-                while (attempt < 3) {
-                    if (attempt > 0) {
-                        statusState.value = "正在重新生成…"
-                        streamingState.value = ""
-                    } else {
-                        statusState.value = if (hadCacheMiss) "缓存未命中，正在更新队列…" else "正在请求 API…"
-                    }
-                    val outcome = orchestrator.run(
-                        character = character,
-                        history = character.instant,
-                        userText = text.trim(),
-                        onDelta = { delta ->
-                            if (!receiveLogged && delta.isNotBlank()) {
-                                receiveLogged = true
-                                statusState.value = "正在接收回复…"
-                            }
-                            streamingState.value = delta
-                        },
-                        onToolActivity = { statusState.value = it },
-                        onQuickRepliesRepaired = { quickRepliesState.value = it },
-                        proactive = proactive,
-                        hotTopicTurn = hotTopicTurn,
-                    )
-                    result = outcome
-                    if (outcome.reply.isNotBlank()) break
-                    attempt++
-                }
+                statusState.value = if (hadCacheMiss) "缓存未命中，正在更新队列…" else "正在请求 API…"
+                val outcome = orchestrator.run(
+                    character = character,
+                    history = character.instant,
+                    userText = text.trim(),
+                    onDelta = { delta ->
+                        if (!receiveLogged && delta.isNotBlank()) {
+                            receiveLogged = true
+                            statusState.value = "正在接收回复…"
+                        }
+                        streamingState.value = delta
+                    },
+                    onToolActivity = { statusState.value = it },
+                    onQuickRepliesRepaired = { quickRepliesState.value = it },
+                    proactive = proactive,
+                    hotTopicTurn = hotTopicTurn,
+                )
+                result = outcome
+                attemptResults += outcome
                 streamingState.value = null
                 val finalResult = result ?: return@launch
                 if (finalResult.reply.isBlank()) {
                     statusState.value = ""
+                    // The FINAL phase already retried the empty round twice; record the
+                    // failed turn once so the per-request rows stay truthful.
+                    runCatching {
+                        appendMetric { metrics ->
+                            metrics + RequestMetric(
+                                at = Instant.now().toString(),
+                                characterId = id,
+                                taskType = TASK_CHAT_MAIN,
+                                model = cfg.modelName,
+                                platform = cfg.apiPlatform,
+                                phase = "empty-reply",
+                                status = "failed",
+                                durationMs = System.currentTimeMillis() - requestStartedAt,
+                            )
+                        }
+                    }
                     eventsState.tryEmit(UiEvent("收到空回复，请重试。你的消息已保留。"))
                     return@launch
                 }
@@ -1536,7 +1627,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 recordMetrics(
                     cfg,
                     id,
-                    finalResult,
+                    attemptResults,
                     character.instant,
                     buildShortTermBlock(character),
                     System.currentTimeMillis() - requestStartedAt,
@@ -1554,7 +1645,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                             metrics + RequestMetric(
                                 at = Instant.now().toString(),
                                 characterId = id,
-                                taskType = "chat",
+                                taskType = TASK_CHAT_MAIN,
                                 model = failedCfg.modelName,
                                 platform = failedCfg.apiPlatform,
                                 phase = (error.message ?: error.toString()).replace(Regex("\\s+"), " ").trim().take(160),
@@ -1716,48 +1807,73 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     private suspend fun recordMetrics(
         cfg: AppConfig,
         characterId: String,
-        result: OrchestratorResult,
+        results: List<OrchestratorResult>,
         requestHistory: List<ChatMessage>,
         shortTermBlock: String,
         durationMs: Long,
     ) {
+        val first = results.firstOrNull() ?: return
+        val last = results.last()
         val at = Instant.now().toString()
-        // Turn totals (all main-chat requests of this turn). `hasUsage == false` means no
-        // request reported usage: the turn is recorded as "no data" — never as a 0 % hit,
-        // which used to pollute the 10-turn average.
-        val hasUsage = result.inputTokens > 0
-        val hitTokens = if (hasUsage) result.cachedTokens.coerceAtLeast(0) else null
-        val missTokens = if (hasUsage) (result.inputTokens - result.cachedTokens).coerceAtLeast(0) else null
-        val hitRate = if (hasUsage) result.cachedTokens.toDouble() / result.inputTokens else null
-        val trace = requestTrace(characterId, requestHistory, shortTermBlock, result.instructionsHash, result.toolsHash)
-        val metric = RequestMetric(
-            at = at,
-            taskType = "chat",
-            characterId = characterId,
-            model = cfg.modelName,
-            platform = cfg.apiPlatform,
-            status = "completed",
-            durationMs = durationMs,
-            instructionsHash = result.instructionsHash,
-            toolsHash = result.toolsHash,
-            historyHash = trace.historyHash,
-            prefixChange = trace.prefixChange,
-            commonHistoryMessages = trace.commonHistoryMessages,
-            contextChars = result.contextChars,
-            inputChars = trace.inputChars,
-            inputTokens = if (hasUsage) result.inputTokens else null,
-            outputTokens = if (hasUsage) result.outputTokens else null,
-            hitTokens = hitTokens,
-            missTokens = missTokens,
-            hitRate = hitRate,
-        )
+        // The prefix trace is a property of the *request*, so it is computed once and
+        // attached to the first `chat.main` row (the request that carried the prefix).
+        val trace = requestTrace(characterId, requestHistory, shortTermBlock, first.instructionsHash, first.toolsHash)
+
+        // One row per model request: every tool round of the turn is its own row, and a
+        // retried (empty-reply) attempt appends its own rows too.
+        val rows = mutableListOf<RequestMetric>()
+        var round = 0
+        results.forEach { result ->
+            val usages = result.roundUsages.ifEmpty {
+                listOfNotNull(
+                    if (result.inputTokens > 0) {
+                        TokenUsage(result.inputTokens, result.outputTokens, result.cachedTokens)
+                    } else {
+                        null
+                    },
+                )
+            }
+            if (usages.isEmpty()) {
+                // The request happened but no usage came back → "no data" row, never a 0 % hit.
+                round++
+                rows += mainMetric(
+                    at = at, cfg = cfg, characterId = characterId, round = round,
+                    usage = null, trace = if (round == 1) trace else null, result = result,
+                )
+            } else {
+                usages.forEach { usage ->
+                    round++
+                    rows += mainMetric(
+                        at = at, cfg = cfg, characterId = characterId, round = round,
+                        usage = usage, trace = if (round == 1) trace else null, result = result,
+                    )
+                }
+            }
+            workerMetric(at, cfg, characterId, result)?.let { rows += it }
+        }
+        // The per-round durations are not reported by the backend; the turn total lands
+        // on the last main row so the list stays honest without inventing per-round values.
+        val lastMain = rows.indexOfLast { it.taskType == TASK_CHAT_MAIN }
+        if (lastMain >= 0) rows[lastMain] = rows[lastMain].copy(durationMs = durationMs)
+        if (rows.isEmpty()) return
+
+        // Header snapshot: the **first** main request of the turn — it is the one that
+        // carries the (possibly broken) cached prefix; tool rounds re-warm it and would
+        // mask a real miss. `null` means "no usage reported".
+        val firstUsage = first.roundUsages.firstOrNull()
+            ?: if (first.inputTokens > 0) {
+                TokenUsage(first.inputTokens, first.outputTokens, first.cachedTokens)
+            } else {
+                null
+            }
+        val usage = usageParts(firstUsage)
         // A completed chat turn always refreshes the header snapshot — including the
         // "no data" case (nulls → the pill shows 缓存未返回命中数据). Keeping the previous
         // numbers here is what made the header look "stuck" after a prefix change.
         val cacheStats = CacheStats(
-            hitTokens = hitTokens,
-            missTokens = missTokens,
-            promptTokens = if (hasUsage) result.inputTokens else null,
+            hitTokens = usage.hit,
+            missTokens = usage.miss,
+            promptTokens = firstUsage?.inputTokens?.takeIf { it > 0 },
             updatedAt = at,
         )
         // Legacy `DEBUG_REPLY_STORAGE_KEY`: a JSON object with the config snapshot,
@@ -1770,11 +1886,86 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 put("model", cfg.modelName)
             }
             put("durationMs", durationMs)
-            put("displayText", result.reply.take(2000))
-            put("fullText", result.rawReply.take(2000))
-            putJsonArray("quickReplies") { result.quickReplies.forEach { add(it) } }
+            put("displayText", last.reply.take(2000))
+            put("fullText", last.rawReply.take(2000))
+            putJsonArray("quickReplies") { last.quickReplies.forEach { add(it) } }
         }.toString()
-        appendMetric(cacheStats = cacheStats, lastReplyDebug = debug) { it + metric }
+        appendMetric(cacheStats = cacheStats, lastReplyDebug = debug) { it + rows }
+    }
+
+    /** One `chat.main` row (one model request of the turn). */
+    private fun mainMetric(
+        at: String,
+        cfg: AppConfig,
+        characterId: String,
+        round: Int,
+        usage: TokenUsage?,
+        trace: RequestTrace?,
+        result: OrchestratorResult,
+    ): RequestMetric {
+        val parts = usageParts(usage)
+        return RequestMetric(
+            at = at,
+            taskType = TASK_CHAT_MAIN,
+            characterId = characterId,
+            model = cfg.modelName,
+            platform = cfg.apiPlatform,
+            status = "completed",
+            round = round,
+            instructionsHash = result.instructionsHash,
+            toolsHash = result.toolsHash,
+            historyHash = trace?.historyHash,
+            prefixChange = trace?.prefixChange,
+            commonHistoryMessages = trace?.commonHistoryMessages,
+            contextChars = result.contextChars,
+            inputChars = trace?.inputChars,
+            inputTokens = usage?.inputTokens?.takeIf { it > 0 },
+            outputTokens = usage?.outputTokens?.takeIf { parts.hasUsage },
+            hitTokens = parts.hit,
+            missTokens = parts.miss,
+            hitRate = parts.rate,
+        )
+    }
+
+    /**
+     * The turn worker's row. Written when it reported usage **or** failed (a failed forced
+     * call still costs a request and must be visible as `status=failed`); nothing is
+     * written when the worker did not run at all and reported nothing.
+     */
+    private fun workerMetric(
+        at: String,
+        cfg: AppConfig,
+        characterId: String,
+        result: OrchestratorResult,
+    ): RequestMetric? {
+        val usage = result.workerUsage
+        if (usage == null && result.workerOk) return null
+        val parts = usageParts(usage)
+        return RequestMetric(
+            at = at,
+            taskType = TASK_CHAT_WORKER,
+            characterId = characterId,
+            model = cfg.modelName,
+            platform = cfg.apiPlatform,
+            status = if (result.workerOk) "completed" else "failed",
+            phase = if (result.workerOk) "" else "worker-failed",
+            inputTokens = usage?.inputTokens?.takeIf { it > 0 },
+            outputTokens = usage?.outputTokens?.takeIf { parts.hasUsage },
+            hitTokens = parts.hit,
+            missTokens = parts.miss,
+            hitRate = parts.rate,
+        )
+    }
+
+    private data class UsageParts(val hasUsage: Boolean, val hit: Int?, val miss: Int?, val rate: Double?)
+
+    /** Splits a usage report into hit/miss/rate; no reported input tokens → "no data". */
+    private fun usageParts(usage: TokenUsage?): UsageParts {
+        val input = usage?.inputTokens ?: 0
+        if (input <= 0) return UsageParts(hasUsage = false, hit = null, miss = null, rate = null)
+        val hit = (usage?.cachedTokens ?: 0).coerceAtLeast(0)
+        val miss = (input - hit).coerceAtLeast(0)
+        return UsageParts(hasUsage = true, hit = hit, miss = miss, rate = hit.toDouble() / input)
     }
 
     /**
@@ -1792,7 +1983,9 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             runCatching {
                 core.data.config.update(
                     current.copy(
-                        requestMetrics = append(current.requestMetrics).takeLast(AppLimits.Api.REQUEST_METRICS),
+                        // Trimmed **per taskType**: a turn's tool rounds must not evict
+                        // the worker/background rows (nor the other way round).
+                        requestMetrics = append(current.requestMetrics).trimMetricsPerTaskType(),
                         cacheStats = cacheStats ?: current.cacheStats,
                         lastReplyDebug = lastReplyDebug ?: current.lastReplyDebug,
                     ),
@@ -1802,7 +1995,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     }
 
     /** Records an auxiliary (background/helper) LLM call's token usage (legacy `recordCacheUsage`). */
-    private fun recordAuxiliaryUsage(taskType: String, usage: com.deeptalking.engine.ondevice.TokenUsage) {
+    private fun recordAuxiliaryUsage(taskType: String, usage: TokenUsage) {
         viewModelScope.launch {
             val cfg = core.currentConfig()
             val at = Instant.now().toString()
@@ -1870,23 +2063,19 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         if (fromIndex !in 0..history.size) return
         val removedIds = history.drop(fromIndex).mapNotNull { it.id.ifBlank { null } }.toSet()
         core.data.chat.replace(characterId, history.take(fromIndex))
-        val character = core.data.characters.get(characterId) ?: return
         fun hasRemovedSource(ids: List<String>) = ids.any { it in removedIds }
-        // Legacy `cleanDynamicStateSources` drops dynamic-state bookkeeping whose
-        // source messages were removed, so the model re-evaluates those fields.
-        // The native meta only carries `updatedAt`, so the affected fields cannot
-        // be attributed precisely; clear the meta maps wholesale for character +
-        // members (the dynamic values themselves are left untouched).
-        core.data.characters.upsert(
-            character.copy(
-                shortTerm = character.shortTerm.filterNot { hasRemovedSource(it.sourceMessageIds) },
-                longTerm = character.longTerm.filterNot { hasRemovedSource(it.sourceMessageIds) },
-                pendingRecall = character.pendingRecall.filterNot { hasRemovedSource(it.sourceMessageIds) },
-                dynamicStateMeta = emptyMap(),
-                members = character.members.map { it.copy(dynamicStateMeta = emptyMap()) },
-                revision = character.revision + 1,
-            ),
-        )
+        // Legacy `cleanDynamicStateSources` drops memory items whose source messages were
+        // removed; the dynamic values themselves are left untouched. `dynamicStateMeta`
+        // timestamps are **kept**: attribution to one field is not possible here, and
+        // clearing them would let a subsequent write report an older update time.
+        core.data.characters.mutate(characterId) { live ->
+            live.copy(
+                shortTerm = live.shortTerm.filterNot { hasRemovedSource(it.sourceMessageIds) },
+                longTerm = live.longTerm.filterNot { hasRemovedSource(it.sourceMessageIds) },
+                pendingRecall = live.pendingRecall.filterNot { hasRemovedSource(it.sourceMessageIds) },
+                revision = live.revision + 1,
+            )
+        }
     }
 
     // ---------------------------------------------------------------- settings
@@ -2415,7 +2604,13 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     /** Tone instruction for one spoken turn: the speaker's `currentTone`. */
     private fun toneFor(segment: SpeechSegment, character: Character?): String? {
         val raw = if (segment.speaker != null) {
-            character?.members?.firstOrNull { it.name == segment.speaker }?.dynamicState?.currentTone
+            val memberTone = character?.members
+                ?.firstOrNull { it.name == segment.speaker }
+                ?.dynamicState?.currentTone
+                // Second phase: per-member tone. Until the worker writes it, fall back to
+                // the group-wide tone so a group reply never goes silent.
+                .orEmpty().ifBlank { character?.dynamicState?.currentTone.orEmpty() }
+            memberTone
         } else {
             character?.dynamicState?.currentTone
         }

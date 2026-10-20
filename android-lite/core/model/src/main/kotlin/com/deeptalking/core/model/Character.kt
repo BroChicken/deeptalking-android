@@ -79,8 +79,8 @@ data class Character(
     /** Archived world-book entries: not counted, not injected, restorable from the editor. */
     val lorebookArchive: List<LorebookEntry> = emptyList(),
     /**
-     * 待办事项：与长期记忆互相独立的约定，由 `add_todo` / `todoUpdates` 维护，
-     * 在角色编辑页的「待办」页签里查看（见 [Todo]）。
+     * 待办事项：与长期记忆互相独立的约定，由 turn worker 的 `submit_state.todos`
+     * 维护，在角色编辑页的「待办」页签里查看（见 [Todo]）。
      */
     val todos: List<Todo> = emptyList(),
     val stickers: List<Sticker> = emptyList(),

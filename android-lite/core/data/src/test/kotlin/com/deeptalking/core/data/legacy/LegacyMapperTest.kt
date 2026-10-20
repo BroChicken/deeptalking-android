@@ -25,6 +25,9 @@ import com.deeptalking.core.model.SceneState
 import com.deeptalking.core.model.SceneSummary
 import com.deeptalking.core.model.ShortTermMemory
 import com.deeptalking.core.model.StaticFillMeta
+import com.deeptalking.core.model.Todo
+import com.deeptalking.core.model.TodoProposer
+import com.deeptalking.core.model.TodoStatus
 import com.deeptalking.core.model.lorebookCapacityCount
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -553,6 +556,87 @@ class LegacyMapperTest {
         assertEquals("forest", restored.scenes.single().key)
         assertEquals("hi", restored.instant.single().content)
         assertEquals(2, restored.staticFillMeta?.failures)
+    }
+
+    @Test
+    fun exportingAndImportingKeepsTodos() = runTest {
+        val characterDao = FakeCharacterDao()
+        val characters = CharacterRepository(characterDao)
+        val chat = ChatRepository(FakeMessageDao())
+        val config = ConfigRepository(FakeConfigDao())
+        val todo = Todo(
+            id = "td1",
+            title = "交报告",
+            detail = "周五前把季度报告发到群里",
+            dueAt = "2026-02-06T09:00:00Z",
+            status = TodoStatus.Done,
+            proposer = TodoProposer.Character,
+            sourceMessageIds = listOf("m1", "m2"),
+            evidence = "好，我周五一定交",
+            createdAt = "2026-02-01T00:00:00Z",
+            updatedAt = "2026-02-06T10:00:00Z",
+            closedAt = "2026-02-06T10:00:00Z",
+        )
+        characters.upsert(Character(id = "c1", name = "Aria", todos = listOf(todo)))
+
+        val exported = BackupService(characters, chat, config).exportJson(activeCharacterId = "c1")
+        val root = Json { ignoreUnknownKeys = true }.parseToJsonElement(exported) as JsonObject
+        val characterJson = (root["characters"] as JsonObject)["c1"] as JsonObject
+        val exportedTodo = (characterJson["todos"] as JsonArray).single() as JsonObject
+        assertEquals("\"done\"", exportedTodo["status"].toString())
+        assertEquals("\"character\"", exportedTodo["proposer"].toString())
+        assertEquals(2, (exportedTodo["sourceMessageIds"] as JsonArray).size)
+
+        val freshDao = FakeCharacterDao()
+        val fresh = LegacyImportService(
+            CharacterRepository(freshDao),
+            ChatRepository(FakeMessageDao()),
+            ConfigRepository(FakeConfigDao()),
+            null,
+        )
+        assertEquals(1, fresh.importJson(exported).characters)
+        assertEquals(listOf(todo), CharacterRepository(freshDao).get("c1")!!.todos)
+    }
+
+    @Test
+    fun backupWithoutTodosImportsAnEmptyList() = runTest {
+        val freshDao = FakeCharacterDao()
+        val fresh = LegacyImportService(
+            CharacterRepository(freshDao),
+            ChatRepository(FakeMessageDao()),
+            ConfigRepository(FakeConfigDao()),
+            null,
+        )
+        // `singleJson` is a pre-todo WebView backup: the key is simply absent.
+        assertEquals(1, fresh.importJson(singleJson).characters)
+        assertTrue(CharacterRepository(freshDao).get("c1")!!.todos.isEmpty())
+        assertTrue(mapCharacter(parse(singleJson).characters!!.getValue("c1"), null).todos.isEmpty())
+    }
+
+    @Test
+    fun todosWithoutTitleAreDroppedAndBadFieldsFallBack() {
+        val json = """
+            {
+              "characters": {
+                "c1": {
+                  "id": "c1",
+                  "todos": [
+                    { "id": "t1", "title": "  ", "dueAt": "2026-02-01T00:00:00Z" },
+                    { "id": "t2", "title": "买花", "dueAt": "2026-02-02T00:00:00Z", "status": "bogus",
+                      "sourceMessageIds": [" m1 ", "m1", "m2"] }
+                  ]
+                }
+              }
+            }
+        """.trimIndent()
+        val todo = mapCharacter(parse(json).characters!!.getValue("c1"), null).todos.single()
+        assertEquals("t2", todo.id)
+        assertEquals(TodoStatus.Active, todo.status)
+        assertEquals(TodoProposer.User, todo.proposer)
+        assertEquals("", todo.detail)
+        assertEquals("", todo.evidence)
+        assertEquals(listOf("m1", "m2"), todo.sourceMessageIds)
+        assertNull(todo.closedAt)
     }
 
     @Test

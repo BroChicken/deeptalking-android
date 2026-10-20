@@ -4,10 +4,11 @@ import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.LongTermMemory
 import com.deeptalking.core.model.MemoryCategory
 import com.deeptalking.core.model.PromiseStatus
-import com.deeptalking.domain.agent.prompts.STANDING_COMMITMENT_BLOCK_CHARS
+import com.deeptalking.core.model.Todo
+import com.deeptalking.core.model.TodoStatus
 import com.deeptalking.domain.agent.prompts.STANDING_COMMITMENT_LIMIT
-import com.deeptalking.domain.agent.prompts.STANDING_COMMITMENT_LINE_CHARS
-import com.deeptalking.domain.agent.prompts.buildStandingCommitmentBlock
+import com.deeptalking.domain.agent.prompts.UNFINISHED_BLOCK_CHARS
+import com.deeptalking.domain.agent.prompts.buildUnfinishedBlock
 import com.deeptalking.domain.agent.prompts.buildVolatileContext
 import com.deeptalking.domain.agent.prompts.selectStandingCommitments
 import com.deeptalking.domain.memory.MemoryServiceImpl
@@ -17,21 +18,18 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.time.Instant
-import java.time.ZoneId
-import java.time.ZonedDateTime
-import java.time.format.DateTimeFormatter
 
 /**
- * 「每晚/每天」这类周期性约定本来只是一条普通长期记忆，只有被检索命中才进上下文，
- * 于是经常整晚都没被执行。现在每轮从长期记忆里用确定性判据挑出周期性/仪式类约定，
- * 只注入「一行摘要 +（若有）期限」，并有条数上限与字符上限；其余记忆仍按需检索。
+ * 「每晚/每天」这类周期性约定本来只是一条普通长期记忆，只有被检索命中才进上下文。
+ * V2 把它并进【未完成事项】（`- [周期] key：value`），不再单独占【长期约定提醒】段；
+ * 待办同样并入这段，同一条记忆不得以两种身份重复出现。
  */
 class StandingCommitmentPromptTest {
 
     private val memory = MemoryServiceImpl()
 
-    /** 固定"现在"，否则【时间基准】里的秒会随时间跳到下一格。 */
-    private val now = Instant.parse("2026-10-14T04:00:00Z")
+    /** 固定"现在"，否则【时间】里的分钟会随时间跳到下一格。 */
+    private val now: Instant = Instant.parse("2026-10-14T04:00:00Z")
 
     private fun mem(
         id: String,
@@ -54,7 +52,7 @@ class StandingCommitmentPromptTest {
     )
 
     @Test
-    fun `周期性约定每轮注入一行摘要与期限`() = runBlocking {
+    fun `周期性约定进入未完成事项`() = runBlocking {
         val character = Character(
             id = "c1",
             name = "小雨",
@@ -64,20 +62,21 @@ class StandingCommitmentPromptTest {
                     key = "每晚的约定",
                     value = "晚安吻后说一次「鱼鱼爱你」，不许重样",
                     importance = 9,
-                    dueAt = "2026-10-20T12:00:00Z",
                 ),
             ),
         )
-        val context = buildVolatileContext(character = character, query = "在吗", memory = memory, now = now)
-        assertTrue(context.contains("【长期约定提醒"))
-        assertTrue(context.contains("长期约定"))
-        assertTrue(context.contains("不要在 reply 里复述"))
-        assertTrue(context.contains("- 每晚的约定: 晚安吻后说一次「鱼鱼爱你」，不许重样"))
+        val block = buildUnfinishedBlock(character, now)
+        assertTrue(block.startsWith("【未完成事项】"))
+        assertTrue(block.contains("- [周期] 每晚的约定：晚安吻后说一次「鱼鱼爱你」，不许重样"))
+        assertFalse(block.contains("[待办]"))
 
-        // 期限按本地时间渲染（不写死时区，避免测试机时区不同而失败）。
-        val expectedDue = ZonedDateTime.ofInstant(Instant.parse("2026-10-20T12:00:00Z"), ZoneId.systemDefault())
-            .format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"))
-        assertTrue(context.contains("截止/约定时间：$expectedDue"))
+        val context = buildVolatileContext(character = character, query = "在吗", memory = memory, now = now)
+        assertTrue(context.contains("【未完成事项】"))
+        assertTrue(context.contains("[周期] 每晚的约定"))
+        // 旧段整段消失。
+        assertFalse(context.contains("【长期约定提醒"))
+        assertFalse(context.contains("【待跟进承诺】"))
+        assertFalse(context.contains("【待办约定】"))
     }
 
     @Test
@@ -108,13 +107,14 @@ class StandingCommitmentPromptTest {
             ),
         )
         assertTrue(selectStandingCommitments(character).isEmpty())
-        assertEquals("", buildStandingCommitmentBlock(character))
+        assertEquals("", buildUnfinishedBlock(character, now))
         val context = buildVolatileContext(character = character, query = "在吗", memory = memory, now = now)
-        assertFalse(context.contains("长期约定提醒"))
+        assertFalse(context.contains("【未完成事项】"))
+        assertFalse(context.contains("【长期约定提醒"))
     }
 
     @Test
-    fun `超过条数上限时按重要性再按最近更新时间取舍`() = runBlocking {
+    fun `超过条数上限时按重要性再按最近更新时间取舍`() {
         val character = Character(
             id = "c1",
             name = "小雨",
@@ -131,7 +131,7 @@ class StandingCommitmentPromptTest {
         assertEquals(listOf("b", "d", "c", "e"), selectStandingCommitments(character).map { it.id })
         assertEquals(STANDING_COMMITMENT_LIMIT, selectStandingCommitments(character).size)
 
-        val block = buildStandingCommitmentBlock(character)
+        val block = buildUnfinishedBlock(character, now)
         assertTrue(block.contains("每天早安吻"))
         assertTrue(block.contains("每个月看一次电影"))
         assertTrue(block.contains("每周写一封信"))
@@ -142,6 +142,48 @@ class StandingCommitmentPromptTest {
         assertTrue(block.indexOf("每天早安吻") < block.indexOf("每个月看一次电影"))
         assertTrue(block.indexOf("每个月看一次电影") < block.indexOf("每周写一封信"))
         assertTrue(block.indexOf("每周写一封信") < block.indexOf("一直戴着手链"))
+    }
+
+    @Test
+    fun `待办按期限升序且整段有字符上限`() {
+        val character = Character(
+            id = "c1",
+            name = "小雨",
+            todos = listOf(
+                Todo(id = "t2", title = "交报告", detail = "下班前发邮件", dueAt = "2026-10-21T10:00:00Z"),
+                Todo(id = "t1", title = "买牛奶", detail = "顺路", dueAt = "2026-10-13T10:00:00Z"),
+                Todo(id = "t3", title = "已完成的", status = TodoStatus.Done, dueAt = "2026-10-01T10:00:00Z"),
+            ),
+            longTerm = listOf(
+                mem(id = "m1", key = "每晚的约定", value = "晚安吻后说一句「鱼鱼爱你」", importance = 9),
+            ),
+        )
+        val block = buildUnfinishedBlock(character, now)
+        assertTrue(block.contains("- [待办] 买牛奶：顺路（"))
+        assertTrue(block.contains("，已过期）"))
+        assertTrue(block.indexOf("买牛奶") < block.indexOf("交报告"))
+        assertFalse(block.contains("已完成的"))
+        // 待办在前，周期性约定在后。
+        assertTrue(block.indexOf("[待办]") < block.indexOf("[周期]"))
+        assertTrue("block too long: ${block.length}", block.length <= UNFINISHED_BLOCK_CHARS)
+    }
+
+    @Test
+    fun `同一条记忆不会同时以待办与周期身份出现`() {
+        val character = Character(
+            id = "c1",
+            name = "小雨",
+            todos = listOf(
+                Todo(id = "t1", title = "每晚说晚安", detail = "", dueAt = "2026-10-14T22:00:00Z"),
+            ),
+            longTerm = listOf(
+                mem(id = "m1", key = "每晚说晚安", value = "睡前一通电话", importance = 9),
+            ),
+        )
+        val block = buildUnfinishedBlock(character, now)
+        assertEquals(1, Regex("- \\[(待办|周期)] 每晚说晚安").findAll(block).count())
+        assertTrue(block.contains("[待办]"))
+        assertFalse(block.contains("[周期]"))
     }
 
     @Test
@@ -157,20 +199,16 @@ class StandingCommitmentPromptTest {
                 mem(id = "m4", key = "每月抄写$long", value = long, importance = 6),
             ),
         )
-        val block = buildStandingCommitmentBlock(character)
+        val block = buildUnfinishedBlock(character, now)
         assertTrue(block.isNotEmpty())
-        val lines = block.lines().drop(1)
-        assertTrue(lines.isNotEmpty())
-        lines.forEach { line ->
-            assertTrue("line too long: ${line.length}", line.length <= STANDING_COMMITMENT_LINE_CHARS)
+        block.lines().drop(1).forEach { line ->
+            assertTrue("line too long: ${line.length}", line.length <= 100)
         }
-        // 整段硬上限：4 条都取满时会被截掉末尾（取舍确定：先丢最不重要的）。
-        assertTrue("block too long: ${block.length}", block.length <= STANDING_COMMITMENT_BLOCK_CHARS)
-        assertTrue("block cap did not bind: ${lines.size} lines", lines.size < STANDING_COMMITMENT_LIMIT)
+        assertTrue("block too long: ${block.length}", block.length <= UNFINISHED_BLOCK_CHARS)
     }
 
     @Test
-    fun `没有周期性约定时不产生任何空段`() = runBlocking {
+    fun `没有未完成事项时不产生任何空段`() = runBlocking {
         val character = Character(
             id = "c1",
             name = "小雨",
@@ -178,11 +216,11 @@ class StandingCommitmentPromptTest {
                 mem(id = "m1", key = "周末去看展", value = "说好一起去看展", importance = 10),
             ),
         )
-        assertEquals("", buildStandingCommitmentBlock(character))
+        assertEquals("", buildUnfinishedBlock(character, now))
         val context = buildVolatileContext(character = character, query = "在吗", memory = memory, now = now)
-        assertFalse(context.contains("【长期约定提醒"))
-        // 不凭空多出空行/标题：状态段之后紧接着就是下一个真实的段落，
-        // 中间只有 block() 固定的一个分隔，没有多出来的空段。
-        assertTrue(context.contains("当前语气: (未设置)\n\n【本轮主动召回的相关长期记忆】"))
+        assertFalse(context.contains("【未完成事项】"))
+        // 不凭空多出空行/标题：状态段之后紧接着就是下一个真实段落，中间只有固定分隔。
+        assertTrue(context.contains("【记忆召回】"))
+        assertFalse(context.contains("\n\n\n"))
     }
 }

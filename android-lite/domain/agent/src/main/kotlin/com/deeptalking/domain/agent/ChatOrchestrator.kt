@@ -6,11 +6,14 @@ import com.deeptalking.core.model.AppConfig
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.DynamicState
+import com.deeptalking.core.model.DynamicStateMeta
 import com.deeptalking.core.model.LongTermMemory
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.StaticProfile
+import com.deeptalking.core.model.Todo
+import com.deeptalking.core.model.TodoProposer
 import com.deeptalking.core.model.TodoStatus
 import com.deeptalking.domain.agent.prompts.DYNAMIC_STATE_FIELDS
 import com.deeptalking.domain.agent.prompts.PersonaInputs
@@ -18,7 +21,6 @@ import com.deeptalking.domain.agent.prompts.RequestBuilder
 import com.deeptalking.domain.agent.prompts.STATIC_PROFILE_FIELDS
 import com.deeptalking.domain.agent.prompts.buildShortTermBlock
 import com.deeptalking.domain.agent.prompts.buildSystemPrompt
-import com.deeptalking.domain.agent.prompts.buildVolatileContext
 import com.deeptalking.domain.agent.prompts.withDynamicField
 import com.deeptalking.domain.agent.prompts.withStaticField
 import com.deeptalking.domain.agent.background.BackgroundTasks
@@ -27,7 +29,6 @@ import com.deeptalking.domain.agent.background.dedupeRepeatedEnding
 import com.deeptalking.domain.agent.background.detectStyleViolations
 import com.deeptalking.domain.agent.background.recentReplyTexts
 import com.deeptalking.domain.agent.tools.MemoryToolSupport
-import com.deeptalking.domain.agent.tools.SubmitResponseTool
 import com.deeptalking.domain.memory.MemoryService
 import com.deeptalking.domain.memory.ShortTermDraft
 import com.deeptalking.domain.memory.TimeRef
@@ -46,6 +47,7 @@ import com.deeptalking.domain.memory.resolveMemoryConflicts
 import com.deeptalking.domain.memory.resolveTimeRef
 import com.deeptalking.domain.memory.upsertLongTermMemory
 import com.deeptalking.engine.ondevice.LlmBackend
+import com.deeptalking.engine.ondevice.TokenUsage
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -54,6 +56,7 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import java.time.Instant
 import java.time.ZonedDateTime
+import java.util.UUID
 
 /** Result of one user turn. */
 data class OrchestratorResult(
@@ -78,6 +81,16 @@ data class OrchestratorResult(
     val inputTokens: Int = 0,
     val outputTokens: Int = 0,
     val cachedTokens: Int = 0,
+    /**
+     * Usage of **each** main-chat request this turn made, in request order (tool rounds
+     * included). One entry per `chat.main` metric row; [inputTokens]/[outputTokens]/
+     * [cachedTokens] above stay the turn totals for callers that want the aggregate.
+     */
+    val roundUsages: List<TokenUsage> = emptyList(),
+    /** Usage reported by the turn-worker (`submit_state`) call, if it reported any. */
+    val workerUsage: TokenUsage? = null,
+    /** True when the turn worker's forced call succeeded and its state was applied. */
+    val workerOk: Boolean = false,
     /** FNV-1a hash of the system instructions (legacy `instructionsHash`). */
     val instructionsHash: String = "",
     /** FNV-1a hash of this request's tool definitions (legacy `toolsHash`). */
@@ -142,7 +155,7 @@ class ChatOrchestrator(
         val recentAssistantReplies = history
             .filter { it.role == Role.Assistant && !it.isLoading && it.content.isNotBlank() }
             .map { it.content }
-        val volatileContext = buildVolatileContext(
+        val volatile = com.deeptalking.domain.agent.prompts.buildVolatileContextForTurn(
             character = character,
             query = userText,
             memory = memory,
@@ -152,7 +165,7 @@ class ChatOrchestrator(
         )
         val contextMessage = ChatMessage(
             role = Role.User,
-            content = "【系统提供的本轮上下文，仅供角色理解，不代表用户陈述】\n" + volatileContext,
+            content = "【系统提供的本轮上下文，仅供角色理解，不代表用户陈述】\n" + volatile.text,
         )
         // The short-term window is prepended, *before* the history. The window is only
         // appended to by the fold pass, so between folds the block is byte-identical and
@@ -167,7 +180,6 @@ class ChatOrchestrator(
         }
 
         val autoTools = tools.definitions(context)
-        val submitTool = SubmitResponseTool().definitionFor(context)
         val instructionsHash = fnv1a(instructions)
         val toolsHash = fnv1a(
             autoTools.joinToString("\n") { "${it.name}|${it.description}|${it.parametersJson}|${it.strict}" },
@@ -178,45 +190,17 @@ class ChatOrchestrator(
             instructions = instructions,
             baseInput = input,
             autoTools = autoTools,
-            submitTool = submitTool,
             builder = builder,
             model = config.modelName,
             onDelta = onDelta,
             onToolActivity = onToolActivity,
         )
 
-        val parsedBase = when {
-            outcome.submitCall != null ->
-                ResponseParser.parseSubmitResponse(outcome.submitCall.arguments)
-                    ?: ResponseParser.parseTurnFromText(outcome.text)
-            else -> ResponseParser.parseTurnFromText(outcome.text)
-        }
-        // Prose/salvage turns may still carry a legacy `<MEM_UPDATE>` block; parse and
-        // fold its long-term / dynamic-state parts in (legacy `parseMemoryFromText`).
-        // `shortTerm` inside such a block is ignored: the short-term window is only
-        // appended to by the whole-window extraction pass.
-        val memUpdate = if (parsedBase.raw == null) ResponseParser.parseMemoryFromText(outcome.text) else null
-        val parsed = if (memUpdate != null) {
-            parsedBase.copy(
-                longTerm = memUpdate.longTerm,
-                longTermTimeRefs = memUpdate.longTermTimeRefs,
-                dynamicState = memUpdate.dynamicState,
-                staticFields = memUpdate.staticFields,
-                memberDynamicState = memUpdate.memberDynamicState,
-                promiseUpdates = memUpdate.promiseUpdates,
-                todoUpdates = memUpdate.todoUpdates,
-                recall = memUpdate.recall,
-            )
-        } else {
-            parsedBase
-        }
+        // Plain-text protocol: the assistant text is the reply. JSON output is only
+        // accepted as a whole object (legacy/cached-prompt compatibility).
+        val parsed = ResponseParser.parseTurnFromText(outcome.text)
 
-        val quickReplies = if (parsed.quickReplies.size >= 2) {
-            parsed.quickReplies
-        } else {
-            val fromText = ResponseParser.parseQuickRepliesFromText(outcome.text)
-            if (fromText.size > parsed.quickReplies.size) fromText else parsed.quickReplies
-        }
+        // Quick replies are produced by the turn worker (decision 2/7).
 
         // Tool-driven edits win first; memory deltas fold onto that copy.
         // The pending recall surfaced in this turn's volatile context is consumed here;
@@ -239,10 +223,9 @@ class ChatOrchestrator(
         val memoryInstant = (character.instant + history.filter { !it.rejected } + memoryAssistant)
             .distinctBy { it.id }
         val recalled = outcome.updatedCharacter ?: character
-        // Legacy `consumeInjectedRecalls`: the volatile context injects the
-        // persisted pending-recall items first, so only those ids are consumed.
-        val injectedRecallIds = recalled.pendingRecall.map { it.id }
-            .take(AppLimits.Agent.TOOL_MEMORY_INJECT_LIMIT)
+        // Consume exactly the recall ids rendered in this turn's volatile context (the
+        // rendered set is capped by the recall budget, not by the whole pending list).
+        val injectedRecallIds = volatile.recallIds
         val base = consumeInjectedRecalls(
             bumpLorebookMentions(
                 recalled,
@@ -251,6 +234,7 @@ class ChatOrchestrator(
             injectedRecallIds,
         )
         val updated = applyMemory(base, parsed, memoryAssistant)
+            .let { applyTone(it, parsed.tone) }
 
         // The visible reply may be replaced by the style critique before it is shown,
         // matching the legacy flow (critique runs inline; repair + extraction run after).
@@ -285,29 +269,56 @@ class ChatOrchestrator(
         val instantWindow = history.filter { !it.rejected } + assistantMessage
         val characterWithInstant = updated.copy(instant = instantWindow, revision = character.revision + 1)
 
+        // Turn worker: produces dynamicState (without currentTone), quickReplies, todos and
+        // promise status changes through one forced `submit_state` call. Failure is not
+        // fatal: the reply is already final, so we keep the previous state (decision 6).
+        val worker = if (backgroundTasks != null && runBackgroundTasks) {
+            runTurnWorker(
+                character = characterWithInstant,
+                userText = userText,
+                reply = displayReply,
+                replyId = assistantMessage.id,
+                proactive = proactive,
+            )
+        } else {
+            WorkerResult(character = characterWithInstant)
+        }
+        val finalCharacter = run {
+            var current = worker.character
+            // Static-field revision call (replaces the deleted update_character_field tool).
+            if (!character.isGroup) {
+                FieldRevision.detect(userText)?.let { key ->
+                    onToolActivity("正在调整设定…")
+                    FieldRevision.revise(llm, config, current, key, userText)?.let { value ->
+                        current = FieldRevision.apply(current, key, value, Instant.now().toString())
+                    }
+                }
+            }
+            current
+        }
+
         if (backgroundTasks != null && runBackgroundTasks) {
             backgroundTasks.scheduleTurn(
-                character = characterWithInstant,
+                character = finalCharacter,
                 reply = displayReply,
                 userText = userText,
-                currentQuickReplies = quickReplies,
+                currentQuickReplies = worker.quickReplies,
                 messages = history.filter { !it.isLoading } + assistantMessage,
                 critiqueEnabled = config.styleCritique,
                 quickReplyRepairEnabled = config.quickReplyRepair,
                 onCharacterUpdated = { bg -> onCharacterUpdated(characterWithInstant, bg) },
                 onQuickRepliesRepaired = onQuickRepliesRepaired,
                 styleViolations = styleViolations,
-                proseFallback = parsed.raw == null && memUpdate == null,
             )
         }
 
         return OrchestratorResult(
             reply = displayReply,
-            quickReplies = quickReplies,
-            updatedCharacter = characterWithInstant,
+            quickReplies = worker.quickReplies,
+            updatedCharacter = finalCharacter,
             proactive = proactive,
-            staticChanges = diffStaticChanges(character, characterWithInstant),
-            lorebookChanges = diffLorebookChanges(character, characterWithInstant),
+            staticChanges = diffStaticChanges(character, finalCharacter),
+            lorebookChanges = diffLorebookChanges(character, finalCharacter),
             stickerFileRef = outcome.stickerFileRef,
             rawReply = outcome.text,
             // Turn totals across **every** request the turn made (tool rounds + the
@@ -319,6 +330,9 @@ class ChatOrchestrator(
             inputTokens = outcome.roundUsages.sumOf { it.inputTokens },
             outputTokens = outcome.roundUsages.sumOf { it.outputTokens },
             cachedTokens = outcome.roundUsages.sumOf { it.cachedTokens ?: 0 },
+            roundUsages = outcome.roundUsages,
+            workerUsage = worker.usage,
+            workerOk = worker.ok,
             instructionsHash = instructionsHash,
             toolsHash = toolsHash,
             contextChars = contextMessage.content.length,
@@ -650,4 +664,245 @@ class ChatOrchestrator(
         }
         return raw.trim()
     }
+
+    // ------------------------------------------------------------------ turn worker
+
+    /** Applies the main call's `【语气】` line: value + per-field timestamp, never blanking it. */
+    private fun applyTone(character: Character, tone: String?): Character {
+        val value = tone?.trim()?.takeIf { it.isNotEmpty() } ?: return character
+        if (value == character.dynamicState.currentTone) return character
+        return character.copy(
+            dynamicState = character.dynamicState.copy(currentTone = value),
+            dynamicStateMeta = character.dynamicStateMeta +
+                ("currentTone" to DynamicStateMeta(updatedAt = Instant.now().toString())),
+        )
+    }
+
+    private fun dynamicValue(state: DynamicState, key: String): String = when (key) {
+        "currentSituation" -> state.currentSituation
+        "currentLocation" -> state.currentLocation
+        "currentMood" -> state.currentMood
+        "currentOccupation" -> state.currentOccupation
+        "currentGoal" -> state.currentGoal
+        "currentTone" -> state.currentTone
+        else -> ""
+    }
+
+    /** Writes `updatedAt` only for the dynamic keys the worker actually changed. */
+    private fun mergeDynamicMeta(
+        current: Map<String, DynamicStateMeta>,
+        before: DynamicState,
+        after: DynamicState,
+        now: String,
+    ): Map<String, DynamicStateMeta> {
+        var meta = current
+        DYNAMIC_STATE_FIELDS.forEach { (key, _) ->
+            if (dynamicValue(before, key) != dynamicValue(after, key)) {
+                meta = meta + (key to DynamicStateMeta(updatedAt = now))
+            }
+        }
+        return meta
+    }
+
+    /**
+     * Runs the forced `submit_state` call and folds its fields onto the character.
+     * Any failure (transport, no call, unparseable arguments, rejected evidence) keeps the
+     * previous state; the reply has already been produced and must not be affected.
+     */
+    private suspend fun runTurnWorker(
+        character: Character,
+        userText: String,
+        reply: String,
+        replyId: String,
+        proactive: Boolean,
+    ): WorkerResult {
+        val result = runCatching {
+            llm.complete(
+                TurnWorker.buildRequest(
+                    config = config,
+                    character = character,
+                    userText = userText,
+                    reply = reply,
+                    replyId = replyId,
+                    proactive = proactive,
+                    now = Instant.now(),
+                ),
+            )
+        }.getOrNull() ?: return WorkerResult(character = character)
+
+        val output = TurnWorker.parse(result)
+        if (!output.ok) return WorkerResult(character = character, usage = output.usage)
+
+        val now = Instant.now()
+        val nowZoned = ZonedDateTime.now()
+        val assistant = character.instant.lastOrNull { it.id == replyId }
+            ?: ChatMessage(id = replyId, role = Role.Assistant, content = reply)
+        var working = character
+        val sources = knownSources(working)
+
+        output.dynamicState?.let { state ->
+            val fields = JsonObject(state.filterKeys { it != "currentTone" })
+            if (working.isGroup) {
+                // Groups keep their shared state in `groupSharedDynamic` (the volatile
+                // context reads that field); only situation/location are shared.
+                val sharedKeys = setOf("currentSituation", "currentLocation")
+                val shared = JsonObject(fields.filterKeys { it in sharedKeys })
+                val before = working.groupSharedDynamic
+                val after = applyDynamicStateFields(before, shared, working, assistant, sources, nowZoned)
+                working = working.copy(groupSharedDynamic = after)
+            } else {
+                val before = working.dynamicState
+                val after = applyDynamicStateFields(before, fields, working, assistant, sources, nowZoned)
+                working = working.copy(
+                    dynamicState = after,
+                    dynamicStateMeta = mergeDynamicMeta(working.dynamicStateMeta, before, after, now.toString()),
+                )
+            }
+        }
+
+        output.memberDynamicState?.forEach { element ->
+            val obj = element as? JsonObject ?: return@forEach
+            val name = (obj["memberName"] as? JsonPrimitive)?.contentOrNull.orEmpty()
+            val state = obj["dynamicState"] as? JsonObject ?: return@forEach
+            val index = working.members.indexOfFirst { it.name.equals(name, ignoreCase = true) }
+            if (index < 0) return@forEach
+            val member = working.members[index]
+            val before = member.dynamicState
+            val after = applyDynamicStateFields(
+                before,
+                JsonObject(state.filterKeys { it != "currentTone" }),
+                working,
+                assistant,
+                sources,
+                nowZoned,
+            )
+            val members = working.members.toMutableList()
+            members[index] = member.copy(
+                dynamicState = after,
+                dynamicStateMeta = mergeDynamicMeta(member.dynamicStateMeta, before, after, now.toString()),
+            )
+            working = working.copy(members = members)
+        }
+
+        output.todos?.forEach { element ->
+            val obj = element as? JsonObject ?: return@forEach
+            working = applyWorkerTodo(working, obj, assistant, sources, nowZoned)
+        }
+
+        output.promiseUpdates?.forEach { element ->
+            val obj = element as? JsonObject ?: return@forEach
+            val id = (obj["promiseId"] as? JsonPrimitive)?.contentOrNull.orEmpty()
+            val status = (obj["status"] as? JsonPrimitive)?.contentOrNull.orEmpty()
+            if (id.isBlank() || status.isBlank()) return@forEach
+            val update = PromiseUpdate(
+                promiseId = id,
+                status = status,
+                sourceMessageIds = (obj["sourceMessageIds"] as? JsonArray)
+                    ?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }.orEmpty(),
+                evidence = (obj["evidence"] as? JsonPrimitive)?.contentOrNull.orEmpty(),
+            )
+            working = applyPromiseUpdate(working, update, knownSources(working))
+        }
+
+        return WorkerResult(
+            character = working,
+            quickReplies = output.quickReplies,
+            ok = true,
+            usage = output.usage,
+        )
+    }
+
+    /** `submit_state.todos`: create goes through [TodoPolicy.validateTodoCreation]; the rest reuses [applyTodoUpdate]. */
+    private fun applyWorkerTodo(
+        character: Character,
+        obj: JsonObject,
+        assistant: ChatMessage,
+        sources: Map<String, SourceRef>,
+        nowZoned: ZonedDateTime,
+    ): Character {
+        fun str(key: String): String = (obj[key] as? JsonPrimitive)?.contentOrNull.orEmpty()
+        fun ids(): List<String> = (obj["sourceMessageIds"] as? JsonArray)
+            ?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }.orEmpty()
+        val op = str("op").trim().lowercase()
+        if (op != "create") {
+            val update = TodoUpdate(
+                todoId = str("todoId"),
+                status = when (op) {
+                    "done" -> "done"
+                    "cancel" -> "cancelled"
+                    else -> ""
+                },
+                dueAt = str("dueAt").takeIf { it.isNotBlank() },
+                sourceMessageIds = ids(),
+                evidence = str("evidence"),
+            )
+            return applyTodoUpdate(character, update, sources)
+        }
+
+        val title = str("title").trimTo(100)
+        val detail = str("detail").trimTo(900)
+        if (title.isEmpty() || detail.isEmpty()) return character
+        val proposer = if (str("proposer").trim().lowercase() == "character") {
+            TodoProposer.Character
+        } else {
+            TodoProposer.User
+        }
+        val evidence = str("evidence").trimTo(300)
+        val sourceIds = ids().map { it.trim() }.filter { it.isNotEmpty() }
+        val timeRef = ResponseParser.parseTimeRef(obj)
+        val resolved = resolveTimeRef(timeRef, nowZoned)
+        val dueAt = MemoryToolSupport.normalizeTimestamp(str("dueAt"), null) ?: resolved?.iso
+        val decision = TodoPolicy.validateTodoCreation(
+            character = character,
+            proposer = proposer,
+            sourceIds = sourceIds,
+            evidence = evidence,
+            dueAtIso = dueAt,
+            sources = sources,
+        )
+        val accepted = decision as? TodoPolicy.Creation.Accepted ?: return character
+        val base = parseZoned(dueAt) ?: nowZoned
+        val parsedTitle = parseRelativeText(title, base)
+        val parsedDetail = parseRelativeText(detail, base)
+        val sourceIdList = accepted.sources.map { it.id }.distinct().take(8)
+        val now = Instant.now().toString()
+        val existing = character.todos.indexOfFirst {
+            it.status == TodoStatus.Active && it.title.equals(parsedTitle, ignoreCase = true)
+        }
+        val todos = if (existing >= 0) {
+            val old = character.todos[existing]
+            character.todos.toMutableList().also {
+                it[existing] = old.copy(
+                    detail = parsedDetail,
+                    dueAt = dueAt.orEmpty(),
+                    proposer = proposer,
+                    sourceMessageIds = sourceIdList,
+                    evidence = evidence,
+                    updatedAt = now,
+                )
+            }
+        } else {
+            character.todos + Todo(
+                id = UUID.randomUUID().toString(),
+                title = parsedTitle,
+                detail = parsedDetail,
+                dueAt = dueAt.orEmpty(),
+                status = TodoStatus.Active,
+                proposer = proposer,
+                sourceMessageIds = sourceIdList,
+                evidence = evidence,
+                createdAt = now,
+                updatedAt = now,
+            )
+        }
+        return character.copy(todos = todos)
+    }
 }
+
+/** Result of one turn-worker pass: the patched character plus its quick replies. */
+data class WorkerResult(
+    val character: Character,
+    val quickReplies: List<String> = emptyList(),
+    val ok: Boolean = false,
+    val usage: com.deeptalking.engine.ondevice.TokenUsage? = null,
+)

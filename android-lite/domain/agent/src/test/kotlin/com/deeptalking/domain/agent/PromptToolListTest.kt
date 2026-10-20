@@ -1,9 +1,11 @@
 package com.deeptalking.domain.agent
 
+import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.LorebookOrigin
-import com.deeptalking.domain.agent.prompts.RULE_A
+import com.deeptalking.domain.agent.prompts.PersonaInputs
 import com.deeptalking.domain.agent.prompts.buildLorebookInjection
+import com.deeptalking.domain.agent.prompts.buildSystemPrompt
 import com.deeptalking.domain.memory.MemoryServiceImpl
 import com.deeptalking.domain.memory.matchLorebookEntries
 import org.junit.Assert.assertFalse
@@ -11,23 +13,90 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * The system prompt's "available tools" list must describe the tool set the model actually
- * receives, and a body-less world-book entry must be visible exactly when it can be filled.
+ * The system prompt must describe the V2 tool set the model actually receives
+ * (docs/OUTBOUND_CALLS_V2.md §一(三)) and must not mention any retired tool or the old
+ * JSON/submit_response protocol. A body-less world-book entry must be visible exactly when
+ * it can be filled.
  */
 class PromptToolListTest {
 
-    @Test
-    fun ruleAListsEveryRegisteredTool() {
-        // `send_sticker` is only registered when the character has stickers and
-        // `submit_response` is the terminal call described by the output-format rule, so
-        // neither belongs in this enumeration.
-        val registered = defaultTools(MemoryServiceImpl(), web = null, stickersEnabled = true)
-            .map { it.definition.name }
-            .filterNot { it == "send_sticker" || it == "submit_response" }
+    private val character = Character(id = "c1", name = "小雨")
 
-        registered.forEach { name ->
-            assertTrue("工具清单里缺少 $name", RULE_A.contains(name))
+    private fun systemPrompt(): String = buildSystemPrompt(PersonaInputs(character = character))
+
+    @Test
+    fun systemPromptListsTheEightV2Tools() {
+        val prompt = systemPrompt()
+        listOf(
+            "search_memory",
+            "web_search",
+            "web_fetch",
+            "search",
+            "hot_board",
+            "memory_write",
+            "upsert_lorebook_entry",
+            "send_sticker",
+        ).forEach { name ->
+            assertTrue("system prompt 缺少工具 $name", prompt.contains(name))
         }
+    }
+
+    @Test
+    fun systemPromptNeverMentionsRetiredToolsOrTheJsonProtocol() {
+        val prompt = systemPrompt()
+        listOf(
+            "submit_response",
+            "list_memories",
+            "delete_memory",
+            "update_memory",
+            "add_todo",
+            "update_character_field",
+            "get_current_time",
+            "ask_user",
+            "search_video",
+            "search_music",
+            "search_posts",
+            "baidu_hot",
+            "toutiao_hot",
+            "douyin_hot",
+            "zhihu_hot",
+            "quickReplies",
+        ).forEach { retired ->
+            assertFalse("system prompt 仍在提旧工具/旧协议：$retired", prompt.contains(retired))
+        }
+    }
+
+    @Test
+    fun platformToolsTakeAnExplicitPlatform() {
+        val prompt = systemPrompt()
+        assertTrue(prompt.contains("platform=bilibili"))
+        assertTrue(prompt.contains("platform=baidu"))
+        assertTrue(prompt.contains("upsert_lorebook_entry"))
+    }
+
+    @Test
+    fun outputChannelKeepsTheVoiceLock() {
+        val prompt = systemPrompt()
+        assertTrue(prompt.contains("【输出通道】"))
+        assertTrue(prompt.contains("【语气】"))
+        assertTrue(prompt.contains("至少自然带出其中 2 处签名标记"))
+        assertTrue(prompt.contains("不得向默认 AI 助手腔靠拢"))
+    }
+
+    @Test
+    fun groupRulesOnlyAppearForGroups() {
+        assertFalse(systemPrompt().contains("【群组附加规则】"))
+
+        val group = Character(
+            id = "g1",
+            name = "合租小屋",
+            isGroup = true,
+            members = emptyList(),
+        )
+        val groupPrompt = buildSystemPrompt(PersonaInputs(character = group))
+        assertTrue(groupPrompt.contains("【群组附加规则】"))
+        assertTrue(groupPrompt.contains("10. "))
+        assertTrue(groupPrompt.contains("11. "))
     }
 
     @Test
@@ -64,8 +133,10 @@ class PromptToolListTest {
 
         val injection = buildLorebookInjection(matchLorebookEntries(listOf(entry), "随便聊聊"))
 
-        assertTrue(injection.contains("【世界书·常驻前提（始终成立的设定）】"))
+        assertTrue(injection.contains("【世界书】"))
         assertTrue(injection.contains("银月商会：银月商会在西街，经营药材。"))
         assertFalse(injection.contains("正文为空"))
+        // Always-active only decides whether an entry is injected; it is no longer labelled.
+        assertFalse(injection.contains("常驻前提"))
     }
 }

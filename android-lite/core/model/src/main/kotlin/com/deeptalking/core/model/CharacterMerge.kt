@@ -28,10 +28,10 @@ fun mergeCharacterChanges(before: Character, after: Character, live: Character):
         description = pick(before.description, after.description, live.description),
         isGroup = pick(before.isGroup, after.isGroup, live.isGroup),
         interactionRules = pick(before.interactionRules, after.interactionRules, live.interactionRules),
-        staticProfile = pick(before.staticProfile, after.staticProfile, live.staticProfile),
-        dynamicState = pick(before.dynamicState, after.dynamicState, live.dynamicState),
-        groupSharedDynamic = pick(before.groupSharedDynamic, after.groupSharedDynamic, live.groupSharedDynamic),
-        dynamicStateMeta = pick(before.dynamicStateMeta, after.dynamicStateMeta, live.dynamicStateMeta),
+        staticProfile = mergeStaticProfile(before.staticProfile, after.staticProfile, live.staticProfile),
+        dynamicState = mergeDynamicState(before.dynamicState, after.dynamicState, live.dynamicState),
+        groupSharedDynamic = mergeDynamicState(before.groupSharedDynamic, after.groupSharedDynamic, live.groupSharedDynamic),
+        dynamicStateMeta = mergeDynamicStateMeta(before.dynamicStateMeta, after.dynamicStateMeta, live.dynamicStateMeta),
         avatarRepairPending = pick(before.avatarRepairPending, after.avatarRepairPending, live.avatarRepairPending),
         counters = pick(before.counters, after.counters, live.counters),
         sceneState = pick(before.sceneState, after.sceneState, live.sceneState),
@@ -58,6 +58,54 @@ fun mergeCharacterChanges(before: Character, after: Character, live: Character):
 
 /** [after] wins only when it differs from [before]; otherwise the stored value stays. */
 private fun <T> pick(before: T, after: T, live: T): T = if (after != before) after else live
+
+/**
+ * Field-wise merge of a dynamic state: a writer only wins on the keys it actually changed,
+ * so a worker mood update and a user situation edit made at the same time both survive.
+ */
+internal fun mergeDynamicState(before: DynamicState, after: DynamicState, live: DynamicState): DynamicState {
+    if (before == after) return live
+    return live.copy(
+        currentSituation = pick(before.currentSituation, after.currentSituation, live.currentSituation),
+        currentLocation = pick(before.currentLocation, after.currentLocation, live.currentLocation),
+        currentMood = pick(before.currentMood, after.currentMood, live.currentMood),
+        currentOccupation = pick(before.currentOccupation, after.currentOccupation, live.currentOccupation),
+        currentGoal = pick(before.currentGoal, after.currentGoal, live.currentGoal),
+        currentTone = pick(before.currentTone, after.currentTone, live.currentTone),
+    )
+}
+
+/** Same rule for the per-field timestamps: merge by key, never replace the whole map. */
+internal fun mergeDynamicStateMeta(
+    before: Map<String, DynamicStateMeta>,
+    after: Map<String, DynamicStateMeta>,
+    live: Map<String, DynamicStateMeta>,
+): Map<String, DynamicStateMeta> {
+    if (before == after) return live
+    val result = live.toMutableMap()
+    after.forEach { (key, value) ->
+        if (before[key] != value) result[key] = value
+    }
+    (before.keys - after.keys).forEach { key -> result.remove(key) }
+    return result
+}
+
+/** Field-wise merge of the static profile (field revision vs. auto-fill/edit). */
+internal fun mergeStaticProfile(before: StaticProfile, after: StaticProfile, live: StaticProfile): StaticProfile {
+    if (before == after) return live
+    return live.copy(
+        gender = pick(before.gender, after.gender, live.gender),
+        age = pick(before.age, after.age, live.age),
+        race = pick(before.race, after.race, live.race),
+        appearance = pick(before.appearance, after.appearance, live.appearance),
+        personality = pick(before.personality, after.personality, live.personality),
+        fears = pick(before.fears, after.fears, live.fears),
+        background = pick(before.background, after.background, live.background),
+        speakingStyle = pick(before.speakingStyle, after.speakingStyle, live.speakingStyle),
+        language = pick(before.language, after.language, live.language),
+        userAddress = pick(before.userAddress, after.userAddress, live.userAddress),
+    )
+}
 
 /**
  * Entry-wise merge of a world book. Entries the writer added or changed are applied
@@ -186,9 +234,9 @@ internal fun mergeMemberChanges(before: GroupMember, after: GroupMember, live: G
         name = pick(before.name, after.name, live.name),
         emoji = pick(before.emoji, after.emoji, live.emoji),
         roleInGroup = pick(before.roleInGroup, after.roleInGroup, live.roleInGroup),
-        staticProfile = pick(before.staticProfile, after.staticProfile, live.staticProfile),
-        dynamicState = pick(before.dynamicState, after.dynamicState, live.dynamicState),
-        dynamicStateMeta = pick(before.dynamicStateMeta, after.dynamicStateMeta, live.dynamicStateMeta),
+        staticProfile = mergeStaticProfile(before.staticProfile, after.staticProfile, live.staticProfile),
+        dynamicState = mergeDynamicState(before.dynamicState, after.dynamicState, live.dynamicState),
+        dynamicStateMeta = mergeDynamicStateMeta(before.dynamicStateMeta, after.dynamicStateMeta, live.dynamicStateMeta),
         shortTerm = pick(before.shortTerm, after.shortTerm, live.shortTerm),
         longTerm = mergeMemories(before.longTerm, after.longTerm, live.longTerm),
         instant = pick(before.instant, after.instant, live.instant),

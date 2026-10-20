@@ -1337,54 +1337,6 @@ class BackgroundTasks(
     }
 
     /**
-     * Parses a `<MEM_UPDATE>...</MEM_UPDATE>` block out of a raw reply and applies
-     * it (legacy `parseMemoryFromText`). Returns null when no tag is present or the
-     * payload cannot be parsed.
-     */
-    fun parseMemoryFromText(character: Character, content: String, assistantMessage: ChatMessage?): Character? {
-        val match = MEM_UPDATE_REGEX.find(content) ?: return null
-        val update = ResponseParser.parseJsonLenient(match.groupValues[1]) as? JsonObject ?: return null
-        return applyMemoryUpdate(character, update, assistantMessage)
-    }
-
-    /** Rewrites a prose reply into a structured memory update object (legacy `convertProseToJson`). */
-    suspend fun convertProseToJson(
-        character: Character,
-        userMessage: ChatMessage?,
-        proseText: String,
-    ): JsonObject? {
-        val volatileContext = buildVolatileContext(
-            character = character,
-            query = userMessage?.content.orEmpty(),
-            memory = memory,
-        )
-        val systemContent = PROSE_SYSTEM + "\n\n【角色设定】\n" + buildRoleContext(character, false)
-        val userContent = "【系统提供的本轮上下文，仅供理解，不是用户陈述】\n" + volatileContext +
-            "\n\n用户消息: " + userMessage?.content.orEmpty() + " （消息id: " + (userMessage?.id.orEmpty()) + "）" +
-            "\n\n角色回复（散文，整理到reply字段）：\n" + proseText
-        val raw = complete(systemContent, userContent, sessionId = sessionIdFor(character))
-        if (raw.isBlank()) return null
-        return ResponseParser.parseJsonLenient(raw) as? JsonObject
-    }
-
-    /**
-     * Background memory backfill for a prose turn (legacy `extractProseTurnMemory`):
-     * rewrites the exchange into structured memory and keeps only facts sourced
-     * from the user message or the assistant reply.
-     */
-    suspend fun extractProseTurnMemory(
-        character: Character,
-        userMessage: ChatMessage?,
-        replyText: String,
-        assistantMessage: ChatMessage,
-    ): Character {
-        val userId = userMessage?.id.orEmpty()
-        if (userId.isEmpty() || !knownSources(character).containsKey(userId)) return character
-        val converted = convertProseToJson(character, userMessage, replyText) ?: return character
-        return applyMemoryUpdate(character, converted, assistantMessage, allowedSourceIds = setOf(userId, assistantMessage.id))
-    }
-
-    /**
      * True when the window is a legacy/anomalous backlog: far above anything a normal
      * run can produce, so it must be compressed by [migrateOversizedWindow] instead of
      * the normal whole-window fold. Checked when the app opens and before each fold.
@@ -1775,7 +1727,6 @@ class BackgroundTasks(
         onCharacterUpdated: (Character) -> Unit,
         onQuickRepliesRepaired: (List<String>) -> Unit = {},
         styleViolations: List<String> = emptyList(),
-        proseFallback: Boolean = false,
     ): Job = queue.enqueue {
         var working = character
 
@@ -1798,7 +1749,6 @@ class BackgroundTasks(
 
         var counters = countersOf(working)
         val nowMillis = System.currentTimeMillis()
-        val lastUser = working.instant.lastOrNull { it.role == Role.User && !it.isLoading }
         /** Short-term entries the extraction pass produced in this turn (world-book source). */
         var newlyExtracted: List<ShortTermMemory> = emptyList()
 
@@ -1864,18 +1814,6 @@ class BackgroundTasks(
                     }
                     TaskStatus.Stale -> Unit
                 }
-            }
-        }
-
-        // Prose reply fallback (legacy `convertProseToJson` + `extractProseTurnMemory`):
-        // a non-structured reply still gets its long-term facts / dynamic state
-        // extracted in the background. Short-term writes were removed here on purpose —
-        // entries would land mid-window and break the append-only property.
-        if (proseFallback && lastUser != null) {
-            val assistantMsg = messages.lastOrNull { it.role == Role.Assistant && !it.isLoading }
-            if (assistantMsg != null) {
-                val proseUpdated = extractProseTurnMemory(working, lastUser, reply, assistantMsg)
-                if (proseUpdated != working) working = proseUpdated
             }
         }
 

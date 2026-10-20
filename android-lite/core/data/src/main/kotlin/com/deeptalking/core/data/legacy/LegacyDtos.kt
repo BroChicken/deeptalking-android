@@ -350,6 +350,27 @@ data class LegacyCharacter(
     @SerialName("lorebookMigratedAt") val lorebookMigratedAt: String? = null,
     /** Flattened variant: dynamic fields hoisted to the character root. */
     @SerialName("fields") val fields: LegacyFieldBag? = null,
+    /** 待办事项（native-only；旧 WebView 备份里没有该键）。 */
+    @SerialName("todos") val todos: List<LegacyTodo>? = null,
+)
+
+/**
+ * One todo entry. Every field is optional so a hand-edited/older payload still
+ * decodes; [mapCharacter] then drops entries without a title and defaults the rest.
+ */
+@Serializable
+data class LegacyTodo(
+    @SerialName("id") val id: String? = null,
+    @SerialName("title") val title: String? = null,
+    @SerialName("detail") val detail: String? = null,
+    @SerialName("dueAt") val dueAt: String? = null,
+    @SerialName("status") val status: String? = null,
+    @SerialName("proposer") val proposer: String? = null,
+    @SerialName("sourceMessageIds") val sourceMessageIds: List<String>? = null,
+    @SerialName("evidence") val evidence: String? = null,
+    @SerialName("createdAt") val createdAt: String? = null,
+    @SerialName("updatedAt") val updatedAt: String? = null,
+    @SerialName("closedAt") val closedAt: String? = null,
 )
 
 @Serializable

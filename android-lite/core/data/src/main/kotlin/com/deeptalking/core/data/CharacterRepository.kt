@@ -6,9 +6,12 @@ import com.deeptalking.core.model.Character
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import java.time.Instant
+import java.util.concurrent.ConcurrentHashMap
 
 class CharacterRepository(
     private val dao: CharacterDao,
@@ -23,6 +26,15 @@ class CharacterRepository(
 
     private val reportedCorrupt = java.util.concurrent.ConcurrentHashMap.newKeySet<Int>()
 
+    /**
+     * One lock per character id. Every read-modify-write of a row goes through [mutate], so
+     * two writers (the chat turn, a background memory pass, the editor) cannot read the same
+     * row and silently drop each other's change. Locks are cheap and bounded by the number of
+     * characters, so they are kept for the process lifetime (removing one while another
+     * waiter holds it would let a third writer create a second lock for the same id).
+     */
+    private val writeLocks = ConcurrentHashMap<String, Mutex>()
+
     fun observeAll(): Flow<List<Character>> =
         dao.observeAll().map { rows -> rows.mapNotNull(::decode) }
 
@@ -31,7 +43,7 @@ class CharacterRepository(
 
     suspend fun get(id: String): Character? = dao.get(id)?.let(::decode)
 
-    suspend fun upsert(character: Character) {
+    suspend fun upsert(character: Character): Character {
         val now = Instant.now().toString()
         val stamped = character.copy(updatedAt = now)
         dao.upsert(
@@ -41,6 +53,23 @@ class CharacterRepository(
                 payload = AppJson.encodeToString(stamped),
             )
         )
+        return stamped
+    }
+
+    /**
+     * Read-modify-write of one row under a **per-id** lock: [transform] receives the freshest
+     * stored character, never a caller-held snapshot, so two writers cannot overwrite each
+     * other. Returns the written character, or null when [id] no longer exists.
+     *
+     * This is the write entry point for turns, background passes and the card editor.
+     * [upsert] stays for creating/importing whole rows.
+     */
+    suspend fun mutate(id: String, transform: (Character) -> Character): Character? {
+        val lock = writeLocks.computeIfAbsent(id) { Mutex() }
+        return lock.withLock {
+            val live = get(id) ?: return@withLock null
+            upsert(transform(live))
+        }
     }
 
     suspend fun replaceAll(characters: List<Character>) {

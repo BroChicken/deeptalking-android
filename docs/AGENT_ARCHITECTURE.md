@@ -1,7 +1,7 @@
 ﻿# Agent 架构文档（原生 Android）
 
 > 本文档描述 **当前实现**：原生 Android 应用的 Agent 机制（`:domain:agent` / `:domain:memory`，宿主在 `:app`）。只写最新状态，历史看 git。
-> 模块职责、依赖方向与构建流程见 [NATIVE_MODULES.md](NATIVE_MODULES.md)；解析机制链见 [PARSE_GRAPH.md](PARSE_GRAPH.md)；朗读链路见 [REMOTE_TTS.md](REMOTE_TTS.md)；**每一次外发调用（LLM/语音/联网）的传输格式与发送内容**见 [OUTBOUND_CALLS.md](OUTBOUND_CALLS.md)。
+> 模块职责、依赖方向与构建流程见 [NATIVE_MODULES.md](NATIVE_MODULES.md)；解析机制链见 [PARSE_GRAPH.md](PARSE_GRAPH.md)；朗读链路见 [REMOTE_TTS.md](REMOTE_TTS.md)；**每一次外发调用（LLM/语音/联网）的传输格式与发送内容**见 [OUTBOUND_CALLS_V2.md](OUTBOUND_CALLS_V2.md)（旧结构化协议存档见 `OUTBOUND_CALLS.md`）。
 > 代码锚点用**模块:函数名**（行号会漂移，用 grep 函数名定位）；改动 agent 循环、工具清单、提示词、记忆系统、字段或常量时必须同步更新本文档。
 
 ## 模块锚点
@@ -9,12 +9,13 @@
 | 关注点 | 原生锚点 |
 |---|---|
 | 宿主接线（回合、状态、指标、主动开口） | `:app` 的 `AppViewModel`（`submitTurn` / `proactiveLoop` / `recordMetrics` / `armHotTopicTurn`）、`NativeCore`（装配 `ChatOrchestrator`、后台任务、辅助调用） |
-| Agent 循环 | `:domain:agent` 的 `AgentLoop`（`run` / `collectStream` / `attempt` / `salvageText` / `toolActivityHint`） |
-| 回合编排与落盘 | `:domain:agent` 的 `ChatOrchestrator.run`（`applyMemory` / `applyLongTerm` / `applyDynamicStateFields` / `applyPromiseUpdate`） |
+| Agent 循环 | `:domain:agent` 的 `AgentLoop`（`run` / `collectStream` / `collectResultWithRetry` / `salvageText` / `toolActivityHint`），阶段枚举 `prompts/RequestPhase` |
+| 回合编排与落盘 | `:domain:agent` 的 `ChatOrchestrator.run`（`runTurnWorker` / `applyWorkerTodo` / `applyMemory` / `applyDynamicStateFields` / `applyPromiseUpdate`）、`FieldRevision`（静态字段修订） |
 | 工具注册 | `:domain:agent` 的 `Tools.defaultTools`（+ `tools/*Tool.kt`） |
-| 工具实现 | `:domain:agent` 的 `tools/*`（`SearchMemoryTool` 等） |
+| 回合 worker | `:domain:agent` 的 `TurnWorker`（强制 `submit_state`：动态状态 / 快速回应 / 待办 / 约定） |
+| 工具实现 | `:domain:agent` 的 `tools/*`（`SearchMemoryTool` / `MemoryWriteTool` 等） |
 | 提示词装配 | `:domain:agent` 的 `prompts/Prompts.kt`（`buildSystemPrompt` / `buildVolatileContext` / `buildShortTermBlock` / `TimeContext`）、`RequestBuilder` |
-| 结构化解析 | `:domain:agent` 的 `ResponseParser`、`StreamText` |
+| 结构化解析 | `:domain:agent` 的 `ResponseParser`、`StreamText`、`ToneText` |
 | 后台任务与文风守卫 | `:domain:agent` 的 `background/BackgroundTasks`、`background/StyleGuard`、`background/AnalysisSalvage` |
 | 记忆系统 | `:domain:memory` 的 `MemoryServiceImpl` / `MemoryPolicy` / `Retrieval` / `MemoryEvidence` / `LorebookMatcher` / `LorebookStore` / `TimeUtils` / `RelativeTimeMigration` |
 | 传输与联网 | `:core:network` 的 `ResponsesLlmBackend`（`buildBody` / `newRequest` / `ResponsesSseInterpreter`）、`HttpWebContentProvider` |
@@ -26,9 +27,9 @@
 本项目的"agent"不是某个类，而是 **LLM + 人格 + 记忆 + 工具 + 运行循环** 的组合：
 
 - 模型不再只输出一段文字，而是可以在一次回复中**主动调用工具 → 拿到执行结果 → 继续推理**，循环往复，直到给出最终答案。
-- 这种"思考（reasoning）→ 行动（tool call）→ 观察（tool output）→ 收尾（结构化 reply）"的循环就是 agent 的本质。
+- 这种"思考（reasoning）→ 行动（tool call）→ 观察（tool output）→ 收尾"的循环就是 agent 的本质。
 
-> **人格 + 记忆 + 世界书** 提供身份与状态 → **`while` 循环**让模型反复"想→调工具→看结果" → **`submit_response`** 保证最终以结构化 JSON 收尾并落盘记忆。
+> **人格 + 记忆 + 世界书** 提供身份与状态 → **`while` 循环**让模型反复"想→调工具→看结果" → **主调用只输出纯文本正文 + 末尾一行 `【语气】`**；动态状态/快速回应/待办/约定由**回合 worker**（`submit_state`）在正文之后整理落盘。
 
 ## 二、总体数据流
 
@@ -37,131 +38,114 @@
    │
    ▼
 ChatOrchestrator.run
-   ├─ buildSystemPrompt            人格 + 交互规则（纯静态 → 可缓存前缀）
+   ├─ buildSystemPrompt            人格 + 交互规则 + 输出通道（纯静态 → 可缓存前缀）
    ├─ buildShortTermBlock          短期窗口整块，注入到历史之前
-   ├─ RequestBuilder.mapHistory    历史（append-only）+ 本轮用户消息
-   └─ buildVolatileContext         记忆召回 / 世界书 / 状态 / 时间基准 / 本轮指令（末尾 user 项）
+   ├─ RequestBuilder.mapHistory    历史（append-only，assistant 纯文本）+ 本轮用户消息
+   └─ buildVolatileContext         11 段上下文（末尾 user 项）
    │
    ▼
 AgentLoop.run  loop
-   ├─ ResponsesLlmBackend.stream   SSE：text / reasoning / function_call / web_search_call
-   ├─ 有工具调用？→ ToolRegistry.execute 执行一个 → 结果回传 → continue
-   ├─ 只调 ask_user？→ syntheticSubmitReply（把问题当回复）
-   ├─ 拿到合法正文（submit_response / 结构化 JSON / 散文）？→ break
-   └─ 否则 → 阶段二强制 submit_response（兜底，必要时重试）
+   ├─ AUTO 阶段                    工具可用：只执行工具并回传，正文在后续轮返回
+   ├─ FINAL 阶段                   无工具（toolChoice=Auto）；空回合最多重试 2 次
+   └─ 拿到正文 → 纯文本 + 【语气】行
    │
    ▼
-ChatOrchestrator.applyMemory  落盘 longTerm / dynamicState / promiseUpdates（短期窗口不由主对话写）
+ResponseParser.parseTurnFromText   正文 / 语气拆分（历史 JSON 仅在整段是单个对象时兼容）
    │
    ▼
-BackgroundTasks.scheduleTurn  后台串行维护：文风校对、快速回应换位、记忆抽取/分析、场景概要、世界书整理、空字段补全
+TurnWorker.run（runTurnWorker）    强制 submit_state：dynamicState / memberDynamicState / quickReplies / todos / promiseUpdates
+FieldRevision                      用户显式改字段时单字段修订
    │
    ▼
-渲染回复 + quickReplies（缺失或视角不对时后台换位生成补齐）
+BackgroundTasks.scheduleTurn       后台：文风校对、快速回应校验/换位、记忆抽取/分析、场景概要、世界书整理、空字段补全
+   │
+   ▼
+渲染正文 + 语气（朗读）+ quickReplies
 ```
 
-## 三、五大部件
+## 三、核心部件
 
 ### 1. API 载体（Responses API）
 
 - `ResponsesLlmBackend.buildBody()`（`:core:network`）+ `ResponsesDto`：请求体字段 `model`、`input`（首条 system 提升为 `instructions`）、`stream`、`temperature`、`max_output_tokens=8192`、`tools`、`tool_choice`、`reasoning.effort`。
 - 端点：`responsesEndpoint()`（把 base URL 归一化为 `/responses`；DeepSeek 去尾 `/v1`，OpenCode Go 保留）。
 - 请求头：`Content-Type`、`User-Agent`、`Authorization: Bearer`（缺 Key 抛清晰错误）、流式加 `Accept: text/event-stream`、`opencode` 平台加 `x-opencode-session`（`deeptalking-<charId>` / `deeptalking-general`）。
-- 阶段一（auto）的工具数组里**包含 `submit_response`**（`Tools.defaultTools` 末尾），模型可以在同一轮里"调完信息工具 → 调 `submit_response` 提交"，一次请求收尾。
-- 阶段二（submit）为**兜底**：只有阶段一连正文都没拿到时才进入，此时 `tools` 只有 `submit_response`、`tool_choice` 锁定，且 `reasoning.effort='none'`（DeepSeek 仅在该 effort 下支持锁定工具）。
+- `tools`：主调用只带**信息/写入类工具**（下表 8 个）；`tool_choice` 恒为 `auto`。终稿那一轮（`RequestPhase.FINAL`）`tools` 为空、`reasoning.effort='none'`，正文以纯文本返回。
 - 传输超时：chat 180s（call + read），SSE 空闲 60s；**辅助/后台调用 90s**（`LlmRequest.auxiliary`，见"健壮性"）。
 
 ### 2. 工具清单（agent 的能力）
 
-`Tools.defaultTools(memory, web, stickersEnabled)`——**13 个信息工具 + 条件 `send_sticker` + `submit_response`**（顺序即注册顺序）：
+`Tools.defaultTools(memory, web, stickersEnabled)`——**8 个工具**（顺序即注册顺序）：
 
 | 工具 | 作用 | 实现 |
 |---|---|---|
-| `get_current_time` | 获取当前时间/时区 | `GetCurrentTimeTool` |
-| `search_memory` | 按关键词检索长期记忆（可指定成员私人记忆）；**支持按日期召回**（`date`/`timeRef`/`slot`，返回那天的原始对话+摘要+长期记忆） | `SearchMemoryTool` |
-| `list_memories` | 按分类盘点记忆清单（不含详情） | `ListMemoriesTool` |
-| `delete_memory` | 按 ID 删除记忆（`short_` 前缀可删短期条目） | `DeleteMemoryTool` |
-| `add_todo` | 新增独立待办（须「明确日期 + 双方同意」；用户发起→用户原话，角色发起→用户应答原话，期限须能定位） | `AddTodoTool` |
-| `ask_user` | 向用户提出澄清问题 | `AskUserTool` |
-| `update_character_field` | 精准修改基础设定字段（说话风格、称呼等） | `UpdateCharacterFieldTool` |
-| `upsert_lorebook_entry` | 写入/更新世界书条目（世界层设定唯一入口，保护人工维护条目） | `UpsertLorebookEntryTool` |
+| `search_memory` | 检索长期记忆（关键词 / 按日期 `date`/`timeRef`/`slot` / 给 `category` 即盘点分类，`limit` 可调）；群组可指定成员私人记忆 | `SearchMemoryTool` |
+| `web_search` | 通用联网搜索（必应 RSS，`limit` 1–20） | `WebSearchTool` |
 | `web_fetch` | 读取链接（网页正文 / 图片 / 站内专门解析）；虎扑帖子、网易云歌曲、B站视频链接各有专门解析。**只读链接、不做关键词搜索** | `WebFetchTool` → `HttpWebContentProvider` |
-| `update_memory` | 按 ID 修正记忆（用户纠正时用） | `UpdateMemoryTool` |
+| `search` | 按关键词搜一个社区平台：`platform` ∈ `bilibili` / `netease` / `hupu` | `SearchTool` |
+| `hot_board` | 指定平台热榜：`platform` ∈ `baidu` / `toutiao` / `douyin` / `zhihu` | `HotBoardTool` |
+| `memory_write` | 按 ID 修正（`op=update`，须 evidence + sourceMessageIds）或删除（`op=delete`）记忆 | `MemoryWriteTool` |
+| `upsert_lorebook_entry` | 写入/更新世界书条目（世界层设定唯一入口，保护人工维护条目） | `UpsertLorebookEntryTool` |
 | `send_sticker` | 发表情包（**仅当角色有贴图时注册**，schema 内联该角色的标签枚举） | `SendStickerTool` |
-| `web_search` | 通用联网搜索（必应 RSS，`limit` 可调 1–20） | `WebSearchTool` |
-| `search_video` | 按关键词搜 **B站** 视频（免账号） | `SocialSearchTool(platform=bilibili)` |
-| `search_music` | 按关键词搜 **网易云音乐** 歌曲（免账号，返回歌曲 id 可用 `web_fetch` 看热评） | `SocialSearchTool(platform=netease)` |
-| `search_posts` | 按关键词搜 **虎扑** 帖子（免账号） | `SocialSearchTool(platform=hupu)` |
-| `baidu_hot` | **百度**热搜（免账号） | `HotBoardTool(platform=baidu)` |
-| `toutiao_hot` | **今日头条**热榜（免账号） | `HotBoardTool(platform=toutiao)` |
-| `douyin_hot` | **抖音**热榜（免账号） | `HotBoardTool(platform=douyin)` |
-| `zhihu_hot` | **知乎**热榜（免账号） | `HotBoardTool(platform=zhihu)` |
-| `submit_response` | 结构化收尾（见下） | `SubmitResponseTool` |
 
 每个工具就是一段 JSON Schema 描述（name + description + parameters），模型据此决定何时调用。
-**工具描述是"何时用哪个工具"的权威依据**，system 提示词的规则 A 只留一句导引。
-新增工具 = 新增 `AgentTool` 实现 + 在 `defaultTools` 注册，`AgentLoop` 不变。
+**工具描述是"何时用哪个工具"的权威依据**，system 提示词的规则 A 只留一句导引 + 工具名单。
+新增工具 = 新增 `AgentTool` 实现 + 在 `defaultTools` 注册，`AgentLoop` 不变；`ToolRegistry` 构造时**重名直接抛异常**（同名工具会让 `execute` 静默取第一个）。
 
-**一个工具只连一个平台**（搜索类）：平台是工具身份的一部分，不再通过 `platform` 参数让模型去挑——
-`search_video`/`search_music`/`search_posts` 与四个 `*_hot` 都是同一个类按固定平台常量实例化
-（`SocialSearchTool` / `HotBoardTool`），因此不存在"选错平台"这一步，也不必让模型记住
-`netease` 才是音乐这类隐式映射。代价是工具条数变多（工具 schema 属于请求前缀，一次性的
-`toolsHash` 变化 = 每个角色一次破缓存）。`SocialToolsTest` 有回归护栏：这些工具的 schema
-里不得再出现 `platform` 参数。
+**平台搜索/热榜各用一个工具 + 显式 `platform` 枚举**：`search` 与 `hot_board` 在 schema 里把平台列成 enum，而不是每个平台一个工具名——工具条数少、`toolsHash` 更稳，模型也不必记隐式映射（"netease 才是音乐"）。
 
 ### 3. 工具实现（agent 的手）
 
 `ToolRegistry.execute()`（`:domain:agent`）：
 
-- 模型只"说"要调用，真正干活的是工具类：读写长期记忆、返回时间、记约定等。
-- 统一返回 JSON 字符串，异常安全（`try/catch` 兜底，失败返回 `{ ok: false, reason }`），**异常不中断整轮**。
+- 模型只"说"要调用，真正干活的是工具类：检索/修正记忆、读世界书、联网检索、发表情等。
+- 统一返回 JSON 字符串，异常安全（`try/catch` 兜底，失败返回 `{ ok: false, reason }`），**异常不中断整轮**；`ToolRegistry` 对未知工具/被禁用工具同样回 `ok:false`。
 
 ### 4. Agent 循环（大脑）
 
 `AgentLoop.run()`（`:domain:agent`）：
 
-- **工具调用（每轮一个）**：DeepSeek thinking 模式**不支持并行 `function_call` 回传（会 400）**，因此模型一次返回多个 `function_call` 时只执行并回传**第一个信息类工具**，其余丢弃、由模型下一轮基于结果重发；`reasoning` 必须先于 `function_call`、再跟配对的 `function_call_output`。`AppLimits.Agent.MAX_TOOL_CALLS`(12) 是整轮总量上限。若同一轮里既有信息类工具又有 `submit_response`，先执行该工具；只有工具失败（`ok:false`）时才丢弃这一轮的提交，继续让模型修正。**`web_search` 是本地 function 工具**（DeepSeek Responses 会静默忽略内置 `web_search`）：本地注册同名工具，经 `HttpWebContentProvider.searchWeb()` 实际检索 RSS 后回传结果。
-- **上限**：`MAX_TOOL_ROUNDS = 5`（`AppLimits.Agent`）与 `MAX_TOOL_CALLS = 12`；达到任一上限后未执行的调用回传 `ok:false` 说明，并按"有正文就收尾、没有才转阶段二"处理。
-- **reasoning 回传**：thinking 模式的 reasoning 项必须先回传，否则上下文断裂。
-- **ask_user 特判**：本轮只调 `ask_user`（且无 `submit_response`）时，直接把问题包成结构化回复（`AgentLoop.syntheticSubmitReply`），不进入工具循环。
-- **一次提交 + 兜底**（不再每轮重发）：阶段一 `RequestPhase.AUTO`（工具自由，含 `submit_response`）。只要拿到正文——`submit_response` 调用、合法 JSON 正文、或**散文**——就直接采用，**散文即终稿**，不再为了补 `quickReplies`/记忆而重发一轮。阶段二 `RequestPhase.SUBMIT` 只作为"阶段一连正文都没有"时的兜底，`quickReplies` **不阻塞收尾**（缺失/非法直接接受，由后台换位生成补齐）。
-- **空回复重试**：同一循环内最多重试 2 次（共 3 次请求），保留已累计的工具往返。
-- **散文轮的记忆/状态后台补**：散文收尾时正文立即显示，`BackgroundTasks.extractProseTurnMemory()` 在后台把这一轮整理成 shortTerm / longTerm / dynamicState 落盘（串行队列，不阻塞也不改写正文）。
-- **状态显示**：循环内所有右上角文案经 `onStatus` 回调驱动（`AppViewModel.statusState`）；工具提示来自纯函数 `AgentLoop.toolActivityHint(name)`；阶段分支（`auto-tool` / `auto-tool-limit` / `auto-final` / `submit-retry` / `empty`）在 `AgentLoop.run` 内一一对应下表。
+- **两阶段（`RequestPhase { AUTO, FINAL }`）**：`AUTO` 工具可用，**只执行工具并继续**——同一轮里模型若既调工具又写正文，正文丢弃（契约是"工具或正文，二选一"），终稿在后续轮返回；`FINAL` **无工具**（`tools` 为空、`tool_choice=Auto`、`reasoningEffort=none`），是唯一能结束回合的阶段。工具轮达 `MAX_TOOL_ROUNDS`(5) 或 `MAX_TOOL_CALLS`(12) 时直接转 `FINAL`。
+- **工具回传**：`reasoning` 必须先于 `function_call`、再跟配对的 `function_call_output`。DeepSeek thinking 模式**不支持并行 `function_call` 回传（会 400）**，因此一轮里模型给出多个调用时按序执行并逐条回传；`reasoningJson` 随调用一起写回，保证上下文不断裂。**`web_search` 是本地 function 工具**（DeepSeek Responses 会静默忽略内置 `web_search`）：本地注册同名工具，经 `HttpWebContentProvider.searchWeb()` 实际检索 RSS 后回传结果。
+- **空回合重试**：循环只有 `AUTO` 与 `FINAL` 两相；`FINAL` 阶段无正文时最多重试 2 次（`emptyAttempts < 2`），之后返回空结果，由外层 `AppViewModel` 的回合重试/失败提示接管。
+- **状态显示**：循环内所有右上角文案经 `onToolActivity` 回调驱动（`AppViewModel.statusState`）；工具提示来自纯函数 `AgentLoop.toolActivityHint(name)`。
+- **正文之后由 worker 补结构化字段**：收尾阶段结束后，`ChatOrchestrator` 先落历史与正文，再跑 turn worker（见下）与字段修订；后台任务只做记忆维护与文风/快速回应校验，不改写已显示的正文。
 
-### 5. 结构化收尾协议（agent 的手续）
+### 5. 输出协议（纯文本 + 语气行）
 
-`SubmitResponseTool`（`:domain:agent` 的 `tools/`）+ `ResponseParser.parseSubmitResponse()`。
+主调用**没有收尾工具**：assistant 文本就是回复正文；正文之后另起一行、只写一行 `【语气】<朗读指导：语气、情绪、语速、节奏、停顿、重音，≤60 字>`（`Prompts.OUTPUT_CHANNEL`）。朗读时 `ToneText.split` 把这一行拆出来，作为 `TtsTurn.style` 交给朗读引擎；正文里绝不出现字段名/JSON/工具说明。
 
-推荐每轮调用一次 `submit_response` 收尾（阶段一工具里就有它），用 JSON Schema（`strict: true`）强制校验，一次性输出：
+- 历史 assistant 消息按**纯文本**重新序列化（`RequestBuilder.mapHistory`，`trimText(1200)`），不再包 `{"reply": …}`——否则模型会把历史当成"输出格式"继续写 JSON。
+- `ResponseParser.parseTurnFromText` 只在"整段文本就是一个 JSON 对象"时兼容旧格式（缓存/旧提示词遗留），其余一律 `ToneText.split`。
+- 动态状态、成员状态、快速回应、待办、约定变更都由下面的 worker 生产，**不占主调用的输出通道**。
 
-| 字段 | 说明 |
+### 6. turn worker（结构化整理）
+
+`TurnWorker`（`:domain:agent`）+ `ChatOrchestrator.runTurnWorker`：正文已定稿后，用一次**强制 function call** 拿到本轮的结构化增量。
+
+| 项 | 取值 / 行为 |
 |---|---|
-| `reply` | 用户可见回复正文（Markdown，动作/表情/心理活动用全角括号） |
-| `quickReplies` | 恰好两条**用户视角**短句（用户下一句可直接发送；不得是角色的台词、表态或角色对用户的提问） |
-| `longTerm` | 未来仍有价值的稳定事实（category∈userProfile/relationship/events/promises/habits） |
-| `dynamicState` | 角色动态状态（6 字段） |
-| `memberDynamicState` | 群组成员动态状态（仅群组） |
-| `promiseUpdates` | 用户明确完成/取消的**承诺**（resolved/cancelled，属 `promises` 叙事记忆） |
-| `todoUpdates` | 用户明确**完成/取消/改期**的**待办**（done/cancelled，或改 `dueAt`；须引用户原话） |
-| `recall` | 主动召回记忆的请求 |
+| 工具 | `tools = [submit_state]`，`tool_choice = Function("submit_state")`，`reasoningEffort = "none"`，`stream = false`，`auxiliary = true` |
+| 输入 | 【当前状态】/【当前待办】/【当前约定】/【本轮用户消息（id）】/【角色回复（id）】/【时间基准】/【最近对话】；主动开场时换成【本轮无用户消息（角色主动开场）】 |
+| 输出 | `dynamicState`（**不含 `currentTone`**）、`memberDynamicState`（仅群组，`[{memberName, dynamicState}]`）、`quickReplies`（恰好 2 条）、`todos`（create/done/cancel/reschedule）、`promiseUpdates`（resolved/cancelled） |
+| 落盘 | 动态字段仍走 `applyDynamicStateFields` + `dynamicStateMeta`（证据闸门 `resolveDynamicStateSources` / `hasValidUserEvidence`）；新建待办走 `TodoPolicy.validateTodoCreation`（`applyWorkerTodo`），其余变更复用 `applyTodoUpdate`；约定走 `applyPromiseUpdate` |
+| 失败 | **不重试**：传输/解析/校验失败一律保留旧状态，正文不受影响；`result.workerOk=false` 只记一条 `chat.worker` 失败指标 |
 
-这是"回复 + 写记忆"合一的契约，保证每轮回复结构合法。**没有 `shortTerm` 字段**：短期窗口只由整窗抽取写入（见"记忆子任务"）。
+群组只把共享的 `currentSituation`/`currentLocation` 写进 `groupSharedDynamic`，成员各自的状态写进对应 `member.dynamicState`（成员的 `currentTone` 不由 worker 写）。
 
-### 6. 右上角状态显示（全分支）
+### 7. 右上角状态显示（全分支）
 
 | stage | 触发条件 | 动作 | 右上角文案 |
 |---|---|---|---|
-| `auto-tool` | 阶段一模型发起工具调用 | run-tool | `工具结果已返回，正在继续推理…` + 对应工具提示 |
-| `auto-tool-limit` | 工具轮次达 `MAX_TOOL_ROUNDS` | accept-text / force-submit | 有正文 → `工具调用已达上限，直接收尾…`；无正文 → 正在整理 |
-| `auto-final` | 阶段一未调用工具、拿到正文 | accept-text / force-submit | 合法 JSON **或散文** → 直接采用（无提示）；完全没有正文 → 正在整理 |
-| `quick-replies-missing` | `submit_response` 有 `reply` 但缺/非法 `quickReplies` | accept-reply | 直接接受正文，`quickReplies` 交后台补齐（无提示） |
-| `submit-retry` | 阶段二兜底仍未拿到合法 `submit_response` | retry-submit | 正在重新整理 |
-| `empty` | 无可用正文 | regenerate / fail | 有额度 → `正在重新生成（第2次）…`；否则提示失败并保留用户消息 |
+| `auto-tool` | AUTO 阶段模型发起工具调用 | 执行工具 | 对应工具提示 + `工具结果已返回，正在继续推理…` |
+| `auto-tool-limit` | 工具轮次达 `MAX_TOOL_ROUNDS` / `MAX_TOOL_CALLS` | 转 FINAL | `正在整理回复…` |
+| `auto-final` | AUTO 阶段没有工具调用、也拿不到正文 | 转 FINAL | `正在整理回复…` |
+| `final-empty` | FINAL 阶段没有正文 | 重试（≤2 次） | `正在重新生成…` |
+| `empty` | 重试后仍无正文 | 失败 | 外层提示"收到空回复，请重试。你的消息已保留。" |
 
-工具提示（`AgentLoop.toolActivityHint`）：`get_current_time`→`正在确认时间…`、`search_memory`→`正在回忆…`、`list_memories`→`正在整理记忆…`、`delete_memory`→`正在清理记忆…`、`add_todo`→`已记下，正在回应…`、`update_character_field`→`已按你的要求调整设定…`、`upsert_lorebook_entry`→`已更新世界书…`、`web_search`→`正在搜索…`、`web_fetch`→`正在读取网页…`、`search_video`→`正在搜B站视频…`、`search_music`→`正在搜歌…`、`search_posts`→`正在搜虎扑帖子…`、`baidu_hot`/`toutiao_hot`/`douyin_hot`/`zhihu_hot`→`正在看热榜…`、`send_sticker`→`正在挑表情…`，未知工具回退 `正在处理…`。
+工具提示（`AgentLoop.toolActivityHint`）：`search_memory`→`正在回忆…`、`web_search`→`正在搜索…`、`web_fetch`→`正在读取网页…`、`search`→`正在搜索…`、`hot_board`→`正在看热榜…`、`memory_write`→`正在更新记忆…`、`upsert_lorebook_entry`→`已更新世界书…`、`send_sticker`→`正在挑表情…`，未知工具回退 `正在处理…`；字段修订另有 `正在调整设定…`。
 
-> 主提示词的 0/7/8 与【输出格式】都要求"以结构化方式收尾"（调用 `submit_response` 或输出单个 JSON 对象）且 `quickReplies` 恒为两条用户视角短句；但**客户端不把 `quickReplies` 当收尾门槛**——散文/缺 quickReplies 的收尾一律直接采用。
+> `quickReplies` 不是收尾门槛：worker 失败就没有按钮，正文照常显示；后台换位生成只在开关开启且结果通过 `detectQuickReplyIssues` 时补上。
 
 ## 四、记忆系统
 
@@ -174,7 +158,7 @@ BackgroundTasks.scheduleTurn  后台串行维护：文风校对、快速回应�
 | `instant` | 最近原始消息（发给模型的历史窗口） | 高水位 60 / 低水位 20（追加式，整窗折叠后压回 20） |
 | `shortTerm` | 事件流程摘要 | 高水位 40 / 低水位 20（整窗注入，靠整窗折叠消化而非截断） |
 | `longTerm` | 分类长期记忆 | 无数量上限（仅 `applyMemoryDecay` 时效遗忘） |
-| `scenes` | 场景概要 | 保留最近 8 条（`Scene.RETAIN`），注入最近 2 条（`Scene.SUMMARIES`） |
+| `scenes` | 场景概要 | 保留最近 8 条（`Scene.RETAIN`），注入最近 1 条 |
 | `history`（存档） | 完整聊天记录队列 | 上限 `History.ARCHIVE_MESSAGES`(400)，纯 FIFO，与窗口互不影响 |
 
 **上下文窗口（高/低水位 + 整窗折叠）**：`INSTANT=60` / `INSTANT_TRIM_FLOOR=20`、`SHORT_TERM=40` / `SHORT_TERM_TRIM_FLOOR=20`。两个窗口都是同一形态：
@@ -193,9 +177,9 @@ BackgroundTasks.scheduleTurn  后台串行维护：文风校对、快速回应�
 - subject 仅限 `user` / `relationship` / `world` / `character`（`legacy` 仅作历史兼容，不再写入）。
 - `MemoryEvidence.isValidAutomaticMemory()` 校验来源引用与证据逐字摘录，防止模型编造记忆。
 - 短期记忆在捕获时写入 `sourceRoles` 与 `userEvidence`（用户消息逐字摘录，`[{sourceMessageId,text}]`），短期→长期分析据此在源消息滚出 `instant` 后仍能校验 `evidence` 逐字来自声明的用户消息。**`sourceRoles` 与 `sourceMessageIds` 是逐位对齐的平行数组**：合并来源必须走 `:core:model` 的 `alignSources`/`mergeSources` 逐位重建——把它当集合去重会让来源 role 塌缩，之后所有来源都变无 role、校验直接失败。
-- 主对话的结构化写入（`submit_response` 的 `longTerm`/`staticFields`/`dynamicState`/`promiseUpdates`）同样过证据/意图校验（`ChatOrchestrator.applyMemory` → `MemoryPolicy.upsertLongTermMemory` / `MemoryEvidence.hasValidUserEvidence` / `hasStaticEditIntent` / `resolveDynamicStateSources`）。
-- **短期记忆不由主对话写**：`submit_response` 没有 `shortTerm` 字段，窗口唯一的写入者是整窗抽取（`BackgroundTasks.analyzeShortTermBatch`）。这样窗口在两次折叠之间不会被写在中部或提前压缩，注入块才能保持逐字稳定。
-- **短期条目可被修正/删除**：`update_memory`（`short_` 前缀 ID，支持 `value`/`eventTime`；改正后 `revision+1` 并移到队尾，等下一轮折叠写进长期记忆）与 `delete_memory`（同前缀）都能作用于短期；`search_memory` 的关键词召回也返回 `shortTerm` 命中。
+- 主对话（纯文本协议）**不再自动写长期记忆**：正常轮次里 `longTerm` 由后台抽取/分析产生；记忆的修正与删除只走 `memory_write` 工具（`MemoryPolicy` / `MemoryEvidence.hasValidUserEvidence` 校验）。旧结构本身是完整 JSON 的兼容路径仍会经 `ChatOrchestrator.applyMemory` → `MemoryPolicy.upsertLongTermMemory` 落盘。
+- **短期记忆不由主对话写**：主调用没有任何记忆字段，窗口唯一的写入者是整窗抽取（`BackgroundTasks.analyzeShortTermBatch`）。这样窗口在两次折叠之间不会被写在中部或提前压缩，注入块才能保持逐字稳定。
+- **短期条目可被修正/删除**：`memory_write` 支持 `short_` 前缀 ID（`op=update` 支持 `value`/`eventTime`；改正后 `revision+1` 并移到队尾，等下一轮折叠写进长期记忆）；`search_memory` 的关键词召回也返回 `shortTerm` 命中。
 
 ### 相关度检索
 
@@ -208,7 +192,7 @@ BackgroundTasks.scheduleTurn  后台串行维护：文风校对、快速回应�
 
 ### 注入与衰减
 
-- `buildVolatileContext(character, query, memory, now, proactiveTurn, hotTopicTurn, recentAssistantReplies)` — 把最相关的记忆与本轮动态上下文注入本轮 prompt（只注入 `AppLimits.Agent.TOOL_MEMORY_INJECT_LIMIT = 5` 条长期记忆，其余提示模型用 `search_memory` 检索）。**没有任何区块预算**：这是主对话请求体，所有块整块注入（只保留"每条条目"级别的兜底上限，靠提示词的软限制让它尽量不触发）。区块顺序按"越靠后越近"排列：可选话题库 → 角色当前状态 → 长期约定提醒 → 待跟进承诺 → **待办约定** → 世界书 → 群成员私人记忆 → 用户最新纠正 → 互动节奏 → 场景概要 → 长期召回 + 取用说明/主体约定 → 时间基准 → 消息时间元数据 → 风格尾块 + 本轮指令。**最末尾两条系统触发的本轮指令**：`proactiveTurn`（主动开场）与 `hotTopicTurn`（热榜开场，见 `HotTopicPolicy`：每角色每逻辑日掷一次、10%、每天 1 次/每周 2 次；命中时要求先调一个热榜工具——`zhihu_hot` 优先——再挑一条话题带入）。两条都只加在 volatile 上下文尾部，**不进 system prompt**，所以不会打乱缓存前缀。`metadata` 回传本轮真正注入的召回 ID 与世界书条目，供主线在回复落盘后精确清除 `pendingRecall` 与累计 `mentions`。检索查询经 `buildMemoryQuery()` 扩展：用户明显指代前文时附加最近对话，避免短指代召回不到正确记忆。
+- `buildVolatileContext(character, query, memory, now, proactiveTurn, hotTopicTurn, recentAssistantReplies)` — 把本轮动态上下文拼成 **11 段固定顺序**（见"volatile 段落"与 §六 预算）。**有硬预算**：整段 ≤ `VOLATILE_HARD_CHARS`(8000)，超限按 可选话题 → 场景概要 → 世界书 → 记忆召回 的顺序整段丢弃（时间 / 当前状态 / 未完成事项 / 本轮写法 永不丢）。检索查询经 `buildMemoryQuery()` 扩展：用户明显指代前文时附加最近对话。`buildVolatileContextForTurn` 额外返回**本轮实际渲染的召回 ID**，供主线在回复落盘后精确消费 `pendingRecall`（没挤进 3 条上限的不丢）。**热榜开场**（`HotTopicPolicy`：每角色每逻辑日掷一次、10%、每天 1 次/每周 2 次）命中时 `10 本轮指令` 段要求先调 `hot_board(platform=zhihu)` 再挑一条话题；两条指令都只加在 volatile 尾部，**不进 system prompt**，所以不会打乱缓存前缀。本轮实际注入的世界书条目直接取自 `selectLorebook` 的结果并累计 `mentions`（`bumpLorebookMentions`）。
 - `MemoryPolicy.applyMemoryDecay()`：按时间衰减 events/promises 的重要性与状态。
 - `MemoryPolicy.computeEffectiveImportance()`：`(importance + learnedBonus) × decay`（0-10 封顶）。
 
@@ -225,9 +209,9 @@ BackgroundTasks.scheduleTurn  后台串行维护：文风校对、快速回应�
 
 `scheduleMemoryRetry()` 统一指数退避（5 分钟 → 30 分钟封顶）；成功后清零。
 
-**短期摘要按位置消费（没有逐条标记）**：短期窗口是高低水位对（40 → 20），**位置就是状态**——比最新 20 条更老的那一段（每批最多 `ANALYSIS_BATCH`(40) 条）就是本批要消化的，分析成功即**原样丢掉这一批**，最新 20 条留作下一批（以及注入块）的上下文。因此不需要 `analyzedAt`/`analyzedRevision` 这类"两个消费者都确认才允许裁剪"的记账（一旦和位置错位就会死锁：标记说"都处理过" → 每轮都判"没有待办" → 窗口只涨不降）。`revision` 只剩一个用途：条目被 `update_memory` 改写时自增，用来把**请求飞行期间刚改过**的条目扣在窗口里、下一轮再读。
+**短期摘要按位置消费（没有逐条标记）**：短期窗口是高低水位对（40 → 20），**位置就是状态**——比最新 20 条更老的那一段（每批最多 `ANALYSIS_BATCH`(40) 条）就是本批要消化的，分析成功即**原样丢掉这一批**，最新 20 条留作下一批（以及注入块）的上下文。因此不需要 `analyzedAt`/`analyzedRevision` 这类"两个消费者都确认才允许裁剪"的记账（一旦和位置错位就会死锁：标记说"都处理过" → 每轮都判"没有待办" → 窗口只涨不降）。`revision` 只剩一个用途：条目被 `memory_write` 改写时自增，用来把**请求飞行期间刚改过**的条目扣在窗口里、下一轮再读。
 
-**证据与时间精度**：`MemoryEvidence.evidenceMatchesSummary()` 要求证据与实际回复有 ≥2 个双字片段重叠（≥35%），不"满 8 字即采信"；`applyStaticFields` 与 `update_character_field` 都额外要求 `hasStaticEditIntent()`（用户原话提到该字段且是修改意图）。`TimeUtils.resolveTimeRef` 对带时分秒的 explicit ISO 原样保留（含时区偏移），只给"仅日期有理"的结果补时段起点。
+**证据与时间精度**：`MemoryEvidence.evidenceMatchesSummary()` 要求证据与实际回复有 ≥2 个双字片段重叠（≥35%），不"满 8 字即采信"；静态字段修订（`FieldRevision`）与动态状态写入都额外要求 `hasStaticEditIntent()` / `hasValidUserEvidence()`（用户原话提到该字段且是修改意图）。`TimeUtils.resolveTimeRef` 对带时分秒的 explicit ISO 原样保留（含时区偏移），只给"仅日期有理"的结果补时段起点。
 
 ### 基础设定字段（10 字段）
 
@@ -235,19 +219,27 @@ BackgroundTasks.scheduleTurn  后台串行维护：文风校对、快速回应�
 
 **只留"人本身"的设定**：原本还有「价值观」与「关键过往」两项，它们分别与「性格特征」「背景故事」重叠（后者只是前者加时间线），**已删除**——设定越少、越不易互相矛盾，注入也更省。旧页面的这两个字段由 `:core:data` 的 `RetiredStaticFields` 在**读取时并入幸存字段**（性格 ← 价值观、背景 ← 关键过往）并摘掉退休键；旧备份走 `LegacyMapper` 的同一条合并规则，所以升级不丢人设。
 
-**写作规则**（`core:model` 的 `StaticFieldRules`，两条写入路径共用——工具/`submit_response.staticFields` 与界面/建卡）：
+**写作规则**（`core:model` 的 `StaticFieldRules`，两条写入路径共用——`FieldRevision` 单字段修订与界面/建卡）：
 
 - **只写明确的简短陈述句**：禁止「不是 A 而是 B」这类对比句（`contrastReason` 命中即**拒收**，工具会回一条明确错误让模型当场改写；它不静默截断也不偷改语义）。
 - **按字段收敛**（`AppLimits.StaticProfile`）：短字段（性别/年龄/种族/语言/称呼）**40 字**、叙述字段（外貌/性格/恐惧弱点/说话风格）**120 字**、背景故事**250 字**；超长按句末标点回退截断（`clamp`）。动态状态等非基础设定字段不受这些上限约束。
 - **两条通道语义不同**（`:feature:characters` 的 `FieldCleaning`）：**模型 / 建卡通道**（`MemoryToolSupport.cleanFieldValue`、`FieldCleaning.cleanFieldValue`）保留上面两条严格规则；**用户手写通道**（编辑器保存，`FieldCleaning.cleanUserWrittenField`）**对比句原样保留、不截断**，只去字段名前缀 / 括号说明，并把每一条处理作为可见提示回报给用户。注入侧另有单字段 600（背景 800）、整段 8000 字上限兜底，所以卡片存更长的文本不会撑大提示词。
 
+**模型侧的写入方式：单字段修订，没有工具**。`FieldRevision.detect(userText)` 只在用户**显式要求改字段**时命中（别名表 + 意图词，否定句不命中），随后：
+
+1. 用一次 `auxiliary` 小调用（`FieldRevision.buildRequest`，`stream=false`、`reasoningEffort=none`、`temperature=0.3`）只重写那一个字段；
+2. `FieldRevision.clean(key, raw)` 按 `StaticFieldRules` 清洗（对比句拒收、按字段长度上限收敛）；
+3. 写回 `staticProfile` 并把 `staticFieldMeta[key].updatedAt` 置为当前时间。
+
+群组不维护本体基础设定字段；成员字段仍只在该成员卡片上编辑。
+
 ### 动态状态（6 字段）
 
 `Prompts.DYNAMIC_STATE_FIELDS`（`:domain:agent`）：`currentSituation` / `currentLocation` / `currentMood` / `currentOccupation` / `currentGoal` / `currentTone`。
 
-`currentTone`（当前语气）由模型每轮更新，写成面向朗读的 TTS 播报指令（按需描述语气/情绪/语速/节奏/停顿/重音，可短可长、软上限约 60 字），朗读时直接作为 `TtsTurn.style` 传给当前朗读引擎（端侧 CosyVoice 的 instruct 指令，或远程服务器的 `instructions` 字段），省去"朗读前再调一次 API 生成语气指令"的开销。旧的 `currentRelationship`（当前关系）与 `currentImportantOthers`（当前重要他人）已不再使用，其旧值不迁移。
+`currentTone`（当前语气）由主调用正文末尾的 `【语气】` 行给出（`ResponseParser` 的 `tone` → `ChatOrchestrator.applyTone` 写进 `dynamicState.currentTone` + `dynamicStateMeta`），是面向朗读的 TTS 播报指令（语气/情绪/语速/节奏/停顿/重音，软上限约 60 字），朗读时直接作为 `TtsTurn.style` 传给当前朗读引擎（端侧 CosyVoice 的 instruct 指令，或远程服务器的 `instructions` 字段）。旧的 `currentRelationship`（当前关系）与 `currentImportantOthers`（当前重要他人）已不再使用，其旧值不迁移。
 
-除 `currentTone` 外，每个字段的 value 必须带 `sourceMessageIds` + `evidence` 溯源；群组整体只维护 `currentSituation` + `currentLocation`（`GROUP_SHARED_DYNAMIC_FIELDS`），成员各自的完整状态（含 `currentTone`）写入 `memberDynamicState`。`currentTone` 是朗读投递属性（自指、非事实状态），**每轮必填且免证据门**（`applyDynamicStateFields` 对 `currentTone` 跳过来源解析），是唯一不受"仅更新有依据字段"约束的动态字段。
+除 `currentTone` 外，每个字段的 value 必须带 `sourceMessageIds` + `evidence` 溯源；这些字段由 turn worker 的 `submit_state` 写入。群组整体只维护 `currentSituation` + `currentLocation`（`GROUP_SHARED_DYNAMIC_FIELDS`），成员各自的处境/位置/情绪/职业/目标写进 `memberDynamicState`；成员 `currentTone` 不由 worker 产生，朗读时取该成员的 `currentTone`、为空则回退群组语气（`AppViewModel.toneFor`）。`currentTone` 是朗读投递属性（自指、非事实状态），**免证据门**（`applyDynamicStateFields` 对 `currentTone` 跳过来源解析）。
 
 ### 世界书（lorebook）
 
@@ -291,8 +283,8 @@ BackgroundTasks.scheduleTurn  后台串行维护：文风校对、快速回应�
 ### 成员记忆隔离（群组）
 
 - 每个成员持有独立 `member.memory.longTerm`。
-- 路由：`submit_response.longTerm` 可带 `memberName` → 写入该成员记忆；记忆工具同样支持 `memberName`。
-- 注入：`buildVolatileContext` 为每个成员单独注入私人记忆（标记"仅该成员知道"），群组规则要求不得张冠李戴。
+- 路由：`search_memory` / `memory_write` / `upsert_lorebook_entry` 都可传 `memberName` → 作用于该成员的私人记忆/世界书；后台抽取产出的长期记忆写入共享层。
+- 注入：`buildVolatileContext` 为选中的成员各注入 1 条私人记忆（标记"仅该成员知道"），群组规则要求不得张冠李戴；成员动态状态由 turn worker 的 `memberDynamicState` 维护。
 
 ### 话题系统（主动提话题 + 冷场 + 话题切换）
 
@@ -306,47 +298,49 @@ BackgroundTasks.scheduleTurn  后台串行维护：文风校对、快速回应�
 - `summarizeScene()`：把"这一段已告一段落的情节"压缩成 1-2 段（≤300 字）**只含剧情要点**的记忆（谁做了什么/学到或决定了什么/地点物品伤势关系变化/新发现/未解决的目标承诺威胁期限）；写明主体、绝对日期、不引对白、不编造。**输入带时间**：在规则与转录之间拼一个 `【时间基准】`（当前本地时间/时区/ISO/逻辑日，与 volatile 逐字同款），转录每行前面标该条消息自身的时间 `yyyy-MM-dd HH:mm（逻辑日 YYYY-MM-DD 时段）`，没有可用时间戳的消息标 `（本条时间未知）`；提示词据此要求"日期只能依据给到的时间信息写、无时间标注的消息不得编日期"。存储结构与检索未变。
 - 触发：**场景切换**（location 变化）或**场景超长**（`Scene.SPAN`(12) 条消息），且消息数 ≥ `Scene.MIN_MESSAGES`(6)。
 - 游标存 `character.sceneState`（`key`/`startCount`/`startSequence`/`messageCount`，按消息 `sequence` 推进）。
-- 注入：最近 2 条渲染为 `【场景概要（较早情节的压缩记录…）】`。
+- 注入：最近 1 条渲染为 `【场景概要】`（不再按 `key` 过滤，≤300 字）。
 
 ### 用户约定（promises，纯叙事记忆）与独立待办（todo）
 
 **长期记忆与待办互相独立**：`promises` 只是被角色记住的叙事记忆（角色记得你们之间有过什么约定/承诺），
 **永远不会变成待办**；待办是单独的实体 `Character.todos`（见下），二者互不派生。
 
-- **约定确认（仅记忆元信息）** `MemoryEvidence.promisePushDecision()`：判定一条 `promisor=user/relationship` 的约定是否是**用户本人同意**过的。`promisor=character`（角色单方承诺）照常存进记忆，但不计入"已确认"；`promisor=user` 要求 `sourceMessageIds` 解析得出且全是用户原话（`evidence` 必须逐字对上）；`promisor=relationship`（双方约定）还必须有另一方原话佐证；其余（群组成员名 / 空 / 旧数据）一律不计入。**结论会落盘**：严格闸门通过的那一刻把 `pushConfirmedAt`（时间）与 `pushConfirmedDueAt`（当时被确认的 `dueAt`）写进记忆（`AppViewModel.recordPromiseConfirmations` 只扫刚回过一轮的角色，幂等；无期限的已确认约定也打标），标记按 `dueAt` 失效。**它只是记忆元信息，不再服务任何列表**：设置页那份待办列表已删除，应用也不做通知投递（无通知权限、无 WorkManager）。
+- **约定确认（仅记忆元信息）** `MemoryEvidence.promisePushDecision()`：判定一条 `promisor=user/relationship` 的约定是否是**用户本人同意**过的。`promisor=character`（角色单方承诺）照常存进记忆，但不计入"已确认"；`promisor=user` 要求 `sourceMessageIds` 解析得出且全是用户原话（`evidence` 必须逐字对上）；`promisor=relationship`（双方约定）还必须有另一方原话佐证；其余（群组成员名 / 空 / 旧数据）一律不计入。**结论会落盘**：严格闸门通过的那一刻把 `pushConfirmedAt`（时间）与 `pushConfirmedDueAt`（当时被确认的 `dueAt`）写进记忆（`AppViewModel.recordPromiseConfirmations` 只扫刚回过一轮的角色，幂等；无期限的已确认约定也打标），标记按 `dueAt` 失效。**它只是记忆元信息，不服务任何列表**：应用不提供全局待办列表，也不做通知投递（无通知权限、无 WorkManager）。
 - **期限定位**：`dueAtBackedByEvidence(sources, dueAt)`（原 `dueAtBackedByUserEvidence`，泛化后按传入来源判断）要求期限能在给定原话里定位（相对词按消息时间换算后核对日期；绝对日期直接比对；只有粗粒度时间词时"出现过时间词"即可）。`promisePushDecision` 用它判定 `dueAtNeedsConfirmation`。
-- **周期性约定注入**：`Prompts.buildStandingCommitmentBlock()` 确定性挑周期性 promises/habits（见"上下文与预算"表），只注入一行摘要；这是叙事记忆的补丁，与待办无关。
-- **独立待办（todo）**：模型 `Character.todos: List<Todo>`（`id/title/detail/dueAt/status/proposer/sourceMessageIds/evidence/createdAt/updatedAt/closedAt`，`TodoStatus` = active/done/cancelled，`TodoProposer` = user/character）。**新增只有一条闸门** `TodoPolicy.validateTodoCreation()`：①期限必填且能在对话原话里定位；②`proposer=user` 时用户原话含期限与提议；③`proposer=character` 时必须附**用户应答的原话**，且该原话不得是明确拒绝（`TodoPolicy.isUserRefusal`）；**同意与否以模型的判断为主，关键词只做其中一环**（`isUserAgreement` 只作正向确认信号，覆盖不到的说法一律不否决），期限落在双方任一方的原话里即可。写入走 `add_todo` 工具；改期/完成/取消走 `submit_response.todoUpdates`（须引用户原话，且改期也要能定位）。**关闭条目保留 `AppLimits.Todo.CLOSED_RETENTION_DAYS`(30) 天**：`TodoPolicy.pruneClosedTodos()` 在启动维护时真删更老的，列表（`TodoBuckets`）再防御性过滤一次。对话中未结束的待办由 `Prompts.buildTodoBlock()` 注入 volatile（固定顺序，无命中不出段），角色可自然提起。
+- **周期性约定注入**：`Prompts.selectStandingCommitments()` 确定性挑周期性 promises/habits（见"上下文与预算"表），与待办一起并入 `3 未完成事项`，每条约一行；这是叙事记忆的补丁，与待办无关。
+- **独立待办（todo）**：模型 `Character.todos: List<Todo>`（`id/title/detail/dueAt/status/proposer/sourceMessageIds/evidence/createdAt/updatedAt/closedAt`，`TodoStatus` = active/done/cancelled，`TodoProposer` = user/character）。**新增只有一条闸门** `TodoPolicy.validateTodoCreation()`：①期限必填且能在对话原话里定位；②`proposer=user` 时用户原话含期限与提议；③`proposer=character` 时必须附**用户应答的原话**，且该原话不得是明确拒绝（`TodoPolicy.isUserRefusal`）；**同意与否以模型的判断为主，关键词只做其中一环**（`isUserAgreement` 只作正向确认信号，覆盖不到的说法一律不否决），期限落在双方任一方的原话里即可。**唯一写入通道是 turn worker 的 `submit_state.todos`**（`ChatOrchestrator.applyWorkerTodo`）：`create` 走上面的闸门，`done`/`cancel`/`reschedule` 走 `applyTodoUpdate`（须引用户原话，改期也要能定位）。**关闭条目保留 `AppLimits.Todo.CLOSED_RETENTION_DAYS`(30) 天**：`TodoPolicy.pruneClosedTodos()` 在启动维护时真删更老的，列表（`TodoBuckets`）再防御性过滤一次。未结束的待办与周期性约定合并成 `【未完成事项】`（`Prompts.buildUnfinishedBlock()`，固定顺序，无命中不出段），角色可自然提起。
 - **待办 UI**：角色编辑弹窗的「待办」页签（`:feature:characters`，仅角色本体；成员页签不显示），分 `进行中 / 已超时（由 dueAt < now 派生）/ 已完成 / 已取消`，后两组默认折叠；进行中/已超时行「完成 / 取消」，关闭行「删除」——都只是**手动兜底**，正常生命周期由模型处理。
 
 ## 六、上下文与预算
 
 ### 记忆预算
 
-**volatile 没有区块预算**：该段属于主对话请求体，所有块整块注入，取舍只剩"条数上限 × 每条兜底上限"。
+volatile 有**整段硬上限**（`VOLATILE_HARD_CHARS`=8000）；超限时按固定顺序整段丢弃，取舍仍优先"条数上限 × 每条上限"。
 
 | 项 | 值 | 说明 |
 |---|---|---|
 | 短期窗口注入 | 整窗（20~40 条） | 注入到**历史之前**的独立 user 块，不进 volatile |
-| `TOOL_MEMORY_INJECT_LIMIT` | 5 | 每轮注入的长期记忆条数 |
-| 世界书注入 | `Lorebook.INJECT_ENTRIES`(6) 条 | 预算 `INJECT_CHARS`(1400) 装不下的条目**跳过、继续装后面的** |
-| 场景概要 | `Scene.SUMMARIES`(2) 条 | 整条注入（写入时已受 300/400 字约束） |
-| 长期约定提醒 | `STANDING_COMMITMENT_LIMIT`(4) 条 / 每行 `LINE_CHARS`(100) / 整段 `BLOCK_CHARS`(420) | 确定性挑周期性 promises/habits；**无命中时整段不出现** |
-| 待办约定 | `Todo.INJECT_LIMIT`(4) 条 / 每行 `LINE_CHARS`(100) / 整段 `BLOCK_CHARS`(420) | `Prompts.buildTodoBlock()`：只注入 `Character.todos` 里仍未结束的（按期限升序）；**无命中时整段不出现** |
-| 每条兜底上限 | 短期正文/长期 value/群私人 1200、长期 key 120 | 仅为兜底；提示词软限制让它尽量不触发 |
+| 记忆召回 | `RECALL_INJECT_LIMIT`(3) 条 / 单条 `RECALL_LINE_CHARS`(1200) / 总预算 3600 | 只截断超长单条（按 `。！？；` 句末边界），3×1200 即总量上限；`pendingRecall` 按**实际渲染**的 id 消费 |
+| 世界书注入 | `Lorebook.INJECT_ENTRIES`(6) 条 / `INJECT_CHARS`(1400) | 装不下的条目**跳过、继续装后面的** |
+| 场景概要 | 1 条 / ≤300 字 | 只取最近一条（不再按 `key` 过滤） |
+| 未完成事项 | 待办 `Todo.INJECT_LIMIT`(4) + 周期约定 `STANDING_COMMITMENT_LIMIT`(4)；每行 100 / 整段 `UNFINISHED_BLOCK_CHARS`(400) | 待办按期限升序；同一件事不会同时以 `[待办]`/`[周期]` 出现；**无命中整段不出现** |
+| 本轮写法 | `WRITING_BLOCK_CHARS`(500) | 口吻 + 骨架 + 话题 + 上一轮问题 + 收尾去重 |
+| 消息时间元数据 | 14 条 | `id \| role \| timestamp`，供 `sourceMessageIds` 引用 |
+| 超限丢弃顺序 | 可选话题 → 场景概要 → 世界书 → 记忆召回 | 时间 / 当前状态 / 未完成事项 / 本轮写法**永不丢** |
+| 每条兜底上限 | 长期 value / 群私人 1200、召回 key 120 | 仅为兜底；提示词软限制让它尽量不触发 |
 
 ### 请求装配与缓存前缀
 
 一轮请求的形状（`ChatOrchestrator.run` + `RequestBuilder`）：
 
 ```
-instructions（system，纯静态角色设定）
+instructions（system：交互规则 + 角色设定 + 输出通道，纯静态）
 input:
   [0]     短期窗口块（user）    ← 【近期摘要记忆…】整窗
-  [1..n]  历史 = instant 窗口（20~60 条原文）
+  [1..n]  历史 = instant 窗口（20~60 条原文，assistant 纯文本）
   [n+1]   本轮用户消息
   [n+2]   volatile 上下文（user，最后一条）
-tools: AUTO 阶段全部工具 / SUBMIT 阶段只有 submit_response
+tools: AUTO 阶段 8 个工具 / FINAL 阶段无 tools（tool_choice 恒为 auto）
 ```
 
 - **短期块放在历史之前**是有意的：它只在折叠那一轮变化，而折叠同时把历史 rebase 掉——即"它变的时候前缀本来就要断"。中间那段它逐字不变，于是和"追加式历史"一起待在缓存前缀里。
@@ -361,17 +355,20 @@ tools: AUTO 阶段全部工具 / SUBMIT 阶段只有 submit_response
 
 ### 前缀缓存策略
 
-- system = 交互规则 + 【角色设定（固定，不随对话变化）】+【硬性约束与语气锁定】+【输出格式】，全部为静态内容，跨轮不变。
-- **首尾放最高优先级**：规则块开头是优先级阶梯，静态块**末尾**再放硬性约束（0.5 禁令 + 2.5 语气锁定）与输出格式 —— 兼顾 primacy 与 recency，同时保持全部静态可缓存。
-- 历史消息逐字按序（最旧→最新）拼接、不重排、不注入消息 ID；**同一条消息在任何一轮都用同一编码**（含 `trimTo` 上限），因此上一轮的"当前用户消息"在下一轮变成历史时字节不变。
-- **所有随轮变化的内容（记忆、世界书、场景概要、节奏骨架、违规纠正提醒、语气回顾、声音契约/群聊声音锁定、本轮指令）汇总进 `buildVolatileContext`，作为独立的末尾 user 项追加**，不写进任何历史消息体内。
-- 生成示例固定使用同一份精简 JSON 示例，system 从首轮起稳定。
-- 语气相关注入在 volatile 尾部按固定顺序排列：节奏骨架 → 违规纠正提醒 → 每 N 轮语气回顾 → 声音契约（单角色）/群聊声音锁定（群聊，每位有说话风格的成员各一块、块数随成员数、不封顶）（越靠后越接近生成点，遵从度越高）。
+- system = 【交互规则】(`RULE_0`–`RULE_6` + `RULE_A` 工具名单) + 【群组附加规则】（仅群组）+【角色设定（固定，不随对话变化）】+【输出通道】，全部静态，跨轮不变。
+- 历史消息逐字按序（最旧→最新）拼接、不重排、不注入消息 ID；**同一条消息在任何一轮都用同一编码**（含 `trimText` 上限），因此上一轮的"当前用户消息"在下一轮变成历史时字节不变。assistant 历史按纯文本原样回放，不再包 JSON。
+- **所有随轮变化的内容汇总进 `buildVolatileContext`**，作为独立的末尾 user 项追加，不写进任何历史消息体内：时间 / 当前状态 / 未完成事项 / 世界书 / 场景概要 / 记忆召回 / 成员私人记忆 / 本轮写法（口吻摘要与示例、骨架、话题、上一轮问题、收尾去重）/ 可选话题 / 本轮指令 / 消息时间元数据。
+- 语气相关注入都收在 `8 本轮写法` 的固定顺序里：口吻（风格摘要 + 2 条示例 + 称呼）→ 骨架 → 话题 → 上一轮问题（每 3 轮的语气回顾也走这一行）→ 收尾去重；群组按成员各一行口吻。越靠后越接近生成点，遵从度越高。
 - 禁止：把随轮内容插进历史中间、每轮改写 system 措辞、volatile 各段随机换序（都会打掉前缀命中）。
 
 ### 逐请求缓存与耗时统计
 
-`AppViewModel.recordMetrics`（chat）/ `recordAuxiliaryUsage`（辅助调用）写 `RequestMetric`：`taskType`（`chat` / `auxiliary` 等）、`platform`、`phase`、`status`（`completed` / `failed` / `note`）、`inputTokens` / `outputTokens` / `hitTokens` / `missTokens` / `hitRate`、`durationMs`、`instructionsHash` / `toolsHash` / `historyHash`、`commonHistoryMessages`、`prefixChange`、`contextChars` / `inputChars`。记录保留最近 60 条（`AppLimits.Api.REQUEST_METRICS`）。**一轮对话只写一条 chat 记录，数值是本轮所有主对话请求（工具轮 + 强制收尾轮）的合计**——只有第一轮会带破缓存的前缀，只记最后一轮（那一轮通常已被本轮自己写热）会让命中率永远看着很高；后台/辅助调用（抽取、分析、场景、世界书、快捷回复）一律不计入右上角。没有拿到用量的请求记"无数据"（`hitRate=null`，不按 0% 计入均值），右上角 `cacheStats` **每轮都刷新**（无数据时显示「缓存未返回命中数据」），**失败的 chat 轮也会留一条 `status='failed'`**（`phase` 存原因），失败的后台调用同样留痕。缓存条显示本轮（含工具轮）命中率与最近 10 次对话轮均值；设置页「调试信息」展示逐请求明细（含 `prefixChange`，用于判断"这次破缓存是我改了设定还是历史自然增长"）。
+`AppViewModel.recordMetrics`（主对话 + worker）/ `recordAuxiliaryUsage`（后台辅助调用）写 `RequestMetric`：`taskType`、`platform`、`phase`、`status`（`completed` / `failed` / `note`）、`round`、`inputTokens` / `outputTokens` / `hitTokens` / `missTokens` / `hitRate`、`durationMs`、`instructionsHash` / `toolsHash` / `historyHash`、`commonHistoryMessages`、`prefixChange`、`contextChars` / `inputChars`。记录**按 `taskType` 各保留最近 `AppLimits.Api.REQUEST_METRICS`(60) 条**（一种请求不会挤掉另一种）。
+
+- **每条请求一行**：主对话用 `chat.main`——工具轮、FINAL 轮、外层重试的每一轮都是独立一行；turn worker 用 `chat.worker`（成功有用量才写，失败写一条 `status=failed`、`phase=worker-failed`）。后台（抽取/分析/场景/世界书/字段补全/快速回应）用自己的 taskType，不计入右上角平均。
+- **失败也留痕**：空回复写一条 `chat.main` + `status=failed`、`phase=empty-reply`；异常轮把错误摘要写进 `phase`；辅助调用失败同样 `status=failed`。
+- **缓存条**取本轮**第一条** `chat.main`（带缓存前缀的那条）的命中率，以及最近 10 条 `chat.*` 的均值；没有用量时 `hitRate=null`（"无数据"，不按 0% 计入均值），并显示「缓存未返回命中数据」。
+- **"指标"按钮**（`AppRoot`，右上角缓存条旁）按 `taskType` 分组展开最近记录，各组的条数与平均命中率分开显示；设置页「调试信息」另给逐请求明细（含 `prefixChange`，用于判断"这次破缓存是我改了设定还是历史自然增长"）。
 
 ## 七、人格与 Prompt
 
@@ -379,73 +376,70 @@ tools: AUTO 阶段全部工具 / SUBMIT 阶段只有 submit_response
 
 | 规则 | 内容要点 |
 |---|---|
-| — | 优先级阶梯（规则块首行）：`0／0.5 与【输出格式】= 硬性契约 > 2.5／2.6 > 角色设定 > 风格偏好` |
-| `0` | （最高优先级）本轮必须以结构化方式收尾，二选一：调用 `submit_response` 工具（推荐）或直接输出单个 JSON 对象；不得在结构化内容之外写说明/旁白 |
-| `1` | 保持角色身份连续；先用已提供的记忆；"系统提供的本轮上下文"不是用户的话 |
-| `2` | reply 正文写法（像日常说话）：**不设下限**、只设 **≤250 字上限**防大段空话；分段/行内样式限制；**动作/表情/心理/旁白一律写全角括号、单拍短、不堆叠、总量 ≤ ¼、不复述对白情绪**；**自己说的话直接写、不加引号包裹；只有引用他人话语/歌词/诗句/书名或专有名词原文时才用符号（引号用「」、书名用《》、逐字照抄），并避免英文直引号（JSON 需转义）**；去重（禁重复近期整句/句式/意象/固定动作/收尾） |
-| `2.6` | **表演质量（真人感）**：show-don't-tell、句长节奏起伏、对白优先、回避陈词滥调与复用比喻、删掉不推进内容的句子、人物性格稳定 |
-| `3` | 人格/背景锁定 + `dynamicState` 更新与溯源规则（时间写法见 `3.8`） |
-| `3.5` | 谨慎修改基础设定：用户直接要求 → `update_character_field`；无要求时仅"决定性不可逆转折"才改；value 写成明确的简短陈述句（禁「不是…而是…」对比句） |
-| `3.6` | 状态/设定字段的 value 写法（只写内容本身，不加主语，解释进 evidence）；**基础设定字段有硬长度上限并只写陈述句**——见「基础设定字段」一节 |
-| `3.7` | 记忆字段必须写明主体（禁止"我/你/TA"这类代词） |
-| `3.8` | 时间一律写绝对日期，相对说法填 `timeRef` |
-| `3.9` | 用户提"说话方式类"要求时，本轮 reply 直接演出、禁止元话术 |
-| `4`–`6` | 只记录未来有价值的信息；`subject` 取值约束；promises（叙事记忆）的承诺方/受约方与状态流转 |
-| `6.5` | 待办（todo）与长期记忆独立：新增须「明确日期 + 双方同意」，用 `add_todo`；完成/取消/改期走 `todoUpdates` 并引用用户原话 |
-| `7` | `quickReplies` 恰好两条且必须是**用户视角**（禁止角色口吻、**禁止角色对用户的提问**、禁止复述角色台词） |
-| `8` | JSON 字段结构精简示例（字段完整定义见 `submit_response` 工具 schema） |
-| `9` | `longTerm.category` 取值与 `importance` 范围 |
-| `9.5` | 相对时间（timeRef）说明（取值与示例已下沉到工具 schema） |
-| `A` | 工具使用总则（详细适用场景以工具描述为准；工具结果属内部上下文，不得向用户透露检索过程） |
-| `10`–`12` | 群组：发言格式、记忆归属、设定三层（群组 quickReplies 同样要求用户视角） |
-| — | 【角色设定（固定，不随对话变化）】= `buildSystemPrompt` 的静态角色块 |
-| `0.5` | **只扮演角色本人：禁止替用户说话或行动**——置于硬性约束块（静态块末尾） |
-| `2.5` | 语气锁定：腔调只能来自设定的"说话风格"与"对用户的称呼"，并硬性要求口癖/句尾助词/称呼等签名标记真的出现（≥2 处），禁止中和成通用书面语或默认 AI 助手腔——与 0.5 同在硬性约束块 |
-| — | 【输出格式】工具调用与单个 JSON 对象二选一收尾（静态块最后一行） |
+| `0` | 只输出角色这一轮的回复正文；不要 JSON、字段名、工具说明、前后缀或代码块围栏 |
+| `1` | 保持角色身份，先用手上已给的记忆；"系统提供的本轮上下文"不是用户的话 |
+| `2` | 像日常说话：可只一句/几个字/一个动作；整段 ≤250 字；自然分段；不总结、不升华、不硬抛开放问题 |
+| `3` | 只写角色自身的言行，不替用户说话或行动；用户括号里的动作/心理只作语境 |
+| `4` | 动作/表情/心理/环境用全角括号、单拍短、总量 ≤ ¼；台词直接写不加引号；引用用「」《》；不用标题/列表/代码块 |
+| `5` | 需要工具时**只调工具、不写正文**；工具结果回来后再写正文；正文不提工具名或检索过程 |
+| `6` | 文风以"说话风格"和"对用户的称呼"为准；不向默认助手腔靠拢；不复用最近几轮的整句/句式/比喻/意象/收尾 |
+| `A` | 本会话可用工具清单（8 个，逐一点名）+ 何时用哪个工具的导引；日期用 `search_memory` 的 `date`/`timeRef`；说"第一次/从来没/总是"前先检索 |
+| `10` | 群组：只能由已列出的成员发言，每人独立一行"成员名：内容"；成员之间语气必须显著不同 |
+| `11` | 群组：成员私人记忆互不相通，只有全体都知道的事才写共享记忆；不得张冠李戴 |
+| — | 【角色设定（固定，不随对话变化）】= `buildSystemPrompt` 的静态角色块（群组含群组前提与成员清单） |
+| — | 【输出通道】正文之后另起一行，只写一行 `【语气】<朗读指导，≤60 字>`；语气只来自说话风格与称呼，至少带出 2 处签名标记 |
 
 ### 节奏骨架
 
-`Prompts.buildNarrativePatternDirective()`：从 10 条结构模板（动作/描写 → 对白 → 描写的排列组合）里每轮随机取一条，注入 volatile 尾部的 `【本轮节奏骨架（每轮随机给出，仅作节奏参考）】`，用于打破"每轮结构雷同"。
+`NARRATIVE_PATTERNS`：从 10 条结构模板（动作/描写 → 对白 → 描写的排列组合）里每轮随机取一条，写成 `8 本轮写法` 里的 `骨架: <骨架名>：<说明>`，用于打破"每轮结构雷同"。
 
 ### volatile 段落（按顺序）
 
-可选话题库 → 角色当前状态（+群成员状态）→ **长期约定提醒** → **待跟进承诺** → **待办约定** → **世界书资料** → 成员私人记忆 → 用户最新纠正 → 互动节奏（重连/久别）→ **场景概要** → 本轮主动召回的相关长期记忆 + 记忆取用说明 + 记忆主体约定 → 时间基准 → 消息时间元数据 → 结尾多样性 → **本轮节奏骨架** → 冷场/话题切换指令 →（主动开场时）角色主动开场 →（热榜开场时）热榜指令 → **快速回应视角提醒** → **违规纠正提醒** → **每 N 轮语气回顾** → **声音契约（单角色）/群聊声音锁定（群聊）**。
+固定 11 段，空段整段不出现：
 
-> 顺序原则是"越靠后越近"：更早的背景（话题库/状态/承诺/世界书）在前，较早情节（场景）→ 较早记忆（长期召回）→ 现在（时间基准/时间线）→ 本轮指令（尾块）在后。**短期窗口不在这里**：它整窗注入到历史之前（见"请求装配与缓存前缀"）。
+1. **【时间】** — 本地时钟 + 周几 + 时段 + 逻辑日；间隔 ≥6 小时追加"可温和重连"。
+2. **【当前状态】** — 处境/位置/情绪/职业/目标（每项 ≤60 字，不含 `currentTone`）；群组为"群组: …" + 每位成员一行。
+3. **【未完成事项】** — `[待办]`（未结束，按期限升序，过期标注）+ `[周期]`（周期性 promises/habits）；同一件事不重复出现；整段 ≤400 字。
+4. **【世界书】** — ≤6 条 / ≤1400 字；正文为空的条目写成"（正文为空，待补充；条目ID: …；关键词: …）"并提示按 ID 补写。
+5. **【场景概要】** — 最近 1 条，≤300 字。
+6. **【记忆召回】** — 用户最新纠正行 + 最多 3 条召回（每条 ≤1200 字）+ 一句免责与主体说明；无召回时写"无相关长期记忆"。
+7. **【成员私人记忆】**（仅群组）— 选中成员各 1 条，每人 ≤300 字；成员集合 = 本轮提到的成员名 → 上一轮发言人 → 全员。
+8. **【本轮写法】**（≤500 字）— 口吻（风格摘要 + 2 条示例 + 称呼，群组按成员分行）→ 骨架（10 条模板随机一条）→ 话题（冷场/切换二选一）→ 上一轮问题（违规标签，或每 3 轮语气回顾）→ 收尾不要重复。
+9. **【可选话题】** — 仅冷场或主动开场；3 条、每条 ≤60 字。
+10. **【本轮指令】** — 主动开场 / 热榜开场（`hot_board(platform=zhihu)`），可同时出现。
+11. **【消息时间元数据】** — 最近 14 条非 loading 消息的 `id | role | timestamp`，供 `sourceMessageIds` 引用。
+
+> 顺序原则是"越靠后越近"：身份状态在前，较早情节（场景）→ 较早记忆（召回）→ 现在（时间/时间线）→ 本轮指令在后。**短期窗口不在这里**：它整窗注入到历史之前（见"请求装配与缓存前缀"）。整段 >8000 字时按 9 → 5 → 4 → 6 的顺序丢弃（见 §六 预算）。
 >
-> 记忆取用说明：提醒召回条目"按关键词与时间粗略召回，可能只有部分相关或已过时"，不得硬提旧事、不得当作用户刚说过的话。
->
-> **长期约定提醒（周期性/仪式类）**：`Prompts.buildStandingCommitmentBlock()` 用确定性判据（`category` ∈ promises/habits 且 `status=active` 且 key/value 命中周期性词表——`每(个)?(天|日|晚|早|晨|周|月|年|次|回|逢|一)` / `一直|永远|始终|照例|如常` / `every( day|night|week|month|time)` / `always` / `forever`，裸「每」不算）挑出"每晚…/一直…"这类每轮都生效的约定，只注入**一行摘要 +（若有）期限**，约定正文本体仍靠检索。上限 `STANDING_COMMITMENT_LIMIT`(4) 条 / 每行 `STANDING_COMMITMENT_LINE_CHARS`(100) / 整段 `STANDING_COMMITMENT_BLOCK_CHARS`(420)，排序 importance ↓ → 最近更新 ↓ → id（同一角色输出恒定）；**无命中时整段不出现**（不出标题、不留空行）。它是"固定仪式被静默遗忘"的补丁，不是第二份记忆注入。
+> **周期性约定**：`Prompts.selectStandingCommitments()` 用确定性判据（`category` ∈ promises/habits 且 `status=active` 且 key/value 命中周期性词表——`每(个)?(天|日|晚|早|晨|周|月|年|次|回|逢|一)` / `一直|永远|始终|照例|如常` / `every( day|night|week|month|time)` / `always` / `forever`，裸「每」不算）挑出"每晚…/一直…"这类每轮生效的约定，排序 importance ↓ → 最近更新 ↓ → id，取前 4 条，与待办合并进 `3 未完成事项`；**无命中时整段不出现**。它是"固定仪式被静默遗忘"的补丁，不是第二份记忆注入。
 
 ### 语气/风格遵从（attention）
 
 把最容易违反的约束尽量贴近生成点，并用客户端检测闭环（纯函数，可单测；在 `StyleGuard`）：
 
-- **优先级阶梯**：规则块开头声明"0／0.5 与【输出格式】= 硬性契约 > 2.5 语气锁定与 2.6 表演质量 > 角色设定 > 风格偏好"。
-- **静态块末尾重申**：`【硬性约束与语气锁定（最高优先级，冲突时以这里为准）】` 内含 0.5 禁令与 2.5 语气锁定，紧跟【输出格式】（recency，且全部静态可缓存）。
-- **声音契约** `StyleGuard.buildStyleAnchor()`：每轮在 volatile 最末尾给出「说话风格摘要 + 3 条逐字示例台词 + 对用户的称呼 + 本轮硬约束」，硬约束要求回复**至少自然带出设定的口头禅/句尾助词/称呼共 2 处**并保持标点习惯，**禁止通用书面语与默认 AI 助手腔**；示例从完整 `speakingStyle` 抽取后再截断摘要，避免长风格丢示例。`speakingStyle` 为空时不出契约（依赖补全字段功能填充）。
-- **群聊声音锁定** `StyleGuard.buildGroupVoiceContract()`：群聊时为**每位有 `speakingStyle` 的成员**各出一块（成员名 + 说话风格摘要 + 3 条示例 + 称呼 + 该成员专属要求），块数随成员数、不封顶；总纲要求成员之间语气显著不同。无说话风格的成员跳过。
+- **静态声明**：`OUTPUT_CHANNEL` 要求语气只来自设定的"说话风格"与"对用户的称呼"，至少自然带出 2 处签名标记，不得向默认助手腔靠拢；`RULE_6` 复述同一条文风约束。
+- **贴生成点的口吻行** `voiceSpec()`：`8 本轮写法` 第一行给出「口吻: 风格摘要（≤60 字）；示例: 2 条逐字台词；称呼: …」；群组为每位有 `speakingStyle` 的成员各一行。示例从完整 `speakingStyle` 抽取后再截断摘要，避免长风格丢示例；`speakingStyle` 为空时不出口吻行（依赖补全字段功能填充）。
 - **违规检测** `StyleGuard.detectStyleViolations(reply, char, prevReplies)`：纯函数返回标签
   `metaTalk`（元话术）／`speaksForUser`（替用户说话）／`cliche`（陈词滥调表）／`reusedImagery`（复用近期意象）／`toneDrift`（声明的口癖缺失或句长过于整齐）／`recitedLore`（复述世界书条目）。
-- **内部提醒**（不展示给用户）：违规标签随消息持久化（`message.styleViolations`），下一轮由 `StyleGuard.buildStyleCorrectionReminder()` 在 volatile 尾部点名纠正。
-- **每 N 轮语气回顾** `StyleGuard.buildStyleReview()`：`reviewEveryTurns`（3）轮一次，汇总近期违规并重申语气契约。
+- **内部提醒**（不展示给用户）：违规标签随消息持久化（`message.styleViolations`），下一轮由 `buildWritingSection` 收进 `8 本轮写法` 的"上一轮: …，本轮不得再出现"一行。
+- **每 N 轮语气回顾** `styleReviewDue()`：`reviewEveryTurns`（3）轮一次，在没有具体违规时把语气要点写进同一行。
 - **critique 调用** `BackgroundTasks`（只改文风、不改剧情）：命中违规且 `AppConfig.styleCritique` 开启时追加一次修订请求；解析失败或长度比例异常一律**回退原文**；**引用保护**（确定性兜底，`StyleGuard.keepsProtectedContent`）：把 `「」『』《》〈〉` 与英文/弯引号包起来的引用段落、以及世界书条目名/角色名/成员名/对用户的称呼逐一比对，**只要有一处被改写、增删或换序就整体回退原文**（不做局部修补——那会留下半截被改写的引用）；修订后重新检测并以剩余违规为准。
 
 ### 快速回应视角（quickReplies）
 
-「快速回应」必须是**用户**下一句会发的话，而模型容易写成角色口吻或角色的提问。这里同样用"校验 + 后台修正"闭环：
+「快速回应」必须是**用户**下一句会发的话，而模型容易写成角色口吻或角色的提问。链路是"worker 生产 + 客户端校验 + 后台换位"：
 
-- **提示词层**：规则 `7` 明确三类禁止写法（角色口吻 / **角色视角的提问** / 复述角色台词）并给出对比例句；`submit_response` 的 `quickReplies` 描述与群组规则 `10` 同步收紧。
+- **生产层**：turn worker 的 `TurnWorker.SYSTEM` 明确要求"恰好两条、用户此刻可能原样发给角色的话；不得是角色口吻、角色提问或复述角色刚说过的话；不写 Markdown、括号动作、消息 ID"，`submit_state` 的 `quickReplies` 也是 `minItems/maxItems = 2`。主调用提示词不再提快速回应。
 - **校验层** `StyleGuard.detectQuickReplyIssues(replies, char, replyText)`：纯函数返回标签 `missing` / `placeholder`（照抄占位文字）/ `action`（带括号动作）/ `mirrored`（与角色本轮台词逐字或镜像重复）/ `characterName`（出现角色名）/ `tooLong`。
-- **修正层** `BackgroundTasks.repairQuickReplies()`：**换位生成**——用一个身份为"用户本人"的后台小调用重写（system 明写"你就是这位用户本人…不要扮演<角色名>"），成功后只更新快速回应按钮，**不触碰已显示的正文**；失败回退兜底短句。开关 `AppConfig.quickReplyRepair`（默认开）。
-- **不阻塞**：quickReplies 不参与"是否重发一轮"的判定；缺失/非法一律先接受正文，由后台补上。
-- **内部提醒**：问题随消息持久化（`message.quickReplyIssues`），下一轮由 `StyleGuard.buildQuickReplyPerspectiveReminder()` 在 volatile 尾部点名。
+- **修正层** `BackgroundTasks.repairQuickReplies()`：**换位生成**——用一个身份为"用户本人"的后台小调用重写（system 明写"你就是这位用户本人…不要扮演<角色名>"），成功后只更新快速回应按钮，**不触碰已显示的正文**；失败保留 worker 已给的两条（没有则不出按钮）。开关 `AppConfig.quickReplyRepair`（默认开）。
+- **不阻塞**：quickReplies 不参与"是否重发一轮"的判定；worker 失败也只是没有按钮，正文照常显示。
+- **内部记录**：问题随消息持久化（`message.quickReplyIssues`）留档；volatile 不再单独出一段"快速回应视角"提醒，视角问题在 worker 提示词与校验层处理。
 
 ### 人格组装
 
-- `buildSystemPrompt()`（`:domain:agent` 的 `prompts/Prompts.kt`）：从 `char.basicInfo` 拼人格（主字段 + 次字段，共 12 项 `STATIC_PROFILE_FIELDS`）；群组则拼群组信息 + 成员清单。
+- `buildSystemPrompt()`（`:domain:agent` 的 `prompts/Prompts.kt`）：从 `char.staticProfile` 拼人格（10 项 `STATIC_PROFILE_FIELDS`）；群组则拼群组信息 + 成员清单。
 - 动态状态渲染为"状态"文本（未设置的显示 `(未设置)`；volatile 里的角色/成员状态块同样用 `(未设置)` 并脱敏"用户"词）。
-- `RequestBuilder.build()` / `mapHistory()`：装配 system + 历史 + 本轮 volatile；`mapHistory` 对空 assistant 消息整条丢弃、非空包成 `{"reply": …}` 作格式示范、贴图转图片。
+- `RequestBuilder.build()` / `mapHistory()`：装配 system + 历史 + 本轮 volatile；`mapHistory` 丢弃被拒绝的消息、对空 assistant 消息整条丢弃、非空 assistant **按纯文本原样回放**（`trimText(1200)`）、贴图转图片。
 
 ### 子任务提示词（非主对话）
 
@@ -463,15 +457,16 @@ tools: AUTO 阶段全部工具 / SUBMIT 阶段只有 submit_response
 | 短期→长期 `analyzeShortTermBatch`（分析） | `BackgroundTasks` | **整窗折叠**：`shortTerm` 满 40 触发，输入是**整个窗口**（低水位留下的 20 条只作上下文）；**价值判据**（可跨轮复用/影响后续/用户明确表达）才记，**证据不足宁可不记**；`arcOf` 命名一旦确定保持稳定；**取证链锚在短期条目上**；**每条 value ≤200 字、arc 叙事 ≤300 字** |
 | 场景概要 `summarizeScene` | `BackgroundTasks` | 1-2 段 ≤300 字，只含剧情要点，不引对白、不编造、写绝对日期 |
 | 文风校对（critique） | `BackgroundTasks` | **只改文风、不改剧情**；不得复述规则；只返回 `{"reply":"…"}`；空结果或长度比例异常一律回退原文；**引用段落（「」『』《》〈〉/引号）与世界书条目名/角色名/成员名/称呼被改动也整体回退** |
-| 快速回应换位生成 `repairQuickReplies` | `BackgroundTasks` | 身份是**用户本人**；只输出 `{"quickReplies":[...]}`；结果再过一遍 `detectQuickReplyIssues`，不通过就放弃（回退兜底） |
-| 散文轮记忆整理 `extractProseTurnMemory` | `BackgroundTasks` | 复用"对话记录整理助手"把散文轮补成结构化记忆；**后台执行**、不改写已显示正文、还原已注入召回 |
-| 其他 | emoji 头像（`NativeCore.requestEmojiAvatar`）、散文转 JSON（`convertProseToJson`）、字段重排（`remapFields`）、贴图标签（`NativeCore.tagSticker`） | 低价值路径，未做经验对齐 |
+| 快速回应换位生成 `repairQuickReplies` | `BackgroundTasks` | 身份是**用户本人**；只输出 `{"quickReplies":[...]}`；结果再过一遍 `detectQuickReplyIssues`，不通过就放弃 |
+| 回合整理 `submit_state`（turn worker） | `TurnWorker` | 强制 function call、`stream=false`、`reasoningEffort=none`；只写本轮有依据的增量；动态字段须带 `sourceMessageIds` + `evidence`；快速回应恰好两条；待办新建须可定位期限 + 双方同意；约定只在用户明确完成/取消时更新 |
+| 字段修订 `FieldRevision` | `FieldRevision` | 只重写用户点名的那一个静态字段，输出纯文本；`cleanFieldValue` 拒收对比句并按字段上限收敛；群组不做 |
+| 其他 | emoji 头像（`NativeCore.requestEmojiAvatar`）、字段重排（`remapFields`）、贴图标签（`NativeCore.tagSticker`） | 低价值路径，未做经验对齐 |
 
 ## 八、健壮性
 
 - **API 请求级重试**：`ApiRetry`（`:domain:agent`）对瞬时失败（网络错误 / 超时 / HTTP 429 / 5xx）自动重试最多 3 次（1s/2s/4s 指数退避）；**用户主动取消不重试**（`CancellationException` 直接抛出）。后台辅助调用在 `BackgroundTasks.completeDetailed` 用同一策略。
-- **工具失败可恢复**：工具失败时回传可修正的提示（如 `delete_memory` 找不到 ID 时提示先 `list_memories`）。本轮工具 `ok:false` 时不采用同一轮的提交，继续让模型修正，避免"回复说改了、实际没改"。
-- **每轮一个工具 + 上限**：每轮只执行并回传第一个信息类工具；`MAX_TOOL_CALLS` 约束整轮总数。
+- **工具失败可恢复**：工具失败时回传可修正的提示（如 `memory_write` 找不到 ID 时提示先用 `search_memory` 查询）。工具返回 `ok:false` 不中断回合，模型下一轮可修正。
+- **工具轮上限**：`MAX_TOOL_ROUNDS`(5) / `MAX_TOOL_CALLS`(12)；达到任一上限直接转 FINAL 出正文，不会把整轮耗在工具上。
 - **记忆任务重试**：`extraction` / `analysis` / `scene` / `lorebook` 四组计数器（`*Failures` / `*RetryAt`），`scheduleMemoryRetry` 指数退避（5→30 分钟封顶）。
 - **后台任务过期保护**：`captureGuard` / `isGuardCurrent`（`revision` + 末条消息 ID）保护**会覆盖用户可见状态**的任务（场景概要、静态补全、动态状态）；**折叠/分析这类只做增量的任务改为合并写回**——重读最新角色后把新条目追加到最新列表、只移除刚刚折过的那批，所以用户中途又发消息时折叠结果照样落地（不再整批判 `Stale` 丢弃）。
 - **摘要不被提前丢弃**：消费只发生在读它的那一趟之后——分析失败的批次原样留在窗口里、由退避门控重试；**世界书整理排在长期分析之前**、读的正是短期抽取刚产出的那批（再加内存里上次失败遗留的），逐条校验来源与字段，坏条目跳过（其余照常入库）并记录原因；这一趟失败时那批**留在内存待重试**（连续失败后弹窗问「重试 / 忽略」），不会因为分析随后消费掉短期条目而永久丢失。**窗口去重只在消费这一刻做**（`BackgroundTasks.settleShortTerm` → `MemoryPolicy.dedupeShortTerm`）：同一逻辑日+时段且相似度 ≥0.6，或全局 ≥`NEAR_DUP_SIMILARITY`(0.72) 合并；稳定期内不碰窗口，否则已发出的请求前缀会变得不可预测。
@@ -481,13 +476,14 @@ tools: AUTO 阶段全部工具 / SUBMIT 阶段只有 submit_response
 - **短期记忆上限靠"消费即丢"不靠"截断"**：分析一趟读走低水位之上的那一段（每批最多 `ANALYSIS_BATCH`(40) 条），成功后原样丢掉；没读到的最新 20 条永不丢，稳态就是 20~40。图片只保留最近 `IMAGE_RETENTION_MESSAGES`(60) 条消息（更早的删附件与文件、正文保留）。**一次弹窗、之后自动跑完**：`AppViewModel.checkMemoryCleanupPrompt` 只在短期超出高水位或有超窗图片时询问一次；确认后 `NativeCore.pruneOldMessageImages` 把超窗图片**原地压成缩略图**，`drainShortTermBacklog` 把积压消费成长期记忆（每次 1 批、空闲每分钟 1 批），直到降到低水位 20 才清除标记。**去重/修复这类 O(n²) 重活跑在 `Dispatchers.Default`/`IO` 上**（放主线程会 ANR，且修复标记写不进去 → 每次启动重跑）。
 - **时间精度**：`TimeUtils.resolveTimeRef` 保留带时区/时分的 explicit ISO，仅"日期或时段"表达才落整点/时段起点。记忆衰减/排序的时间基准逐级回退（`lastRecalled` → `updatedAt` → `createdAt`），不可解析时不短路更新的时间戳、也不被当成 1970 年。
 - **联网工具超时**：`HttpWebContentProvider` 给 B站 API、短链解析、Microlink、网页直连统一设超时，避免任意外部请求卡死工具循环。
-- **请求失败也留痕**：chat 轮失败、辅助调用失败都会写 `RequestMetric`（`status='failed'`，原因在 `phase`）；`authorizationHeader` 在 API Key 缺失时提前抛清晰错误，不发出 `Bearer undefined` 请求。
+- **请求失败也留痕**：主对话每条请求一行 `chat.main`、worker 一条 `chat.worker`；失败都写 `status='failed'`（原因在 `phase`），空回复写 `empty-reply`。`authorizationHeader` 在 API Key 缺失时提前抛清晰错误，不发出 `Bearer undefined` 请求。
 - **文风校对可回退**：critique 在任何异常（解析失败、空结果、长度比例异常）下都返回原文；**引用/专有名词被改动也整体回退**（`StyleGuard.keepsProtectedContent`，逐字比对引用段落与条目名/角色名/称呼）。
-- **快速回应后台补齐可回退**：换位生成失败（或结果仍不过校验）时退回兜底短句；回来太晚（已被下一轮覆盖）直接丢弃，不会覆盖新一轮。
-- **后台任务串行**：后台队列把"散文轮记忆整理""快速回应补写"等串成一条链，避免交错写同一份角色状态；都不阻塞正文显示。
-- **散文即终稿不再重写**：阶段一拿到散文就直接采用，`convertProseToJson` 只在后台补记忆，不会把用户已看到的正文换成"整理"后的版本。
+- **快速回应可回退**：换位生成失败（或结果仍不过校验）时保留 worker 已给的两条；回来太晚（已被下一轮覆盖）直接丢弃，不会覆盖新一轮。
+- **后台任务互不排队、写回合并**：`BackgroundTaskQueue` 不设共享锁（一次补课不会把场景/世界书/快速回应堵住），各任务用 `mergeCharacterChanges` 只并自己那份，所以交错执行也不会写坏同一份角色状态；都不阻塞正文显示。
+- **正文即终稿**：主调用拿到正文就直接采用，worker 只在正文之后补结构化字段，失败保留旧状态，绝不改写已显示的正文。
+- **后台写回只改自己动过的字段**：`CharacterRepository.mutate(id)` 用 **per-id 锁**做读-改-写，编辑器保存（`AppViewModel.saveCharacterEdit`）只提交脏 key 并保留 `staticFieldMeta`/`dynamicStateMeta`，`CharacterParity` 不再清 meta；后台任务用 `mergeCharacterChanges` 只并自己那份。因此并发写入不会互相回滚，也不会用旧快照覆盖 `updatedAt`。
 - **共享 HTML 工具**：HTML 实体解码/去标签/可读文本抽取是同一份实现，避免多处漂移。
-- **导入/导出归一化**：`LegacyImportService` / `BackupService` 逐字段校验（世界书、场景概要、场景状态、计数器、来源数组），坏角色跳过并计入 `ImportSummary.skipped`。
+- **导入/导出归一化**：`LegacyImportService` / `BackupService` 逐字段校验（世界书、场景概要、场景状态、计数器、来源数组、**待办 `todos`**），坏角色跳过并计入 `ImportSummary.skipped`。
 - **版本号单一来源**：`android-lite/app/build.gradle.kts` 的 `versionName` / `versionCode`，应用内版本徽标读 `BuildConfig`；改动用 `tools/native-version.ps1`。
 
 ## 九、关键常量速查
@@ -496,24 +492,25 @@ tools: AUTO 阶段全部工具 / SUBMIT 阶段只有 submit_response
 
 | 常量 | 值 | 备注 |
 |---|---|---|
-| `Agent.MAX_TOOL_ROUNDS` / `MAX_TOOL_CALLS` / `TOOL_MEMORY_INJECT_LIMIT` | 5 / 12 / 5 | 工具循环上限与每轮注入记忆条数 |
+| `Agent.MAX_TOOL_ROUNDS` / `MAX_TOOL_CALLS` | 5 / 12 | AUTO 阶段的工具轮与调用总数上限 |
 | `Api.AUXILIARY_TIMEOUT_MS` | 90 000 | 辅助/后台调用的传输超时（chat 为 180s） |
 | `Api.AUXILIARY_MAX_OUTPUT_TOKENS` | 8 192 | 辅助调用显式输出上限 |
-| `Api.REQUEST_METRICS` | 60 | 请求指标保留条数 |
+| `Api.REQUEST_METRICS` | 60 | 请求指标保留条数（**每个 `taskType`** 各自 60） |
 | `Memory.INSTANT` / `INSTANT_TRIM_FLOOR` / `INSTANT_HARD_CAP` / `INSTANT_MIGRATION_THRESHOLD` | 60 / 20 / 120 / 120 | 历史窗口高低水位、紧急上限、补课阈值 |
 | `Memory.SHORT_TERM` / `SHORT_TERM_TRIM_FLOOR` / `SHORT_TERM_HARD_CAP` / `SHORT_TERM_MERGE_WINDOW` / `SHORT_TERM_LOW_WATER` | 40 / 20 / 80 / 5 / 20 | 短期窗口形态 |
 | `Memory.ANALYSIS_BATCH` / `SUMMARY_SOURCES` / `CLEANUP_BATCHES_PER_RUN` / `NEAR_DUP_SIMILARITY` / `PENDING_RECALL` | 40 / 60 / 1 / 0.72 / 6 | 折叠批大小、清理批数、近似去重阈值、待召回上限 |
 | `Memory.LONG_TERM_PER_CATEGORY` | 40 | 保留常量，长期记忆当前无数量淘汰 |
 | `Prompt.ROLE_CHARS` / `MEMBER_CHARS` | 8 000 / 900 | 单角色设定 / 群组成员注入上限 |
 | `Lorebook.ENTRIES` / `KEYWORDS_PER_ENTRY` / `NAME_CHARS` / `CONTENT_CHARS` / `INJECT_ENTRIES` / `INJECT_CHARS` / `MAX_ALWAYS_ACTIVE` / `AUTO_ENTRIES_PER_PASS` | 200 / 8 / 60 / 400 / 6 / 1 400 / 6 / 3 | `CONTENT_CHARS` 是写入约束（超限拒收不截断） |
-| `Scene.RETAIN` / `SUMMARIES` / `SPAN` / `MIN_MESSAGES` | 8 / 2 / 12 / 6 | 场景概要保留/注入条数与触发跨度 |
+| `Scene.RETAIN` / `SUMMARIES` / `SPAN` / `MIN_MESSAGES` | 8 / 2 / 12 / 6 | 场景概要保留条数、触发跨度与最少消息数；`SUMMARIES` 为保留常量，**实际注入最近 1 条** |
 | `History.ARCHIVE_MESSAGES` / `PAGE` | 400 / 50 | 聊天存档上限与分页 |
 | `Media.IMAGE_RETENTION_MESSAGES` / `THUMBNAIL_DIMENSION` / `THUMBNAIL_QUALITY` / `IMPORTED_IMAGE_*` | 60 / 384 / 60 / 512 / 70 | 图片保留与缩略/导入压缩 |
 | `Sticker.MAX_DIMENSION` / `TARGET_BYTES` | 384 / 120 KB | 贴图压缩目标 |
 | `max_output_tokens` | 8 192 | 主对话请求体 |
 | `DYNAMIC_STATE_FIELDS` | 6 | `Prompts`（`currentTone` 取代旧关系两字段） |
-| `STATIC_PROFILE_FIELDS` | 12 | `Prompts` |
-| `STANDING_COMMITMENT_LIMIT` / `STANDING_COMMITMENT_LINE_CHARS` / `STANDING_COMMITMENT_BLOCK_CHARS` | 4 / 100 / 420 | `Prompts`：长期约定提醒的条数 / 每行 / 整段上限（无命中不出段） |
-| `Todo.CLOSED_RETENTION_DAYS` / `INJECT_LIMIT` / `LINE_CHARS` / `BLOCK_CHARS` | 30 / 4 / 100 / 420 | `AppLimits`：已完成/已取消待办保留天数；待办注入的条数 / 每行 / 整段上限（无命中不出段） |
-| JSON 示例 | 固定一份精简示例 | system 前缀从首轮起稳定 |
-| 请求追踪字段 | `RequestMetric[]` | taskType/platform/phase/status/tokens/hitRate/durationMs/prefixChange/commonHistoryMessages/hashes |
+| `STATIC_PROFILE_FIELDS` | 10 | `Prompts` |
+| `RECALL_INJECT_LIMIT` / `RECALL_LINE_CHARS` / `VOLATILE_HARD_CHARS` / `WRITING_BLOCK_CHARS` | 3 / 1 200 / 8 000 / 500 | `Prompts`：召回条数与单条上限（总预算 3×1200）、volatile 硬上限、本轮写法整段上限 |
+| `UNFINISHED_BLOCK_CHARS` | 400 | `Prompts`：未完成事项整段上限（待办 4 + 周期 4，每行 100） |
+| `STANDING_COMMITMENT_LIMIT` | 4 | `Prompts`：周期性约定的条数上限（与待办合并进「未完成事项」） |
+| `Todo.CLOSED_RETENTION_DAYS` / `INJECT_LIMIT` / `LINE_CHARS` / `BLOCK_CHARS` | 30 / 4 / 100 / 420 | `AppLimits`：已完成/已取消待办保留天数；待办注入的条数 / 每行 / 整段上限（`BLOCK_CHARS` 为保留常量，实际由 `UNFINISHED_BLOCK_CHARS` 统辖） |
+| 请求追踪字段 | `RequestMetric[]` | taskType/round/platform/phase/status/tokens/hitRate/durationMs/prefixChange/commonHistoryMessages/hashes |

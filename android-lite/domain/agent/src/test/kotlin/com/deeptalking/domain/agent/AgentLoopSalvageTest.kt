@@ -36,7 +36,6 @@ class AgentLoopSalvageTest {
             instructions = "sys",
             baseInput = emptyList(),
             autoTools = emptyList(),
-            submitTool = ToolDefinition(name = "submit_response", description = "", parametersJson = "{}"),
             builder = RequestBuilder(AppConfig(stream = false)),
             model = "m",
         )

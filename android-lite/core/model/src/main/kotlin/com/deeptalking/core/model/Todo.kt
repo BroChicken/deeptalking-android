@@ -7,8 +7,8 @@ import kotlinx.serialization.Serializable
  * 待办事项（todo）——与长期记忆**互相独立**的一条约定。
  *
  * 由用户或角色提出、双方同意、且对话里出现明确日期时才新增（见 `domain:memory` 的
- * `TodoPolicy` / `domain:agent` 的 `add_todo`）；完成/取消/改期由 `submit_response` 的
- * `todoUpdates` 处理（须引用户原话），角色编辑页的待办 tab 提供「完成 / 取消 / 删除」兜底。
+ * `TodoPolicy` / turn worker 的 `submit_state.todos`）；完成/取消/改期同样由
+ * `submit_state.todos` 处理（须引用户原话），角色编辑页的待办 tab 提供「完成 / 取消 / 删除」兜底。
  */
 @Serializable
 enum class TodoStatus {

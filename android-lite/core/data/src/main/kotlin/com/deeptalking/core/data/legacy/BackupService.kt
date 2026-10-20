@@ -25,6 +25,9 @@ import com.deeptalking.core.model.ShortTermMemory
 import com.deeptalking.core.model.StaticFillMeta
 import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.core.model.Sticker
+import com.deeptalking.core.model.Todo
+import com.deeptalking.core.model.TodoProposer
+import com.deeptalking.core.model.TodoStatus
 import kotlinx.coroutines.flow.first
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.add
@@ -150,6 +153,10 @@ class BackupService(
             put("dynamicStateMeta", dynamicStateMetaToJson(character.dynamicStateMeta))
         }
         if (character.avatarRepairPending) put("avatarRepairPending", true)
+        // 待办是「未完成事项」的唯一载体：不导出就会在换机/清数据后永久丢失。
+        if (character.todos.isNotEmpty()) {
+            putJsonArray("todos") { character.todos.forEach { add(todoToJson(it)) } }
+        }
         put(
             "memory",
             memoryToJson(
@@ -499,6 +506,31 @@ class BackupService(
         put("misses", entry.misses)
         entry.lastMentionedAt?.let { put("lastMentionedAt", it) }
         entry.createdAt?.let { put("createdAt", it) }
+    }
+
+    private fun todoToJson(todo: Todo): JsonObject = buildJsonObject {
+        put("id", todo.id)
+        put("title", todo.title)
+        put("detail", todo.detail)
+        put("dueAt", todo.dueAt)
+        put("status", todoStatusKey(todo.status))
+        put("proposer", todoProposerKey(todo.proposer))
+        putJsonArray("sourceMessageIds") { todo.sourceMessageIds.forEach { add(it) } }
+        put("evidence", todo.evidence)
+        todo.createdAt?.let { put("createdAt", it) }
+        todo.updatedAt?.let { put("updatedAt", it) }
+        todo.closedAt?.let { put("closedAt", it) }
+    }
+
+    private fun todoStatusKey(status: TodoStatus): String = when (status) {
+        TodoStatus.Active -> "active"
+        TodoStatus.Done -> "done"
+        TodoStatus.Cancelled -> "cancelled"
+    }
+
+    private fun todoProposerKey(proposer: TodoProposer): String = when (proposer) {
+        TodoProposer.User -> "user"
+        TodoProposer.Character -> "character"
     }
 
     private fun stickerToJson(sticker: Sticker): JsonObject = buildJsonObject {

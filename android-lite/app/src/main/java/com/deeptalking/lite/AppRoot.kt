@@ -20,8 +20,10 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Group
 import androidx.compose.material.icons.filled.Menu
@@ -61,6 +63,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -70,6 +73,7 @@ import com.deeptalking.core.designsystem.AppTheme
 import com.deeptalking.core.designsystem.DeepTalkingTheme
 import com.deeptalking.core.designsystem.legacy
 import com.deeptalking.core.data.legacy.decodeImportBytes
+import com.deeptalking.core.model.RequestMetric
 import com.deeptalking.feature.characters.CharactersScreen
 import com.deeptalking.feature.chat.ChatScreen
 import com.deeptalking.feature.settings.SettingsScreen
@@ -766,6 +770,7 @@ private fun AppHeader(
             } else {
                 CachePill(config, Modifier.padding(end = 6.dp))
             }
+            MetricBreakdownButton(config)
             ThemeMenu(currentThemeId = currentThemeId, onSelect = onSelectTheme)
             Text(
                 "v" + version,
@@ -793,7 +798,9 @@ private fun CachePill(config: com.deeptalking.core.model.AppConfig, modifier: Mo
             val miss = stats.missTokens ?: 0
             val total = hit + miss
             val rate = if (total > 0) Math.round(hit * 100.0 / total).toInt() else 0
-            val recent = config.requestMetrics.filter { it.taskType == "chat" && it.hitRate != null }.takeLast(10)
+            val recent = config.requestMetrics
+                .filter { it.taskType.startsWith("chat") && it.hitRate != null }
+                .takeLast(10)
             val average = if (recent.isNotEmpty()) {
                 Math.round(recent.sumOf { it.hitRate ?: 0.0 } * 100.0 / recent.size).toInt()
             } else {
@@ -815,6 +822,138 @@ private fun CachePill(config: com.deeptalking.core.model.AppConfig, modifier: Mo
             .border(1.dp, legacy.border, RoundedCornerShape(4.dp))
             .padding(horizontal = 6.dp, vertical = 2.dp),
     )
+}
+
+/** Rows one task-type group averages over in the breakdown dialog. */
+private const val METRIC_WINDOW = 10
+
+/** One task type's cache summary (newest [METRIC_WINDOW] rows that reported usage). */
+private data class MetricGroup(
+    val taskType: String,
+    val rows: Int,
+    val hitTokens: Int?,
+    val inputTokens: Int?,
+    val hitRate: Int?,
+    val recentRates: List<Int>,
+    val lastAt: String,
+)
+
+private fun metricGroups(metrics: List<RequestMetric>): List<MetricGroup> =
+    metrics.groupBy { it.taskType }
+        .map { (taskType, all) ->
+            val usable = all.filter { (it.inputTokens ?: 0) > 0 }.takeLast(METRIC_WINDOW)
+            val hit = usable.sumOf { it.hitTokens ?: 0 }
+            val input = usable.sumOf { it.inputTokens ?: 0 }
+            MetricGroup(
+                taskType = taskType,
+                rows = all.size,
+                hitTokens = if (usable.isEmpty()) null else hit,
+                inputTokens = if (usable.isEmpty()) null else input,
+                hitRate = if (input > 0) Math.round(hit * 100.0 / input).toInt() else null,
+                recentRates = usable.mapNotNull { it.hitRate?.let { rate -> Math.round(rate * 100).toInt() } },
+                lastAt = all.lastOrNull()?.at.orEmpty(),
+            )
+        }
+        .sortedByDescending { it.lastAt }
+
+/** Compact token count for the breakdown dialog (`1.2k` / `3.4M`). */
+private fun compactTokens(value: Int): String = when {
+    value >= 1_000_000 -> String.format(java.util.Locale.US, "%.1fM", value / 1_000_000.0)
+    value >= 1_000 -> String.format(java.util.Locale.US, "%.1fk", value / 1_000.0)
+    else -> value.toString()
+}
+
+/**
+ * Small button next to the cache pill. Opens the per-`taskType` cache breakdown: the pill
+ * itself stays the 10-request average of [`chat.*`]; this dialog separates `chat.main`
+ * (one row per model request, tool rounds included), `chat.worker` and the background
+ * kinds (`memory.*`, `lorebook.*`, legacy `chat`/`auxiliary`...), all shown as stored.
+ */
+@Composable
+private fun MetricBreakdownButton(config: com.deeptalking.core.model.AppConfig) {
+    var open by remember { mutableStateOf(false) }
+    val legacy = MaterialTheme.legacy
+    Text(
+        "指标",
+        fontSize = 10.sp,
+        color = legacy.textMuted,
+        maxLines = 1,
+        modifier = Modifier
+            .padding(end = 2.dp)
+            .clip(RoundedCornerShape(4.dp))
+            .background(legacy.bg)
+            .border(1.dp, legacy.border, RoundedCornerShape(4.dp))
+            .clickable { open = true }
+            .padding(horizontal = 5.dp, vertical = 2.dp),
+    )
+    if (open) {
+        val groups = metricGroups(config.requestMetrics)
+        Dialog(onDismissRequest = { open = false }) {
+            Surface(
+                shape = RoundedCornerShape(12.dp),
+                color = legacy.panel,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp)
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Text(
+                        "缓存指标 · 按任务类型",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = legacy.text,
+                    )
+                    if (groups.isEmpty()) {
+                        Text("还没有请求记录", fontSize = 12.sp, color = legacy.textMuted)
+                    }
+                    groups.forEach { group -> MetricGroupRow(group) }
+                    Text(
+                        "每类保留最近 ${com.deeptalking.core.common.AppLimits.Api.REQUEST_METRICS} 条",
+                        fontSize = 10.sp,
+                        color = legacy.textMuted,
+                    )
+                    TextButton(onClick = { open = false }, modifier = Modifier.align(Alignment.End)) {
+                        Text("关闭", fontSize = 12.sp)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MetricGroupRow(group: MetricGroup) {
+    val legacy = MaterialTheme.legacy
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(group.taskType, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = legacy.text)
+            Spacer(Modifier.weight(1f))
+            Text("${group.rows} 条", fontSize = 10.sp, color = legacy.textMuted)
+        }
+        val hit = group.hitTokens
+        val input = group.inputTokens
+        val rate = group.hitRate
+        Text(
+            if (hit == null || input == null || rate == null) {
+                "未返回命中数据"
+            } else {
+                "命中 ${compactTokens(hit)} / 输入 ${compactTokens(input)} · 命中率 $rate%"
+            },
+            fontSize = 11.sp,
+            color = legacy.textSecondary,
+        )
+        if (group.recentRates.isNotEmpty()) {
+            Text(
+                "最近 ${group.recentRates.size} 次：" + group.recentRates.joinToString(" · ") { "$it%" },
+                fontSize = 10.sp,
+                color = legacy.textMuted,
+            )
+        }
+    }
 }
 
 @Composable

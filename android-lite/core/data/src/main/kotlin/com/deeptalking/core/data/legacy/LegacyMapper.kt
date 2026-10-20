@@ -25,6 +25,9 @@ import com.deeptalking.core.model.ShortTermMemory
 import com.deeptalking.core.model.StaticFillMeta
 import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.core.model.Sticker
+import com.deeptalking.core.model.Todo
+import com.deeptalking.core.model.TodoProposer
+import com.deeptalking.core.model.TodoStatus
 import com.deeptalking.core.model.convergeLorebookCapacity
 import com.deeptalking.core.model.mergeSources
 import kotlinx.serialization.json.Json
@@ -261,6 +264,45 @@ internal fun dedupeLongTermList(items: List<LongTermMemory>, category: MemoryCat
         )
     }
     return result
+}
+
+/**
+ * Maps exported todos. Entries without a title are junk (they can't be shown) and are
+ * dropped; an unrecognized `status` falls back to [TodoStatus.Active] so an unknown
+ * token can never silently hide a still-open commitment. Ids are deduped and capped
+ * like every other source-id list.
+ */
+private fun mapTodos(raw: List<LegacyTodo>?): List<Todo> = (raw ?: emptyList()).mapNotNull { dto ->
+    val title = (dto.title ?: "").trim()
+    if (title.isEmpty()) return@mapNotNull null
+    Todo(
+        id = dto.id ?: "",
+        title = title,
+        detail = dto.detail ?: "",
+        dueAt = dto.dueAt ?: "",
+        status = todoStatusOf(dto.status),
+        proposer = if ((dto.proposer ?: "").trim().lowercase() == "character") {
+            TodoProposer.Character
+        } else {
+            TodoProposer.User
+        },
+        sourceMessageIds = (dto.sourceMessageIds ?: emptyList())
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .take(8),
+        evidence = dto.evidence ?: "",
+        createdAt = dto.createdAt,
+        updatedAt = dto.updatedAt,
+        closedAt = dto.closedAt,
+    )
+}
+
+private fun todoStatusOf(raw: String?): TodoStatus = when (raw?.trim()?.lowercase()) {
+    "done" -> TodoStatus.Done
+    "cancelled", "canceled" -> TodoStatus.Cancelled
+    "active", null, "" -> TodoStatus.Active
+    else -> TodoStatus.Active
 }
 
 fun mapLorebook(dto: LegacyLorebookEntry): LorebookEntry = LorebookEntry(
@@ -567,6 +609,7 @@ fun mapCharacter(dto: LegacyCharacter, stickerSink: StickerSink?): Character {
         lorebook = (dto.lorebook ?: emptyList()).map { mapLorebook(it) },
         lorebookArchive = (dto.lorebookArchive ?: emptyList()).map { mapLorebook(it) },
         stickers = mapStickers(dto.stickers, stickerSink),
+        todos = mapTodos(dto.todos),
         instant = mapInstantMessages(memory?.instant, stickerSink).takeLast(160),
         dynamicStateMeta = mapDynamicStateMeta(dto.dynamicStateMeta),
         avatarRepairPending = dto.avatarRepairPending == true ||

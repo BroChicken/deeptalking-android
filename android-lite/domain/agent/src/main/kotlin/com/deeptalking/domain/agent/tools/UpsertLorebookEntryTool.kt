@@ -32,16 +32,22 @@ class UpsertLorebookEntryTool : AgentTool {
     override val definition = ToolDefinition(
         name = "upsert_lorebook_entry",
         description = "写入/更新世界书条目——世界层设定的唯一去处（时代与世界观、地点、组织、专有名词、历史、规则、背景事实）。**同一件事物只能有一条**：先对照现有条目，凡名称相近、关键词相同或内容重叠的都算同一条，必须用它的 entryId/name 更新合并，绝不新建近似条目；当你用 entryId/name 明确指定要更新的条目时，content 会**替换**该条目原有内容，因此更新时要写全该条目应有的完整内容（不要只写增量，否则会丢信息）；**内容要精炼，一条只讲一件事，目标 300 字以内（硬上限 400 字，超了会被拒绝，要求你精简后重写）**；未指定 id/name 而由系统按相似度命中时，同样会用你这次写的完整内容**替换**该条目。只在近期对话里已经出现/确立、且**会反复复用**的这类设定，或用户补充修正了这类设定时才使用；一次性的小事、可从上下文直接看出的细节不要写。**用户手写条目（origin=user）受保护，不得覆盖或改写**；若现有用户条目已覆盖同一设定，不要重复写入。keywords 写剧情里可能出现的称呼（命中才注入；没给关键词时系统会用条目名当触发词）；只有确实需要每轮生效的世界前提/规则才把 alwaysActive 设为 true（常驻条目数量有限，不要滥用）。必须给出 sourceMessageIds 与 evidence 证明该设定已在对话中出现（本轮新编、尚未落库的内容不要写，等它出现在消息里再由整理任务沉淀）；拿不出依据就不要写。",
-        parametersJson = """{"type":"object","properties":{"name":{"type":"string","description":"条目名（如「赤月王国」「银月商会」）；未给 entryId 时按名字匹配已有条目"},"content":{"type":"string","description":"命中后注入的设定内容，用你这次写的完整内容替换原内容（不要只写增量，否则会丢信息）；内容要精炼，一条只讲一件事，不超过 400 字（超了会被拒绝，请精简后重写）"},"keywords":{"type":"array","items":{"type":"string"},"description":"触发关键词（剧情里可能出现的称呼）；常驻条目可留空，留空时系统会用条目名当触发词"},"alwaysActive":{"type":"boolean","description":"true=常驻（每轮都注入，用于世界前提/规则）；false=只在关键词命中时注入。**更新已有条目时省略这个字段就保留它原来的设置**（不会把它从常驻改掉）"},"entryId":{"type":"string","description":"可选，明确要更新的条目ID（比按名字匹配更精确）"},"memberName":{"type":"string","description":"可选，群组对话中写入某位成员的私人世界书（不传则写入共享世界书）"},"sourceMessageIds":{"type":"array","items":{"type":"string"},"description":"该设定所在的消息ID（必须是上下文里真实的已存在消息ID）"},"evidence":{"type":"string","description":"逐字摘录或紧扣原文的短句，体现该设定"}},"required":["name","content","sourceMessageIds","evidence"],"additionalProperties":false}""",
+        parametersJson = """{"type":"object","properties":{"name":{"type":"string","description":"条目名（如「赤月王国」「银月商会」）；未给 entryId 时按名字匹配已有条目。entryId 与 name 至少给一个"},"content":{"type":"string","description":"命中后注入的设定内容，用你这次写的完整内容替换原内容（不要只写增量，否则会丢信息）；内容要精炼，一条只讲一件事，不超过 400 字（超了会被拒绝，请精简后重写）"},"keywords":{"type":"array","items":{"type":"string"},"description":"触发关键词（剧情里可能出现的称呼），最多 8 个；常驻条目可留空，留空时系统会用条目名当触发词"},"alwaysActive":{"type":"boolean","description":"true=常驻（每轮都注入，用于世界前提/规则）；false=只在关键词命中时注入。**更新已有条目时省略这个字段就保留它原来的设置**（不会把它从常驻改掉）"},"entryId":{"type":"string","description":"可选，明确要更新的条目ID（比按名字匹配更精确）；与 name 至少给一个"},"memberName":{"type":"string","description":"可选，群组对话中写入某位成员的私人世界书（不传则写入共享世界书）"},"sourceMessageIds":{"type":"array","items":{"type":"string"},"description":"该设定所在的消息ID（必须是上下文里真实的已存在消息ID）"},"evidence":{"type":"string","description":"逐字摘录或紧扣原文的短句，体现该设定"}},"required":["content","evidence"],"additionalProperties":false}""",
     )
 
     override suspend fun execute(call: ToolCall, context: AgentContext): AgentToolResult {
         val args = ToolArgs.parse(call.arguments)
         val character = context.character
         val name = ToolArgs.string(args, "name").trim().take(AppLimits.Lorebook.NAME_CHARS)
+        val entryIdArg = ToolArgs.string(args, "entryId").trim()
         val rawContent = ToolArgs.string(args, "content").trim()
-        if (name.isEmpty() || rawContent.isEmpty()) {
-            return AgentToolResult(errorJson("name 与 content 不能为空"))
+        if (rawContent.isEmpty()) {
+            return AgentToolResult(errorJson("content 不能为空"))
+        }
+        // `content` + `evidence` are the schema's required fields; the id/name pair is
+        // enforced here because *one of them* must identify the target entry.
+        if (name.isEmpty() && entryIdArg.isEmpty()) {
+            return AgentToolResult(errorJson("entryId 与 name 至少给一个：更新已有条目用它的 entryId/name，新建条目给 name"))
         }
         val sourceIds = ToolArgs.strings(args, "sourceMessageIds").map { it.trim() }.filter { it.isNotEmpty() }
         val evidence = ToolArgs.string(args, "evidence").trim()
@@ -76,7 +82,7 @@ class UpsertLorebookEntryTool : AgentTool {
             .filter { it.isNotEmpty() }
             .take(AppLimits.Lorebook.KEYWORDS_PER_ENTRY)
         val alwaysActive = ToolArgs.bool(args, "alwaysActive")
-        val entryId = ToolArgs.string(args, "entryId").trim()
+        val entryId = entryIdArg
         val memberName = ToolArgs.string(args, "memberName").trim()
 
         if (memberName.isNotEmpty() && character.isGroup) {
@@ -175,6 +181,9 @@ private fun upsert(
 
     // No keywords and not always-on would never be injected at all; use the entry name
     // as the trigger instead of rejecting the entry outright.
+    if (name.isEmpty()) {
+        return UpsertResult(false, "找不到该 entryId 对应的条目；新建条目请给出 name")
+    }
     val triggerKeywords = keywords.ifEmpty { listOf(name) }
     // The always-active ceiling demotes a new entry to keyword-driven instead of rejecting
     // it — the model's content is the valuable part and must not be thrown away.

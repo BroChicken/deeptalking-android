@@ -6,6 +6,13 @@ object AppLimits {
 
     object Api {
         const val AUXILIARY_TIMEOUT_MS = 90_000L
+
+        /**
+         * Rolling per-request metric rows kept **for each task type** (`chat.main`,
+         * `chat.worker`, `memory.*`, ...). Per-type, not global: one chat turn can write
+         * several `chat.main` rows (one per tool round), and a global cap made those
+         * rows evict every background kind. Trim with `trimMetricsPerTaskType`.
+         */
         const val REQUEST_METRICS = 60
         const val PREFIX_SNAPSHOTS = 12
 

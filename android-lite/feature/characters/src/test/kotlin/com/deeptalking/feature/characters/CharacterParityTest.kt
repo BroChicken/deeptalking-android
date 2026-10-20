@@ -187,7 +187,7 @@ class CharacterParityTest {
     }
 
     @Test
-    fun normalizeEditedDraftClearsDynamicStateMeta() {
+    fun normalizeEditedDraftKeepsDynamicStateMeta() {
         val character = Character(
             id = "c",
             name = "林晚",
@@ -198,11 +198,12 @@ class CharacterParityTest {
             ),
         )
         val normalized = CharacterParity.normalizeEditedDraft(character, null, base, zone)
-        assertTrue(normalized.dynamicStateMeta.isEmpty())
+        assertEquals(setOf("currentLocation", "currentMood"), normalized.dynamicStateMeta.keys)
+        assertEquals("2026-10-01T00:00:00Z", normalized.dynamicStateMeta.getValue("currentLocation").updatedAt)
     }
 
     @Test
-    fun normalizeGroupEditedDraftUsesSharedDynamicAndClearsSharedMeta() {
+    fun normalizeGroupEditedDraftUsesSharedDynamicAndKeepsSharedMeta() {
         val group = Character(
             id = "g",
             isGroup = true,
@@ -215,11 +216,11 @@ class CharacterParityTest {
         )
         val normalized = CharacterParity.normalizeEditedDraft(group, null, base, zone)
         assertEquals("2026-10-07在营地", normalized.groupSharedDynamic.currentSituation)
-        assertEquals(setOf("currentMood"), normalized.dynamicStateMeta.keys)
+        assertEquals(setOf("currentLocation", "currentMood"), normalized.dynamicStateMeta.keys)
     }
 
     @Test
-    fun normalizeMemberEditedDraftClearsMemberDynamicStateMeta() {
+    fun normalizeMemberEditedDraftKeepsMemberDynamicStateMeta() {
         val member = GroupMember(
             id = "m",
             name = "阿黎",
@@ -228,7 +229,19 @@ class CharacterParityTest {
         )
         val group = Character(id = "g", isGroup = true, members = listOf(member))
         val normalized = CharacterParity.normalizeEditedDraft(group, 0, base, zone)
-        assertTrue(normalized.members[0].dynamicStateMeta.isEmpty())
+        assertEquals(setOf("currentMood"), normalized.members[0].dynamicStateMeta.keys)
+    }
+
+    @Test
+    fun userEditedDraftKeepsDynamicStateMeta() {
+        val character = Character(
+            id = "c",
+            name = "林晚",
+            dynamicState = DynamicState(currentMood = "开心"),
+            dynamicStateMeta = mapOf("currentMood" to DynamicStateMeta("2026-10-01T00:00:00Z")),
+        )
+        val result = CharacterParity.normalizeUserEditedDraft(character, base = base, zone = zone)
+        assertEquals(setOf("currentMood"), result.character.dynamicStateMeta.keys)
     }
 
     // ------------------------------------------------ 用户手写通道（编辑器保存）

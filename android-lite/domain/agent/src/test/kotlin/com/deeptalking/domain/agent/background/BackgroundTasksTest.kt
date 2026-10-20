@@ -558,24 +558,6 @@ class BackgroundTasksTest {
     }
 
     @Test
-    fun parseMemoryFromTextAppliesMemUpdate() {
-        val (background, _) = tasks(emptyList())
-        val character = Character(
-            id = "c1",
-            instant = listOf(ChatMessage(id = "u1", role = Role.User, content = "用户喜欢咖啡")),
-        )
-        val reply = """<MEM_UPDATE>{"shortTerm":[{"content":"用户喜欢咖啡","sourceMessageIds":["u1"]}],""" +
-            """"longTerm":[{"category":"userProfile","subject":"user","key":"用户饮品偏好","value":"用户喜欢咖啡","sourceMessageIds":["u1"],"evidence":"用户喜欢咖啡"}]}</MEM_UPDATE>"""
-        val updated = background.parseMemoryFromText(character, reply, null)
-        assertTrue(updated != null)
-        // Only the long-term part of a legacy block folds now: the short-term window is
-        // owned by the whole-window extraction pass.
-        assertTrue(updated!!.longTerm.any { it.value.contains("咖啡") })
-        assertTrue("legacy block must not write short-term", updated.shortTerm.isEmpty())
-        assertEquals(null, background.parseMemoryFromText(character, "无标签", null))
-    }
-
-    @Test
     fun initialMemoryMigrationIsNoOpForAnOrdinaryWindow() = runBlocking {
         val (background, _) = tasks(emptyList())
         val character = Character(

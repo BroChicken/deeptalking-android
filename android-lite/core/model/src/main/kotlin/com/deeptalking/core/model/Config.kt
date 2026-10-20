@@ -1,5 +1,6 @@
 package com.deeptalking.core.model
 
+import com.deeptalking.core.common.AppLimits
 import kotlinx.serialization.Serializable
 
 @Serializable
@@ -15,7 +16,7 @@ data class AppConfig(
     val quickReplyRepair: Boolean = true,
     /** Empty = 清浅; otherwise `theme-black` / `theme-blue` / `theme-yellow`. */
     val activeTheme: String = "",
-    /** Rolling API usage/cache metrics (legacy `requestMetrics`, capped at 60). */
+    /** Latest chat cache/usage metrics, capped at `AppLimits.Api.REQUEST_METRICS` **per task type**. */
     val requestMetrics: List<RequestMetric> = emptyList(),
     /** Latest chat cache-usage snapshot (legacy `cacheStats`). */
     val cacheStats: CacheStats? = null,
@@ -97,15 +98,29 @@ data class PlatformSlot(
     val modelName: String = "",
 )
 
+/** Task type of a main chat model request (one row per round). */
+const val TASK_CHAT_MAIN = "chat.main"
+
+/** Task type of the turn worker's forced `submit_state` request. */
+const val TASK_CHAT_WORKER = "chat.worker"
+
 /** One API request's usage/cache summary, mirroring the legacy metric shape. */
 @Serializable
 data class RequestMetric(
     val at: String = "",
     val characterId: String? = null,
+    /**
+     * Request kind. The main chat is `chat.main` (one row per model request, tool rounds
+     * included), the turn worker is `chat.worker`; background passes use their own names
+     * (`memory.*`, `lorebook.*`, `auxiliary`, ...). Legacy rows may still say `chat`.
+     */
     val taskType: String = "chat",
     val model: String = "",
     val platform: String = "",
+    /** Failure reason (`status=failed` rows); never a hit-rate input. */
     val phase: String = "",
+    /** 1-based index of the main-chat request inside its turn (null for other kinds). */
+    val round: Int? = null,
     val status: String = "completed",
     val durationMs: Long? = null,
     val instructionsHash: String? = null,
@@ -121,6 +136,30 @@ data class RequestMetric(
     val missTokens: Int? = null,
     val hitRate: Double? = null,
 )
+
+/**
+ * Trims a rolling metric list to [cap] records **per task type**, keeping the newest of
+ * each kind. A chat turn now writes one row per model request (tool rounds included) and
+ * background passes write their own rows; a single global cap let the chattiest kind
+ * evict every other kind, so e.g. `chat.worker` or `memory.*` never showed up at all.
+ * Order is preserved (oldest → newest).
+ */
+fun List<RequestMetric>.trimMetricsPerTaskType(
+    cap: Int = AppLimits.Api.REQUEST_METRICS,
+): List<RequestMetric> {
+    if (cap <= 0) return emptyList()
+    val seen = HashMap<String, Int>()
+    val keep = HashSet<Int>()
+    for (index in indices.reversed()) {
+        val taskType = this[index].taskType
+        val count = seen[taskType] ?: 0
+        if (count < cap) {
+            seen[taskType] = count + 1
+            keep += index
+        }
+    }
+    return filterIndexed { index, _ -> index in keep }
+}
 
 @Serializable
 data class PlatformPreset(

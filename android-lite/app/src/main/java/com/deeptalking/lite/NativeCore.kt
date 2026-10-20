@@ -19,6 +19,7 @@ import com.deeptalking.core.model.RequestMetric
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.core.model.mergeCharacterChanges
+import com.deeptalking.core.model.trimMetricsPerTaskType
 import com.deeptalking.core.model.TTS_BACKEND_REMOTE
 import com.deeptalking.core.network.HttpWebContentProvider
 import com.deeptalking.core.network.DohDns
@@ -937,7 +938,8 @@ class NativeCore(context: Context) {
         runCatching {
             val latest = data.config.current()
             data.config.update(
-                latest.copy(requestMetrics = (latest.requestMetrics + metric).takeLast(AppLimits.Api.REQUEST_METRICS)),
+                // Per-taskType cap, same as the chat path: one kind must not evict another.
+                latest.copy(requestMetrics = (latest.requestMetrics + metric).trimMetricsPerTaskType()),
             )
         }
     }

@@ -4,6 +4,8 @@ DeepTalking 的原生 Android 应用：Kotlin + Jetpack Compose 多模块，入�
 
 - 模块清单、依赖方向与关键接口：`docs/NATIVE_MODULES.md`
 - Agent（agent 循环、工具、提示词、记忆、后台任务）：`docs/AGENT_ARCHITECTURE.md`
+- 每次外发调用的原文（主调用纯文本 + `【语气】`、turn worker 的 `submit_state`、辅助/记忆任务）：`docs/OUTBOUND_CALLS_V2.md`
+- 解析机制链：`docs/PARSE_GRAPH.md`
 - 语音朗读链路（端侧 / 远程）：`docs/REMOTE_TTS.md`
 - 包名 `com.deeptalking.lite`，显示名 DeepTalking
 

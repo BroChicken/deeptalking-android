@@ -16,12 +16,8 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.collect
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.put
 
 /** Result of one full agent/tool loop. */
 data class LoopOutcome(
@@ -62,12 +58,23 @@ class AgentLoop(
     private val registry: ToolRegistry,
 ) {
 
+    /**
+     * Runs the turn in two phases (see REPLY_PIPELINE_PLAN §12.1#2):
+     *
+     * - `AUTO`: the model may call information tools. Tool rounds are tool-only; any prose
+     *   that arrives alongside a call is discarded (the contract says "tool or prose, not
+     *   both"), and the final prose arrives in a later round.
+     * - `FINAL`: no tools at all. This is the only phase that can terminate the turn; an
+     *   empty FINAL round is retried at most twice and then returns an empty outcome so the
+     *   caller (single outer retry loop) owns the "empty reply" UX.
+     *
+     * There is no terminal `submit_response` call any more: the main call is plain text.
+     */
     suspend fun run(
         character: Character,
         instructions: String,
         baseInput: List<ChatMessage>,
         autoTools: List<ToolDefinition>,
-        submitTool: ToolDefinition,
         builder: RequestBuilder,
         model: String,
         onDelta: (String) -> Unit = {},
@@ -84,11 +91,10 @@ class AgentLoop(
         val roundUsages = mutableListOf<com.deeptalking.engine.ondevice.TokenUsage>()
         var lastReasoning: List<String> = emptyList()
         var phase = RequestPhase.AUTO
-        var submitAttempted = false
         var emptyAttempts = 0
 
         while (true) {
-            val tools = if (phase == RequestPhase.AUTO) autoTools else listOf(submitTool)
+            val tools = if (phase == RequestPhase.AUTO) autoTools else emptyList()
             val request = builder.build(phase, instructions, messages, tools, model, sessionIdFor(workingCharacter))
             val turn = collectResultWithRetry(request, onDelta, onToolActivity)
             val result = turn.result
@@ -99,115 +105,74 @@ class AgentLoop(
             lastReasoning = result.reasoning
             val responseText = salvageText(result)
             val salvaged = turn.salvaged
+            val infoCalls = result.toolCalls.filter { it.name != LLM_STATUS_CHUNK_NAME }
 
-            val submitCall = result.toolCalls.firstOrNull { it.name == "submit_response" }
-            val parsedSubmit = submitCall?.let { ResponseParser.parseSubmitResponse(it.arguments) }
-            val infoCalls = result.toolCalls.filter { it.name != "submit_response" }
-
-            // Special case: a lone ask_user becomes this turn's reply.
-            if (phase == RequestPhase.AUTO && infoCalls.size == 1 && infoCalls[0].name == "ask_user") {
-                val question = ToolJson.question(infoCalls[0].arguments)
-                if (question.isNotBlank()) {
-                    return LoopOutcome(
-                        text = responseText,
-                        submitCall = syntheticSubmitReply(question),
-                        rounds = rounds,
-                        executedCalls = executedCalls,
-                        updatedCharacter = latestCharacter,
-                        stickerFileRef = latestSticker,
-                        usage = lastUsage,
-                        roundUsages = roundUsages,
-                    )
-                }
-            }
-
-            var toolFailed = false
             if (phase == RequestPhase.AUTO && infoCalls.isNotEmpty()) {
-                val atLimit = rounds >= AppLimits.Agent.MAX_TOOL_ROUNDS ||
+                if (rounds >= AppLimits.Agent.MAX_TOOL_ROUNDS ||
                     executedCalls >= AppLimits.Agent.MAX_TOOL_CALLS
-                if (atLimit) {
-                    // chatStageDecision('auto-tool-limit')
-                    val accumulated = responseText.ifBlank { salvaged.orEmpty() }
-                    if (accumulated.isNotBlank()) {
-                        onToolActivity("工具调用已达上限，直接收尾…")
-                        return LoopOutcome(accumulated, null, rounds, executedCalls, latestCharacter, latestSticker, lastUsage, roundUsages)
-                    }
+                ) {
                     onToolActivity("正在整理回复…")
-                    phase = RequestPhase.SUBMIT
-                    submitAttempted = false
+                    appendReasoning(messages, result.reasoning, rounds)
+                    phase = RequestPhase.FINAL
                     continue
                 }
-                rounds++
-                executedCalls++
-                val call = infoCalls.first()
-                val callId = call.id.ifBlank { "call_$rounds" }
-                onToolActivity(toolActivityHint(call.name))
-                val toolResult = registry.execute(call, context)
-                toolResult.stickerFileRef?.let { latestSticker = it }
-                toolResult.updatedCharacter?.let { updated ->
-                    latestCharacter = updated
-                    workingCharacter = updated
-                    context = AgentContext(character = workingCharacter, activeCharacterId = workingCharacter.id)
+                for (call in infoCalls) {
+                    rounds++
+                    executedCalls++
+                    val callId = call.id.ifBlank { "call_$rounds" }
+                    onToolActivity(toolActivityHint(call.name))
+                    val toolResult = registry.execute(call, context)
+                    toolResult.stickerFileRef?.let { latestSticker = it }
+                    toolResult.updatedCharacter?.let { updated ->
+                        latestCharacter = updated
+                        workingCharacter = updated
+                        context = AgentContext(character = workingCharacter, activeCharacterId = workingCharacter.id)
+                    }
+                    messages += ChatMessage(
+                        id = "assistant_${rounds}",
+                        role = Role.Assistant,
+                        content = "",
+                        toolCallId = callId,
+                        toolName = call.name,
+                        toolArguments = call.arguments,
+                        reasoningJson = reasoningArray(lastReasoning),
+                        internalOnly = false,
+                        isLoading = false,
+                    )
+                    messages += ChatMessage(
+                        id = callId,
+                        role = Role.Tool,
+                        content = toolResult.contentJson,
+                        toolCallId = callId,
+                    )
+                    if (rounds >= AppLimits.Agent.MAX_TOOL_ROUNDS ||
+                        executedCalls >= AppLimits.Agent.MAX_TOOL_CALLS
+                    ) {
+                        break
+                    }
                 }
-                toolFailed = isToolFailure(toolResult.contentJson)
-                messages += ChatMessage(
-                    id = "assistant_${rounds}",
-                    role = Role.Assistant,
-                    content = "",
-                    toolCallId = callId,
-                    toolName = call.name,
-                    toolArguments = call.arguments,
-                    reasoningJson = reasoningArray(lastReasoning),
-                    internalOnly = false,
-                    isLoading = false,
-                )
-                messages += ChatMessage(
-                    id = callId,
-                    role = Role.Tool,
-                    content = toolResult.contentJson,
-                    toolCallId = callId,
-                )
                 onToolActivity("工具结果已返回，正在继续推理…")
-                if (parsedSubmit == null || toolFailed) continue
-            }
-
-            if (parsedSubmit != null) {
-                return LoopOutcome(responseText, submitCall, rounds, executedCalls, latestCharacter, latestSticker, lastUsage, roundUsages)
-            }
-
-            if (phase == RequestPhase.AUTO) {
-                // chatStageDecision('auto-final'): prose or valid JSON text is final.
-                if (responseText.isNotBlank()) {
-                    return LoopOutcome(responseText, null, rounds, executedCalls, latestCharacter, latestSticker, lastUsage, roundUsages)
-                }
-                onToolActivity("正在整理回复…")
-                appendReasoning(messages, result.reasoning, rounds)
-                phase = RequestPhase.SUBMIT
-                submitAttempted = false
                 continue
             }
 
-            // Submit phase: give the forced submit_response exactly one explicit re-attempt.
-            if (!submitAttempted) {
-                // chatStageDecision('submit-retry')
-                submitAttempted = true
-                onToolActivity("正在重新整理回复…")
-                continue
-            }
             val usable = responseText.ifBlank { salvaged.orEmpty() }
             if (usable.isNotBlank()) {
                 return LoopOutcome(usable, null, rounds, executedCalls, latestCharacter, latestSticker, lastUsage, roundUsages)
             }
-            // Legacy `chatStageDecision('empty')`: an empty turn is retried up to twice
-            // within the same loop, keeping the accumulated tool round-trips.
+            if (phase == RequestPhase.AUTO) {
+                onToolActivity("正在整理回复…")
+                appendReasoning(messages, result.reasoning, rounds)
+                phase = RequestPhase.FINAL
+                continue
+            }
+            // FINAL: an empty round is retried at most twice (decision 14).
             if (emptyAttempts < 2) {
                 emptyAttempts++
                 onToolActivity("正在重新生成…")
                 continue
             }
-            break
+            return LoopOutcome("", null, rounds, executedCalls, latestCharacter, latestSticker, lastUsage, roundUsages)
         }
-        return LoopOutcome("", null, rounds, executedCalls, latestCharacter, latestSticker, lastUsage, roundUsages)
     }
 
     /**
@@ -223,12 +188,6 @@ class AgentLoop(
         ResponseParser.extractReplyJsonFromAnyOutput(response, result.reasoning)
             .takeIf { it.isNotBlank() }?.let { return it }
         return ResponseParser.extractAnyResponseText(response)
-    }
-
-    private fun isToolFailure(contentJson: String): Boolean {
-        val element = runCatching { Json.parseToJsonElement(contentJson) }.getOrNull() ?: return true
-        val obj = element as? JsonObject ?: return false
-        return obj["ok"]?.let { (it as? JsonPrimitive)?.contentOrNull } == "false"
     }
 
     private fun appendReasoning(messages: MutableList<ChatMessage>, reasoning: List<String>, round: Int) {
@@ -305,12 +264,6 @@ class AgentLoop(
                             if (call.arguments.isNotBlank()) onToolActivity(call.arguments)
                         } else {
                             pending[call.id.ifBlank { call.name }] = call
-                            if (call.name == "submit_response" && call.arguments.trimStart().startsWith("{")) {
-                                StreamText.extractReplyFromJson(call.arguments)?.let { reply ->
-                                    salvaged = reply
-                                    StreamText.displayFor(text.toString(), reply)?.let(onDelta)
-                                }
-                            }
                         }
                     }
                     is LlmChunk.Completed -> completed = chunk.result
@@ -345,45 +298,17 @@ class AgentLoop(
             items.forEach { item -> runCatching { add(Json.parseToJsonElement(item)) } }
         }.toString()
     }
-
-    private fun syntheticSubmitReply(question: String): ToolCall {
-        val args = buildJsonObject {
-            put("reply", question)
-            put(
-                "quickReplies",
-                buildJsonArray {
-                    add("嗯，我明白")
-                    add("稍等，我想一下")
-                },
-            )
-        }
-        return ToolCall(id = "ask_user", name = "submit_response", arguments = args.toString())
-    }
 }
 
-private object ToolJson {
-    fun question(arguments: String): String =
-        (ResponseParser.parseJsonLenient(arguments) as? JsonObject)
-            ?.let { (it["question"] as? JsonPrimitive)?.contentOrNull }
-            .orEmpty()
-            .trim()
-}
-
-/** Top-right activity hint per tool, mirroring legacy `toolActivityHint` (`status-settings.js:1-15`). */
+/** Top-right activity hint per tool. */
 internal fun toolActivityHint(name: String): String = when (name) {
-    "get_current_time" -> "正在确认时间…"
     "search_memory" -> "正在回忆…"
-    "list_memories" -> "正在整理记忆…"
-    "delete_memory" -> "正在清理记忆…"
-    "add_todo" -> "已记下，正在回应…"
-    "update_character_field" -> "已按你的要求调整设定…"
-    "upsert_lorebook_entry" -> "已更新世界书…"
     "web_search" -> "正在搜索…"
     "web_fetch" -> "正在读取网页…"
-    "search_video" -> "正在搜B站视频…"
-    "search_music" -> "正在搜歌…"
-    "search_posts" -> "正在搜虎扑帖子…"
-    "baidu_hot", "toutiao_hot", "douyin_hot", "zhihu_hot" -> "正在看热榜…"
+    "search" -> "正在搜索…"
+    "hot_board" -> "正在看热榜…"
+    "memory_write" -> "正在更新记忆…"
+    "upsert_lorebook_entry" -> "已更新世界书…"
     "send_sticker" -> "正在挑表情…"
     else -> "正在处理…"
 }

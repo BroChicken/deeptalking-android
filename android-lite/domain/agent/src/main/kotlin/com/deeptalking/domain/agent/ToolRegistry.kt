@@ -9,6 +9,13 @@ import com.deeptalking.engine.ondevice.ToolDefinition
  */
 class ToolRegistry(private val tools: List<AgentTool>) {
 
+    init {
+        // Tool names are the model's only handle; two tools sharing one name would make
+        // `execute` silently pick whichever came first. Fail loudly at construction.
+        val duplicates = tools.groupBy { it.definition.name }.filterValues { it.size > 1 }.keys
+        require(duplicates.isEmpty()) { "工具名重复: ${duplicates.joinToString(", ")}" }
+    }
+
     fun definitions(context: AgentContext): List<ToolDefinition> =
         tools.filter { it.isEnabled(context) }.map { it.definitionFor(context) }
 

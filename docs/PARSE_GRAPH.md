@@ -6,67 +6,59 @@
 ## 0. 设计铁律（改动的硬约束）
 
 - **INV-1 单点解析**：所有"模型输出 → 结构化对象"都经 `ResponseParser.parseJsonLenient`（`:domain:agent`）。改它=改全系统。
-- **INV-2 顶层类型契约**：主回复解析必须返回**对象**（`parseSubmitResponse` / `parseTurnFromText` → `buildTurn` 只接受 `JsonObject`）。返回数组=快速回应/记忆全丢（静默失败）。
+- **INV-2 顶层类型契约**：主回复解析必须返回对象（`parseTurnFromText` → `buildTurn` 只接受 `JsonObject`）。返回数组=旧 JSON 兼容路径失效（静默失败）。
 - **INV-3 不改字段名集合**（`Prompts.DYNAMIC_STATE_FIELDS` / `STATIC_PROFILE_FIELDS`）而不检查下游：工具 schema、清洗、迁移、UI、提示词全部由这两个常量驱动。
 - **INV-4 前缀缓存稳定**：system 固定在前、历史原样递增、volatile 只挂当前用户消息；任何"每轮变化的文本塞进 system 前缀"都会击穿缓存。
-- **INV-5 阶段二只用于兜底**：阶段一（含 `submit_response` 工具）拿到正文就直接收尾；只有"连正文都没有"才进阶段二锁定 `submit_response`。
-- **INV-6 待办与长期记忆独立，准入须「明确日期 + 双方同意」**（`TodoPolicy` / `add_todo`）；`promises` 是叙事记忆、仍需用户原话证据（`isValidAutomaticMemory`）。
-- **INV-7 正文优先，不为 quickReplies 重发**：合法 JSON（即使缺 quickReplies）或散文都直接采用；快速回应由后台补齐，绝不再为它多发一轮。
+- **INV-5 FINAL 相无工具**：`AUTO` 拿不到正文就转 `FINAL`（`tools` 为空、`toolChoice=Auto`、`reasoning.effort=none`），FINAL 空回合最多重试 2 次；回合只在这两相之间流转。
+- **INV-6 待办与长期记忆独立，准入须「明确日期 + 双方同意」**（`TodoPolicy.validateTodoCreation` / worker 的 `submit_state.todos`）；`promises` 是叙事记忆、仍需用户原话证据（`isValidAutomaticMemory`）。
+- **INV-7 正文优先，不为 quickReplies 重发**：主调用只产出纯文本 + `【语气】` 行；快速回应由 turn worker 生产（可选，失败不影响正文），后台换位生成只作兜底。
 - **INV-8 快速回应必须是用户视角**：`StyleGuard.detectQuickReplyIssues` 校验，失败由 `BackgroundTasks.repairQuickReplies`（换位生成）重写；不得覆盖已显示的正文。
 
 ## 1. 核心机制链（主链）
 
 ```
-模型原始输出 fullText / function_call.arguments
+模型原始输出 fullText
         │
         ▼
-  ResponseParser.parseJsonLenient(text)        ★中枢★  (返回值类型不定：对象 / 数组 / null)
-        ├─ L1 stripFences → JSON.parse 严格
-        ├─ L2 removeTrailingCommas → JSON.parse
-        ├─ L3 repairFreetextFieldsByScan         ← 自由文本引号/换行修复（引号配对感知扫描）
-        ├─ L4 repairFreetextFieldsLegacy         ← 旧策略兜底（不劣于修复前）
-        ├─ L5 safeJson(切片 {..} / [..])          ← 可能把数组当合法 JSON 返回（INV-2 违例源）
-        └─ L6 safeJson(全文)
+  ResponseParser.parseTurnFromText(text)       ★主链★
+        ├─ StreamText.stripHiddenText            剥离 <MEM_UPDATE> 残留（仅显示用途）
+        ├─ 整段是单个 JSON 对象？→ parseJsonLenient → buildTurn（旧格式兼容）
+        └─ 否则 → ToneText.split：正文 + 末尾【语气】行
         │
-   ┌────┴───────────────────────┬──────────────────────────┐
-   ▼                            ▼                          ▼
-parseSubmitResponse        StreamText.extractReplyFromJson   parseQuickReplyList /
-（主回复：必须对象）         （流式气泡 + salvage）            parseQuickRepliesFromText
-   │                            │                          │
-   ▼                            ▼                          ▼
-ChatOrchestrator.applyMemory ─► applyDynamicStateFields   detectQuickReplyIssues（视角校验）
-   ├ shortTerm（不由主对话写）        │                          │
-   ├ longTerm / promises              ▼                          ▼
-   ├ dynamicState（6 字段）      memberDynamicState       通过 → quickRepliesState
-   └ memberDynamicState                                 不通过 → repairQuickReplies
-        │                                                  （后台换位生成，不改正文）
         ▼
-ResponseParser.parseMemoryFromText（从 reply 文本抓 <MEM_UPDATE>）
+  ParsedTurn { reply, tone }                    正文立即显示
         │
-        ▼（散文收尾时）
-BackgroundTasks.extractProseTurnMemory（后台补 shortTerm/longTerm/dynamicState，不阻塞正文）
+        ├─ AgentLoop.salvageText（空文本时）→ extractResponsesText / 内嵌 reply JSON / extractAnyResponseText
+        │
+        ▼
+  TurnWorker.parse(result)                      强制 function call：submit_state
+        ├─ dynamicState（不含 currentTone） → applyDynamicStateFields
+        ├─ memberDynamicState（群组）        → 对应成员 dynamicState
+        ├─ quickReplies                      → 快速回应按钮（失败则无按钮）
+        ├─ todos                             → TodoPolicy.validateTodoCreation / applyTodoUpdate
+        └─ promiseUpdates                    → applyPromiseUpdate
+        │
+        ▼
+  FieldRevision.detect → 单字段修订（用户显式改字段时）
 ```
 
 ## 2. 全部调用方（谁受 `parseJsonLenient` 影响）
 
 | 调用点 | 期望返回 | 若返回数组/null 的后果 |
 |---|---|---|
-| `parseSubmitResponse`（主回复工具参数） | 对象 | 判为"无合法提交"→ 走阶段二强制 submit；快速回应丢 |
-| `parseTurnFromText`（正文即终稿） | 对象 | 同上 |
-| `parseQuickReplyList` / `parseQuickRepliesFromText` | 数组 | 快速回应 fallback，交给后台换位生成 |
+| `parseTurnFromText`（正文即终稿） | 对象（仅旧格式兼容路径） | 退回纯文本 + 语气行，正文照常显示 |
+| `TurnWorker.parse` | 对象（`submit_state` 参数） | 本轮结构化增量全部丢弃（正文不受影响） |
 | `StreamText.extractReplyFromJson`（流式气泡/salvage） | 字符串 | 气泡为空 → `AgentLoop.salvageText` 抢救 |
-| `parseMemoryFromText` ← `<MEM_UPDATE>` | 对象 | 记忆不落盘 |
-| `submit_response` 工具参数解析 | 对象 | 记忆/回复字段缺失 |
-| `ask_user` 参数解析 | 对象 | 澄清问题丢失（`AgentLoop.syntheticSubmitReply` 兜底） |
 | 角色/群组生成、成员补全、群组升级、头像描述、话题 | 对象 | 生成失败（`CharacterParity.parseGeneratedDraft` 等） |
 | AI 字段迁移 / 世界书迁移（`NativeCore.runWorldLoreMigration` / `remapCharacterFields`） | 对象 | 迁移失败回退本地合并 |
+| 世界书整理 / 抽取 / 分析 / 场景 / 快速回应修补（辅助调用） | 对象或数组（按任务约定） | 任务失败，按各自退避重试；不改已显示正文 |
 
 ## 3. 字段集合驱动链（改字段时）
 
 字段常量在 `:domain:agent` 的 `prompts/Prompts.kt`。
 
 ```
-DYNAMIC_STATE_FIELDS ──┬─► submit_response schema (SubmitResponseTool.buildSchema)
+DYNAMIC_STATE_FIELDS ──┬─► TurnWorker SCHEMA（submit_state 的 dynamicState/memberDynamicState）
                        ├─► ChatOrchestrator.applyDynamicStateFields（落盘校验）
                        ├─► FieldCleaning.cleanFieldValue / CharacterParity（清洗）
                        ├─► buildSystemPrompt / buildVolatileContext（提示词注入与状态块）
@@ -74,22 +66,22 @@ DYNAMIC_STATE_FIELDS ──┬─► submit_response schema (SubmitResponseTool.
                        ├─► 角色编辑器「当前状态」页签（CharactersScreen）
                        └─► 生成/补全/升级提示词里的字段清单（CharacterParity）
 
-STATIC_PROFILE_FIELDS ─┬─► submit_response schema (staticFieldProperties)
-                       ├─► applyStaticFields / update_character_field 工具 enum
+STATIC_PROFILE_FIELDS ─┬─► TurnWorker 不含静态字段（成员/本体字段都不由 worker 写）
+                       ├─► FieldRevision.detect 的别名表 / FieldRevision.revise（单字段修订）
                        ├─► buildSystemPrompt（角色卡注入与成员块）
                        ├─► buildVolatileContext 的话题库 / BackgroundTasks.autoFillStaticFields
                        ├─► 角色编辑器「基础」页签
                        └─► LegacyMapper 的旧字段迁移（worldView→background 等）
 ```
 
-> 原生 `DYNAMIC_STATE_FIELDS` 为 **6 项**：`currentSituation` / `currentLocation` / `currentMood` / `currentOccupation` / `currentGoal` / `currentTone`（`currentTone` 是朗读投递属性，每轮必填、免证据门）。
+> 原生 `DYNAMIC_STATE_FIELDS` 为 **6 项**：`currentSituation` / `currentLocation` / `currentMood` / `currentOccupation` / `currentGoal` / `currentTone`。其中前 5 项由 turn worker 写（群组成员走 `memberDynamicState`），`currentTone` 只来自主调用末尾的 `【语气】` 行、免证据门。
 
 ## 4. 已知脆弱点与对应加固
 
 | ID | 脆弱点 | 触发 | 后果 | 加固 |
 |---|---|---|---|---|
 | F1 | 自由文本字段修复不感知引号配对/嵌套 | 字段值内含未转义 `"` 且后接 `}`/`]`/`"key":` | 字段被提前截断 → JSON 非法 → L5 把数组当合法 → `quickReplies` 丢（ARRAY 返回） | `repairFreetextFieldsByScan`（引号配对感知扫描 + `hasLaterCandidate` 消歧）＋ `repairStringArrayField` 逐项修数组；旧策略保留为下限兜底 |
-| F2 | 解析可能"成功"返回非预期顶层类型 | 同上 | 静默失败，调用方按对象用则读到空 | `parseSubmitResponse` / `parseTurnFromText` 的顶层类型守卫（只接受 `JsonObject`） |
+| F2 | 解析可能"成功"返回非预期顶层类型 | 同上 | 静默失败，调用方按对象用则读到空 | `parseTurnFromText` / `TurnWorker.parse` 的顶层类型守卫（只接受 `JsonObject`；后者解析不出就当本轮无增量） |
 | F3 | 快速回应仅在 `memUpdate` 为对象时走文本兜底 | memUpdate 为数组/null | 快速回应不兜底 | 由 F1+F2 覆盖（返回对象后正常） |
 
 ### F1 修复算法
@@ -98,40 +90,39 @@ STATIC_PROFILE_FIELDS ─┬─► submit_response schema (staticFieldProperties
 3. 数组型字段（`quickReplies`）用 `repairStringArrayField` 单独修每个字符串项。
 4. `repairFreetextFields` 汇总多个候选修复串，返回**第一个能整段解析成功**的；全失败则退回旧策略（不劣于修复前）。
 
-## 4.5 请求体布局与阶段一/二路径
+## 4.5 请求体布局与 AUTO / FINAL 路径
 
-### 请求体（Responses API，`ResponsesLlmBackend.buildBody`；由 `RequestBuilder.build` 装配）
+### 请求体（Responses API，`ResponsesLlmBackend.buildBody`；由 `RequestBuilder.build(phase, …)` 装配）
 ```
 {
   model, instructions(=system提示词，单独提顶层), input(=对话+工具回传),
   stream, temperature, max_output_tokens(8192), reasoning.effort,
   tools: [...],        // ★工具定义在顶层，与 input/instructions 平级
-  tool_choice: 'auto' | {type:'function', name:'submit_response'}
+  tool_choice: 'auto'
 }
 ```
-- **阶段一 `auto`（正常路径，一次请求收尾）**：`tools = Tools.defaultTools()`，`tool_choice: Auto`；工具数组**含 `submit_response`**，所以"调完信息工具 → 调 `submit_response` 提交"在同一轮完成。工具调用只发生在这里。
-- **阶段二 `submit`（兜底，仅当阶段一连正文都没拿到）**：`tools = [submit_response]`（**只有 1 个**），`tool_choice` 锁定，`reasoning.effort='none'`。
+- **AUTO 相（正常路径）**：`tools = Tools.defaultTools()`（8 个），`tool_choice: Auto`。模型若发起工具调用，**这一轮的正文丢弃**，只执行工具、回传结果、`continue`。
+- **FINAL 相（唯一收尾相）**：`tools` 为空（传输层省略 `tools`），`tool_choice: Auto`，`reasoning.effort='none'`；正文以纯文本返回。AUTO 拿不到正文、或工具轮达上限时转入。
+- turn worker 是**另一条请求**：`tools=[submit_state]`、`tool_choice={type:'function', name:'submit_state'}`、`stream=false`、`reasoning.effort='none'`、`auxiliary=true`。
 
-### 产出路径（正文优先、quickReplies 不阻塞）
+### 产出路径（正文优先、worker 不阻塞）
 ```
-主路径一：阶段一 submit_response 工具调用 → parseSubmitResponse
-        └─ 有 obj ? 直接采用 reply（缺 quickReplies 也接受）+ 落盘记忆
-主路径二：阶段一直接返回纯文本 JSON {reply,...} → parseTurnFromText
-主路径三：阶段一直接返回散文 → 直接采用（散文即终稿）；记忆/状态由
-        BackgroundTasks.extractProseTurnMemory 后台补写
-兜底：阶段一完全没有正文 → 阶段二锁定 submit_response → parseSubmitResponse
+主路径一：FINAL 返回纯文本 → ToneText.split → 正文 + 【语气】
+        └─ 正文立即采用；语气写 dynamicState.currentTone
+主路径二：整段文本是单个 JSON 对象（旧格式/缓存遗留）→ buildTurn 兼容解析
+        └─ 只取 reply 与 tone，其余字段照旧落盘
+空回合：FINAL 无正文 → 重试（≤2 次）→ 仍空则本轮失败提示
 ```
-- `parseSubmitResponse` 缺 quickReplies 时仍带上已解析的对象，调用方照常落盘记忆、直接接受正文。
-- quickReplies 由 `StyleGuard.detectQuickReplyIssues`（视角校验）+ `BackgroundTasks.repairQuickReplies`（后台换位生成）补齐；换位生成也失败才回退兜底短句。
-- 空回复在 `AgentLoop` 同一循环内最多重试 2 次，保留已累计的工具往返。
+- quickReplies 由 turn worker 的 `submit_state` 提供（恰好两条、用户视角）；`StyleGuard.detectQuickReplyIssues` 校验不过时由 `BackgroundTasks.repairQuickReplies` 换位重写，失败就不出按钮。
+- 主调用不写 `longTerm` / `shortTerm`：记忆只由后台抽取/分析与 `memory_write` 工具产生。
 
 ## 4.6 待办（todo）准入原则
 
 - **定义**：待办 = 用户与角色之间、**有明确日期**且**双方同意**的一件待办；是**独立实体**（`Character.todos`），与长期记忆互相独立。
-- **准入**（`TodoPolicy.validateTodoCreation`，唯一入口 `add_todo` 工具）：①期限必填且能在对话原话里定位；②用户发起→用户原话含期限与提议；③角色发起→必须附**用户应答的原话**，且该原话不得是明确拒绝（`isUserRefusal` 否决，`isUserAgreement` 只作正向信号；**同意与否以模型的判断为主，关键词只做一环**）。`sourceMessageIds`+`evidence` 经 `MemoryEvidence.hasValidUserEvidence` 校验。
-- **禁止**：没有明确日期、期限定位不到、或角色单方叮嘱而用户没答应的，一律拒绝（工具返回 `ok:false` 并说明原因）。
-- **生命周期**：改期/完成/取消由 `submit_response.todoUpdates` 处理（须引用户原话，改期还要能定位）；角色编辑页待办 tab 提供「完成 / 取消 / 删除」手动兜底。
-- **与 promises 区分**：`longTerm` 的 `promises` 是叙事记忆，走 `isValidAutomaticMemory`（来源须为用户消息），**不再产生待办**。
+- **准入**（`TodoPolicy.validateTodoCreation`，唯一入口是 turn worker 的 `submit_state.todos` 里 `op=create`）：①期限必填且能在对话原话里定位；②用户发起→用户原话含期限与提议；③角色发起→必须附**用户应答的原话**，且该原话不得是明确拒绝（`isUserRefusal` 否决，`isUserAgreement` 只作正向信号；**同意与否以模型的判断为主，关键词只做一环**）。`sourceMessageIds`+`evidence` 经 `MemoryEvidence.hasValidUserEvidence` 校验。
+- **禁止**：没有明确日期、期限定位不到、或角色单方叮嘱而用户没答应的，一律拒绝（`applyWorkerTodo` 跳过该条）。
+- **生命周期**：改期/完成/取消由同一 `submit_state.todos` 的 `reschedule`/`done`/`cancel` 处理（须引用户原话，改期还要能定位，走 `applyTodoUpdate`）；角色编辑页待办 tab 提供「完成 / 取消 / 删除」手动兜底。
+- **与 promises 区分**：`promises` 是叙事记忆，走 `isValidAutomaticMemory`（来源须为用户消息），**不产生待办**。
 
 ## 5. 改动检查清单（每次改前必读）
 
@@ -140,20 +131,21 @@ STATIC_PROFILE_FIELDS ─┬─► submit_response schema (staticFieldProperties
 - [ ] 是否改 system prompt 文本？→ 检查前缀缓存（INV-4）；改 `RULE_A` 之类文本会让每个角色一次性破缓存。
 - [ ] 是否改 `versionName`？→ 同步 `versionCode`，跑 `tools/native-verify.ps1`。
 - [ ] 是否新增 `parseJsonLenient` 调用？→ 检查返回类型守卫。
-- [ ] 是否改请求体阶段（`RequestBuilder`/`ResponsesLlmBackend`）？→ 核对阶段二 tools/tool_choice（INV-5）。
+- [ ] 是否改请求体阶段（`RequestBuilder`/`ResponsesLlmBackend`）？→ 核对 FINAL 相 tools 为空、`tool_choice=auto`（INV-5）。
 - [ ] 是否改待办（todo）准入？→ 必须保留「明确日期 + 双方同意」约束（INV-6）；改 promises 自动写入则保留"用户原话证据"约束。
+- [ ] 是否改 `submit_state` 字段？→ 同步 `TurnWorker.SCHEMA`、`TurnWorker.parse`、`ChatOrchestrator.runTurnWorker` 与 `OUTBOUND_CALLS_V2.md` 附录 B-1。
 
 ## 6. GRAPH（YAML 镜像）
 
 ```yaml
 invariants:
   INV-1: {rule: single-parse-entry, at: ResponseParser.parseJsonLenient}
-  INV-2: {rule: main-reply-must-be-object, guard: parseSubmitResponse|parseTurnFromText}
+  INV-2: {rule: main-reply-must-be-object, guard: parseTurnFromText|TurnWorker.parse}
   INV-3: {rule: field-set-change-requires-downstream-audit, keys: [DYNAMIC_STATE_FIELDS, STATIC_PROFILE_FIELDS]}
   INV-4: {rule: prefix-cache-stability}
-  INV-5: {rule: submit-phase-tools-only-submit_response, why: 'full tools dilute strict schema -> quickReplies dropped; phase 2 is fallback-only'}
+  INV-5: {rule: final-phase-has-no-tools, why: 'FINAL terminates the turn with plain text; an empty FINAL round is retried at most twice'}
   INV-6: {rule: todo-requires-date-and-mutual-agreement, why: 'todo is independent of long-term memory; a character instruction with no user agreement must not become a to-do'}
-  INV-7: {rule: body-first-never-refetch-for-quickReplies, why: 'accepting prose/JSON-without-quickReplies avoids the per-turn forced submit round; quick replies are repaired in the background'}
+  INV-7: {rule: body-first-never-refetch-for-quickReplies, why: 'quick replies come from the turn worker, never from an extra main-call round'}
   INV-8: {rule: quickReplies-must-be-user-viewpoint, guard: StyleGuard.detectQuickReplyIssues, repair: BackgroundTasks.repairQuickReplies}
 
 nodes:
@@ -162,36 +154,34 @@ nodes:
   repairFreetextFieldsLegacy:{kind: function, role: fallback, risk: medium, defect: F1}
   safeJson:                {kind: function, role: fallback, risk: medium, defect: F2}
   decodeJsonEscapes:       {kind: function, role: helper, risk: low}
-  parseSubmitResponse:     {kind: function, role: main-reply-tool, risk: high}
-  parseTurnFromText:       {kind: function, role: prose-json, risk: high}
+  parseTurnFromText:       {kind: function, role: main-reply, risk: high}
+  buildTurn:               {kind: function, role: legacy-json-compat, risk: medium}
+  ToneText.split:          {kind: function, role: reply-tone-split, risk: high}
+  TurnWorker.parse:        {kind: function, role: worker-output, risk: high}
   StreamText.extractReplyFromJson:{kind: function, role: stream-bubble, risk: medium}
-  parseQuickReplyList:     {kind: function, role: quick-replies, risk: medium}
-  parseQuickRepliesFromText:{kind: function, role: quick-replies-fallback, risk: low}
   ChatOrchestrator.applyMemory:{kind: function, role: memory-write, risk: high}
+  ChatOrchestrator.runTurnWorker:{kind: function, role: worker-apply, risk: high}
   applyDynamicStateFields: {kind: function, role: dynamic-write, risk: medium}
-  parseMemoryFromText:     {kind: function, role: mem-update-extract, risk: low}
+  FieldRevision.detect:    {kind: function, role: static-field-revise, risk: medium}
   DYNAMIC_STATE_FIELDS:    {kind: const, role: field-set, risk: high}
   STATIC_PROFILE_FIELDS:   {kind: const, role: field-set, risk: high}
 
 edges:
-  - {from: model_output,             to: parseJsonLenient}
-  - {from: parseJsonLenient,         to: parseSubmitResponse}
-  - {from: parseJsonLenient,         to: parseTurnFromText}
+  - {from: model_output,             to: parseTurnFromText}
+  - {from: parseTurnFromText,        to: ToneText.split}
+  - {from: parseTurnFromText,        to: buildTurn, note: 'only when the whole text is a single JSON object'}
+  - {from: buildTurn,                to: parseJsonLenient}
+  - {from: TurnWorker.parse,         to: parseJsonLenient}
+  - {from: ChatOrchestrator.runTurnWorker, to: TurnWorker.parse}
+  - {from: ChatOrchestrator.runTurnWorker, to: applyDynamicStateFields}
   - {from: parseJsonLenient,         to: StreamText.extractReplyFromJson}
-  - {from: parseJsonLenient,         to: parseQuickReplyList}
-  - {from: parseJsonLenient,         to: parseQuickRepliesFromText}
-  - {from: parseJsonLenient,         to: parseMemoryFromText}
-  - {from: parseJsonLenient,         to: 'submit_response.args'}
-  - {from: parseJsonLenient,         to: 'ask_user.args'}
   - {from: parseJsonLenient,         to: 'LegacyMapper.field-migration'}
   - {from: parseJsonLenient,         to: 'CharacterParity.generate/fill/upgrade'}
   - {from: repairFreetextFieldsByScan, to: parseJsonLenient, note: 'used by L3 and stream salvage'}
-  - {from: parseSubmitResponse,      to: ChatOrchestrator.applyMemory}
+  - {from: parseTurnFromText,        to: ChatOrchestrator.applyMemory}
   - {from: ChatOrchestrator.applyMemory, to: applyDynamicStateFields}
-  - {from: parseQuickReplyList,      to: quickRepliesState}
-  - {from: quickRepliesState,        to: renderQuickReplies}
-  - {from: DYNAMIC_STATE_FIELDS,     to: [submit_response.schema, applyDynamicStateFields, FieldCleaning.cleanFieldValue, buildVolatileContext, LegacyMapper.mapDynamicState, editor-state-tab, prompts]}
-  - {from: STATIC_PROFILE_FIELDS,    to: [submit_response.schema, applyStaticFields, update_character_field.enum, buildSystemPrompt, buildVolatileContext, autoFillStaticFields, editor-basic-tab, LegacyMapper]}
+  - {from: DYNAMIC_STATE_FIELDS,     to: [TurnWorker.SCHEMA, applyDynamicStateFields, FieldCleaning.cleanFieldValue, buildVolatileContext, LegacyMapper.mapDynamicState, editor-state-tab, prompts]}
+  - {from: STATIC_PROFILE_FIELDS,    to: [FieldRevision.detect, buildSystemPrompt, buildVolatileContext, autoFillStaticFields, editor-basic-tab, LegacyMapper]}
 
 failure_modes:
   F1: {cause: unescaped-quote-then-brace, effect: premature-field-cut, cascade: 'json-invalid -> array-returned -> quickReplies-lost'}

@@ -5,13 +5,15 @@ import com.deeptalking.engine.ondevice.ToolCall
 import com.deeptalking.engine.ondevice.ToolDefinition
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ToolRegistryTest {
 
-    private val fake = object : AgentTool {
+    private fun echoTool(name: String = "echo") = object : AgentTool {
         override val definition = ToolDefinition(
-            name = "echo",
+            name = name,
             description = "Echoes back",
             parametersJson = "{}",
         )
@@ -19,6 +21,8 @@ class ToolRegistryTest {
         override suspend fun execute(call: ToolCall, context: AgentContext): AgentToolResult =
             AgentToolResult("""{"ok":true}""")
     }
+
+    private val fake = echoTool()
 
     private val context = AgentContext(
         character = Character(id = "c1"),
@@ -38,5 +42,20 @@ class ToolRegistryTest {
         val result = registry.execute(ToolCall("1", "echo", "{}"), context)
         assertEquals("""{"ok":true}""", result.contentJson)
         assertEquals(false, result.isError)
+    }
+
+    @Test
+    fun duplicateToolNamesFailFast() {
+        val error = assertThrows(IllegalArgumentException::class.java) {
+            ToolRegistry(listOf(echoTool("same"), echoTool("same")))
+        }
+        assertTrue(error.message.orEmpty().contains("工具名重复"))
+        assertTrue(error.message.orEmpty().contains("same"))
+    }
+
+    @Test
+    fun distinctNamesAreAccepted() {
+        val registry = ToolRegistry(listOf(echoTool("a"), echoTool("b")))
+        assertEquals(listOf("a", "b"), registry.definitions(context).map { it.name })
     }
 }

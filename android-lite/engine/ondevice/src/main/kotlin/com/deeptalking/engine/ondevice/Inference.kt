@@ -54,7 +54,15 @@ data class LlmRequest(
      * 90s for these while chat turns got 180s.
      */
     val auxiliary: Boolean = false,
-)
+) {
+    init {
+        // A forced function call without its definition is a provider-side 400. Fail
+        // locally instead (FINAL rounds pass `ToolChoice.Auto` with no tools).
+        require(toolChoice !is ToolChoice.Function || tools.isNotEmpty()) {
+            "ToolChoice.Function(${(toolChoice as ToolChoice.Function).name}) requires a tool definition"
+        }
+    }
+}
 
 data class ToolCall(
     val id: String,

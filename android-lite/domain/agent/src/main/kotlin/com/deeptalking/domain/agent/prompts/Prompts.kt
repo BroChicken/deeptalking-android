@@ -17,14 +17,11 @@ import com.deeptalking.core.model.ShortTermMemory
 import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.core.model.Todo
 import com.deeptalking.core.model.TodoStatus
+import com.deeptalking.core.model.extractSpeechSegments
 import com.deeptalking.domain.agent.background.STYLE_GUARD
-import com.deeptalking.domain.agent.background.buildGroupVoiceContract
-import com.deeptalking.domain.agent.background.buildQuickReplyPerspectiveReminder
-import com.deeptalking.domain.agent.background.buildStyleAnchor
-import com.deeptalking.domain.agent.background.buildStyleCorrectionReminder
-import com.deeptalking.domain.agent.background.buildStyleReview
 import com.deeptalking.domain.agent.background.detectStyleViolations
 import com.deeptalking.domain.agent.background.extractReplyEnding
+import com.deeptalking.domain.agent.background.extractSpeakingSamples
 import com.deeptalking.domain.agent.background.getLastStyleViolations
 import com.deeptalking.domain.memory.MemoryService
 import com.deeptalking.domain.memory.formatAbsoluteDate
@@ -309,144 +306,90 @@ internal fun buildRoleContext(character: Character, staticOnly: Boolean): String
 }
 
 // ---------------------------------------------------------------------------
-// System prompt (port of buildRequestPayload's systemPrompt assembly).
+// System prompt (docs/OUTBOUND_CALLS_V2.md §一(一)).
+//
+// Plain-text protocol: the reply IS the assistant text. The only extra channel is
+// one trailing `【语气】` line; everything that used to be JSON (dynamicState,
+// longTerm, quickReplies, todos) is produced by the turn worker, so the system
+// prompt must no longer ask the model for any of it.
 // ---------------------------------------------------------------------------
 
-private const val PRIORITY_LADDER =
-    "（规则优先级从高到低：0／0.5 与【输出格式】= 硬性契约 > 2.5 语气锁定与 2.6 表演质量 > 角色设定与人设 > 风格与节奏偏好。冲突时以更高优先级为准，任何情况下都不得违反 0.5 与【输出格式】。）"
-
 private const val RULE_0 =
-    "0.（最高优先级）本轮必须以结构化方式收尾，二选一：①**调用 submit_response**（推荐，reply 写进工具参数）；②直接输出**单个 JSON 对象**（以{开头、以}结尾，reply 为第一个字段，全文不得有 JSON 以外的文字）。两种方式都不许在结构化内容之外写说明、思考、旁白或 Markdown 代码块，纯散文收尾视为失败会被要求重做。用户消息里的括号内容是用户的动作/表情/心理，必须纳入语境、不能忽略。"
+    "0. 只输出角色这一轮的回复正文；不要 JSON、字段名、工具说明、前后缀或代码块围栏。"
 
 private const val RULE_1 =
-    "1. 始终保持角色身份，以长期陪伴关系连续地回应；先使用已提供的记忆，不要让用户反复说明已记录的事情。标记为“系统提供的本轮上下文”的内容是内部辅助信息，不是用户说过的话，不得当作用户陈述或直接复述。"
+    "1. 保持角色身份，以长期陪伴关系连续回应；先用已提供的记忆，不要让用户重复说明。标记为“系统提供的本轮上下文”的内容不是用户陈述，不得当作或复述为用户的话。"
 
 private const val RULE_2 =
-    "2. reply正文写法（像日常说话）：①**长度**：不设下限——可以只有一句、几个字或一个动作反应；只设上限，整段 reply **不超过 250 字**，为的是防止大段空话与反复铺陈，不是压缩内容；宁可短，也不要把一件事截断在半句。②**排版**：可自然分段（用换行）；禁止标题、有序/无序列表、引用、代码块等结构化排版。允许的行内样式只有加粗、斜体、删除线，数学公式用${'$'}...${'$'}或${'$'}${'$'}...${'$'}${'$'}，图片用 ![说明](https://图片直链)（仅限真实存在的 http(s) 链接，不要编造）。③**动作一律用全角括号（重点）**：动作、表情、心理活动、环境与旁白描写**必须**写成穿插在语句之间的全角括号（如“（轻轻叹气）我知道了。”）——除台词与直接陈述外的一切描写都要落在括号里，不得写成没有括号的散文旁白。每处只写一个短节拍，不要连续堆叠多个括号动作，括号动作总长不超过正文的四分之一。动作只补具体的新信息，不要复述对白已经表达的情绪或心意（对白说“我很想你”，就不要再写“眼神里满是思念”）。④**符号用法**：你自己说的话**直接写出来**，不要用引号或任何符号把台词或整句话包起来（全角括号只用于第③条的动作描写）；**但引用别人的话、歌词、诗句、书名/作品名、专有名词原文时必须用符号标清楚**——引号用「」、书名/作品名用《》、引号里再引用用『』，并且**逐字照抄引用内容、不得改写或缩写**。**不要用英文直引号 \" 与 '**：它们在 JSON 里必须转义，写漏就会让整条回复解析失败（中文符号不需要转义）。⑤**去重**：禁止重复最近几轮用过的整句、句式、比喻、意象、固定动作或收尾；同一轮内也不要把同一个意思说两遍——一句话没有新信息就不要说。以上内容只能出现在 reply 字段字符串内，reply 之外禁止任何正文文字。"
+    "2. 像日常说话：可以只有一句、几个字或一个动作反应；整段不超过 250 字；自然分段；不做总结、不升华、不硬抛开放式提问。"
 
-private const val RULE_2_6 =
-    "2.6 表演质量（真人感，像日常说话，与格式规则同等重要）：①呈现而非概述（show, don't tell）——用具体的动作、表情、语气、停顿、环境细节把情绪演出来（这些描写按第 2 条一律写进全角括号），少用“我很开心／很惊讶／很关心”这类直白说明。②句长与节奏要有起伏：长短句交替，允许短句、独字反应、省略与留白，避免每句长度相近、每段结构雷同。③对白为主、叙述为辅：该由台词完成的内容就写进台词，不要改写成旁白转述。④回避陈词滥调与空泛形容词（如“心湖泛起涟漪”“勾起嘴角”“空气中弥漫着”）；同一角色在相邻几轮内不得复用相同的比喻、意象或句式。⑤删掉所有不推进内容的句子：不做总结、不刻意升华、不在结尾强行抛出开放式提问凑字数；角色可以有情绪起伏、可以拒绝、可以转移话题、可以沉默，不必永远体贴周到。⑥保持人物的稳定与连续：性格、说话方式、对用户的称呼与关系状态前后一致，不要为了讨好用户而突然改变立场或口吻。"
-
-private const val RULE_3_PREFIX =
-    "3. 人格、背景与角色设定锁定。dynamicState可更新字段："
-
-private const val RULE_3_SUFFIX =
-    "。用户信息引用真实用户消息ID并逐字摘录原话；角色在本轮可见回复中明确表现或说出的状态用sourceMessageIds:[\"current_response\"]，evidence可概括回复大意或引短句。每个字段只能选一种来源，禁止混用current_response与真实ID，禁止按未写出的心理活动或猜测更新。仅更新本轮确有可见依据的字段；无变化或无可引用依据就省略，不要为凑字段反复盘点或凭空填写。标记为(未设置)的空字段若本轮有明确依据应一并补全，不得编造。currentTone用于后续语音朗读，**每轮都必须给出**（不受“仅更新有依据的字段”限制、无需引用证据），写成一段自然的朗读指导，按需描述语气、情绪、语速、节奏、停顿、重音与情感层次（可短可长，通常不超过约 60 字，例如“声音温柔含笑，语速偏慢，句尾轻轻收住，带一点不易察觉的疲惫”）。currentSituation写具体日期+时段（时间格式见 3.8）。"
-
-private const val RULE_3_5 =
-    "3.5 谨慎修改基础设定（性别/年龄/种族/外貌/性格/恐惧弱点/背景/说话风格/语言方言/对用户的称呼）。①用户直接要求改时：调用 update_character_field 精准改用户点名的字段，只改提到的、不连带改动，value 写成明确的简短陈述句（禁止「不是…而是…」这类对比句）；②无用户直接要求时：仅剧情决定性、不可逆转折且证据明确才可通过 staticFields 改，禁止凭情绪/猜测/轻微剧情改；③世界层设定（时代/地点/组织/专有名词/历史/规则）不进基础设定，用 upsert_lorebook_entry 写入世界书。字段 value 写法、世界观条目规则、用户手写条目保护、\"xx字段已修改\"提示等详见对应工具描述。静态字段 value 的长度上限：短字段 40 字、叙述字段 120 字、背景故事 250 字（超长会被截断、对比句会被拒收）。"
-
-private const val RULE_3_6 =
-    "3.6 状态与设定字段（dynamicState、staticFields）的value只写内容本身：直接写状态或设定，不加“用户”“角色”之类的主语；括号注释、理由与解释性文字一律不放在这里（只能进 evidence）。"
-
-private const val RULE_3_7 =
-    "3.7 记忆字段（longTerm的key与value）必须写明“是谁”，禁止使用“我/你/TA/他/她”这类指代不清的代词：涉及用户写“用户”，涉及角色写角色名，双方共同的事写清各自做了什么（正确如“用户喜欢喝美式咖啡。”）；解释性内容只能放在 evidence。"
-
-private const val RULE_3_8 =
-    "3.8 时间一律写绝对日期，禁止写“明天/上周/三天后”这类相对时间词：longTerm的key与value、dynamicState与staticFields的value都必须写“YYYY-MM-DD”或“YYYY-MM-DD 时段”。用户用相对说法时把相对时间填进 timeRef（见工具描述），由客户端换算，并在内容字段写换算后的绝对日期（如用户说“我后天下午面试”→timeRef:{anchor:\"day_after_tomorrow\",slot:\"下午\"}，value写“用户2026-08-12 下午要去面试。”）。日期与时段一律以【时间基准】给出的**逻辑日**与**时段**为准（一天从 02:00 起算，00:00-02:00 属于前一天的深夜），也不要使用“昨晚/昨天/今晚/刚刚”这类相对说法描述刚发生的事。"
-
-private const val RULE_3_9 =
-    "3.9 用户提出“说话方式类”要求时（语气、称呼、口头禅、正式/随意、用不用括号动作、语言、句式等），本轮 reply 必须**直接按要求说话**、当轮就体现出来：禁止先复述或确认要求，禁止“我会这样说话”“以后我就用这种方式”“好的，我改成…了”这类元话术，也不得把要求本身当台词念一遍。若该要求属于持久设定（说话风格、对用户的称呼、语言/方言等），按 3.5 同时用 update_character_field 更新；无论是否调用工具，reply 都只演出、不说明。"
+private const val RULE_3 =
+    "3. 只写角色自身的言行，不替用户说话或行动；需要用户表态时用问句、停顿或留白。用户消息里的括号内容是对方的动作/表情/心理，只作语境理解，不得续写或替他扩写。"
 
 private const val RULE_4 =
-    "4. 只记录未来仍有价值的信息。**短期记忆不由你写**：系统会在后台从原始对话整理事件摘要（submit_response 里没有 shortTerm 字段，写了也会被忽略）。你只负责 longTerm 与 promiseUpdates，它们的 evidence 必须逐字摘录用户原话；dynamicState按上一条动态状态规则引用。无法引用时不要记录或更新。"
+    "4. 动作、表情、心理、环境写进全角括号，每处一个短节拍、不堆叠（括号描写总长不超过正文四分之一）；台词直接写，不加引号；引用他人话语、歌词、书名用「」《》，逐字照抄、不改写；不用标题、列表、引用块、代码块。"
 
 private const val RULE_5 =
-    "5. subject只能是user、relationship、world（约定另见下条）。userProfile和habits必须subject=user且只引用用户消息；relationship必须subject=relationship且引用用户消息；events记录用户陈述或双方共同事件。"
-
-private const val RULE_5_5 =
-    "5.5 约定(promises)是**叙事记忆**（角色记得你们之间有过什么约定/承诺），与「待办事项」互相独立——promises 只是被记住，不会变成待办。要写明承诺方与受约方：promisor与promisee取值只能是 user、character、relationship。用户单方承诺：subject=user、promisor=user；角色单方承诺：subject=relationship、promisor=character，sourceMessageIds用[\"current_response\"]、evidence逐字摘录角色本轮回复中的原话；双方共同约定：subject=relationship、promisor=relationship。约定的时间写绝对日期（dueAt用ISO，或把相对说法填进timeRef）。"
+    "5. 需要工具时只调用工具，不要同时写正文；工具结果返回后再写正文。不得在正文里提及工具名或检索过程；工具返回的图片本身可以直接展示。"
 
 private const val RULE_6 =
-    "6. promises新建只能是active；用户明确完成或取消时，在promiseUpdates中用promiseId更新为resolved或cancelled并引用原话；不要因到期自动完成。"
-
-private const val RULE_6_5 =
-    "6.5 待办事项(todo)与长期记忆**互相独立**（不是 promises）。新增必须同时满足：①对话里出现**明确日期**；②由用户提出或你提出；③**双方同意**。用户发起时以用户原话为准；你发起时，**由你结合上下文判断用户是否真的答应了**（不是被提了一嘴、也不是婉拒/敷衍），并附上用户回应的原话——**同意与否以你的判断为准，不要只看字面关键词**，但用户**明确拒绝/取消**过的一律不记。用 add_todo 记录并附 sourceMessageIds + evidence。缺日期或用户没答应就不要记。用户明确完成/取消/改期某条待办时，在 todoUpdates 中用 todoId 更新并引用用户原话；不要因到期自动完成，也不要把它塞进 longTerm。"
-
-private const val RULE_7 =
-    "7. quickReplies 必须恰好两条（submit_response 里也一样；省略即视为没有，即使本轮不更新任何记忆也要给）。写法：**先把自己换成用户**，写出他此刻最可能发给角色的话（表明处境/感受、提出要求、或回问角色）；两条都必须是用户能**原样发送**的消息，其中的“我”只能指用户自己。再逐条默读为“用户：<短句>”确认通顺。禁止三类：①角色口吻（照搬角色的表态/承诺/关心）；②**角色视角的提问**（那是角色在问用户，不是用户要说的话）；③复述或换个人称重说角色刚说过的话。不得编造事实，不用 Markdown、括号动作、消息ID、时间元数据或隐藏标签。"
-
-private const val JSON_EXAMPLE_BRIEF =
-    "8. JSON 字段结构（未更新字段直接省略；无合格记忆返回空数组/空对象，但 quickReplies 仍两条）：{\"reply\":\"...\",\"quickReplies\":[\"用户短句1\",\"用户短句2\"],\"dynamicState\":{\"currentMood\":{\"value\":\"...\",\"sourceMessageIds\":[\"current_response\"],\"evidence\":\"...\"}},\"longTerm\":[{\"category\":\"userProfile\",\"subject\":\"user\",\"key\":\"...\",\"value\":\"...\",\"tags\":[\"关键词\"],\"importance\":5,\"sourceMessageIds\":[\"msg_id\"],\"evidence\":\"用户原话\"}]}。字段完整定义见 submit_response 工具 schema；示例仅示范结构，**不得模仿其口吻或措辞**（口吻以角色设定为准）。JSON 转义：换行写 \\n，反斜杠写 \\\\，双引号写 \\\"。"
-
-private const val RULE_9 =
-    "9. longTerm.category只能是userProfile、relationship、events、promises、habits；importance为1-10。"
-
-private const val RULE_9_5 =
-    "9.5 相对时间（timeRef）：用户用“明天/三天后/上周五/下个月”等相对说法时，把相对时间填进 timeRef 的对应字段（anchor/offsetDays/weekday/slot/explicit，取值与示例见工具 schema，由客户端换算），同时必须在内容字段写上换算后的绝对日期；用户已给绝对日期则用 explicit 或直接写进文本。时段只能用：深夜、凌晨、清晨、早晨、上午、中午、下午、傍晚、晚上、夜里。"
+    "6. 文风以角色设定的“说话风格”和“对用户的称呼”为准；不向默认助手腔靠拢；不复用最近几轮的整句、句式、比喻、意象与收尾。"
 
 /**
  * "This session's available tools" enumeration. It must list **every** registered tool
- * (`defaultTools`), including the two write tools (`update_character_field`,
- * `upsert_lorebook_entry`) — a partial list contradicted the tool schemas that are
- * actually sent and read as "I don't have that capability". `PromptToolListTest`
- * guards it against drifting again. (`send_sticker` is only registered when the
- * character has stickers; `submit_response` is the terminal call and is described
- * separately by [OUTPUT_FORMAT].)
+ * (`defaultTools`, docs/REPLY_PIPELINE_PLAN.md §10) — a partial list contradicts the
+ * tool schemas actually sent and reads as "I don't have that capability".
+ * `PromptToolListTest` guards it against drifting again.
  *
- * The web tools follow the **one tool = one platform** rule, so the list names each
- * platform's own tool instead of one tool with a `platform` parameter: the model never
- * has to remember an implicit mapping like `netease` = music.
+ * The platform tools take an explicit `platform` argument again (one tool each for
+ * search and hot boards), so the list names the tool instead of one name per platform.
  */
-internal const val RULE_A =
-    "A. 本会话可用工具，何时用、怎么用见各工具描述（get_current_time / search_memory / list_memories / delete_memory / update_memory / add_todo / update_character_field / upsert_lorebook_entry / web_search / web_fetch / search_video / search_music / search_posts / baidu_hot / toutiao_hot / douyin_hot / zhihu_hot / send_sticker / ask_user）。原则：回忆过往用 search_memory，检索不到再 list_memories 盘点；联网类：查资料用 web_search、读指定链接用 web_fetch、搜视频用 search_video（B站）、搜歌用 search_music（网易云音乐）、搜帖子用 search_posts（虎扑）、看热榜用 baidu_hot / toutiao_hot / douyin_hot / zhihu_hot——**这些工具每个只连一个平台，不需要你指定平台**，都免登录，失败或没搜到就直说不确定，不要编造；**用户提到某个具体日期/某天发生的事（如“九号晚上”“三号”“上周五”“那天记不记得”）时，用 search_memory 的 date/timeRef 按日期召回那天的原始对话与记忆，不要只凭摘要回忆**；记忆过期/重复/被用户纠正时先定位再用 delete_memory 或 update_memory 处理，用户明确否认或纠正时必须用 update_memory 带原话改正，不要只靠删除；待办用 add_todo：**必须在对话里出现明确日期、且由用户提出或你提出并双方同意**（你发起时由你判断用户确已答应，并附用户回应原话），缺一不记，细则见规则 6.5；工具结果属系统内部上下文，仅供理解，自然融入 reply，不得向用户透露检索过程或工具名，但工具返回的图片本身可直接展示。**断言前先核对**：说“第一次/从来没/总是/每次/以前也…”这类关于过去、次数或习惯的话之前，先用 search_memory 确认；查不到依据就别断言，改说不确定或反问用户，不要编造。"
+internal const val RULE_A_PREFIX =
+    "A. 本会话可用工具（何时用、怎么用见各工具描述）：search_memory / web_search / web_fetch / search / " +
+        "hot_board / memory_write / upsert_lorebook_entry / send_sticker。" +
+        "回忆过往、盘点记忆用 search_memory（给 category 即盘点分类）；平台搜索用 search（platform=bilibili 视频/UP主、" +
+        "netease 歌曲/歌手、hupu 帖子/讨论）；热榜用 hot_board（platform=baidu / toutiao / douyin / zhihu）；" +
+        "记忆过期、重复或被用户纠正时用 memory_write 带原话与消息 ID 按 id 修正或删除；世界层设定用 upsert_lorebook_entry。" +
+        "用户提到某个具体日期/某天发生的事（如“九号晚上”“上周五”）时，用 search_memory 的 date 或 timeRef 召回那天的原始对话与记忆。" +
+        "说“第一次/从来没/总是/每次/以前也…”这类关于过去、次数或习惯的话之前，先用 search_memory 确认；查不到依据就别断言，改说不确定或反问对方，不要编造。" +
+        "工具结果属系统内部上下文，自然融入正文，不向对方透露检索过程或工具名。以下状态字段由系统在后台维护，你不用输出字段名或 JSON，按当前状态自然演出即可："
+
+private const val RULE_A_SUFFIX = "。"
 
 private const val GROUP_RULE_10 =
-    "10. 当前是群组对话：只能由已列出的成员发言（一人或多人）。reply 中用户可见回复必须用每人独立一行的“成员名：内容”格式（台词直接写、不加引号包裹；只有引用他人话语、歌词或书名时才用「」与《》），动作按第 2 条写进全角括号，例如“张三：（看了一眼纸）这件事我先说说我的看法。\n李四：我补充一点。”。每位成员按语义可自然分段；不要写旁白、不要加未列出的发言者；示例仅示范结构，不得模仿其口吻。quickReplies 同样两条、用户视角，不得写成成员台词/提问/承诺。成员状态用 memberDynamicState 更新，不要写入群组整体 dynamicState。群组整体只维护 currentSituation 与 currentLocation；群组不维护基础设定字段，成员的个人字段在其卡片上修改。"
+    "10. 只能由已列出的成员发言。正文用每人独立一行“成员名：内容”；台词直接写、不加引号包裹，动作按第 4 条写进全角括号，不写旁白，不加未列出的发言者。" +
+        "成员之间语气必须显著不同，不要把某位成员的设定或口头禅安到别人身上。"
 
 private const val GROUP_RULE_11 =
-    "11. 记忆归属：每位成员有自己的私人记忆，互相不知道对方记得什么。只有当某件事实是全体都知道的（如用户公开告诉所有人的信息、群内公开讨论的事）才写入共享记忆（longTerm不填memberName）；若某事实只有某位成员知道、或属于某成员对用户的个人印象/私人约定，则在该条longTerm中填memberName记入其私人记忆。引用成员私人记忆时只能用该成员自己的记忆，不得张冠李戴。"
+    "11. 每位成员的私人记忆互不相通；只有全体都知道的事才写共享记忆。引用成员私人记忆时只能用该成员自己的记忆，不要替成员编造他不知道的记忆，也不得张冠李戴。"
 
-private const val GROUP_RULE_12 =
-    "12. 群组设定分三层：群组前提（这群人是谁、为何在一起）与共同场景全体共用；世界层设定（时代/世界观、地点、组织、专有名词、历史、规则）统一放世界书，不在角色设定里重复；每位成员另有自己的独立设定与当前状态，发言要贴合各自设定，不要把某位成员的设定安到别人身上。"
-
-private const val HARD_0_5 =
-    "0.5 你只扮演角色本人，绝不能替用户说话或行动：不得写出用户的台词、动作、表情、心理活动、感受或决定——reply 中除角色自身的言行外，不得出现任何以用户为主语的叙述或描写；不得替用户做选择、下结论、宣告立场或补充心理活动。用户消息里已有的括号动作只作为语境理解（可自然回应），不得替用户续写、扩写或新增。需要用户表态时把话头留给他（用问句、停顿或留白），不要替他回答。"
-
-private const val HARD_2_5 =
-    "2.5 语气锁定（最高优先级，仅次于规则0）：角色的语气、口吻、腔调**只能**来自角色设定中的“说话风格”与“对用户的称呼”，其优先级**高于**模型自身的通用腔调与惯用文风；不得让本角色的说话方式向任何默认腔调靠拢。**不同角色之间的语气差异必须显著**：同一段话若换到另一个角色口中，读起来应当像另一个人说的。语气只界定**整体调性**（如慵懒、爽利、疏离、黏人、克制、张扬等），细节由“说话风格”和当下剧情自然决定；但**必须让设定的口头禅、句尾助词、称呼、拟声、标点习惯等签名标记真的出现**（至少自然带出其中 2 处），不得把它们中和成通用书面语或默认 AI 助手腔。"
-
-private const val OUTPUT_FORMAT =
-    "【输出格式】收尾只能二选一：①调用 submit_response（reply 写进 reply 字段）；②直接输出单个 JSON 对象（以{开头、以}结尾，reply 为第一个字段，全文不得有 JSON 以外文字）。都不许在结构化内容外写说明/思考/旁白，也不得用 Markdown 代码块；**即使本轮调用过其他工具，也必须以上述方式收尾**；reply 里的英文引号必须转义写 \\\"、换行写 \\n（**引用话语/歌词/书名请优先用「」《》等中文符号，可以完全避开转义**）；quickReplies 恒为两条用户视角的短句。"
+/**
+ * The only output channel besides the prose: one `【语气】` line, used for read-aloud.
+ * The voice lock stays in the system prompt (plan §11.4): the volatile 口吻 line only
+ * carries the summary/samples/address, never the rules themselves.
+ */
+private const val OUTPUT_CHANNEL =
+    "【输出通道】\n" +
+        "正文之后另起一行，只写一行语气：【语气】<朗读指导：语气、情绪、语速、节奏、停顿、重音，≤60 字>。\n" +
+        "语气只能来自角色设定的“说话风格”与“对用户的称呼”，不得向默认 AI 助手腔靠拢，也不得把它中和成通用书面语；" +
+        "至少自然带出其中 2 处签名标记（口头禅、句尾助词、称呼、标点习惯）。"
 
 /** Builds the full system prompt (static prefix) for a turn. */
 fun buildSystemPrompt(inputs: PersonaInputs): String {
     val character = inputs.character
+    val dynamicFieldList = DYNAMIC_STATE_FIELDS.joinToString("、") { "${it.first}（${it.second}）" }
     val sb = StringBuilder()
     sb.append("【交互规则】\n")
-    sb.append(PRIORITY_LADDER).append('\n')
-    sb.append(RULE_0).append('\n')
-    sb.append(RULE_1).append('\n')
-    sb.append(RULE_2).append('\n')
-    sb.append(RULE_2_6).append('\n')
-    val dynamicFieldList = DYNAMIC_STATE_FIELDS.joinToString("、") { "${it.first}（${it.second}）" }
-    sb.append(RULE_3_PREFIX).append(dynamicFieldList).append(RULE_3_SUFFIX).append('\n')
-    sb.append(RULE_3_5).append('\n')
-    sb.append(RULE_3_6).append('\n')
-    sb.append(RULE_3_7).append('\n')
-    sb.append(RULE_3_8).append('\n')
-    sb.append(RULE_3_9).append('\n')
-    sb.append(RULE_4).append('\n')
-    sb.append(RULE_5).append('\n')
-    sb.append(RULE_5_5).append('\n')
-    sb.append(RULE_6).append('\n')
-    sb.append(RULE_6_5).append('\n')
-    sb.append(RULE_7).append('\n')
-    sb.append(JSON_EXAMPLE_BRIEF).append('\n')
-    sb.append(RULE_9).append('\n')
-    sb.append(RULE_9_5).append('\n')
-    sb.append(RULE_A).append('\n')
+    listOf(RULE_0, RULE_1, RULE_2, RULE_3, RULE_4, RULE_5, RULE_6).forEach { sb.append(it).append('\n') }
+    sb.append(RULE_A_PREFIX).append(dynamicFieldList).append(RULE_A_SUFFIX).append('\n')
     if (character.isGroup) {
+        sb.append("\n【群组附加规则】\n")
         sb.append(GROUP_RULE_10).append('\n')
         sb.append(GROUP_RULE_11).append('\n')
-        sb.append(GROUP_RULE_12).append('\n')
     }
     sb.append("\n【角色设定（固定，不随对话变化）】\n")
     sb.append(buildRoleContext(character, staticOnly = true)).append('\n')
-    sb.append("\n【硬性约束与语气锁定（最高优先级，冲突时以这里为准）】\n")
-    sb.append(HARD_0_5).append('\n')
-    sb.append(HARD_2_5).append('\n')
-    sb.append(OUTPUT_FORMAT).append('\n')
+    sb.append('\n').append(OUTPUT_CHANNEL).append('\n')
     return sb.toString()
 }
 
@@ -497,23 +440,6 @@ internal fun actorLabel(character: Character, subject: MemorySubject?): String =
     else -> "相关记忆"
 }
 
-private fun partyLabel(character: Character, value: String?): String? {
-    val v = value?.trim().orEmpty()
-    if (v.isEmpty()) return null
-    return when (v) {
-        "user" -> actorLabel(character, MemorySubject.User)
-        "character" -> actorLabel(character, MemorySubject.Character)
-        "relationship" -> actorLabel(character, MemorySubject.Relationship)
-        "world" -> actorLabel(character, MemorySubject.World)
-        else -> v
-    }
-}
-
-private fun buildNarrativePatternDirective(): String {
-    val pattern = NARRATIVE_PATTERNS.random()
-    return "【本轮节奏骨架（每轮随机给出，仅作节奏参考）】建议本轮按“${pattern.first}”的顺序组织内容：${pattern.second}骨架只约束节奏与详略分布，不要写出任何结构标签或说明文字，措辞与语气一律服从角色设定。\n\n"
-}
-
 private fun isColdFieldRequest(text: String): Boolean = COLD_FIELD_PATTERNS.any { it.containsMatchIn(text) }
 
 private fun topicBigrams(text: String): Set<String> {
@@ -552,68 +478,17 @@ private fun buildMemoryQuery(character: Character, query: String): String {
     return text + "\n" + context
 }
 
-private fun formatContextTime(iso: String?): String {
-    val instant = iso?.let { runCatching { Instant.parse(it) }.getOrNull() } ?: return iso.orEmpty()
-    val snap = TimeContext.snapshot(instant)
-    return "${snap.local} (${snap.timeZone}, ${snap.offset})"
-}
-
-/** Legacy `getPromiseContext`: active promises, overdue first, capped at 3. */
-private fun getPromiseContext(character: Character, selectedIds: Set<String>?): String {
-    val now = Instant.now().toEpochMilli()
-    val selected = character.longTerm
-        .filter { it.category == MemoryCategory.Promises && it.status == PromiseStatus.Active }
-        .filter { item ->
-            if (selectedIds == null || item.id in selectedIds) return@filter true
-            val due = item.dueAt?.let { runCatching { Instant.parse(it).toEpochMilli() }.getOrNull() }
-                ?: return@filter false
-            due >= now - 86400000L && due <= now + 7 * 86400000L
-        }
-        .map { item ->
-            val dueTime = item.dueAt?.let { runCatching { Instant.parse(it).toEpochMilli() }.getOrNull() } ?: 0L
-            Triple(item, dueTime, dueTime > 0 && dueTime < now)
-        }
-        .sortedWith(compareBy({ !it.third }, { if (it.second == 0L) Long.MAX_VALUE else it.second }))
-        .take(3)
-    if (selected.isEmpty()) return ""
-    return selected.joinToString("\n") { (item, dueTime, overdue) ->
-        val due = if (dueTime > 0) "，截止/约定时间：" + formatContextTime(item.dueAt) else ""
-        val promisor = partyLabel(character, item.promisor)
-        val promisee = partyLabel(character, item.promisee)
-        val party = if (promisor != null || promisee != null) {
-            "[" + (promisor ?: "未指定") + "答应" + (promisee ?: "未指定") + "]"
-        } else {
-            ""
-        }
-        "- [ID:${item.id}][${if (overdue) "待确认，已过期" else "进行中"}]$party " +
-            maskUserWord(character, trimText(item.key, 80)) + ": " +
-            maskUserWord(character, trimText(item.value, 260)) + due
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Standing (periodic / ritual) commitments.
 //
 // A deal like “每晚晚安吻后说一次鱼鱼爱你，不许重样” is stored as an ordinary long-term
-// memory, so it only reached the model when keyword retrieval happened to hit it — most
-// nights it was silently forgotten. Injecting *all* long-term memory every turn is not an
-// option (it grows the context and dilutes attention), so this is one small, fixed slot:
-// a deterministic filter keeps only the periodic ones and injects a one-line summary
-// (plus due time when there is one). The body itself is still only injected on retrieval.
+// memory, so it only reached the model when keyword retrieval happened to hit it. It is
+// now folded into 【未完成事项】 (plan §11.3) as a `- [周期] key：value` line — no block of
+// its own, and the same memory must never appear under both identities.
 // ---------------------------------------------------------------------------
 
 /** At most this many standing commitments are reminded per turn. */
 internal const val STANDING_COMMITMENT_LIMIT = 4
-
-/** Hard per-line cap; a longer summary is truncated to fit. */
-internal const val STANDING_COMMITMENT_LINE_CHARS = 100
-
-/** Hard cap for the whole reminder segment (header + lines): lower-ranked lines drop out. */
-internal const val STANDING_COMMITMENT_BLOCK_CHARS = 420
-
-private const val STANDING_COMMITMENT_HEADER =
-    "【长期约定提醒（你与对方之间的长期约定/固定仪式，每一轮都要记得，不要因为对方没提就当它不存在；" +
-        "这是系统给的内部提醒，不要在 reply 里复述，也不要向对方点明这是“约定”）】"
 
 /**
  * Deterministic “periodic / ritual” markers. A bare 「每」 is deliberately absent (「每个人」
@@ -660,55 +535,48 @@ internal fun selectStandingCommitments(character: Character): List<LongTermMemor
         )
         .take(STANDING_COMMITMENT_LIMIT)
 
-/** One-line summary of a commitment (+ due time, when present), capped at [STANDING_COMMITMENT_LINE_CHARS]. */
-private fun standingCommitmentLine(character: Character, item: LongTermMemory): String {
-    val due = if (item.dueAt.isNullOrBlank()) {
-        ""
-    } else {
-        "（截止/约定时间：" + localStampWithSlot(item.dueAt) + "）"
-    }
-    val value = if (item.value.isBlank()) "" else ": " + maskUserWord(character, trimText(item.value, 80))
-    val line = "- " + maskUserWord(character, trimText(item.key, 40)) + value + due
-    if (line.length <= STANDING_COMMITMENT_LINE_CHARS) return line
-    // `take` 数的是 UTF-16 单元：正好截在 emoji 中间会留下半个代理对，先退一格再补省略号。
-    val head = line.take(STANDING_COMMITMENT_LINE_CHARS - 1)
+// ---------------------------------------------------------------------------
+// 【未完成事项】= 待办 (Character.todos) + 周期性约定 (periodic promises/habits).
+// Empty result emits no header and no blank segment at all.
+// ---------------------------------------------------------------------------
+
+private const val UNFINISHED_HEADER = "【未完成事项】"
+
+/** Whole-segment cap (header included); lower-ranked lines drop out. */
+internal const val UNFINISHED_BLOCK_CHARS = 400
+
+/** Per-line cap for a todo/periodic line. */
+private const val UNFINISHED_LINE_CHARS = 100
+
+/** Local `yyyy-MM-dd HH:mm` for a stored ISO timestamp; blank input stays blank. */
+private fun localClockStamp(raw: String?): String {
+    if (raw.isNullOrBlank()) return ""
+    val zdt = parseZoned(raw) ?: return raw
+    return zdt.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"))
+}
+
+/** `take` counts UTF-16 units: back off one when it lands mid-surrogate, then ellipsis. */
+private fun capLine(line: String, limit: Int): String {
+    if (line.length <= limit) return line
+    val head = line.take(limit - 1)
     return (if (head.isNotEmpty() && head.last().isHighSurrogate()) head.dropLast(1) else head) + "…"
 }
 
-/**
- * The standing-commitment reminder segment, or `""` when there is nothing to remind — an
- * empty result emits **no** header and no blank separator, so a turn without periodic
- * deals gains nothing at all.
- */
-internal fun buildStandingCommitmentBlock(character: Character): String {
-    val lines = selectStandingCommitments(character).map { standingCommitmentLine(character, it) }
-    if (lines.isEmpty()) return ""
-    val body = StringBuilder()
-    for (line in lines) {
-        if (STANDING_COMMITMENT_HEADER.length + body.length + 1 + line.length > STANDING_COMMITMENT_BLOCK_CHARS) break
-        body.append('\n').append(line)
-    }
-    if (body.isEmpty()) return ""
-    return STANDING_COMMITMENT_HEADER + body
-}
-
-// ---------------------------------------------------------------------------
-// 待办事项注入（与长期记忆无关；数据来自 Character.todos）
-// ---------------------------------------------------------------------------
-
-private const val TODO_HEADER =
-    "【待办约定（你与对方之间未结束的待办；系统给的内部提醒，到时间自然提起即可，" +
-        "不要在 reply 里点明这是“待办”，也不要逐条复述）】"
+/** Loose identity used to keep one memory from appearing both as [待办] and [周期]. */
+private fun unfinishedIdentity(text: String): String =
+    text.lowercase().replace(Regex("[\\s，。！？、；：,.!?;:\\-—~·" + "\"“”「」『』()（）\\[\\]【】]"), "")
 
 /**
- * 未结束的待办注入段，或 `""`（空则不出现，不出标题、不留空行）。
+ * 未结束事项注入段，或 `""`（空则不出现，不出标题、不留空行）。
  *
- * 只注入 [TodoStatus.Active] 的条目，按期限升序（无期限的最后）、再按标题与 id，保证同一角色
- * 输出恒定。数据是**独立**的 `Character.todos`，不是长期记忆。
+ * 待办只注入 [TodoStatus.Active]，按期限升序（无期限最后）；周期性约定按
+ * [selectStandingCommitments] 的固定取舍顺序取前 4 条。整段 ≤ [UNFINISHED_BLOCK_CHARS]。
  */
-internal fun buildTodoBlock(character: Character, now: Instant = Instant.now()): String {
+internal fun buildUnfinishedBlock(character: Character, now: Instant = Instant.now()): String {
     val nowMillis = now.toEpochMilli()
-    val active = character.todos
+    val lines = mutableListOf<String>()
+    val seen = mutableSetOf<String>()
+    character.todos
         .filter { it.status == TodoStatus.Active }
         .sortedWith(
             compareBy<Todo>(
@@ -718,29 +586,35 @@ internal fun buildTodoBlock(character: Character, now: Instant = Instant.now()):
             ),
         )
         .take(AppLimits.Todo.INJECT_LIMIT)
-    if (active.isEmpty()) return ""
-    val body = StringBuilder()
-    for (todo in active) {
-        val dueMillis = parseZoned(todo.dueAt)?.toInstant()?.toEpochMilli()
-        val overdue = dueMillis != null && dueMillis < nowMillis
-        val due = if (todo.dueAt.isBlank()) {
-            ""
-        } else {
-            "（期限：" + localStampWithSlot(todo.dueAt) + (if (overdue) "，已过期" else "") + "）"
+        .forEach { todo ->
+            val dueMillis = parseZoned(todo.dueAt)?.toInstant()?.toEpochMilli()
+            val due = if (todo.dueAt.isBlank()) {
+                ""
+            } else {
+                "（" + localClockStamp(todo.dueAt) + (if (dueMillis != null && dueMillis < nowMillis) "，已过期" else "") + "）"
+            }
+            val detail = if (todo.detail.isBlank()) "" else "：" + maskUserWord(character, trimText(todo.detail, 80))
+            lines += "- [待办] " + maskUserWord(character, trimText(todo.title, 40)) + detail + due
+            if (todo.title.isNotBlank()) seen += unfinishedIdentity(todo.title)
+            if (todo.detail.isNotBlank()) seen += unfinishedIdentity(todo.detail)
         }
-        val detail = if (todo.detail.isBlank()) "" else ": " + maskUserWord(character, trimText(todo.detail, 80))
-        val line = "- " + maskUserWord(character, trimText(todo.title, 40)) + detail + due
-        val capped = if (line.length <= AppLimits.Todo.LINE_CHARS) {
-            line
-        } else {
-            val head = line.take(AppLimits.Todo.LINE_CHARS - 1)
-            (if (head.isNotEmpty() && head.last().isHighSurrogate()) head.dropLast(1) else head) + "…"
-        }
-        if (TODO_HEADER.length + body.length + 1 + capped.length > AppLimits.Todo.BLOCK_CHARS) break
-        body.append('\n').append(capped)
+    selectStandingCommitments(character).forEach { item ->
+        if (item.key.isNotBlank() && unfinishedIdentity(item.key) in seen) return@forEach
+        if (item.value.isNotBlank() && unfinishedIdentity(item.value) in seen) return@forEach
+        val value = if (item.value.isBlank()) "" else "：" + maskUserWord(character, trimText(item.value, 80))
+        lines += "- [周期] " + maskUserWord(character, trimText(item.key, 40)) + value
+    }
+    if (lines.isEmpty()) return ""
+    val body = mutableListOf<String>()
+    var used = UNFINISHED_HEADER.length
+    for (line in lines) {
+        val capped = capLine(line, UNFINISHED_LINE_CHARS)
+        if (used + 1 + capped.length > UNFINISHED_BLOCK_CHARS) break
+        body += capped
+        used += 1 + capped.length
     }
     if (body.isEmpty()) return ""
-    return TODO_HEADER + body
+    return UNFINISHED_HEADER + "\n" + body.joinToString("\n")
 }
 
 /** Legacy `buildTopicSuggestions`. */
@@ -827,45 +701,41 @@ private fun currentStyleViolations(character: Character, recentAssistantReplies:
     return detectStyleViolations(recent.last(), character, recent.dropLast(1))
 }
 
-/** Port of `buildLorebookContext` (two sections + footer) using selectLorebook hits. */
+/**
+ * 【世界书】段 (docs/OUTBOUND_CALLS_V2.md §一(二)4.4) using `selectLorebook` hits.
+ *
+ * The count (≤6) and the 1400-char budget are enforced by `LorebookMatcher.select`, so this
+ * assembly must **not** truncate again; the single-entry `CONTENT_CHARS` trim is only a
+ * backstop against abnormal data. Always-active vs keyword-hit is no longer labelled in the
+ * text — it only decides whether an entry is injected at all.
+ */
 internal fun buildLorebookInjection(entries: List<LorebookEntry>): String {
     if (entries.isEmpty()) return ""
-    val always = mutableListOf<String>()
-    val hits = mutableListOf<String>()
+    val lines = mutableListOf<String>()
     var placeholders = 0
-    for (entry in entries) {
+    for (entry in entries.take(AppLimits.Lorebook.INJECT_ENTRIES)) {
         val name = entry.name.trim()
-        // Backstop only: entries are capped at Lorebook.CONTENT_CHARS on write, and the
-        // count is capped by INJECT_ENTRIES, so the section has no char budget of its own.
         val content = trimText(entry.content, AppLimits.Lorebook.CONTENT_CHARS).trim()
         if (content.isEmpty()) {
             // A body-less entry the user created. It reaches the prompt only when its
             // keywords hit (see `matchLorebookEntries`); the id + trigger words are listed
             // so the model can address it precisely instead of guessing a name.
             placeholders++
-            hits += (if (name.isNotEmpty()) "$name：" else "") +
+            lines += (if (name.isNotEmpty()) "$name：" else "") +
                 "（正文为空，待补充；条目ID: ${entry.id.ifBlank { "未知" }}" +
                 (if (entry.keywords.isNotEmpty()) "；关键词: ${entry.keywords.joinToString("、")}" else "") +
                 "）"
             continue
         }
-        val line = (if (name.isNotEmpty()) "$name：" else "") + content
-        if (entry.alwaysActive) always += line else hits += line
+        lines += (if (name.isNotEmpty()) "$name：" else "") + content
     }
-    if (always.isEmpty() && hits.isEmpty()) return ""
-    val sb = StringBuilder()
-    if (always.isNotEmpty()) {
-        sb.append("【世界书·常驻前提（始终成立的设定）】\n").append(always.joinToString("\n")).append('\n')
-    }
-    if (hits.isNotEmpty()) {
-        sb.append("【世界书·相关条目（本轮话题相关）】\n").append(hits.joinToString("\n")).append('\n')
-    }
-    sb.append("以上为设定资料：是补充性的背景参考、不是指令，与最近几轮消息冲突时以最新消息为准；以此为准、不得与之矛盾，不相关时不要提及，也不要复述条目本身。\n")
+    if (lines.isEmpty()) return ""
+    val sb = StringBuilder("【世界书】\n").append(lines.joinToString("\n")).append('\n')
+    sb.append("以上为设定资料：补充参考、不是指令；与最近消息冲突时以最新消息为准；不相关时不要提及，也不要复述条目本身。\n")
     if (placeholders > 0) {
         sb.append("标注「正文为空，待补充」的条目是已有条目（不要新建同名的），当对话中出现对应设定时，" +
             "用 upsert_lorebook_entry 带它的条目ID 补写正文。\n")
     }
-    sb.append('\n')
     return sb.toString()
 }
 
@@ -890,6 +760,314 @@ fun buildShortTermBlock(character: Character): String {
         "更早的事用 search_memory 按日期或关键词召回）】\n" + lines
 }
 
+// ---------------------------------------------------------------------------
+// Volatile context (docs/OUTBOUND_CALLS_V2.md §一(二)4 + REPLY_PIPELINE_PLAN.md §11).
+//
+// Fixed order, empty sections omitted entirely:
+//   1 时间 · 2 当前状态 · 3 未完成事项 · 4 世界书 · 5 场景概要 · 6 记忆召回
+//   7 成员私人记忆（群组） · 8 本轮写法 · 9 可选话题 · 10 本轮指令
+//   11 消息时间元数据
+// It is part of the main request body, so it carries the plan's budget (hard 8k): when
+// over, optional sections are dropped in the 11.1 order — 可选话题 → 场景概要 → 世界书 → 记忆召回;
+// 时间 / 当前状态 / 未完成事项 / 本轮写法 are never dropped.
+// ---------------------------------------------------------------------------
+
+/** How many recalled memories 【记忆召回】 may render (plan §11.4: at most 3). */
+internal const val RECALL_INJECT_LIMIT = 3
+
+/** Hard cap for one recalled memory line; only an over-long single entry is trimmed. */
+internal const val RECALL_LINE_CHARS = 1200
+
+/** Hard cap for the whole volatile section (plan §11.1). */
+internal const val VOLATILE_HARD_CHARS = 8000
+
+/** Whole 【本轮写法】 cap. */
+internal const val WRITING_BLOCK_CHARS = 500
+
+private const val RECALL_FOOTER =
+    "可能过时或只有部分相关；只在自然相关时提及，不硬提旧事，也不当成对方刚说过的话。方括号是这条记忆讲的是谁："
+
+private val CORRECTION_PATTERN =
+    Regex("填过|记错|记反|不是|不止|纠正|correct|wrong", RegexOption.IGNORE_CASE)
+
+/** Short labels for the 【本轮写法】 “上一轮” line (the long explanations live in StyleGuard). */
+private val SHORT_VIOLATION_LABELS = mapOf(
+    "metaTalk" to "出现元话术",
+    "speaksForUser" to "替用户说话",
+    "cliche" to "陈词滥调",
+    "reusedImagery" to "复用近期比喻或收尾",
+    "toneDrift" to "语气漂移、句长过齐",
+    "recitedLore" to "复述世界书条目",
+)
+
+private const val PROACTIVE_DIRECTIVE =
+    "【主动开场】用户正停在对话里但没说话。主动打招呼，或提起最近一次共同经历、一件待跟进的事、一个角色此刻想聊的话题。" +
+        "贴合角色性格、自然不突兀；不要问\"你想聊什么\"\"怎么不说话\"；不要提\"系统触发\"。"
+
+private const val HOT_TOPIC_DIRECTIVE =
+    "【热榜】先调用 hot_board（platform=zhihu）查一次热榜，挑一条与角色人设、与你们共同兴趣最合得来、能自然引入的话题。" +
+        "主动开场就围绕它起头，回应就在合适时自然引到它。只挑一条，不罗列榜单、不复读热度数字，也不提\"热搜/热榜/系统/工具\"。" +
+        "对方在说严肃、紧急或伤心的事时正常回应，不必强行提话题。工具没取到内容（ok:false）就按平常方式回应，不编造话题。"
+
+/** Parsed voice spec of one persona: style summary (≤60), up to 2 samples and the address. */
+private fun voiceSpec(profile: StaticProfile): String {
+    val style = profile.speakingStyle
+    val idx = style.indexOf("示例")
+    val summary = trimText(
+        (if (idx >= 0) style.substring(0, idx) else style).trim().trimEnd('；', ';', '，', ','),
+        60,
+    )
+    val samples = extractSpeakingSamples(style).take(2)
+    val address = normalizeUserAddress(profile.userAddress)
+    val parts = mutableListOf<String>()
+    if (summary.isNotEmpty()) parts += summary
+    if (samples.isNotEmpty()) parts += "示例: " + samples.joinToString(" / ")
+    if (address.isNotEmpty()) parts += "称呼: $address"
+    if (parts.isEmpty()) return ""
+    return "口吻: " + parts.joinToString("；")
+}
+
+/** `1 时间`: local clock + weekday + slot + logical day, plus the ≥6h reconnect hint. */
+private fun buildTimeSection(character: Character, now: Instant): String {
+    val zdt = ZonedDateTime.ofInstant(now, ZoneId.systemDefault())
+    val snap = TimeContext.snapshot(now)
+    val clock = zdt.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"))
+    val weekday = zdt.format(DateTimeFormatter.ofPattern("EEEE", Locale.CHINA))
+    val head = "【时间】$clock（$weekday，${snap.slot}；逻辑日 ${snap.day}）"
+    val gap = getLastReplyGap(character)
+    return if (gap != null && gap.second) {
+        head + "\n距上次回复已过 ${gap.first}，可温和重连，不编造期间发生的事。"
+    } else {
+        head
+    }
+}
+
+/** `2 当前状态`: non-empty fields only, ≤60 chars each, never `currentTone`. */
+private fun buildStateSection(character: Character): String {
+    val fields = listOf(
+        "currentSituation" to "处境",
+        "currentLocation" to "位置",
+        "currentMood" to "情绪",
+        "currentOccupation" to "职业/身份",
+        "currentGoal" to "目标",
+    )
+    val lines = mutableListOf<String>()
+    if (!character.isGroup) {
+        fields.forEach { (key, label) ->
+            val value = maskUserWord(character, trimText(dynamicStateValue(character.dynamicState, key), 60))
+            if (value.isNotEmpty()) lines += "$label: $value"
+        }
+    } else {
+        val shared = fields.filter { it.first in GROUP_SHARED_DYNAMIC_FIELDS }.mapNotNull { (key, label) ->
+            val value = maskUserWord(character, trimText(dynamicStateValue(character.groupSharedDynamic, key), 60))
+            if (value.isEmpty()) null else "$label=$value"
+        }
+        if (shared.isNotEmpty()) lines += "群组: " + shared.joinToString("；")
+        character.members.forEach { member ->
+            val memberFields = fields.mapNotNull { (key, label) ->
+                val value = maskUserWord(member, trimText(dynamicStateValue(member.dynamicState, key), 60))
+                if (value.isEmpty()) null else "$label=$value"
+            }
+            if (memberFields.isNotEmpty()) {
+                lines += "成员·" + member.name.trim() + ": " + memberFields.joinToString("；")
+            }
+        }
+    }
+    if (lines.isEmpty()) return ""
+    return "【当前状态】\n" + lines.joinToString("\n")
+}
+
+/** `5 场景概要`: the most recent summary only (≤300), no `key` filtering. */
+private fun buildSceneSection(character: Character): String {
+    val scene = character.scenes.lastOrNull()?.content?.trim().orEmpty()
+    if (scene.isEmpty()) return ""
+    return "【场景概要】\n" + maskUserWord(character, trimText(scene, 300))
+}
+
+/**
+ * Trim an over-long single memory at a sentence boundary. Entries within the limit are
+ * rendered verbatim — half sentences are worse than a slightly long line (plan §11.4).
+ */
+private fun clipRecallValue(raw: String): String {
+    val text = raw.trim()
+    if (text.length <= RECALL_LINE_CHARS) return text
+    val head = text.take(RECALL_LINE_CHARS - 1)
+    val cut = head.lastIndexOfAny(charArrayOf('。', '！', '？', '；'))
+    val kept = if (cut > RECALL_LINE_CHARS / 2) head.substring(0, cut + 1) else head
+    return kept.trimEnd() + "…"
+}
+
+/** `6 记忆召回`: latest correction line + up to 3 memories + one short disclaimer. */
+private fun buildRecallSection(
+    character: Character,
+    recalled: List<LongTermMemory>,
+    recallIds: MutableList<String>,
+    recent: List<ChatMessage>,
+): String {
+    val sb = StringBuilder("【记忆召回】")
+    val corrections = recent
+        .filter { it.role == Role.User && CORRECTION_PATTERN.containsMatchIn(it.content) }
+        .takeLast(2)
+        .map { "[${it.id}] ${trimText(it.content, 200)}" }
+    if (corrections.isNotEmpty()) {
+        sb.append("\n用户最新纠正（优先于以下记忆）: ").append(corrections.joinToString("；"))
+    }
+    var rendered = 0
+    for (item in recalled) {
+        if (rendered >= RECALL_INJECT_LIMIT) break
+        val line = "[" + actorLabel(character, item.subject) + "][" + item.category.legacyKey + "] " +
+            maskUserWord(character, trimText(item.key, 120)) + ": " +
+            maskUserWord(character, clipRecallValue(item.value))
+        sb.append('\n').append(line)
+        recallIds += item.id
+        rendered++
+    }
+    if (rendered == 0) {
+        sb.append("\n无相关长期记忆")
+    } else {
+        sb.append('\n').append(RECALL_FOOTER)
+        sb.append("标为角色名或“背景”的才是角色的事，标为“")
+        sb.append(normalizeUserAddress(character.staticProfile.userAddress).ifBlank { "对方" })
+        sb.append("”或“你们”的都是对方或双方的事，绝不能当成角色自己做的。")
+    }
+    return sb.toString()
+}
+
+/**
+ * Members whose private memory gets one line this turn (plan §11.4):
+ * names mentioned in this turn's text → last reply's segment speakers → all members.
+ */
+private fun selectPrivateMemoryMembers(character: Character, query: String): List<GroupMember> {
+    val members = character.members.filter { it.name.isNotBlank() }
+    if (members.isEmpty()) return emptyList()
+    val named = members.filter { query.contains(it.name.trim()) }
+    if (named.isNotEmpty()) return named
+    val lastReply = character.instant
+        .filter { it.role == Role.Assistant && !it.isLoading && it.content.isNotBlank() }
+        .lastOrNull()
+        ?.content
+        ?: return members
+    val speakers = extractSpeechSegments(lastReply, members.map { it.name.trim() })
+        .mapNotNull { it.speaker }
+        .toSet()
+    val bySpeaker = members.filter { it.name.trim() in speakers }
+    return if (bySpeaker.isNotEmpty()) bySpeaker else members
+}
+
+/** `7 成员私人记忆` (group only): one memory per selected member, ≤300 chars each. */
+private suspend fun buildPrivateMemorySection(
+    character: Character,
+    query: String,
+    memory: MemoryService,
+    memoryQuery: String,
+): String {
+    if (!character.isGroup) return ""
+    val members = selectPrivateMemoryMembers(character, query)
+    if (members.isEmpty()) return ""
+    val lines = mutableListOf<String>()
+    members.forEach { member ->
+        val memberChar = Character(
+            id = member.id,
+            name = member.name,
+            staticProfile = member.staticProfile,
+            dynamicState = member.dynamicState,
+            shortTerm = member.shortTerm,
+            longTerm = member.longTerm,
+            lorebook = member.lorebook,
+            pendingRecall = member.pendingRecall,
+        )
+        val item = runCatching { memory.retrieve(memberChar, memoryQuery, 1) }.getOrDefault(emptyList()).firstOrNull()
+            ?: return@forEach
+        val body = if (item.value.isNotBlank()) item.value else item.key
+        if (body.isBlank()) return@forEach
+        lines += "[" + member.name.trim() + "] " + maskUserWord(character, trimText(body, 300))
+    }
+    if (lines.isEmpty()) return ""
+    return "【成员私人记忆】\n" + lines.joinToString("\n")
+}
+
+/** The plan's per-3-turn voice review, folded into 【本轮写法】 (no separate segment). */
+private fun styleReviewDue(character: Character): Boolean {
+    val turns = character.instant.count { it.role == Role.Assistant && !it.isLoading }
+    return turns > 0 && turns % STYLE_GUARD.reviewEveryTurns == 0
+}
+
+/** `8 本轮写法`: voice + skeleton + cold/switch + last-turn violations + ending dedupe. */
+private fun buildWritingSection(
+    character: Character,
+    query: String,
+    recentAssistantReplies: List<String>,
+): String {
+    val lines = mutableListOf<String>()
+    if (character.isGroup) {
+        character.members.forEach { member ->
+            val voice = voiceSpec(member.staticProfile)
+            if (voice.isNotEmpty()) lines += "[" + member.name.trim() + "] " + voice
+        }
+    } else {
+        val voice = voiceSpec(character.staticProfile)
+        if (voice.isNotEmpty()) lines += voice
+    }
+    val pattern = NARRATIVE_PATTERNS.random()
+    lines += "骨架: ${pattern.first}：${pattern.second}"
+    if (isColdFieldRequest(query)) {
+        lines += "话题: 自然开启新话题，不要把选择推回给用户"
+    } else if (detectTopicSwitch(character, query)) {
+        lines += "话题: 以用户当前话题为准，不要重提旧话题"
+    }
+    val violations = currentStyleViolations(character, recentAssistantReplies)
+    if (violations.isNotEmpty()) {
+        lines += "上一轮: " + violations.joinToString("、") { SHORT_VIOLATION_LABELS[it] ?: it } + "，本轮不得再出现"
+    } else if (styleReviewDue(character)) {
+        lines += "上一轮: 语气以说话风格为准，不复用近期比喻与收尾，不替对方说话"
+    }
+    val endings = recentEndings(character, recentAssistantReplies, 1)
+    if (endings.isNotEmpty()) lines += "收尾不要重复: ${endings[0]}"
+    if (lines.isEmpty()) return ""
+    val sb = StringBuilder("【本轮写法】")
+    var used = "【本轮写法】".length
+    for (line in lines) {
+        val available = WRITING_BLOCK_CHARS - used - 1
+        if (available < 20) break
+        val capped = capLine(line, available)
+        sb.append('\n').append(capped)
+        used += 1 + capped.length
+    }
+    return sb.toString()
+}
+
+/** `9 可选话题`: three short topics, only on a cold field request or a proactive turn. */
+private fun buildTopicsSection(character: Character, query: String, proactiveTurn: Boolean): String {
+    if (!proactiveTurn && !isColdFieldRequest(query)) return ""
+    val topics = buildTopicSuggestions(character).take(3).map { trimText(it, 60) }.filter { it.isNotEmpty() }
+    if (topics.isEmpty()) return ""
+    return "【可选话题】" + topics.mapIndexed { index, topic -> "${index + 1}. $topic" }.joinToString(" ")
+}
+
+/** `10 本轮指令`: proactive opening and/or the hot-board turn. */
+private fun buildInstructionSection(proactiveTurn: Boolean, hotTopicTurn: Boolean): String {
+    val parts = mutableListOf<String>()
+    if (proactiveTurn) parts += PROACTIVE_DIRECTIVE
+    if (hotTopicTurn) parts += HOT_TOPIC_DIRECTIVE
+    return parts.joinToString("\n\n")
+}
+
+/** `11 消息时间元数据`: last 14 non-loading messages, for `sourceMessageIds`. */
+private fun buildTimelineSection(character: Character): String {
+    val recent = character.instant.filter { !it.isLoading }.takeLast(14)
+    if (recent.isEmpty()) return ""
+    val lines = recent.joinToString("\n") { "${it.id} | ${it.role.name.lowercase()} | ${it.timestamp.orEmpty()}" }
+    return "【消息时间元数据，仅供内部推理】\n$lines"
+}
+
+/**
+ * One assembled volatile section: the text plus the ids of the memories **actually
+ * rendered** in 【记忆召回】. `ChatOrchestrator` must consume exactly these ids (legacy
+ * `memory.lastInjectedRecallIds`) so a pending recall that did not fit the 3-line limit is
+ * not silently dropped.
+ */
+internal data class VolatileContextResult(val text: String, val recallIds: List<String>)
+
 suspend fun buildVolatileContext(
     character: Character,
     query: String,
@@ -898,161 +1076,65 @@ suspend fun buildVolatileContext(
     proactiveTurn: Boolean = false,
     hotTopicTurn: Boolean = false,
     recentAssistantReplies: List<String> = emptyList(),
-): String {
-    val time = TimeContext.snapshot(now)
+): String = buildVolatileContextForTurn(
+    character = character,
+    query = query,
+    memory = memory,
+    now = now,
+    proactiveTurn = proactiveTurn,
+    hotTopicTurn = hotTopicTurn,
+    recentAssistantReplies = recentAssistantReplies,
+).text
+
+/** [buildVolatileContext] plus the recall ids, for callers that consume the recall. */
+internal suspend fun buildVolatileContextForTurn(
+    character: Character,
+    query: String,
+    memory: MemoryService,
+    now: Instant = Instant.now(),
+    proactiveTurn: Boolean = false,
+    hotTopicTurn: Boolean = false,
+    recentAssistantReplies: List<String> = emptyList(),
+): VolatileContextResult {
     val memoryQuery = buildMemoryQuery(character, query)
-    val injected = runCatching {
-        memory.retrieve(character, memoryQuery, AppLimits.Agent.TOOL_MEMORY_INJECT_LIMIT)
+    val recalled = runCatching {
+        memory.retrieve(character, memoryQuery, RECALL_INJECT_LIMIT)
     }.getOrDefault(emptyList())
-    val selectedPromiseIds = if (memoryQuery.isEmpty()) {
-        null
-    } else {
-        runCatching { memory.retrieve(character, memoryQuery, 12).map { it.id }.toSet() }.getOrDefault(emptySet())
-    }
-    // Per-entry backstops only (the prompts ask for short entries, so these rarely
-    // trigger) — the volatile section as a whole is injected with no block budget.
-    val memoryLines = injected.map { item ->
-        "[${actorLabel(character, item.subject)}][${item.category.legacyKey}] " +
-            "${maskUserWord(character, trimText(item.key, 120))}: ${maskUserWord(character, trimText(item.value, 1200))}"
-    }
-
-    val recent = character.instant.filter { !it.isLoading }.takeLast(14)
-    val timeline = recent.joinToString("\n") { "${it.id} | ${it.role.name.lowercase()} | ${it.timestamp.orEmpty()}" }
-    val timeBlock = "【时间基准】\n当前本地时间: ${time.local}\n时区: ${time.timeZone} (${time.offset})" +
-        "\nISO时间: ${time.iso}\n逻辑日: ${time.day} ${time.slot}\n"
-    val timelineBlock = "【消息时间元数据，仅供内部推理】\n$timeline\n"
-
-    val violations = currentStyleViolations(character, recentAssistantReplies)
-    val tailBuilder = StringBuilder()
-    val endings = recentEndings(character, recentAssistantReplies, 1)
-    if (endings.isNotEmpty()) tailBuilder.append("【结尾多样性】不要重复最近的收尾：${endings[0]}\n")
-    tailBuilder.append(buildNarrativePatternDirective())
-    if (isColdFieldRequest(query)) {
-        tailBuilder.append("【本轮冷场】角色自然开启新话题，不要把选择推回给用户。\n")
-    } else if (detectTopicSwitch(character, query)) {
-        tailBuilder.append("【本轮话题切换】以用户当前话题为准，不要重提旧话题。\n")
-    }
-    tailBuilder.append(buildQuickReplyPerspectiveReminder(character))
-    tailBuilder.append(buildStyleCorrectionReminder(violations))
-    tailBuilder.append(buildStyleReview(character))
-    val voiceContract = if (character.isGroup) buildGroupVoiceContract(character) else buildStyleAnchor(character)
-    val tail = tailBuilder.toString() + voiceContract
-
-    // No block budget in this section: it is part of the main chat request body, so
-    // every block is injected in full. Only the per-entry backstops above cap a single
-    // entry and the prompts keep entries short, so they rarely trigger. Ordering reads
-    // "further back = older": background -> older memories -> now -> this turn's
-    // directives, so nothing is mistaken for something that just happened.
-    val sb = StringBuilder()
-    fun block(text: String) {
-        val trimmed = text.trim()
-        if (trimmed.isEmpty()) return
-        if (sb.isNotEmpty()) sb.append("\n\n")
-        sb.append(trimmed)
-    }
-
-    val topics = buildTopicSuggestions(character)
-    if (topics.isNotEmpty()) {
-        block(
-            "【可选话题库（仅在需要时自然引出，不要生硬报菜名）】\n" +
-                topics.mapIndexed { index, topic -> "${index + 1}. $topic" }.joinToString("\n"),
-        )
-    }
-
-    val stateLines = DYNAMIC_STATE_FIELDS
-        .filter { !character.isGroup || it.first in GROUP_SHARED_DYNAMIC_FIELDS }
-        .map { (key, label) ->
-            "$label: " + maskUserWord(character, trimText(dynamicStateValue(character.dynamicState, key), 200).ifBlank { "(未设置)" })
-        }
-        .toMutableList()
-    if (character.isGroup) {
-        character.members.forEach { member ->
-            stateLines += "【${member.name}】" + trimText(buildDynamicStateContext(member.dynamicState), 220)
-        }
-    }
-    block("【角色当前状态，可随对话变化】\n" + stateLines.joinToString("\n"))
-
-    // A small, fixed reminder of the periodic/ritual deals (see buildStandingCommitmentBlock)
-    // — they belong to every turn, but must never grow into a second memory dump. Sits next
-    // to the promises block; an empty result adds nothing (no header, no blank segment).
-    block(buildStandingCommitmentBlock(character))
-
-    val promises = getPromiseContext(character, selectedPromiseIds)
-    if (promises.isNotEmpty()) block("【待跟进承诺】\n$promises")
-
-    // 待办事项（独立于记忆）：把未结束的待办以固定顺序注入，角色可在对话里自然提前提起。
-    block(buildTodoBlock(character, now))
-
+    val recent = character.instant.filter { !it.isLoading }
+    val recallIds = mutableListOf<String>()
     val loreEntries = runCatching { memory.selectLorebook(character, query) }.getOrDefault(emptyList())
         .take(AppLimits.Lorebook.INJECT_ENTRIES)
-    block(buildLorebookInjection(loreEntries))
 
-    if (character.isGroup) {
-        character.members.forEach { member ->
-            val memberChar = Character(
-                id = member.id,
-                name = member.name,
-                staticProfile = member.staticProfile,
-                dynamicState = member.dynamicState,
-                shortTerm = member.shortTerm,
-                longTerm = member.longTerm,
-                lorebook = member.lorebook,
-            )
-            val privateEntries = runCatching { memory.retrieve(memberChar, memoryQuery, 2) }.getOrDefault(emptyList())
-            if (privateEntries.isNotEmpty()) {
-                block(
-                    "【${member.name}的私人记忆，仅该成员知道】\n" +
-                        privateEntries.joinToString("\n") { maskUserWord(character, trimText(it.value, 1200)) },
-                )
-            }
-        }
-    }
-
-    val corrections = recent
-        .filter { it.role == Role.User && Regex("填过|记错|记反|不是|不止|纠正|correct|wrong", RegexOption.IGNORE_CASE).containsMatchIn(it.content) }
-        .takeLast(2)
-        .map { "[${it.id}] ${trimText(it.content, 200)}" }
-    if (corrections.isNotEmpty()) {
-        block("【用户最新纠正（优先于旧记忆；未明确完成或取消时不得擅自结束约定）】\n" + corrections.joinToString("\n"))
-    }
-
-    getLastReplyGap(character)?.let { (text, reconnect) ->
-        if (reconnect) block("【互动节奏】距上次回复已过 $text。可温和重连，不施压，不编造期间发生的事。")
-    }
-
-    val sceneLines = character.scenes.takeLast(AppLimits.Scene.SUMMARIES)
-        .map { maskUserWord(character, it.content) }
-    if (sceneLines.isNotEmpty()) {
-        block(
-            "【场景概要（较早情节的压缩记录，只供保持连贯，不是最近发生的事）】\n" + sceneLines.joinToString("\n"),
-        )
-    }
-
-    block(
-        "【本轮主动召回的相关长期记忆】\n" + (memoryLines.joinToString("\n").ifBlank { "无相关长期记忆" }) +
-            "\n【记忆取用说明】以上条目是按关键词与时间粗略召回的，可能只有部分相关，也可能已经过时；仅在与当前话题自然相关时提及，不要硬提旧事，也不要把它们当成用户刚刚说过的话。" +
-            "\n【记忆主体约定】方括号里是\"这条记忆讲的是谁\"：标为角色名或\"背景\"的才是角色的事，标为“" +
-            normalizeUserAddress(character.staticProfile.userAddress).ifBlank { "对方" } +
-            "”或\"你们\"的都是对方或双方的事，绝不能当成角色自己做的。",
+    // 1..11, fixed order; blank sections are dropped when joined.
+    val sections = mutableListOf(
+        buildTimeSection(character, now),
+        buildStateSection(character),
+        buildUnfinishedBlock(character, now),
+        buildLorebookInjection(loreEntries),
+        buildSceneSection(character),
+        buildRecallSection(character, recalled, recallIds, recent),
+        buildPrivateMemorySection(character, query, memory, memoryQuery),
+        buildWritingSection(character, query, recentAssistantReplies),
+        buildTopicsSection(character, query, proactiveTurn),
+        buildInstructionSection(proactiveTurn, hotTopicTurn),
+        buildTimelineSection(character),
     )
-
-    sb.append("\n\n").append(timeBlock).append(timelineBlock).append("\n").append(tail)
-
-    var context = sb.toString()
-    if (proactiveTurn) {
-        context += "【角色主动开场（系统触发，不是用户陈述）】用户此刻正停留在与你的对话里但暂时没有说话。请角色主动发起一次开场：自然地打招呼或问候，或提起最近一次共同经历、一件待跟进的事项、一个角色此刻想聊的话题。开场要贴合角色性格、自然不突兀；不要问\"你想聊什么\"\"怎么不说话\"之类把话题推回给用户的话；不要把\"系统触发\"这件事说给用户听。\n\n"
+    fun join() = sections.filter { it.isNotBlank() }.joinToString("\n\n")
+    var text = join()
+    // 11.1 drop order when the hard cap is exceeded: 可选话题 → 场景概要 → 世界书 → 记忆召回.
+    for (index in listOf(8, 4, 3, 5)) {
+        if (text.length <= VOLATILE_HARD_CHARS) break
+        sections[index] = ""
+        text = join()
     }
-    if (hotTopicTurn) {
-        context += "【本轮热榜话题（系统触发，不是用户陈述）】先调用一个热榜工具查一次热榜（zhihu_hot 话题性最强、建议优先；baidu_hot / toutiao_hot / douyin_hot 更偏社会新闻），从结果里挑**一条**与角色人设、与你们的共同兴趣最合得来、能自然引入的话题。把它带进这一轮：本轮若是主动开场就围绕它起个头，若是回应对方就在合适时自然引到它。只挑一条，不要罗列榜单、不要复读热度数字，也不要提\"热搜/热榜/系统/工具\"这类词。若对方此刻在说严肃、紧急或伤心的事，就正常回应，不必强行提话题。工具没取到内容（ok:false）就按平常方式回应，不得编造话题。\n\n"
-    }
-    return context
+    return VolatileContextResult(text, recallIds.toList())
 }
 
 // ---------------------------------------------------------------------------
 // Request builder.
 // ---------------------------------------------------------------------------
 
-enum class RequestPhase { AUTO, SUBMIT }
+enum class RequestPhase { AUTO, FINAL }
 
 /** Legacy `normalizeTemperature`: clamp to [0, 2]; non-finite falls back. */
 internal fun normalizeTemperature(value: Double, fallback: Double = 0.8): Double =
@@ -1078,17 +1160,19 @@ class RequestBuilder(
         model: String = config.modelName,
         sessionId: String? = null,
     ): LlmRequest {
-        val submitPhase = phase == RequestPhase.SUBMIT
+        // FINAL never carries tools; the transport omits `tools` when the list is empty and
+        // sends `tool_choice: "auto"`, which is the provider default.
+        val finalPhase = phase == RequestPhase.FINAL
         return LlmRequest(
             model = model,
             instructions = instructions,
             input = input,
             tools = tools,
-            toolChoice = if (submitPhase) ToolChoice.Function("submit_response") else ToolChoice.Auto,
+            toolChoice = ToolChoice.Auto,
             temperature = normalizeTemperature(config.temperature),
             maxOutputTokens = 8192,
             stream = config.stream,
-            reasoningEffort = if (submitPhase) "none" else config.reasoningEffort,
+            reasoningEffort = if (finalPhase) "none" else config.reasoningEffort,
             apiPlatform = config.apiPlatform,
             sessionId = sessionId,
             imageResolver = imageResolver,
@@ -1110,7 +1194,10 @@ class RequestBuilder(
                 Role.Assistant -> {
                     val text = trimText(message.content, 1200)
                     if (text.isNotEmpty()) {
-                        mapped += message.copy(content = "{\"reply\":" + jsonQuote(text) + "}")
+                        // Plain-text protocol: history is replayed as the character's own
+                        // words, not wrapped in `{"reply": ...}` (which the model would
+                        // otherwise treat as the output format).
+                        mapped += message.copy(content = text)
                     }
                 }
                 else -> mapped += message

@@ -11,8 +11,8 @@ import com.deeptalking.core.model.TodoStatus
  *
  * 待办与长期记忆**互相独立**：它不读 `longTerm`，也不写 `longTerm`；只有「对话里出现明确
  * 期限」且「双方同意」时才新增。两条写入路径：
- * - 新增 —— `add_todo` 工具（[validateTodoCreation]）；
- * - 改期/完成/取消 —— `submit_response.todoUpdates`（[todoStatusOf] + [dueAtBackedByEvidence]）。
+ * - 新增/改期/完成/取消 —— turn worker 的 `submit_state.todos`（[validateTodoCreation] /
+ *   [todoStatusOf] + [dueAtBackedByEvidence]）。
  * 角色编辑页的待办 tab 提供「完成 / 取消 / 删除」兜底。
  */
 object TodoPolicy {

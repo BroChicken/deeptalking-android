@@ -32,7 +32,7 @@ class ResponseParserTest {
 
     @Test
     fun `buildTurn parses timeRef for short and long memory`() {
-        val turn = ResponseParser.parseSubmitResponse(
+        val turn = ResponseParser.parseTurnFromText(
             """{"reply":"好","quickReplies":["一","二"],
                "shortTerm":[{"content":"用户后天下午面试","sourceMessageIds":["m1"],
                              "timeRef":{"anchor":"day_after_tomorrow","slot":"下午"}}],
@@ -58,12 +58,46 @@ class ResponseParserTest {
     }
 
     @Test
-    fun `parseMemoryFromText extracts the tagged update`() {
-        val prose = "正文\n<MEM_UPDATE>{\"shortTerm\":[{\"content\":\"用户喜欢咖啡\",\"sourceMessageIds\":[\"m1\"]}]}</MEM_UPDATE>"
-        val update = ResponseParser.parseMemoryFromText(prose)
-        assertNotNull(update)
-        assertEquals(1, update!!.shortTerm.size)
-        assertEquals("用户喜欢咖啡", update.shortTerm.first().content)
-        assertNull(ResponseParser.parseMemoryFromText("没有标签"))
+    fun `parseTurnFromText splits the trailing tone line from plain prose`() {
+        val turn = ResponseParser.parseTurnFromText("（轻轻点头）我知道了。\n\n【语气】放轻、放慢，尾音上扬")
+        assertEquals("（轻轻点头）我知道了。", turn.reply)
+        assertEquals("放轻、放慢，尾音上扬", turn.tone)
+        assertNull(turn.raw)
+    }
+
+    @Test
+    fun `parseTurnFromText keeps ordinary brackets and has no tone without a marker`() {
+        val turn = ResponseParser.parseTurnFromText("【系统提示】外面在下雨。")
+        assertEquals("【系统提示】外面在下雨。", turn.reply)
+        assertNull(turn.tone)
+    }
+
+    @Test
+    fun `parseTurnFromText takes the last tone marker and tolerates width variants`() {
+        val turn = ResponseParser.parseTurnFromText("正文里提到【语气】这个词\n补充一句\n【 语气 】：温柔")
+        assertEquals("正文里提到【语气】这个词\n补充一句", turn.reply)
+        assertEquals("温柔", turn.tone)
+    }
+
+    @Test
+    fun `parseTurnFromText reads tone out of a legacy JSON reply`() {
+        val json = """{"reply":"好。\n【语气】温柔","quickReplies":["一","二"]}"""
+        val turn = ResponseParser.parseTurnFromText(json)
+        assertEquals("好。", turn.reply)
+        assertEquals("温柔", turn.tone)
+        assertEquals(listOf("一", "二"), turn.quickReplies)
+        assertNotNull(turn.raw)
+    }
+
+    @Test
+    fun `parseTurnFromText only treats a whole JSON object as JSON`() {
+        val prose = "先说结论：{\"reply\":\"好\"} 大概是这样。"
+        val turn = ResponseParser.parseTurnFromText(prose)
+        assertEquals(prose, turn.reply)
+        assertNull(turn.raw)
+
+        val withTone = "{\"reply\":\"好\"}\n【语气】温柔"
+        assertEquals("{\"reply\":\"好\"}", ResponseParser.parseTurnFromText(withTone).reply)
+        assertEquals("温柔", ResponseParser.parseTurnFromText(withTone).tone)
     }
 }

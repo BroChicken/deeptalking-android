@@ -7,15 +7,14 @@ import com.deeptalking.core.model.MemoryCategory
 import com.deeptalking.core.model.MemorySubject
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.ShortTermMemory
-import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.core.model.Sticker
 import com.deeptalking.domain.agent.AgentContext
 import com.deeptalking.domain.agent.ToolRegistry
 import com.deeptalking.engine.ondevice.ToolCall
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.time.Instant
@@ -51,24 +50,48 @@ class MemoryToolsTest {
     private fun userTurn(id: String, content: String) =
         ChatMessage(id = id, role = Role.User, content = content)
 
+    private suspend fun write(args: String) = MemoryWriteTool(memory).execute(call("memory_write", args), context(Character(id = "c1")))
+
+    // ---- memory_write: delete ---------------------------------------------------------
+
     @Test
-    fun `delete_memory reports not found instead of ok`() = runBlocking {
+    fun `memory_write delete reports not found instead of ok`() = runBlocking {
         val character = Character(id = "c1", longTerm = listOf(mem("m1")))
-        val result = DeleteMemoryTool(memory).execute(call("delete_memory", """{"id":"nope"}"""), context(character))
+        val result = MemoryWriteTool(memory).execute(call("memory_write", """{"op":"delete","id":"nope"}"""), context(character))
         assertTrue(result.contentJson.contains("\"ok\":false"))
         assertTrue(result.contentJson.contains("未找到该记忆ID"))
     }
 
     @Test
-    fun `delete_memory removes the target and returns the updated character`() = runBlocking {
+    fun `memory_write delete removes the target and returns the updated character`() = runBlocking {
         val character = Character(id = "c1", longTerm = listOf(mem("m1")))
-        val result = DeleteMemoryTool(memory).execute(call("delete_memory", """{"id":"m1"}"""), context(character))
+        val result = MemoryWriteTool(memory).execute(call("memory_write", """{"op":"delete","id":"m1"}"""), context(character))
         assertTrue(result.contentJson.contains("\"ok\":true"))
         assertEquals(0, result.updatedCharacter!!.longTerm.size)
     }
 
     @Test
-    fun `update_memory resolves timeRef against eventTime and preserves dueAt for non-promises`() = runBlocking {
+    fun `memory_write delete removes a short term entry`() = runBlocking {
+        val character = Character(
+            id = "c1",
+            shortTerm = listOf(ShortTermMemory(id = "s1", content = "用户被记错的偏好")),
+        )
+        val result = MemoryWriteTool(memory).execute(call("memory_write", """{"op":"delete","id":"s1"}"""), context(character))
+        assertTrue(result.contentJson.contains("\"store\":\"shortTerm\""))
+        assertEquals(0, result.updatedCharacter!!.shortTerm.size)
+    }
+
+    @Test
+    fun `memory_write rejects an unknown op`() = runBlocking {
+        val result = write("""{"op":"upsert","id":"m1"}""")
+        assertTrue(result.contentJson.contains("\"ok\":false"))
+        assertTrue(result.contentJson.contains("op 只能是 update 或 delete"))
+    }
+
+    // ---- memory_write: update ---------------------------------------------------------
+
+    @Test
+    fun `memory_write update resolves timeRef against eventTime and preserves dueAt for non-promises`() = runBlocking {
         val target = mem("m1", key = "名字", value = "用户叫小明")
         val character = Character(
             id = "c1",
@@ -76,10 +99,10 @@ class MemoryToolsTest {
             longTerm = listOf(target),
         )
         val args = """
-            {"id":"m1","value":"明天见","timeRef":{"explicit":"2026-08-10T09:00:00"},
+            {"op":"update","id":"m1","value":"明天见","timeRef":{"explicit":"2026-08-10T09:00:00"},
              "sourceMessageIds":["m1"],"evidence":"我叫阿哲"}
         """.trimIndent()
-        val result = UpdateMemoryTool(memory).execute(call("update_memory", args), context(character))
+        val result = MemoryWriteTool(memory).execute(call("memory_write", args), context(character))
         assertTrue(result.contentJson.contains("\"ok\":true"))
         val updated = result.updatedCharacter!!.longTerm.first { it.id == "m1" }
         assertEquals("2026-08-11见", updated.value)
@@ -88,34 +111,34 @@ class MemoryToolsTest {
     }
 
     @Test
-    fun `update_memory records the previous value text as the correction before`() = runBlocking {
+    fun `memory_write records the previous value text as the correction before`() = runBlocking {
         val character = Character(
             id = "c1",
             instant = listOf(userTurn("m1", "我叫阿哲")),
             longTerm = listOf(mem("m1", key = "名字", value = "用户叫小明")),
         )
-        val args = """{"id":"m1","value":"用户叫阿哲","sourceMessageIds":["m1"],"evidence":"我叫阿哲"}"""
-        val result = UpdateMemoryTool(memory).execute(call("update_memory", args), context(character))
+        val args = """{"op":"update","id":"m1","value":"用户叫阿哲","sourceMessageIds":["m1"],"evidence":"我叫阿哲"}"""
+        val result = MemoryWriteTool(memory).execute(call("memory_write", args), context(character))
 
         assertTrue(result.contentJson.contains("\"ok\":true"))
         val correction = result.updatedCharacter!!.longTerm.first { it.id == "m1" }.corrections.single()
         // `before` is the old *text*, not a JSON blob.
         assertEquals("用户叫小明", correction.before)
         assertEquals("我叫阿哲", correction.evidence)
-        assertTrue("不能再写整条 JSON blob", !correction.before!!.contains("{"))
+        assertFalse("不能再写整条 JSON blob", correction.before!!.contains("{"))
     }
 
     @Test
-    fun `update_memory keeps only the last three corrections`() = runBlocking {
+    fun `memory_write keeps only the last three corrections`() = runBlocking {
         var current = Character(
             id = "c1",
             instant = listOf(userTurn("m1", "我叫阿哲")),
             longTerm = listOf(mem("m1", key = "名字", value = "用户叫小明")),
         )
-        val tool = UpdateMemoryTool(memory)
-        val args = """{"id":"m1","value":"用户叫阿哲","sourceMessageIds":["m1"],"evidence":"我叫阿哲"}"""
+        val tool = MemoryWriteTool(memory)
+        val args = """{"op":"update","id":"m1","value":"用户叫阿哲","sourceMessageIds":["m1"],"evidence":"我叫阿哲"}"""
         repeat(4) {
-            current = tool.execute(call("update_memory", args), context(current)).updatedCharacter!!
+            current = tool.execute(call("memory_write", args), context(current)).updatedCharacter!!
             assertTrue(current.longTerm.first { it.id == "m1" }.corrections.size <= 3)
         }
         val corrections = current.longTerm.first { it.id == "m1" }.corrections
@@ -126,19 +149,32 @@ class MemoryToolsTest {
     }
 
     @Test
-    fun `update_memory rejects evidence that is not verbatim in the user message`() = runBlocking {
+    fun `memory_write requires evidence and source ids for update`() = runBlocking {
+        val character = Character(id = "c1", longTerm = listOf(mem("m1")))
+        val noEvidence = write("""{"op":"update","id":"m1","value":"新内容"}""")
+        assertTrue(noEvidence.contentJson.contains("\"ok\":false"))
+        assertTrue(noEvidence.contentJson.contains("sourceMessageIds"))
+
+        val result = MemoryWriteTool(memory)
+            .execute(call("memory_write", """{"op":"update","id":"m1","value":"新内容","evidence":"我说的"}"""), context(character))
+        assertTrue(result.contentJson.contains("\"ok\":false"))
+        assertTrue(result.contentJson.contains("sourceMessageIds"))
+    }
+
+    @Test
+    fun `memory_write rejects evidence that is not verbatim in the user message`() = runBlocking {
         val character = Character(
             id = "c1",
             instant = listOf(userTurn("m1", "我叫阿哲")),
             longTerm = listOf(mem("m1")),
         )
-        val args = """{"id":"m1","value":"明天见","sourceMessageIds":["m1"],"evidence":"我叫小明"}"""
-        val result = UpdateMemoryTool(memory).execute(call("update_memory", args), context(character))
+        val args = """{"op":"update","id":"m1","value":"明天见","sourceMessageIds":["m1"],"evidence":"我叫小明"}"""
+        val result = MemoryWriteTool(memory).execute(call("memory_write", args), context(character))
         assertTrue(result.contentJson.contains("\"ok\":false"))
     }
 
     @Test
-    fun `update_memory corrects a short term entry and requeues it`() = runBlocking {
+    fun `memory_write corrects a short term entry by membership and requeues it`() = runBlocking {
         val character = Character(
             id = "c1",
             instant = listOf(userTurn("u1", "不是那样，是你记错了")),
@@ -157,8 +193,8 @@ class MemoryToolsTest {
                 ),
             ),
         )
-        val args = """{"id":"s1","value":"用户2026-08-01上午把水洒在角色身上","sourceMessageIds":["u1"],"evidence":"是你记错了"}"""
-        val result = UpdateMemoryTool(memory).execute(call("update_memory", args), context(character))
+        val args = """{"op":"update","id":"s1","value":"用户2026-08-01上午把水洒在角色身上","sourceMessageIds":["u1"],"evidence":"是你记错了"}"""
+        val result = MemoryWriteTool(memory).execute(call("memory_write", args), context(character))
 
         assertTrue(result.contentJson.contains("\"ok\":true"))
         assertTrue(result.contentJson.contains("shortTerm"))
@@ -171,29 +207,44 @@ class MemoryToolsTest {
         assertEquals("s1", corrected.id)
         assertTrue(corrected.content.contains("水"))
         assertTrue("a correction invalidates both consumers", corrected.revision > 1)
+        // The new sources are folded into the roles/evidence triple, otherwise the next
+        // evidence check could no longer resolve them.
+        assertEquals(listOf("u1"), corrected.sourceMessageIds)
+        assertEquals(listOf("user"), corrected.sourceRoles)
+        assertEquals("是你记错了", corrected.userEvidence.single().text)
     }
 
     @Test
-    fun `update_memory still requires the user's verbatim evidence for short term`() = runBlocking {
+    fun `memory_write short term rejects fields it cannot change`() = runBlocking {
         val character = Character(
             id = "c1",
             instant = listOf(userTurn("u1", "不是那样，是你记错了")),
             shortTerm = listOf(ShortTermMemory(id = "s1", content = "用户洒了咖啡")),
         )
-        val args = """{"id":"s1","value":"用户洒了水","sourceMessageIds":["u1"],"evidence":"我从没说过这句"}"""
-        val result = UpdateMemoryTool(memory).execute(call("update_memory", args), context(character))
+        val args = """{"op":"update","id":"s1","key":"新标识","sourceMessageIds":["u1"],"evidence":"是你记错了"}"""
+        val result = MemoryWriteTool(memory).execute(call("memory_write", args), context(character))
         assertTrue(result.contentJson.contains("\"ok\":false"))
+        assertTrue(result.contentJson.contains("只支持修改 value 与 eventTime"))
     }
 
     @Test
-    fun `delete_memory removes a short term entry`() = runBlocking {
+    fun `memory_write still requires the user's verbatim evidence for short term`() = runBlocking {
         val character = Character(
             id = "c1",
-            shortTerm = listOf(ShortTermMemory(id = "s1", content = "用户被记错的偏好")),
+            instant = listOf(userTurn("u1", "不是那样，是你记错了")),
+            shortTerm = listOf(ShortTermMemory(id = "s1", content = "用户洒了咖啡")),
         )
-        val result = DeleteMemoryTool(memory).execute(call("delete_memory", """{"id":"s1"}"""), context(character))
-        assertTrue(result.contentJson.contains("\"store\":\"shortTerm\""))
-        assertEquals(0, result.updatedCharacter!!.shortTerm.size)
+        val args = """{"op":"update","id":"s1","value":"用户洒了水","sourceMessageIds":["u1"],"evidence":"我从没说过这句"}"""
+        val result = MemoryWriteTool(memory).execute(call("memory_write", args), context(character))
+        assertTrue(result.contentJson.contains("\"ok\":false"))
+    }
+
+    // ---- search_memory -----------------------------------------------------------------
+
+    @Test
+    fun `search_memory requires one selector`() = runBlocking {
+        val result = SearchMemoryTool(memory).execute(call("search_memory", "{}"), context(Character(id = "c1")))
+        assertEquals("""{"ok":false,"reason":"请至少给出 query、date、timeRef 或 category 之一"}""", result.contentJson)
     }
 
     @Test
@@ -214,120 +265,33 @@ class MemoryToolsTest {
     }
 
     @Test
-    fun `update_character_field rejects static fields on groups`() = runBlocking {
-        val group = Character(id = "g1", isGroup = true)
-        val args = """{"field":"gender","value":"女","sourceMessageIds":["m1"],"evidence":"改成女"}"""
-        val result = UpdateCharacterFieldTool().execute(call("update_character_field", args), context(group))
-        assertTrue(result.contentJson.contains("\"ok\":false"))
-        assertTrue(result.contentJson.contains("群组只有公用字段可改"))
-    }
-
-    @Test
-    fun `update_character_field cleans meta prefixes and parentheticals`() = runBlocking {
+    fun `search_memory inventory returns ids keys and times only`() = runBlocking {
         val character = Character(
             id = "c1",
-            instant = listOf(userTurn("m1", "你性格改成更冷静些")),
-        )
-        val args = """
-            {"field":"personality","value":"性格：冷静（用户要求）",
-             "sourceMessageIds":["m1"],"evidence":"你性格改成更冷静些"}
-        """.trimIndent()
-        val result = UpdateCharacterFieldTool().execute(call("update_character_field", args), context(character))
-        assertTrue(result.contentJson.contains("\"ok\":true"))
-        assertEquals("冷静", result.updatedCharacter!!.staticProfile.personality)
-    }
-
-    @Test
-    fun `update_character_field keeps the plain reason for a non-manual field`() = runBlocking {
-        val character = Character(
-            id = "c1",
-            instant = listOf(userTurn("m1", "今天我心情很好")),
-            staticProfile = StaticProfile(personality = "冷静"),
-        )
-        val args = """{"field":"personality","value":"更外向","sourceMessageIds":["m1"],"evidence":"今天我心情很好"}"""
-        val result = UpdateCharacterFieldTool().execute(call("update_character_field", args), context(character))
-        assertTrue(result.contentJson.contains("\"ok\":false"))
-        assertTrue(result.contentJson.contains("用户并未明确要求修改"))
-    }
-
-    @Test
-    fun `search_memory bumps usage and honours the relevance filter`() = runBlocking {
-        val character = Character(
-            id = "c1",
-            longTerm = listOf(mem("m1", key = "喜好", value = "用户喜欢喝咖啡")),
-        )
-        val tool = SearchMemoryTool(memory)
-        val result = tool.execute(call("search_memory", """{"query":"咖啡"}"""), context(character))
-        assertTrue(result.contentJson.contains("\"ok\":true"))
-        assertTrue(result.contentJson.contains("\"total\":1"))
-        assertTrue(result.contentJson.contains("\"eventTime\""))
-        val updated = result.updatedCharacter!!.longTerm.first()
-        assertEquals(1, updated.usageCount)
-        assertNotNull(updated.lastUsageAt)
-    }
-
-    @Test
-    fun `upsert_lorebook_entry validates real sources and writes the entry`() = runBlocking {
-        val character = Character(
-            id = "c1",
-            shortTerm = listOf(ShortTermMemory(id = "s1", content = "潮汐镇终年多雾，是海边小城")),
-        )
-        val args = """
-            {"name":"潮汐镇","content":"潮汐镇终年多雾。","keywords":["潮汐镇"],
-             "sourceMessageIds":["s1"],"evidence":"潮汐镇终年多雾"}
-        """.trimIndent()
-        val result = UpsertLorebookEntryTool().execute(call("upsert_lorebook_entry", args), context(character))
-        assertTrue(result.contentJson.contains("\"ok\":true"))
-        assertEquals(1, result.updatedCharacter!!.lorebook.size)
-
-        val badArgs = """
-            {"name":"潮汐镇","content":"潮汐镇终年多雾。","keywords":["潮汐镇"],
-             "sourceMessageIds":["missing"],"evidence":"潮汐镇终年多雾"}
-        """.trimIndent()
-        val rejected = UpsertLorebookEntryTool().execute(call("upsert_lorebook_entry", badArgs), context(character))
-        assertTrue(rejected.contentJson.contains("\"ok\":false"))
-    }
-
-    @Test
-    fun `upsert_lorebook_entry rejects over-long content and falls back to the name as keyword`() = runBlocking {
-        val character = Character(
-            id = "c1",
-            shortTerm = listOf(ShortTermMemory(id = "s1", content = "潮汐镇终年多雾，是海边小城")),
-        )
-        // 450 characters: the tool asks the model to shorten instead of storing a cut entry.
-        val longArgs = """
-            {"name":"潮汐镇","content":"${"多雾。".repeat(150)}",
-             "sourceMessageIds":["s1"],"evidence":"潮汐镇终年多雾"}
-        """.trimIndent()
-        val rejected = UpsertLorebookEntryTool().execute(call("upsert_lorebook_entry", longArgs), context(character))
-        assertTrue(rejected.contentJson.contains("\"ok\":false"))
-
-        val noKeywords = """
-            {"name":"潮汐镇","content":"潮汐镇终年多雾。",
-             "sourceMessageIds":["s1"],"evidence":"潮汐镇终年多雾"}
-        """.trimIndent()
-        val created = UpsertLorebookEntryTool().execute(call("upsert_lorebook_entry", noKeywords), context(character))
-        assertTrue(created.contentJson.contains("\"ok\":true"))
-        assertEquals(listOf("潮汐镇"), created.updatedCharacter!!.lorebook.first().keywords)
-    }
-
-    @Test
-    fun `send_sticker schema exposes the character tag enum through the registry`() {
-        val character = Character(
-            id = "c1",
-            stickers = listOf(
-                Sticker(id = "s1", tag = "开心", fileRef = "f1"),
-                Sticker(id = "s2", tag = "难过", fileRef = "f2"),
-                Sticker(id = "s3", tag = "开心", fileRef = "f3"),
+            longTerm = listOf(
+                mem("m1", category = MemoryCategory.Promises, key = "生日约定", value = "用户答应生日回来"),
+                mem("m2", category = MemoryCategory.UserProfile, key = "口味", value = "用户喜欢咖啡"),
             ),
         )
-        val registry = ToolRegistry(listOf(SendStickerTool()))
-        val definition = registry.definitions(context(character)).single { it.name == "send_sticker" }
-        assertTrue(definition.parametersJson.contains("\"开心\""))
-        assertTrue(definition.parametersJson.contains("\"难过\""))
-        // Duplicate tags are collapsed to a single enum value.
-        assertTrue(Regex("\"开心\"").findAll(definition.parametersJson).count() == 1)
-        assertTrue(definition.description.contains("开心"))
+        val result = SearchMemoryTool(memory).execute(
+            call("search_memory", """{"category":"promises","limit":10}"""),
+            context(character),
+        )
+        val json = result.contentJson
+        assertTrue(json.contains("\"mode\":\"inventory\""))
+        assertTrue(json.contains("\"promises\""))
+        assertTrue(json.contains("\"m1\""))
+        assertTrue(json.contains("\"生日约定\""))
+        assertFalse("盘点模式不含详情", json.contains("\"value\""))
+        assertFalse("其他分类不得混入", json.contains("\"m2\""))
+    }
+
+    @Test
+    fun `search_memory inventory rejects an unknown category`() = runBlocking {
+        val result = SearchMemoryTool(memory)
+            .execute(call("search_memory", """{"category":"todo"}"""), context(Character(id = "c1")))
+        assertTrue(result.contentJson.contains("\"ok\":false"))
+        assertTrue(result.contentJson.contains("category 只能是"))
     }
 
     @Test
@@ -359,5 +323,101 @@ class MemoryToolsTest {
         // Another day must not leak into the result.
         assertTrue(!json.contains("十号之后就没提过了"))
         assertTrue(!json.contains("聊了别的"))
+    }
+
+    @Test
+    fun `search_memory bumps usage and honours the relevance filter`() = runBlocking {
+        val character = Character(
+            id = "c1",
+            longTerm = listOf(mem("m1", key = "喜好", value = "用户喜欢喝咖啡")),
+        )
+        val tool = SearchMemoryTool(memory)
+        val result = tool.execute(call("search_memory", """{"query":"咖啡"}"""), context(character))
+        assertTrue(result.contentJson.contains("\"ok\":true"))
+        assertTrue(result.contentJson.contains("\"total\":1"))
+        assertTrue(result.contentJson.contains("\"eventTime\""))
+        val updated = result.updatedCharacter!!.longTerm.first()
+        assertEquals(1, updated.usageCount)
+        assertNotNull(updated.lastUsageAt)
+    }
+
+    // ---- upsert_lorebook_entry ---------------------------------------------------------
+
+    @Test
+    fun `upsert_lorebook_entry validates real sources and writes the entry`() = runBlocking {
+        val character = Character(
+            id = "c1",
+            shortTerm = listOf(ShortTermMemory(id = "s1", content = "潮汐镇终年多雾，是海边小城")),
+        )
+        val args = """
+            {"name":"潮汐镇","content":"潮汐镇终年多雾。","keywords":["潮汐镇"],
+             "sourceMessageIds":["s1"],"evidence":"潮汐镇终年多雾"}
+        """.trimIndent()
+        val result = UpsertLorebookEntryTool().execute(call("upsert_lorebook_entry", args), context(character))
+        assertTrue(result.contentJson.contains("\"ok\":true"))
+        assertEquals(1, result.updatedCharacter!!.lorebook.size)
+
+        val badArgs = """
+            {"name":"潮汐镇","content":"潮汐镇终年多雾。","keywords":["潮汐镇"],
+             "sourceMessageIds":["missing"],"evidence":"潮汐镇终年多雾"}
+        """.trimIndent()
+        val rejected = UpsertLorebookEntryTool().execute(call("upsert_lorebook_entry", badArgs), context(character))
+        assertTrue(rejected.contentJson.contains("\"ok\":false"))
+    }
+
+    @Test
+    fun `upsert_lorebook_entry requires an id or a name client side`() = runBlocking {
+        val character = Character(
+            id = "c1",
+            shortTerm = listOf(ShortTermMemory(id = "s1", content = "潮汐镇终年多雾，是海边小城")),
+        )
+        val args = """{"content":"潮汐镇终年多雾。","sourceMessageIds":["s1"],"evidence":"潮汐镇终年多雾"}"""
+        val result = UpsertLorebookEntryTool().execute(call("upsert_lorebook_entry", args), context(character))
+        assertTrue(result.contentJson.contains("\"ok\":false"))
+        assertTrue(result.contentJson.contains("entryId 与 name 至少给一个"))
+    }
+
+    @Test
+    fun `upsert_lorebook_entry rejects over-long content and falls back to the name as keyword`() = runBlocking {
+        val character = Character(
+            id = "c1",
+            shortTerm = listOf(ShortTermMemory(id = "s1", content = "潮汐镇终年多雾，是海边小城")),
+        )
+        // 450 characters: the tool asks the model to shorten instead of storing a cut entry.
+        val longArgs = """
+            {"name":"潮汐镇","content":"${"多雾。".repeat(150)}",
+             "sourceMessageIds":["s1"],"evidence":"潮汐镇终年多雾"}
+        """.trimIndent()
+        val rejected = UpsertLorebookEntryTool().execute(call("upsert_lorebook_entry", longArgs), context(character))
+        assertTrue(rejected.contentJson.contains("\"ok\":false"))
+
+        val noKeywords = """
+            {"name":"潮汐镇","content":"潮汐镇终年多雾。",
+             "sourceMessageIds":["s1"],"evidence":"潮汐镇终年多雾"}
+        """.trimIndent()
+        val created = UpsertLorebookEntryTool().execute(call("upsert_lorebook_entry", noKeywords), context(character))
+        assertTrue(created.contentJson.contains("\"ok\":true"))
+        assertEquals(listOf("潮汐镇"), created.updatedCharacter!!.lorebook.first().keywords)
+    }
+
+    // ---- send_sticker ------------------------------------------------------------------
+
+    @Test
+    fun `send_sticker schema exposes the character tag enum through the registry`() {
+        val character = Character(
+            id = "c1",
+            stickers = listOf(
+                Sticker(id = "s1", tag = "开心", fileRef = "f1"),
+                Sticker(id = "s2", tag = "难过", fileRef = "f2"),
+                Sticker(id = "s3", tag = "开心", fileRef = "f3"),
+            ),
+        )
+        val registry = ToolRegistry(listOf(SendStickerTool()))
+        val definition = registry.definitions(context(character)).single { it.name == "send_sticker" }
+        assertTrue(definition.parametersJson.contains("\"开心\""))
+        assertTrue(definition.parametersJson.contains("\"难过\""))
+        // Duplicate tags are collapsed to a single enum value.
+        assertTrue(Regex("\"开心\"").findAll(definition.parametersJson).count() == 1)
+        assertTrue(definition.description.contains("开心"))
     }
 }

@@ -32,8 +32,8 @@ internal object StreamText {
             .replace(ESCAPED_NEWLINE, "\n")
             .replace("\u0000", "\\n")
 
-    /** Strips any `MEM_UPDATE` tail and unescapes literal newlines (legacy `getDisplayText`). */
-    fun getDisplayText(text: String): String {
+    /** Strips any `MEM_UPDATE` tail and unescapes literal newlines, keeping the tone line. */
+    internal fun stripHiddenText(text: String): String {
         var result = text
         val full = MEM_UPDATE_FULL.find(result)
         if (full != null) {
@@ -44,6 +44,12 @@ internal object StreamText {
         }
         return unescapeLiteralNewlines(result)
     }
+
+    /**
+     * Strips any `MEM_UPDATE` tail, unescapes literal newlines, and drops the trailing
+     * `【语气】` read-aloud directive (legacy `getDisplayText`).
+     */
+    fun getDisplayText(text: String): String = ToneText.split(stripHiddenText(text)).body
 
     /** Best-effort extraction of the `reply` string from a (possibly partial) JSON document. */
     fun extractReplyFromJson(raw: String?): String? {
@@ -106,14 +112,15 @@ internal object StreamText {
     /**
      * Computes what the streaming bubble should show. Returns null when nothing
      * safe to display is available yet (e.g. raw JSON with no extractable reply).
+     * A partially streamed `【语气】` marker is held back so the tone never shows up.
      */
     fun displayFor(fullText: String, salvaged: String?): String? {
         (salvaged ?: extractReplyFromJson(fullText))?.let { reply ->
-            return getDisplayText(reply).takeIf { it.isNotBlank() }
+            return ToneText.display(getDisplayText(reply)).takeIf { it.isNotBlank() }
         }
         val trimmed = fullText.trimStart()
         if (trimmed.isNotEmpty() && !trimmed.startsWith("{")) {
-            return getDisplayText(fullText).takeIf { it.isNotBlank() }
+            return ToneText.display(getDisplayText(fullText)).takeIf { it.isNotBlank() }
         }
         return null
     }

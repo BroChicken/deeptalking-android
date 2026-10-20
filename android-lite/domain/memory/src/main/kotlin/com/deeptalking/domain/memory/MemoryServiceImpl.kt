@@ -59,7 +59,7 @@ class MemoryServiceImpl : MemoryService {
         val seen = mutableSetOf<String>()
         fun push(list: List<LorebookEntry>) {
             list.forEach { entry ->
-                if (!entry.enabled || entry.content.isBlank()) return@forEach
+                if (!entry.enabled) return@forEach
                 val key = entry.id.ifBlank { "${entry.name}|${entry.content}" }
                 if (seen.add(key)) entries += entry
             }

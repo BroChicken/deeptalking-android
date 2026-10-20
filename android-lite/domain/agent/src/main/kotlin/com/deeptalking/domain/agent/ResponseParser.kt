@@ -60,6 +60,8 @@ data class ParsedTurn(
     val todoUpdates: List<TodoUpdate> = emptyList(),
     val recall: RecallRequest? = null,
     val raw: JsonObject? = null,
+    /** Trailing `【语气】<朗读指导>` read-aloud direction, when the model provided one. */
+    val tone: String? = null,
 )
 
 /**
@@ -82,40 +84,48 @@ object ResponseParser {
 
     private val trailingCommaRegex = Regex(TRAILING_COMMA)
 
-    private val MEM_UPDATE_REGEX = Regex(
-        "<\\s*MEM_UPDATE\\s*>([\\s\\S]*?)</\\s*MEM_UPDATE\\s*>",
-        RegexOption.IGNORE_CASE,
-    )
-
     private val JSON_SHAPES = listOf('{' to '}', '[' to ']')
 
     // ---------------------------------------------------------------- entry points
 
-    fun parseSubmitResponse(arguments: String?): ParsedTurn? {
-        val root = parseJsonLenient(arguments.orEmpty()) as? JsonObject ?: return null
-        if (root.string("reply").orEmpty().isBlank()) return null
-        return buildTurn(root)
+    /**
+     * Parse a whole assistant text under the v2 plain-text protocol: the reply body plus an
+     * optional trailing `【语气】` line.
+     *
+     * The legacy JSON payload is only honoured when the *entire* (fence-stripped) text is a
+     * single JSON object — [parseJsonLenient] otherwise slices `{...}` out of prose.
+     */
+    fun parseTurnFromText(text: String): ParsedTurn {
+        val visible = StreamText.stripHiddenText(text)
+        if (looksLikeWholeJsonObject(visible)) {
+            val root = parseJsonLenient(visible) as? JsonObject
+            if (root != null && !root.string("reply").orEmpty().isBlank()) {
+                val turn = buildTurn(root)
+                val split = ToneText.split(turn.reply)
+                return turn.copy(
+                    reply = split.body,
+                    tone = split.tone ?: ToneText.split(visible).tone,
+                )
+            }
+        }
+        val split = ToneText.split(visible)
+        return ParsedTurn(reply = split.body, tone = split.tone)
     }
 
-    /** Parse a whole assistant text that may be a JSON object or plain prose. */
-    fun parseTurnFromText(text: String): ParsedTurn {
-        val root = parseJsonLenient(text) as? JsonObject
-        if (root != null && !root.string("reply").orEmpty().isBlank()) {
-            return buildTurn(root)
+    /** True when the whole text (outside an optional ``` fence) is one JSON object. */
+    private fun looksLikeWholeJsonObject(text: String): Boolean {
+        var body = text.trim()
+        if (body.startsWith("```")) {
+            body = body.removePrefix("```json").removePrefix("```").trim()
+            if (body.endsWith("```")) body = body.removeSuffix("```").trim()
         }
-        return ParsedTurn(reply = StreamText.getDisplayText(text))
+        return body.length >= 2 && body.startsWith("{") && body.endsWith("}")
     }
 
     /**
-     * Legacy `parseMemoryFromText`: extracts a `<MEM_UPDATE>...</MEM_UPDATE>` block
-     * from a prose reply and parses it as a memory-update turn (no reply).
-     * Returns null when the tag is absent or the payload is unparseable.
+     * Legacy `parseMemoryFromText` was removed with the structured protocol: `<MEM_UPDATE>`
+     * blocks are still stripped for display in [StreamText], but never applied again.
      */
-    fun parseMemoryFromText(text: String): ParsedTurn? {
-        val match = MEM_UPDATE_REGEX.find(text) ?: return null
-        val root = parseJsonLenient(match.groupValues[1]) as? JsonObject ?: return null
-        return buildTurn(root)
-    }
 
     fun buildTurn(root: JsonObject): ParsedTurn {
         val reply = unescapeLiteralNewlines(root.string("reply").orEmpty())

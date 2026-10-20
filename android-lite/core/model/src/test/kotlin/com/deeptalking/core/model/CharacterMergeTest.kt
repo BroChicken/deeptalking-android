@@ -20,6 +20,48 @@ class CharacterMergeTest {
     )
 
     @Test
+    fun dynamicStateFieldsFromTwoWritersBothSurvive() {
+        val before = Character(id = "c1")
+        // The worker changed the mood.
+        val after = before.copy(dynamicState = DynamicState(currentMood = "有点累"))
+        // While it ran, the user edited the situation.
+        val live = before.copy(dynamicState = DynamicState(currentSituation = "在美术馆"))
+
+        val merged = mergeCharacterChanges(before, after, live)
+
+        assertEquals("在美术馆", merged.dynamicState.currentSituation)
+        assertEquals("有点累", merged.dynamicState.currentMood)
+    }
+
+    @Test
+    fun perFieldTimestampsAreMergedByKey() {
+        val before = Character(id = "c1")
+        val after = before.copy(
+            dynamicStateMeta = mapOf("currentMood" to DynamicStateMeta("2026-10-20T12:00:00Z")),
+        )
+        val live = before.copy(
+            dynamicStateMeta = mapOf("currentSituation" to DynamicStateMeta("2026-10-20T11:00:00Z")),
+        )
+
+        val merged = mergeCharacterChanges(before, after, live)
+
+        assertNotNull(merged.dynamicStateMeta["currentMood"])
+        assertNotNull(merged.dynamicStateMeta["currentSituation"])
+    }
+
+    @Test
+    fun staticProfileFieldsFromTwoWritersBothSurvive() {
+        val before = Character(id = "c1")
+        val after = before.copy(staticProfile = StaticProfile(personality = "冷静"))
+        val live = before.copy(staticProfile = StaticProfile(userAddress = "明明"))
+
+        val merged = mergeCharacterChanges(before, after, live)
+
+        assertEquals("冷静", merged.staticProfile.personality)
+        assertEquals("明明", merged.staticProfile.userAddress)
+    }
+
+    @Test
     fun onlyTheFieldsAWriterChangedAreWritten() {
         val before = Character(id = "c1", name = "原名", lorebook = listOf(entry("l1", "旧内容")))
         val after = before.copy(lorebook = listOf(entry("l1", "新内容")))

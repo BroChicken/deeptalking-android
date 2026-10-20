@@ -67,7 +67,6 @@ class AgentLoopUsageTest {
             instructions = "sys",
             baseInput = emptyList(),
             autoTools = listOf(ProbeTool().definition),
-            submitTool = ToolDefinition(name = "submit_response", description = "", parametersJson = "{}"),
             builder = RequestBuilder(AppConfig(stream = true)),
             model = "m",
         )

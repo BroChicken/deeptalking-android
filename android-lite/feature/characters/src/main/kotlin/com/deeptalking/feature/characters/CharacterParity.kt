@@ -53,13 +53,6 @@ object CharacterParity {
         "lorebook 每条 content 精炼、一条只讲一件事，**目标 300 字以内**（硬上限 " +
             "${AppLimits.Lorebook.CONTENT_CHARS} 字，超过会被丢掉）。"
 
-    private val DYNAMIC_FIELD_KEYS = setOf(
-        "currentSituation", "currentLocation", "currentMood", "currentOccupation",
-        "currentGoal", "currentTone",
-    )
-
-    private val GROUP_SHARED_DYNAMIC_FIELDS = setOf("currentSituation", "currentLocation")
-
     data class GeneratedDraft(
         val isGroup: Boolean,
         val name: String,
@@ -266,23 +259,19 @@ object CharacterParity {
     ): Character {
         if (memberIndex != null && memberIndex in character.members.indices) {
             val source = character.members[memberIndex]
-            // Manually edited dynamic fields drop their AI bookkeeping so the
-            // model re-evaluates them (legacy `delete dynamicStateMeta[key]`).
-            val updated = normalizeMember(source, base, zone).copy(
-                dynamicStateMeta = source.dynamicStateMeta - DYNAMIC_FIELD_KEYS,
-            )
+            // `dynamicStateMeta` is preserved: the editor reports which keys it actually
+            // changed and stamps only those (see `AppViewModel.saveCharacterEdit`).
+            val updated = normalizeMember(source, base, zone)
             return character.copy(members = character.members.toMutableList().also { it[memberIndex] = updated })
         }
         if (character.isGroup) {
             return character.copy(
                 groupSharedDynamic = normalizeDynamicState(character.groupSharedDynamic, base, zone),
-                dynamicStateMeta = character.dynamicStateMeta - GROUP_SHARED_DYNAMIC_FIELDS,
             )
         }
         return character.copy(
             staticProfile = normalizeStaticProfile(character.staticProfile, base, zone),
             dynamicState = normalizeDynamicState(character.dynamicState, base, zone),
-            dynamicStateMeta = character.dynamicStateMeta - DYNAMIC_FIELD_KEYS,
         )
     }
 
@@ -307,7 +296,8 @@ object CharacterParity {
      * "把用户手写的静态字段当模型输出清洗"：
      * - 静态字段（含 `roleInGroup`）走 [FieldCleaning.cleanUserWrittenField]：**对比句保留原文、
      *   不按 40/120/250 硬截断**，只做去前缀 / 去括号说明等轻度规范化，并逐条回报原因；
-     * - 动态状态仍按原规则清洗并清掉 AI 记账。
+     * - 动态状态仍按原规则清洗；`dynamicStateMeta` 原样保留，由保存方只给真正改动的
+     *   key 补时间戳。
      */
     fun normalizeUserEditedDraft(
         character: Character,
@@ -323,7 +313,6 @@ object CharacterParity {
                 roleInGroup = cleanUserRoleInGroup(source.roleInGroup, notices),
                 staticProfile = cleaned,
                 dynamicState = normalizeDynamicState(source.dynamicState, base, zone),
-                dynamicStateMeta = source.dynamicStateMeta - DYNAMIC_FIELD_KEYS,
             )
             return UserEditedDraft(
                 character.copy(members = character.members.toMutableList().also { it[memberIndex] = updated }),
@@ -334,7 +323,6 @@ object CharacterParity {
             return UserEditedDraft(
                 character.copy(
                     groupSharedDynamic = normalizeDynamicState(character.groupSharedDynamic, base, zone),
-                    dynamicStateMeta = character.dynamicStateMeta - GROUP_SHARED_DYNAMIC_FIELDS,
                 ),
                 emptyList(),
             )
@@ -344,7 +332,6 @@ object CharacterParity {
             character.copy(
                 staticProfile = cleaned,
                 dynamicState = normalizeDynamicState(character.dynamicState, base, zone),
-                dynamicStateMeta = character.dynamicStateMeta - DYNAMIC_FIELD_KEYS,
             ),
             notices,
         )

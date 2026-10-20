@@ -5,7 +5,6 @@ import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.ShortTermMemory
-import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.domain.memory.MemoryServiceImpl
 import com.deeptalking.engine.ondevice.LlmBackend
 import com.deeptalking.engine.ondevice.LlmChunk
@@ -17,27 +16,26 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * End-to-end orchestrator test with a scripted fake LLM: proves streaming deltas
- * are reported, a submit_response turn is parsed, and memory deltas are folded
- * onto the character.
+ * End-to-end orchestrator tests for the plain-text protocol: the main call returns prose
+ * plus an optional trailing `【语气】` line, and no longer carries structured fields.
  */
 class ChatOrchestratorTest {
 
-    /** Fake LLM that streams a canned submit_response tool call. */
-    private class ScriptedLlm(private val submitArgs: String) : LlmBackend {
+    /** Fake LLM that streams one canned plain-text reply. */
+    private class ScriptedLlm(private val text: String) : LlmBackend {
         override val id = "scripted"
 
         override fun stream(request: LlmRequest): Flow<LlmChunk> = flow {
-            val call = ToolCall(id = "call-1", name = "submit_response", arguments = submitArgs)
-            emit(LlmChunk.ToolCallStart(call))
-            emit(LlmChunk.Completed(LlmResult(toolCalls = listOf(call))))
+            if (text.isNotEmpty()) emit(LlmChunk.TextDelta(text))
+            emit(LlmChunk.Completed(LlmResult(text = text)))
         }
 
-        override suspend fun complete(request: LlmRequest): LlmResult = LlmResult(text = "")
+        override suspend fun complete(request: LlmRequest): LlmResult = LlmResult(text = text)
     }
 
     private class NoTools : AgentTool {
@@ -47,127 +45,80 @@ class ChatOrchestratorTest {
 
     private fun character() = Character(id = "c1", name = "Alice", emoji = "🙂")
 
+    private fun orchestrator(llm: LlmBackend, config: AppConfig = AppConfig()) = ChatOrchestrator(
+        llm = llm,
+        tools = ToolRegistry(listOf(NoTools())),
+        memory = MemoryServiceImpl(),
+        config = config,
+    )
+
     @Test
-    fun `parses submit_response and folds memory onto the character`() = runBlocking {
-        val args = """
-            {"reply":"你好呀，今天过得怎么样？","quickReplies":["还不错","有点累"],
-             "shortTerm":[{"content":"用户2026-10-04告诉角色今天心情不错","sourceMessageIds":["m1"]}],
+    fun `plain prose reply is returned and the tone line is stripped`() = runBlocking {
+        val result = orchestrator(ScriptedLlm("你好呀，今天过得怎么样？\n\n【语气】温柔含笑，语速偏慢"))
+            .run(
+                character = character(),
+                history = listOf(ChatMessage(id = "m1", role = Role.User, content = "在吗")),
+                userText = "在吗",
+            )
+
+        assertEquals("你好呀，今天过得怎么样？", result.reply)
+        assertEquals("温柔含笑，语速偏慢", result.updatedCharacter.dynamicState.currentTone)
+        assertTrue(
+            "the tone timestamp is written with the value",
+            result.updatedCharacter.dynamicStateMeta["currentTone"]?.updatedAt != null,
+        )
+        assertTrue("quick replies come from the worker", result.quickReplies.isEmpty())
+    }
+
+    @Test
+    fun `missing tone keeps the previous tone`() = runBlocking {
+        val before = character().copy(
+            dynamicState = com.deeptalking.core.model.DynamicState(currentTone = "上一轮的语气"),
+        )
+        val result = orchestrator(ScriptedLlm("（笑了笑）今天天气真好。")).run(
+            character = before,
+            history = listOf(ChatMessage(id = "m1", role = Role.User, content = "天气如何")),
+            userText = "天气如何",
+        )
+
+        assertEquals("（笑了笑）今天天气真好。", result.reply)
+        assertEquals("上一轮的语气", result.updatedCharacter.dynamicState.currentTone)
+    }
+
+    @Test
+    fun `main call no longer writes structured memory fields`() = runBlocking {
+        val json = """
+            {"reply":"你好呀","quickReplies":["还不错","有点累"],
              "longTerm":[{"category":"userProfile","subject":"user","key":"用户姓名","value":"用户叫小明",
                           "sourceMessageIds":["m1"],"evidence":"我叫小明"}]}
         """.trimIndent()
-        val orchestrator = ChatOrchestrator(
-            llm = ScriptedLlm(args),
-            tools = ToolRegistry(listOf(NoTools())),
-            memory = MemoryServiceImpl(),
-            config = AppConfig(),
-        )
-
-        val deltas = StringBuilder()
-        val result = orchestrator.run(
-            character = character(),
-            history = listOf(ChatMessage(id = "m1", role = Role.User, content = "我叫小明")),
-            userText = "我叫小明",
-            onDelta = { deltas.append(it) },
-        )
-
-        assertEquals("你好呀，今天过得怎么样？", result.reply)
-        assertEquals(listOf("还不错", "有点累"), result.quickReplies)
-        assertTrue("long-term memory should be folded", result.updatedCharacter.longTerm.any { it.value.contains("小明") })
-        // The main turn no longer writes short-term memory: the window is only appended
-        // to by the whole-window extraction pass (see BackgroundTasks), so a `shortTerm`
-        // field in a turn reply is ignored on purpose.
-        assertTrue("turn shortTerm must be ignored", result.updatedCharacter.shortTerm.isEmpty())
-    }
-
-    @Test
-    fun `currentTone is applied without the evidence gate`() = runBlocking {
-        val args = """
-            {"reply":"（笑了笑）今天天气真好。","quickReplies":["是啊","出去走走"],
-             "dynamicState":{"currentTone":{"value":"温柔含笑，语速偏慢"},
-                             "currentMood":{"value":"愉快","sourceMessageIds":["ghost"],"evidence":"不存在的原话"}}}
-        """.trimIndent()
-        val orchestrator = ChatOrchestrator(
-            llm = ScriptedLlm(args),
-            tools = ToolRegistry(listOf(NoTools())),
-            memory = MemoryServiceImpl(),
-            config = AppConfig(),
-        )
-
-        val result = orchestrator.run(
-            character = character(),
-            history = listOf(ChatMessage(id = "m1", role = Role.User, content = "今天天气如何")),
-            userText = "今天天气如何",
-        )
-
-        assertEquals(
-            "currentTone (delivery instruction) must be accepted without evidence",
-            "温柔含笑，语速偏慢",
-            result.updatedCharacter.dynamicState.currentTone,
-        )
-        assertEquals(
-            "a non-tone field with an unresolvable source must still be rejected",
-            "",
-            result.updatedCharacter.dynamicState.currentMood,
-        )
-    }
-
-    @Test
-    fun `rejects long-term memory without valid subject and evidence`() = runBlocking {
-        val args = """
-            {"reply":"你好呀","quickReplies":["还不错","有点累"],
-             "longTerm":[{"category":"userProfile","key":"用户姓名","value":"用户叫小明",
-                          "sourceMessageIds":["m1"],"evidence":"我叫小明"}]}
-        """.trimIndent()
-        val orchestrator = ChatOrchestrator(
-            llm = ScriptedLlm(args),
-            tools = ToolRegistry(listOf(NoTools())),
-            memory = MemoryServiceImpl(),
-            config = AppConfig(),
-        )
-
-        val result = orchestrator.run(
+        val result = orchestrator(ScriptedLlm(json)).run(
             character = character(),
             history = listOf(ChatMessage(id = "m1", role = Role.User, content = "我叫小明")),
             userText = "我叫小明",
         )
 
-        assertTrue(
-            "a legacy-subject long-term entry must not be folded",
-            result.updatedCharacter.longTerm.isEmpty(),
-        )
+        // Whole-object JSON is still understood as a legacy fallback, but the length of the
+        // main turn no longer writes the short-term window.
+        assertEquals("你好呀", result.reply)
+        assertTrue(result.updatedCharacter.shortTerm.isEmpty())
     }
 
     @Test
     fun `streams deltas through the callback`() = runBlocking {
-        val streamingLlm = object : LlmBackend {
-            override val id = "streaming"
-            override fun stream(request: LlmRequest): Flow<LlmChunk> = flow {
-                emit(LlmChunk.TextDelta("流式回复"))
-                emit(LlmChunk.TextDelta("正文"))
-                emit(LlmChunk.Completed(LlmResult(text = "流式回复正文")))
-            }
-            override suspend fun complete(request: LlmRequest) = LlmResult()
-        }
-        val orchestrator = ChatOrchestrator(
-            llm = streamingLlm,
-            tools = ToolRegistry(listOf(NoTools())),
-            memory = MemoryServiceImpl(),
-            config = AppConfig(),
-        )
         val deltas = StringBuilder()
-        orchestrator.run(character(), emptyList(), "hi", onDelta = { deltas.append(it) })
+        orchestrator(ScriptedLlm("流式回复正文")).run(
+            character(),
+            emptyList(),
+            "hi",
+            onDelta = { deltas.append(it) },
+        )
         assertTrue("onDelta should receive streamed text", deltas.isNotEmpty())
     }
 
     @Test
     fun `mirrors the turn into character instant`() = runBlocking {
-        val args = """{"reply":"记住了","quickReplies":["好","嗯"]}"""
-        val orchestrator = ChatOrchestrator(
-            llm = ScriptedLlm(args),
-            tools = ToolRegistry(listOf(NoTools())),
-            memory = MemoryServiceImpl(),
-            config = AppConfig(),
-        )
+        val orchestrator = orchestrator(ScriptedLlm("记住了"))
         val history = listOf(ChatMessage(id = "m1", role = Role.User, content = "在吗"))
         val result = orchestrator.run(character(), history, "在吗")
         assertTrue(
@@ -181,88 +132,24 @@ class ChatOrchestratorTest {
     }
 
     @Test
-    fun `main-turn short-term memory goes through source validation`() = runBlocking {
-        val args = """
-            {"reply":"好","quickReplies":["一","二"],
-             "shortTerm":[{"content":"用户2026-10-04说喜欢咖啡","sourceMessageIds":["ghost"]}]}
-        """.trimIndent()
-        val orchestrator = ChatOrchestrator(
-            llm = ScriptedLlm(args),
-            tools = ToolRegistry(listOf(NoTools())),
-            memory = MemoryServiceImpl(),
-            config = AppConfig(),
-        )
-        val result = orchestrator.run(
+    fun `legacy MEM_UPDATE block is stripped and never applied`() = runBlocking {
+        val text = "正文\n<MEM_UPDATE>{\"shortTerm\":[{\"content\":\"用户喜欢咖啡\",\"sourceMessageIds\":[\"m1\"]}]," +
+            "\"longTerm\":[{\"category\":\"userProfile\",\"subject\":\"user\",\"key\":\"用户饮品偏好\"," +
+            "\"value\":\"用户喜欢咖啡\",\"sourceMessageIds\":[\"m1\"],\"evidence\":\"我喜欢咖啡\"}]}</MEM_UPDATE>"
+        val result = orchestrator(ScriptedLlm(text)).run(
             character = character(),
             history = listOf(ChatMessage(id = "m1", role = Role.User, content = "我喜欢咖啡")),
             userText = "我喜欢咖啡",
         )
-        assertTrue(
-            "an unresolvable source id must reject the short-term write",
-            result.updatedCharacter.shortTerm.isEmpty(),
-        )
-    }
 
-    @Test
-    fun `main-turn shortTerm is ignored now that the fold pass owns the window`() = runBlocking {
-        val args = """
-            {"reply":"好","quickReplies":["一","二"],
-             "shortTerm":[{"content":"用户要去面试","sourceMessageIds":["m1"],
-                           "timeRef":{"anchor":"day_after_tomorrow","slot":"下午"}}]}
-        """.trimIndent()
-        val orchestrator = ChatOrchestrator(
-            llm = ScriptedLlm(args),
-            tools = ToolRegistry(listOf(NoTools())),
-            memory = MemoryServiceImpl(),
-            config = AppConfig(),
-        )
-        val result = orchestrator.run(
-            character = character(),
-            history = listOf(ChatMessage(id = "m1", role = Role.User, content = "我后天下午面试")),
-            userText = "我后天下午面试",
-        )
-        // Short-term entries are only produced by the whole-window extraction pass, so
-        // writing them from a turn would land them mid-window (and duplicate the fold).
-        assertTrue(result.updatedCharacter.shortTerm.isEmpty())
-    }
-
-    @Test
-    fun `prose turn folds a legacy MEM_UPDATE block's long-term part`() = runBlocking {
-        val llm = object : LlmBackend {
-            override val id = "prose"
-            override fun stream(request: LlmRequest): Flow<LlmChunk> = flow {
-                emit(
-                    LlmChunk.Completed(
-                        LlmResult(
-                            text = "正文\n<MEM_UPDATE>{\"shortTerm\":[{\"content\":\"用户喜欢咖啡\",\"sourceMessageIds\":[\"m1\"]}]," +
-                                "\"longTerm\":[{\"category\":\"userProfile\",\"subject\":\"user\",\"key\":\"用户饮品偏好\"," +
-                                "\"value\":\"用户喜欢咖啡\",\"sourceMessageIds\":[\"m1\"],\"evidence\":\"我喜欢咖啡\"}]}</MEM_UPDATE>",
-                        ),
-                    ),
-                )
-            }
-            override suspend fun complete(request: LlmRequest) = LlmResult()
-        }
-        val orchestrator = ChatOrchestrator(
-            llm = llm,
-            tools = ToolRegistry(listOf(NoTools())),
-            memory = MemoryServiceImpl(),
-            config = AppConfig(),
-        )
-        val result = orchestrator.run(
-            character = character(),
-            history = listOf(ChatMessage(id = "m1", role = Role.User, content = "我喜欢咖啡")),
-            userText = "我喜欢咖啡",
-        )
         assertEquals("正文", result.reply)
-        assertTrue("long-term part of the legacy block should still fold", result.updatedCharacter.longTerm.any { it.value.contains("咖啡") })
-        // The block's shortTerm part is ignored (the fold pass owns the window).
+        assertFalse(result.reply.contains("MEM_UPDATE"))
+        assertTrue("legacy block must not write long-term memory", result.updatedCharacter.longTerm.isEmpty())
         assertTrue(result.updatedCharacter.shortTerm.isEmpty())
     }
 
     @Test
     fun `non-stream config drives complete instead of stream`() = runBlocking {
-        val args = """{"reply":"非流式","quickReplies":["一","二"]}"""
         var completeCalled = false
         val llm = object : LlmBackend {
             override val id = "nonstream"
@@ -271,17 +158,10 @@ class ChatOrchestratorTest {
             }
             override suspend fun complete(request: LlmRequest): LlmResult {
                 completeCalled = true
-                val call = ToolCall(id = "c1", name = "submit_response", arguments = args)
-                return LlmResult(toolCalls = listOf(call))
+                return LlmResult(text = "非流式")
             }
         }
-        val orchestrator = ChatOrchestrator(
-            llm = llm,
-            tools = ToolRegistry(listOf(NoTools())),
-            memory = MemoryServiceImpl(),
-            config = AppConfig(stream = false),
-        )
-        val result = orchestrator.run(character(), emptyList(), "hi")
+        val result = orchestrator(llm, AppConfig(stream = false)).run(character(), emptyList(), "hi")
         assertTrue("complete() should be used for non-stream config", completeCalled)
         assertEquals("非流式", result.reply)
     }
@@ -289,23 +169,17 @@ class ChatOrchestratorTest {
     @Test
     fun `short-term window is injected before the history, volatile last`() = runBlocking {
         val requests = mutableListOf<LlmRequest>()
-        val args = """{"reply":"好","quickReplies":["一","二"]}"""
         val llm = object : LlmBackend {
             override val id = "recording"
             override fun stream(request: LlmRequest): Flow<LlmChunk> = flow {
                 requests += request
-                val call = ToolCall(id = "call-1", name = "submit_response", arguments = args)
-                emit(LlmChunk.ToolCallStart(call))
-                emit(LlmChunk.Completed(LlmResult(toolCalls = listOf(call))))
+                emit(LlmChunk.Completed(LlmResult(text = "好")))
             }
-            override suspend fun complete(request: LlmRequest): LlmResult = LlmResult()
+            override suspend fun complete(request: LlmRequest): LlmResult {
+                requests += request
+                return LlmResult(text = "好")
+            }
         }
-        val orchestrator = ChatOrchestrator(
-            llm = llm,
-            tools = ToolRegistry(listOf(NoTools())),
-            memory = MemoryServiceImpl(),
-            config = AppConfig(),
-        )
         val character = character().copy(
             shortTerm = listOf(
                 ShortTermMemory(
@@ -316,7 +190,7 @@ class ChatOrchestratorTest {
                 ),
             ),
         )
-        orchestrator.run(
+        orchestrator(llm).run(
             character = character,
             history = listOf(ChatMessage(id = "m1", role = Role.User, content = "我叫小明")),
             userText = "我叫小明",
