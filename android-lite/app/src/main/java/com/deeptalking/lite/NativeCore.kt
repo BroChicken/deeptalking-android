@@ -19,7 +19,6 @@ import com.deeptalking.core.model.RequestMetric
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.core.model.mergeCharacterChanges
-import com.deeptalking.core.model.trimMetricsPerTaskType
 import com.deeptalking.core.model.TTS_BACKEND_REMOTE
 import com.deeptalking.core.network.HttpWebContentProvider
 import com.deeptalking.core.network.DohDns
@@ -37,6 +36,7 @@ import com.deeptalking.engine.cosyvoice.GenerationSettings
 import com.deeptalking.engine.remote.RemoteTtsClient
 import com.deeptalking.engine.remote.RemoteTtsConfig
 import com.deeptalking.engine.remote.RemoteTtsProbe
+import com.deeptalking.engine.remote.RemoteVoiceInfo
 import com.deeptalking.engine.remote.RemoteVoiceUpload
 import com.deeptalking.engine.remote.RemoteTtsSpeaker
 import com.deeptalking.engine.remote.TtsServerFinder
@@ -45,6 +45,7 @@ import com.deeptalking.domain.agent.ToolRegistry
 import com.deeptalking.domain.agent.background.BackgroundTaskQueue
 import com.deeptalking.domain.agent.background.BackgroundTasks
 import com.deeptalking.domain.agent.background.LorebookRetryStore
+import com.deeptalking.domain.agent.background.MemoryTaskKind
 import com.deeptalking.domain.agent.defaultTools
 import com.deeptalking.domain.memory.MemoryServiceImpl
 import com.deeptalking.domain.memory.MEMORY_REPAIR_VERSION
@@ -209,8 +210,22 @@ class NativeCore(context: Context) {
      * Uploads one on-device voice (its prompt-speech gguf) so the server registers it
      * under the same name; the PC then speaks with the phone's own voices.
      */
-    suspend fun uploadTtsVoice(config: RemoteTtsConfig, name: String, bytes: ByteArray): RemoteVoiceUpload =
-        withContext(Dispatchers.IO) { remoteTtsClient.uploadVoice(config, name, bytes) }
+    suspend fun listTtsVoices(config: AppConfig): List<RemoteVoiceInfo> =
+        withContext(Dispatchers.IO) { remoteTtsClient.listVoices(remoteTtsConfig(config)) }
+
+    suspend fun downloadTtsVoice(config: AppConfig, id: String): ByteArray? =
+        withContext(Dispatchers.IO) { remoteTtsClient.downloadVoice(remoteTtsConfig(config), id) }
+
+    suspend fun renameTtsVoice(config: AppConfig, id: String, displayName: String): String? =
+        withContext(Dispatchers.IO) { remoteTtsClient.renameVoice(remoteTtsConfig(config), id, displayName) }
+
+    suspend fun uploadTtsVoice(
+        config: RemoteTtsConfig,
+        name: String,
+        bytes: ByteArray,
+        displayName: String? = null,
+    ): RemoteVoiceUpload =
+        withContext(Dispatchers.IO) { remoteTtsClient.uploadVoice(config, name, bytes, displayName) }
 
     val stickerSink: FileStickerSink = FileStickerSink(appContext)
     val backup: BackupService = BackupService(
@@ -220,6 +235,7 @@ class NativeCore(context: Context) {
         stickerSink = stickerSink,
         mediaSource = MediaRef.source(appContext),
         appVersion = BuildConfig.VERSION_NAME,
+        metrics = data.metrics,
     )
 
     suspend fun currentConfig(): AppConfig = data.config.current().also { applyDohPolicy(it) }
@@ -264,6 +280,13 @@ class NativeCore(context: Context) {
                     lastAuxFailure?.takeIf { it.taskType == "lorebook" }?.reason.orEmpty(),
                 )
             },
+            onMemoryRetryNeeded = { kind, characterId ->
+                onMemoryRetryNeeded?.invoke(
+                    kind,
+                    characterId,
+                    lastFailureNote(memoryTaskType(kind)),
+                )
+            },
         )
 
     /** Task type, reason and time of the most recent failed background call. */
@@ -285,6 +308,72 @@ class NativeCore(context: Context) {
      */
     @Volatile
     var onLorebookRetryNeeded: ((String, String) -> Unit)? = null
+
+    /**
+     * Raised on the third consecutive short-term extraction / long-term analysis failure.
+     * `(kind, characterId, reason)`. "Ignore" in the UI only dismisses the prompt; the
+     * ordinary backoff gate keeps retrying and no data is dropped.
+     */
+    @Volatile
+    var onMemoryRetryNeeded: ((MemoryTaskKind, String, String) -> Unit)? = null
+
+    /** Short wire name used by the failure-note lookup. */
+    private fun memoryTaskType(kind: MemoryTaskKind): String = when (kind) {
+        MemoryTaskKind.Extraction -> "extraction"
+        MemoryTaskKind.Analysis -> "analysis"
+        MemoryTaskKind.Scene -> "scene"
+        MemoryTaskKind.Lorebook -> "lorebook"
+    }
+
+    /** Runs one immediate extraction/analysis retry and persists whatever it changed. */
+    suspend fun retryPendingMemory(
+        config: AppConfig,
+        characterId: String,
+        kind: MemoryTaskKind,
+    ): MemoryRetryOutcome = withContext(Dispatchers.IO) {
+        val character = data.characters.get(characterId)
+            ?: return@withContext MemoryRetryOutcome(ok = false, reason = "角色不存在")
+        // Extraction folds `character.instant`, not the 400-row archive. Re-feeding the
+        // archive here would re-fold already-consumed history and inflate the request.
+        if (kind == MemoryTaskKind.Extraction &&
+            character.instant.count { !it.isLoading } < AppLimits.Memory.INSTANT
+        ) {
+            return@withContext MemoryRetryOutcome(ok = true, noop = true, reason = "暂无可整理的新对话")
+        }
+        val tasks = backgroundTasks(config)
+        val (status, updated) = tasks.retryMemoryTask(character = character, task = kind)
+        persistMemory(character, updated)
+        if (status == BackgroundTasks.TaskStatus.Success) {
+            MemoryRetryOutcome(ok = true)
+        } else {
+            val diagnostic = if (kind == MemoryTaskKind.Analysis) {
+                updated.counters.analysisLastError
+            } else {
+                ""
+            }
+            MemoryRetryOutcome(
+                ok = false,
+                reason = diagnostic.ifBlank { lastFailureNote(memoryTaskType(kind)) }
+                    .ifBlank { "请求失败" }
+                    .take(80),
+            )
+        }
+    }
+
+    /** Persists that the user answered the third-failure prompt for this task streak. */
+    suspend fun markMemoryRetryAcked(characterId: String, kind: MemoryTaskKind) {
+        data.characters.mutate(characterId) { live ->
+            when (kind) {
+                MemoryTaskKind.Extraction -> live.copy(
+                    counters = live.counters.copy(extractionPromptAcked = true),
+                )
+                MemoryTaskKind.Analysis -> live.copy(
+                    counters = live.counters.copy(analysisPromptAcked = true),
+                )
+                else -> live
+            }
+        }
+    }
 
     /** True when a world-book batch is waiting for the user's retry/drop decision. */
     fun hasPendingLorebookRetry(characterId: String): Boolean = lorebookRetries.awaitingUser(characterId)
@@ -702,11 +791,9 @@ class NativeCore(context: Context) {
      * meantime. `instant` is included because folds consume window messages.
      */
     private suspend fun persistMemory(original: Character, updated: Character) {
-        val fresh = data.characters.get(original.id) ?: original
-        // Only what this pass actually changed is written: a concurrent writer (the chat
-        // turn, the user's world-book edit, another maintenance pass) keeps its own fields
-        // and its own entries instead of being rolled back by a whole-row write.
-        data.characters.upsert(mergeCharacterChanges(original, updated, fresh))
+        data.characters.mutate(original.id) { fresh ->
+            mergeCharacterChanges(original, updated, fresh)
+        }
     }
 
     /** One-time world-book migration for characters whose background has not been migrated. */
@@ -935,13 +1022,7 @@ class NativeCore(context: Context) {
             missTokens = miss,
             hitRate = if (input != null && hit != null) hit.toDouble() / input else null,
         )
-        runCatching {
-            val latest = data.config.current()
-            data.config.update(
-                // Per-taskType cap, same as the chat path: one kind must not evict another.
-                latest.copy(requestMetrics = (latest.requestMetrics + metric).trimMetricsPerTaskType()),
-            )
-        }
+        runCatching { data.metrics.append(metric) }
     }
 
     /** One-line character/group generation; returns the raw JSON string from the model. */
@@ -1253,6 +1334,13 @@ class NativeCore(context: Context) {
                 onLorebookRetryNeeded?.invoke(
                     characterId,
                     lastAuxFailure?.takeIf { it.taskType == "lorebook" }?.reason.orEmpty(),
+                )
+            },
+            onMemoryRetryNeeded = { kind, characterId ->
+                onMemoryRetryNeeded?.invoke(
+                    kind,
+                    characterId,
+                    lastFailureNote(memoryTaskType(kind)),
                 )
             },
         )

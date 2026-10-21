@@ -7,14 +7,18 @@ import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.DynamicState
 import com.deeptalking.core.model.DynamicStateMeta
+import com.deeptalking.core.model.FieldEditRegistry
+import com.deeptalking.core.model.FieldSection
 import com.deeptalking.core.model.LongTermMemory
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.Role
+import com.deeptalking.core.model.SpeechSegment
 import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.core.model.Todo
 import com.deeptalking.core.model.TodoProposer
 import com.deeptalking.core.model.TodoStatus
+import com.deeptalking.core.model.parseGroupSpeechSegments
 import com.deeptalking.domain.agent.prompts.DYNAMIC_STATE_FIELDS
 import com.deeptalking.domain.agent.prompts.PersonaInputs
 import com.deeptalking.domain.agent.prompts.RequestBuilder
@@ -58,6 +62,9 @@ import java.time.Instant
 import java.time.ZonedDateTime
 import java.util.UUID
 
+/** Automatic worker retries after the first failed forced call. */
+private const val WORKER_MAX_RETRIES = 2
+
 /** Result of one user turn. */
 data class OrchestratorResult(
     val reply: String,
@@ -91,12 +98,42 @@ data class OrchestratorResult(
     val workerUsage: TokenUsage? = null,
     /** True when the turn worker's forced call succeeded and its state was applied. */
     val workerOk: Boolean = false,
+    /** True when this turn actually attempted the worker (not a proactive/no-background turn). */
+    val workerRan: Boolean = false,
+    /** One-word failure label when [workerOk] is false. */
+    val workerFailure: String = "",
+    /** Persisted short rule-rejection hints after this turn. */
+    val workerIssues: List<String> = emptyList(),
+    /** Synthetic reply id the worker used; the app reuses it for a manual retry. */
+    val workerReplyId: String = "",
+    /** User text of the turn, kept only for a manual worker retry. */
+    val workerUserText: String = "",
+    /**
+     * Problems the worker pass hit without failing the turn: a `todos` entry rejected by
+     * [TodoPolicy] (with the reason), a malformed `quickReplies` count, a request that
+     * returned nothing parseable. The reply is unaffected; the metrics pass records these
+     * so a silently dropped item can still be traced.
+     */
+    val workerNotes: List<String> = emptyList(),
+    /**
+     * Group replies only: the per-member turns of this single assistant message
+     * (speaker + display text). The caller persists them **with** the message so the chat
+     * can draw one bubble per member and read-aloud gets real speakers; history and the
+     * `instant` window still count the reply as one message. Empty for single characters.
+     */
+    val segments: List<SpeechSegment> = emptyList(),
     /** FNV-1a hash of the system instructions (legacy `instructionsHash`). */
     val instructionsHash: String = "",
     /** FNV-1a hash of this request's tool definitions (legacy `toolsHash`). */
     val toolsHash: String = "",
     /** Character count of the per-turn volatile context message (legacy `contextChars`). */
     val contextChars: Int = 0,
+    /**
+     * Characters per volatile-context section of this request (section key → chars), for
+     * `RequestMetric.sectionChars`. Only sections the request actually carried are listed:
+     * a section dropped to fit the hard cap is omitted rather than reported as 0 chars.
+     */
+    val sectionChars: Map<String, Int> = emptyMap(),
 )
 
 /**
@@ -149,7 +186,10 @@ class ChatOrchestrator(
         val mapped = builder.mapHistory(history).let { mapped ->
             if (mapped.size > AppLimits.Memory.INSTANT) mapped.takeLast(AppLimits.Memory.INSTANT) else mapped
         }.toMutableList()
-        if (mapped.lastOrNull()?.role != Role.User) {
+        // The history must end with the user's turn. A proactive opening has **no** user
+        // message at all — appending an empty placeholder would tell the model the user
+        // just said nothing, so the request keeps the real (user-less) shape instead.
+        if (userText.isNotBlank() && mapped.lastOrNull()?.role != Role.User) {
             mapped += ChatMessage(role = Role.User, content = userText, internalOnly = proactive)
         }
         val recentAssistantReplies = history
@@ -233,8 +273,7 @@ class ChatOrchestrator(
             ).copy(instant = memoryInstant),
             injectedRecallIds,
         )
-        val updated = applyMemory(base, parsed, memoryAssistant)
-            .let { applyTone(it, parsed.tone) }
+        val updated = applyTone(base, parsed.tone)
 
         // The visible reply may be replaced by the style critique before it is shown,
         // matching the legacy flow (critique runs inline; repair + extraction run after).
@@ -256,11 +295,18 @@ class ChatOrchestrator(
         // Mirror the live conversation window into `character.instant` (legacy
         // `memory.instant`): tools (add_todo), the volatile context and the
         // background tasks all read user/reply IDs and recent replies from here.
+        // Group replies stay one assistant message: the per-member turns ride along as
+        // `segments` (display text, quotes and stage directions kept verbatim) so the UI can
+        // draw one bubble per member and read-aloud gets real speakers. Single characters
+        // keep an empty list, and the streaming path never writes segments (the reply is
+        // only final here, after critique/dedupe).
+        val replySegments = groupSpeechSegments(character, displayReply)
         val assistantMessage = ChatMessage(
             id = "assistant_" + character.id,
             role = Role.Assistant,
             content = displayReply,
             styleViolations = styleViolations,
+            segments = replySegments,
         )
         // Append-only: the window grows with the turn and is only compacted by the fold
         // pass (which consumes exactly the batch it read). Clamping here would drop the oldest
@@ -272,13 +318,15 @@ class ChatOrchestrator(
         // Turn worker: produces dynamicState (without currentTone), quickReplies, todos and
         // promise status changes through one forced `submit_state` call. Failure is not
         // fatal: the reply is already final, so we keep the previous state (decision 6).
-        val worker = if (backgroundTasks != null && runBackgroundTasks) {
+        val workerRan = backgroundTasks != null && runBackgroundTasks
+        val worker = if (workerRan) {
             runTurnWorker(
                 character = characterWithInstant,
                 userText = userText,
                 reply = displayReply,
                 replyId = assistantMessage.id,
                 proactive = proactive,
+                onStatus = onToolActivity,
             )
         } else {
             WorkerResult(character = characterWithInstant)
@@ -294,7 +342,11 @@ class ChatOrchestrator(
                     }
                 }
             }
-            current
+            // A successful worker replaces the previous turn's hints; a failed one
+            // keeps them (the next attempt still needs the same reminders).
+            current.copy(
+                workerIssues = if (worker.ok) worker.issues else current.workerIssues,
+            )
         }
 
         if (backgroundTasks != null && runBackgroundTasks) {
@@ -305,7 +357,12 @@ class ChatOrchestrator(
                 currentQuickReplies = worker.quickReplies,
                 messages = history.filter { !it.isLoading } + assistantMessage,
                 critiqueEnabled = config.styleCritique,
-                quickReplyRepairEnabled = config.quickReplyRepair,
+                // The worker is the only producer of quick replies. The legacy
+                // "as the user" repair round may only step in when the worker did **not**
+                // succeed (or did not run at all); a successful worker already handed back
+                // its two lines, and a repair would just race it (and re-open the
+                // `issues`-non-empty case on every turn).
+                quickReplyRepairEnabled = quickReplyRepairEnabled(config, worker.ok, worker.quickReplies.size),
                 onCharacterUpdated = { bg -> onCharacterUpdated(characterWithInstant, bg) },
                 onQuickRepliesRepaired = onQuickRepliesRepaired,
                 styleViolations = styleViolations,
@@ -333,11 +390,44 @@ class ChatOrchestrator(
             roundUsages = outcome.roundUsages,
             workerUsage = worker.usage,
             workerOk = worker.ok,
+            workerRan = workerRan,
+            workerFailure = worker.failure,
+            workerIssues = finalCharacter.workerIssues,
+            workerReplyId = assistantMessage.id,
+            workerUserText = userText,
+            workerNotes = worker.notes,
+            segments = replySegments,
             instructionsHash = instructionsHash,
             toolsHash = toolsHash,
             contextChars = contextMessage.content.length,
+            // Only the sections actually kept in the text: `dropped` ones are 0 chars and
+            // the model never saw them, so they must not show up as a (tiny) section.
+            sectionChars = volatile.sections
+                .filter { !it.dropped && it.chars > 0 }
+                .associate { it.name to it.chars },
         )
     }
+
+    /**
+     * Re-runs only the turn worker for a previous turn (the red failed-state action).
+     * The assistant reply is not regenerated; the caller merges the returned character
+     * onto the live row and replaces the quick replies when [WorkerResult.ok].
+     */
+    suspend fun retryWorker(
+        character: Character,
+        userText: String,
+        reply: String,
+        replyId: String,
+        proactive: Boolean,
+        onStatus: (String) -> Unit = {},
+    ): WorkerResult = runTurnWorker(
+        character = character,
+        userText = userText,
+        reply = reply,
+        replyId = replyId,
+        proactive = proactive,
+        onStatus = onStatus,
+    )
 
     /** Port of the legacy `hashRequestPart` (FNV-1a over the FNV offset base). */
     private fun fnv1a(text: String): String {
@@ -441,7 +531,15 @@ class ChatOrchestrator(
         }
 
         parsed.dynamicState?.let { state ->
-            val dynamic = applyDynamicStateFields(updated.dynamicState, state, updated, assistantMessage, sources, nowBase)
+            val dynamic = applyDynamicStateFields(
+                updated.dynamicState,
+                state,
+                updated,
+                assistantMessage,
+                sources,
+                nowBase,
+                isFocused = focusedDynamicFields(updated, null),
+            )
             updated = updated.copy(dynamicState = dynamic)
         }
 
@@ -457,6 +555,7 @@ class ChatOrchestrator(
                     assistantMessage,
                     sources,
                     nowBase,
+                    isFocused = focusedDynamicFields(updated, member.id),
                 )
                 member.copy(dynamicState = dynamic)
             }
@@ -474,10 +573,19 @@ class ChatOrchestrator(
         assistantMessage: ChatMessage,
         sources: Map<String, SourceRef>,
         nowBase: ZonedDateTime,
+        /** Fields the user is typing right now are skipped (the editor's draft is the truth). */
+        isFocused: (String) -> Boolean = { false },
+        /** Worker-only collector; the plain turn path leaves this null. */
+        issues: MutableList<WorkerIssue>? = null,
     ): DynamicState {
         var dynamic = current
         state.forEach { (key, element) ->
-            if (DYNAMIC_STATE_FIELDS.none { it.first == key }) return@forEach
+            val label = DYNAMIC_STATE_FIELDS.firstOrNull { it.first == key }?.second ?: key
+            if (DYNAMIC_STATE_FIELDS.none { it.first == key }) {
+                issues?.add(WorkerIssue(label, "未知字段"))
+                return@forEach
+            }
+            if (isFocused(key)) return@forEach
             val obj = fieldObject(element)
             val raw = fieldValue(element)
             if (raw.isEmpty()) return@forEach
@@ -489,6 +597,7 @@ class ChatOrchestrator(
             if (key != "currentTone" &&
                 resolveDynamicStateSources(host, fieldSourceIds(obj), fieldEvidence(obj), assistantMessage, sources) == null
             ) {
+                issues?.add(WorkerIssue(label, if (fieldSourceIds(obj).isEmpty()) "无证据" else "证据不符"))
                 return@forEach
             }
             dynamic = withDynamicField(dynamic, key, value)
@@ -567,14 +676,21 @@ class ChatOrchestrator(
         character: Character,
         update: PromiseUpdate,
         sources: Map<String, SourceRef>,
+        issues: MutableList<WorkerIssue>? = null,
     ): Character {
         val status = when (update.status.lowercase()) {
             "resolved" -> PromiseStatus.Resolved
             "cancelled" -> PromiseStatus.Cancelled
-            else -> return character
+            else -> {
+                issues?.add(WorkerIssue("约定", "状态无效"))
+                return character
+            }
         }
         val resolved = hasValidUserEvidence(character, update.sourceMessageIds, update.evidence, sources)
-            ?: return character
+            ?: run {
+                issues?.add(WorkerIssue("约定", "证据不符"))
+                return character
+            }
         val shared = character.longTerm.firstOrNull {
             it.id == update.promiseId && it.status == PromiseStatus.Active
         }
@@ -585,7 +701,10 @@ class ChatOrchestrator(
         } else {
             null
         }
-        if (shared == null && member == null) return character
+        if (shared == null && member == null) {
+            issues?.add(WorkerIssue("约定", "不存在"))
+            return character
+        }
         val now = Instant.now().toString()
         // `sourceRoles` is index-aligned with `sourceMessageIds`; both must be cut
         // the same way (a `.distinct()` on roles would leave later ids role-less).
@@ -612,17 +731,26 @@ class ChatOrchestrator(
         character: Character,
         update: TodoUpdate,
         sources: Map<String, SourceRef>,
+        notes: MutableList<String>? = null,
+        issues: MutableList<WorkerIssue>? = null,
     ): Character {
+        fun rejected(reason: String, short: String): Character {
+            notes?.add("todo.${update.status.ifBlank { "update" }} 未应用：$reason（todoId: ${update.todoId}）")
+            issues?.add(WorkerIssue("待办", short))
+            return character
+        }
         val target = character.todos.firstOrNull {
             it.id == update.todoId && it.status == TodoStatus.Active
-        } ?: return character
+        } ?: return rejected("找不到进行中的待办", "不存在")
         val resolved = hasValidUserEvidence(character, update.sourceMessageIds, update.evidence, sources)
-            ?: return character
+            ?: return rejected("用户原话证据校验失败", "证据不符")
         val userSources = resolved.filter { it.role == "user" }
         val status = TodoPolicy.todoStatusOf(update.status)
         val newDue = update.dueAt?.let { MemoryToolSupport.normalizeTimestamp(it, null) }
-        if (status == null && newDue == null) return character
-        if (newDue != null && !dueAtBackedByEvidence(userSources, newDue)) return character
+        if (status == null && newDue == null) return rejected("状态或期限都无效", "状态无效")
+        if (newDue != null && !dueAtBackedByEvidence(userSources, newDue)) {
+            return rejected("期限无法从用户原话定位", "改期无据")
+        }
         val now = Instant.now().toString()
         val closing = status != null && status != TodoStatus.Active
         return character.copy(
@@ -667,10 +795,17 @@ class ChatOrchestrator(
 
     // ------------------------------------------------------------------ turn worker
 
-    /** Applies the main call's `【语气】` line: value + per-field timestamp, never blanking it. */
+    /**
+     * Applies the main call's `【语气】` line: value + per-field timestamp, never blanking it.
+     *
+     * The timestamp is refreshed **even when the text did not change**: `updatedAt` means
+     * "the tone was re-derived from this turn's delivery", not "the string changed", so a
+     * long stretch of identical tone still shows a fresh confirmation time.
+     */
     private fun applyTone(character: Character, tone: String?): Character {
         val value = tone?.trim()?.takeIf { it.isNotEmpty() } ?: return character
-        if (value == character.dynamicState.currentTone) return character
+        // The editor may be typing the read-aloud tone right now: its draft is the truth.
+        if (FieldEditRegistry.isFocused(character.id, null, FieldSection.Dynamic, "currentTone")) return character
         return character.copy(
             dynamicState = character.dynamicState.copy(currentTone = value),
             dynamicStateMeta = character.dynamicStateMeta +
@@ -678,31 +813,9 @@ class ChatOrchestrator(
         )
     }
 
-    private fun dynamicValue(state: DynamicState, key: String): String = when (key) {
-        "currentSituation" -> state.currentSituation
-        "currentLocation" -> state.currentLocation
-        "currentMood" -> state.currentMood
-        "currentOccupation" -> state.currentOccupation
-        "currentGoal" -> state.currentGoal
-        "currentTone" -> state.currentTone
-        else -> ""
-    }
-
-    /** Writes `updatedAt` only for the dynamic keys the worker actually changed. */
-    private fun mergeDynamicMeta(
-        current: Map<String, DynamicStateMeta>,
-        before: DynamicState,
-        after: DynamicState,
-        now: String,
-    ): Map<String, DynamicStateMeta> {
-        var meta = current
-        DYNAMIC_STATE_FIELDS.forEach { (key, _) ->
-            if (dynamicValue(before, key) != dynamicValue(after, key)) {
-                meta = meta + (key to DynamicStateMeta(updatedAt = now))
-            }
-        }
-        return meta
-    }
+    /** True while the user is typing one of [character]'s (or [memberId]'s) dynamic fields. */
+    private fun focusedDynamicFields(character: Character, memberId: String?): (String) -> Boolean =
+        { key -> FieldEditRegistry.isFocused(character.id, memberId, FieldSection.Dynamic, key) }
 
     /**
      * Runs the forced `submit_state` call and folds its fields onto the character.
@@ -715,30 +828,92 @@ class ChatOrchestrator(
         reply: String,
         replyId: String,
         proactive: Boolean,
+        onStatus: (String) -> Unit = {},
     ): WorkerResult {
-        val result = runCatching {
-            llm.complete(
-                TurnWorker.buildRequest(
-                    config = config,
-                    character = character,
-                    userText = userText,
-                    reply = reply,
-                    replyId = replyId,
-                    proactive = proactive,
-                    now = Instant.now(),
-                ),
-            )
-        }.getOrNull() ?: return WorkerResult(character = character)
+        val request = TurnWorker.buildRequest(
+            config = config,
+            character = character,
+            userText = userText,
+            reply = reply,
+            replyId = replyId,
+            proactive = proactive,
+            now = Instant.now(),
+        )
 
-        val output = TurnWorker.parse(result)
-        if (!output.ok) return WorkerResult(character = character, usage = output.usage)
+        var lastFailure = "请求失败"
+        var lastNotes = listOf("worker 请求失败：没有拿到结果")
+        var lastUsage: com.deeptalking.engine.ondevice.TokenUsage? = null
+        var attempt = 0
+        while (true) {
+            var result: com.deeptalking.engine.ondevice.LlmResult? = null
+            var transient = true
+            try {
+                result = llm.complete(request)
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                lastFailure = "请求失败"
+                lastNotes = listOf("worker 请求失败：${error.message ?: error}")
+                transient = isTransientApiError(error)
+            }
 
+            if (result != null) {
+                val output = TurnWorker.parse(result)
+                lastUsage = output.usage
+                if (output.ok) {
+                    val applied = runCatching {
+                        applyWorkerOutput(
+                            character = character,
+                            reply = reply,
+                            replyId = replyId,
+                            output = output,
+                        )
+                    }
+                    applied.getOrNull()?.let { return it }
+                    lastFailure = "解析失败"
+                    lastNotes = listOf("worker 结果无法应用：${applied.exceptionOrNull()?.message ?: "格式错误"}")
+                } else {
+                    lastFailure = if (result.toolCalls.any { it.name == TurnWorker.TOOL_NAME }) "解析失败" else "无结果"
+                    lastNotes = listOf("worker 未返回可解析的 submit_state")
+                }
+            }
+
+            // A non-transient HTTP error (auth/bad request) will not improve by asking
+            // again; parse/no-result failures are worth the two retries.
+            if (!transient || attempt >= WORKER_MAX_RETRIES) break
+            attempt++
+            onStatus("整理失败，正在重试（$attempt/$WORKER_MAX_RETRIES）…")
+            kotlinx.coroutines.delay(if (attempt == 1) 1_000L else 2_000L)
+        }
+
+        return WorkerResult(
+            character = character,
+            ok = false,
+            usage = lastUsage,
+            failure = lastFailure,
+            notes = lastNotes,
+        )
+    }
+
+    /** Applies one successfully parsed worker result, collecting short retry hints. */
+    private fun applyWorkerOutput(
+        character: Character,
+        reply: String,
+        replyId: String,
+        output: TurnWorker.Output,
+    ): WorkerResult {
         val now = Instant.now()
         val nowZoned = ZonedDateTime.now()
         val assistant = character.instant.lastOrNull { it.id == replyId }
             ?: ChatMessage(id = replyId, role = Role.Assistant, content = reply)
         var working = character
         val sources = knownSources(working)
+        // Long diagnostics go to metrics; short labels go to the next worker prompt.
+        val notes = mutableListOf<String>()
+        val issues = mutableListOf<WorkerIssue>()
+        notes += output.warnings
+        if (output.quickReplies.size < 2) issues += WorkerIssue("快捷回复", "条数不足")
+        if (output.warnings.any { it.contains("超过") }) issues += WorkerIssue("快捷回复", "条数过多")
 
         output.dynamicState?.let { state ->
             val fields = JsonObject(state.filterKeys { it != "currentTone" })
@@ -748,52 +923,86 @@ class ChatOrchestrator(
                 val sharedKeys = setOf("currentSituation", "currentLocation")
                 val shared = JsonObject(fields.filterKeys { it in sharedKeys })
                 val before = working.groupSharedDynamic
-                val after = applyDynamicStateFields(before, shared, working, assistant, sources, nowZoned)
-                working = working.copy(groupSharedDynamic = after)
+                val after = applyDynamicStateFields(
+                    before,
+                    shared,
+                    working,
+                    assistant,
+                    sources,
+                    nowZoned,
+                    isFocused = focusedDynamicFields(working, null),
+                    issues = issues,
+                )
+                // The shared state is stored in `groupSharedDynamic`, but its per-field
+                // timestamps live in the same `dynamicStateMeta` map: stamp the keys this
+                // pass actually moved, exactly like the single-character branch.
+                working = working.copy(
+                    groupSharedDynamic = after,
+                    dynamicStateMeta = stampChangedDynamicFields(
+                        working.dynamicStateMeta,
+                        before,
+                        after,
+                        now.toString(),
+                    ),
+                )
             } else {
                 val before = working.dynamicState
-                val after = applyDynamicStateFields(before, fields, working, assistant, sources, nowZoned)
+                val after = applyDynamicStateFields(
+                    before,
+                    fields,
+                    working,
+                    assistant,
+                    sources,
+                    nowZoned,
+                    isFocused = focusedDynamicFields(working, null),
+                    issues = issues,
+                )
                 working = working.copy(
                     dynamicState = after,
-                    dynamicStateMeta = mergeDynamicMeta(working.dynamicStateMeta, before, after, now.toString()),
+                    dynamicStateMeta = stampChangedDynamicFields(
+                        working.dynamicStateMeta,
+                        before,
+                        after,
+                        now.toString(),
+                    ),
                 )
             }
         }
 
-        output.memberDynamicState?.forEach { element ->
-            val obj = element as? JsonObject ?: return@forEach
-            val name = (obj["memberName"] as? JsonPrimitive)?.contentOrNull.orEmpty()
-            val state = obj["dynamicState"] as? JsonObject ?: return@forEach
-            val index = working.members.indexOfFirst { it.name.equals(name, ignoreCase = true) }
-            if (index < 0) return@forEach
-            val member = working.members[index]
-            val before = member.dynamicState
-            val after = applyDynamicStateFields(
-                before,
-                JsonObject(state.filterKeys { it != "currentTone" }),
-                working,
-                assistant,
-                sources,
-                nowZoned,
+        output.memberDynamicState?.let { elements ->
+            working = applyMemberDynamicState(
+                character = working,
+                elements = elements,
+                assistant = assistant,
+                sources = sources,
+                nowZoned = nowZoned,
+                nowIso = now.toString(),
+                issues = issues,
             )
-            val members = working.members.toMutableList()
-            members[index] = member.copy(
-                dynamicState = after,
-                dynamicStateMeta = mergeDynamicMeta(member.dynamicStateMeta, before, after, now.toString()),
-            )
-            working = working.copy(members = members)
         }
 
         output.todos?.forEach { element ->
-            val obj = element as? JsonObject ?: return@forEach
-            working = applyWorkerTodo(working, obj, assistant, sources, nowZoned)
+            val obj = element as? JsonObject ?: run {
+                issues += WorkerIssue("待办", "格式错误")
+                return@forEach
+            }
+            val outcome = applyWorkerTodo(working, obj, assistant, sources, nowZoned)
+            working = outcome.character
+            notes += outcome.notes
+            issues += outcome.issues
         }
 
         output.promiseUpdates?.forEach { element ->
-            val obj = element as? JsonObject ?: return@forEach
+            val obj = element as? JsonObject ?: run {
+                issues += WorkerIssue("约定", "格式错误")
+                return@forEach
+            }
             val id = (obj["promiseId"] as? JsonPrimitive)?.contentOrNull.orEmpty()
             val status = (obj["status"] as? JsonPrimitive)?.contentOrNull.orEmpty()
-            if (id.isBlank() || status.isBlank()) return@forEach
+            if (id.isBlank() || status.isBlank()) {
+                issues += WorkerIssue("约定", "状态无效")
+                return@forEach
+            }
             val update = PromiseUpdate(
                 promiseId = id,
                 status = status,
@@ -801,7 +1010,7 @@ class ChatOrchestrator(
                     ?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }.orEmpty(),
                 evidence = (obj["evidence"] as? JsonPrimitive)?.contentOrNull.orEmpty(),
             )
-            working = applyPromiseUpdate(working, update, knownSources(working))
+            working = applyPromiseUpdate(working, update, knownSources(working), issues)
         }
 
         return WorkerResult(
@@ -809,17 +1018,83 @@ class ChatOrchestrator(
             quickReplies = output.quickReplies,
             ok = true,
             usage = output.usage,
+            notes = notes,
+            issues = workerIssueLines(issues),
         )
     }
 
-    /** `submit_state.todos`: create goes through [TodoPolicy.validateTodoCreation]; the rest reuses [applyTodoUpdate]. */
-    private fun applyWorkerTodo(
+    /**
+     * Applies the worker's `memberDynamicState` (groups). Each member's own state is patched
+     * onto that member — **`currentTone` included**, because a member reads their own lines
+     * with their own delivery (unlike the group-wide shared state, which never carries a tone).
+     * Malformed elements and unknown member names are skipped, exactly like the parse layer.
+     */
+    internal fun applyMemberDynamicState(
+        character: Character,
+        elements: JsonArray,
+        assistant: ChatMessage,
+        sources: Map<String, SourceRef>,
+        nowZoned: ZonedDateTime,
+        nowIso: String,
+        issues: MutableList<WorkerIssue>? = null,
+    ): Character {
+        var working = character
+        elements.forEach { element ->
+            val obj = element as? JsonObject ?: run {
+                issues?.add(WorkerIssue("成员", "格式错误"))
+                return@forEach
+            }
+            val name = (obj["memberName"] as? JsonPrimitive)?.contentOrNull.orEmpty()
+            val state = obj["dynamicState"] as? JsonObject ?: run {
+                issues?.add(WorkerIssue(name.ifBlank { "成员" }, "格式错误"))
+                return@forEach
+            }
+            val index = working.members.indexOfFirst { it.name.equals(name, ignoreCase = true) }
+            if (index < 0) {
+                issues?.add(WorkerIssue(name.ifBlank { "成员" }, "不存在"))
+                return@forEach
+            }
+            val member = working.members[index]
+            val before = member.dynamicState
+            val after = applyDynamicStateFields(
+                before,
+                state,
+                working,
+                assistant,
+                sources,
+                nowZoned,
+                isFocused = focusedDynamicFields(working, member.id),
+                issues = issues,
+            )
+            val members = working.members.toMutableList()
+            members[index] = member.copy(
+                dynamicState = after,
+                dynamicStateMeta = stampChangedDynamicFields(
+                    member.dynamicStateMeta,
+                    before,
+                    after,
+                    nowIso,
+                ),
+            )
+            working = working.copy(members = members)
+        }
+        return working
+    }
+
+    /**
+     * `submit_state.todos`: create goes through [TodoPolicy.validateTodoCreation]; the rest
+     * reuses [applyTodoUpdate].
+     *
+     * A rejected entry is **not** silently dropped: the reason rides back in [WorkerTodoOutcome.notes]
+     * so the metrics pass can record it.
+     */
+    internal fun applyWorkerTodo(
         character: Character,
         obj: JsonObject,
         assistant: ChatMessage,
         sources: Map<String, SourceRef>,
         nowZoned: ZonedDateTime,
-    ): Character {
+    ): WorkerTodoOutcome {
         fun str(key: String): String = (obj[key] as? JsonPrimitive)?.contentOrNull.orEmpty()
         fun ids(): List<String> = (obj["sourceMessageIds"] as? JsonArray)
             ?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }.orEmpty()
@@ -836,12 +1111,22 @@ class ChatOrchestrator(
                 sourceMessageIds = ids(),
                 evidence = str("evidence"),
             )
-            return applyTodoUpdate(character, update, sources)
+            val notes = mutableListOf<String>()
+            val issues = mutableListOf<WorkerIssue>()
+            val changed = applyTodoUpdate(character, update, sources, notes, issues)
+            return WorkerTodoOutcome(changed, notes = notes, issues = issues)
         }
 
-        val title = str("title").trimTo(100)
-        val detail = str("detail").trimTo(900)
-        if (title.isEmpty() || detail.isEmpty()) return character
+        // `title` is the only required text. `detail` is optional — a missing detail used to
+        // drop the whole todo, which lost the entry (and its due time) entirely.
+        val text = workerTodoText(str("title"), str("detail"))
+            ?: return WorkerTodoOutcome(
+                character = character,
+                notes = listOf("todo.create 缺少 title，已忽略（evidence: ${str("evidence").trimTo(80)}）"),
+                issues = listOf(WorkerIssue("待办", "缺标题")),
+            )
+        val title = text.title
+        val detail = text.detail
         val proposer = if (str("proposer").trim().lowercase() == "character") {
             TodoProposer.Character
         } else {
@@ -852,15 +1137,21 @@ class ChatOrchestrator(
         val timeRef = ResponseParser.parseTimeRef(obj)
         val resolved = resolveTimeRef(timeRef, nowZoned)
         val dueAt = MemoryToolSupport.normalizeTimestamp(str("dueAt"), null) ?: resolved?.iso
-        val decision = TodoPolicy.validateTodoCreation(
+        val accepted = when (val decision = TodoPolicy.validateTodoCreation(
             character = character,
             proposer = proposer,
             sourceIds = sourceIds,
             evidence = evidence,
             dueAtIso = dueAt,
             sources = sources,
-        )
-        val accepted = decision as? TodoPolicy.Creation.Accepted ?: return character
+        )) {
+            is TodoPolicy.Creation.Accepted -> decision
+            is TodoPolicy.Creation.Rejected -> return WorkerTodoOutcome(
+                character = character,
+                notes = listOf("todo.create 未通过校验：${decision.reason}（title: $title）"),
+                issues = listOf(WorkerIssue("待办", todoRejectLabel(decision.reason))),
+            )
+        }
         val base = parseZoned(dueAt) ?: nowZoned
         val parsedTitle = parseRelativeText(title, base)
         val parsedDetail = parseRelativeText(detail, base)
@@ -895,9 +1186,59 @@ class ChatOrchestrator(
                 updatedAt = now,
             )
         }
-        return character.copy(todos = todos)
+        return WorkerTodoOutcome(character.copy(todos = todos))
     }
 }
+
+/** Outcome of one `submit_state.todos` entry: the patched character plus any drop reason. */
+internal data class WorkerTodoOutcome(
+    val character: Character,
+    val notes: List<String> = emptyList(),
+    val issues: List<WorkerIssue> = emptyList(),
+)
+
+/** One-word label for a `TodoPolicy` rejection, shown in the next worker prompt. */
+private fun todoRejectLabel(reason: String): String = when {
+    reason.contains("明确期限") || reason.contains("没有期限") -> "无期限"
+    reason.contains("拒绝") || reason.contains("取消") -> "用户拒绝"
+    reason.contains("答应") || reason.contains("同意") -> "未确认"
+    reason.contains("期限") || reason.contains("日期") || reason.contains("时间") -> "期限不明"
+    else -> "证据不符"
+}
+
+/**
+ * `submit_state.todos` create text: `title` is the only required part, a blank `detail`
+ * mirrors it (the entry itself must survive). Null when there is no usable title.
+ */
+internal data class WorkerTodoText(val title: String, val detail: String)
+
+internal fun workerTodoText(rawTitle: String, rawDetail: String): WorkerTodoText? {
+    val title = rawTitle.trimTo(100)
+    if (title.isEmpty()) return null
+    return WorkerTodoText(title, rawDetail.trimTo(900))
+}
+
+/**
+ * Per-member turns of a final assistant reply: groups get [SpeechSegment]s parsed from the
+ * `成员名：内容` format (display text, not TTS text), single characters get none.
+ */
+internal fun groupSpeechSegments(character: Character, reply: String): List<SpeechSegment> =
+    if (!character.isGroup) {
+        emptyList()
+    } else {
+        parseGroupSpeechSegments(reply, character.members.map { it.name })
+    }
+
+/**
+ * May the legacy "as the user" quick-reply repair round run?
+ *
+ * The turn worker is the only producer of quick replies. A successful worker already handed
+ * back its two lines — re-running the repair would race it (and fire on every turn whose
+ * lines merely trip the style checker). Only a worker that did not run or did not succeed
+ * leaves room for the fallback.
+ */
+internal fun quickReplyRepairEnabled(config: AppConfig, workerOk: Boolean, quickReplyCount: Int): Boolean =
+    config.quickReplyRepair && (!workerOk || quickReplyCount < 2)
 
 /** Result of one turn-worker pass: the patched character plus its quick replies. */
 data class WorkerResult(
@@ -905,4 +1246,42 @@ data class WorkerResult(
     val quickReplies: List<String> = emptyList(),
     val ok: Boolean = false,
     val usage: com.deeptalking.engine.ondevice.TokenUsage? = null,
+    /** Non-fatal contract violations, surfaced to the caller for the metrics pass. */
+    val notes: List<String> = emptyList(),
+    /** Short label of an unresolvable failure (`请求失败`/`无结果`/`解析失败`). */
+    val failure: String = "",
+    /** Compact rule-rejection hints for the next worker turn. */
+    val issues: List<String> = emptyList(),
 )
+
+/** Reads one dynamic-state field by its wire key (empty for an unknown key). */
+internal fun dynamicStateFieldValue(state: DynamicState, key: String): String = when (key) {
+    "currentSituation" -> state.currentSituation
+    "currentLocation" -> state.currentLocation
+    "currentMood" -> state.currentMood
+    "currentOccupation" -> state.currentOccupation
+    "currentGoal" -> state.currentGoal
+    "currentTone" -> state.currentTone
+    else -> ""
+}
+
+/**
+ * Writes `updatedAt` only for the dynamic keys that actually changed between [before] and
+ * [after]; every other entry keeps its value. Used by the turn worker for both the single
+ * character's `dynamicState` and a group's `groupSharedDynamic` — the shared state was
+ * written without timestamps, so nothing downstream could tell when a group's scene moved.
+ */
+internal fun stampChangedDynamicFields(
+    current: Map<String, DynamicStateMeta>,
+    before: DynamicState,
+    after: DynamicState,
+    now: String,
+): Map<String, DynamicStateMeta> {
+    var meta = current
+    DYNAMIC_STATE_FIELDS.forEach { (key, _) ->
+        if (dynamicStateFieldValue(before, key) != dynamicStateFieldValue(after, key)) {
+            meta = meta + (key to DynamicStateMeta(updatedAt = now))
+        }
+    }
+    return meta
+}

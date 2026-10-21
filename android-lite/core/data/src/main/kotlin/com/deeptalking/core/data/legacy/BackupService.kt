@@ -4,6 +4,7 @@ import com.deeptalking.core.data.AppJson
 import com.deeptalking.core.data.CharacterRepository
 import com.deeptalking.core.data.ChatRepository
 import com.deeptalking.core.data.ConfigRepository
+import com.deeptalking.core.data.MetricsRepository
 import com.deeptalking.core.model.AppConfig
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
@@ -90,10 +91,13 @@ fun interface MediaSource {
  * (legacy-compatible) and written back to local files on import, so a backup
  * restored on another device still shows images.
  *
- * - `apiKey` is intentionally never exported (mirrors `exportAllData`); the
- *   per-platform `apiKey` half is likewise dropped.
+ * - API keys never appear in this plain JSON. The app layer adds an encrypted root
+ *   `secrets` bundle (API keys + remote-TTS token) with `BackupCipher`; importing it
+ *   is separate from the character/config restore.
  * - `counters`, `lastInjectedRecallIds`, `pendingRecall`, `dynamicStateMeta`,
- *   `staticFieldMeta` and full `requestMetrics` round-trip in the legacy shape.
+ *   `staticFieldMeta` round-trip in the legacy shape. Rolling request metrics are exported
+ *   as their own root `requestMetrics` array from the independent metrics store and
+ *   restored from it (old backups keep `config.requestMetrics`, which is adopted once).
  * - `activeCharacterId` is accepted as a parameter (native stores do not model
  *   an active character); pass the current selection, or omit for `null`.
  */
@@ -108,6 +112,12 @@ class BackupService(
      * legacy `APP_VERSION`. Pass `BuildConfig.VERSION_NAME` from `:app`.
      */
     private val appVersion: String = "native",
+    /**
+     * Independent metrics store. When supplied it is exported as its own root array
+     * (`requestMetrics`) and restored from it on import; `AppConfig.requestMetrics` stays
+     * only as the legacy shape a WebView build reads.
+     */
+    private val metrics: MetricsRepository? = null,
 ) {
     private val codec = Json {
         prettyPrint = true
@@ -118,9 +128,17 @@ class BackupService(
         val all = characters.observeAll().first()
         val appConfig = config.observe().first()
         val messagesByCharacter = all.associate { it.id to chat.getMessages(it.id) }
+        // The rolling metrics live in their own store, so a backup carries them as their
+        // own root array (every field, `round` and `sectionChars` included).
+        val metricRows = metrics?.all().orEmpty()
 
         val root = buildJsonObject {
             put("config", AppJson.encodeToJsonElement(appConfig))
+            if (metricRows.isNotEmpty()) {
+                putJsonArray("requestMetrics") {
+                    metricRows.forEach { add(AppJson.encodeToJsonElement(it)) }
+                }
+            }
             putJsonObject("characters") {
                 for (character in all) {
                     put(character.id, characterToJson(character, messagesByCharacter[character.id].orEmpty()))
@@ -139,7 +157,7 @@ class BackupService(
     }
 
     suspend fun importJson(json: String): ImportSummary =
-        LegacyImportService(characters, chat, config, stickerSink).importJson(json)
+        LegacyImportService(characters, chat, config, stickerSink, metrics).importJson(json)
 
     private fun AppConfig.exportDateOrNow(): String =
         java.time.Instant.now().toString().substringBefore('.').ifBlank { java.time.Instant.now().toString() }
@@ -351,6 +369,20 @@ class BackupService(
         }
         if (message.quickReplyIssues.isNotEmpty()) {
             putJsonArray("quickReplyIssues") { message.quickReplyIssues.forEach { add(it) } }
+        }
+        // Group replies travel as one message plus per-member turns; without this the
+        // per-bubble speaker attribution would be lost on backup/restore.
+        if (message.segments.isNotEmpty()) {
+            putJsonArray("segments") {
+                message.segments.forEach { segment ->
+                    add(
+                        buildJsonObject {
+                            put("speaker", segment.speaker)
+                            put("text", segment.text)
+                        },
+                    )
+                }
+            }
         }
     }
 

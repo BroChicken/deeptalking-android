@@ -353,28 +353,42 @@ New-NetFirewallRule -DisplayName 'cosyvoice-server' -Direction Inbound -Protocol
 
 `prompt_speech.gguf` 是端侧与 PC 端同一格式，两端因此可以共用**同一个音色文件**：
 
-- **手机 → PC（一键）**：设置 → 语音朗读 → 远程 → 「**上传本机音色到电脑**」。App 把每个端侧音色
-  的 gguf 按**同名**（`voices/<文件名去扩展名>.gguf`）POST 到 `POST /v1/voices`，服务端落盘并立即注册；
-  端侧导入时已经做过裁剪/编码，所以两端是**逐字节同一个音色**，不需要在 PC 上重做一遍。
-- PC → 手机：WebUI 的「Save speaker」导出 `.gguf`，放进手机 `voices/` 目录后重启 App 即出现在音色列表。
-- 手工/批量（等价做法）：把手机 `filesDir/cosyvoice/voices/*.gguf` 拷到 PC，用
-  `--voice-prompt <名字>=<文件>` 注册；`run-server.ps1` 已经会自动把 `voices/*.gguf` 全部注册。
+- **双向（一键）**：设置 → 语音朗读 → 「**同步音色和名称**」。App 先拉取 `GET /v1/voices` 的
+  稳定 id / 显示名 / 大小 / FNV 指纹，再按 id 对齐：手机有电脑没有 → 上传；电脑有手机没有 → 下载；
+  同名但不同文件 → 手机保留原名，另一端依次加 `_1`、`_2`；同一 id 内容不同 → 只报告，不覆盖。
+  显示名不一致时以**端侧（手机）名字优先**，用 `PUT /v1/voices/<id>` 修改电脑端显示名。改名只改显示名，
+  朗读请求仍用稳定 speaker id，不重新编码音频。
+- **单向上传**：仍保留「只上传本机音色到电脑」；旧版服务端没有清单接口时，同步按钮会自动降级为这种方式，
+  并明确提示“电脑端服务端版本过旧，只能上传，不能同步名称/下载”。
+- **服务端持久化**：显示名保存在 `--voice-dir/names.json`，重启后仍保留；音色文件仍是
+  `<--voice-dir>/<id>.gguf`。
+- PC → 手机的手工方式仍可用：WebUI 的「Save speaker」导出 `.gguf`，放进手机 `voices/` 目录后重启 App
+  即出现在音色列表。
 
-上传接口（`cosyvoice-server`，API 与 WebUI 模式都有）：
+音色接口（`cosyvoice-server`，API 与 WebUI 模式都有）：
 
 ```powershell
-# 原始 gguf 作为请求体；名字走查询参数，服务端存成 <--voice-dir>/<name>.gguf
-curl.exe -sS -X POST "http://10.84.116.224:8080/v1/voices?name=builtin_1_v2" `
+# 清单：id、显示名、大小、FNV 指纹
+curl.exe -sS "http://10.84.116.224:8080/v1/voices"
+# 下载某个音色
+curl.exe -sS -o builtin_1_v2.gguf "http://10.84.116.224:8080/v1/voices/builtin_1_v2"
+# 原始 gguf 作为请求体；name 是稳定 id，display_name 是用户显示名
+curl.exe -sS -X POST "http://10.84.116.224:8080/v1/voices?name=builtin_1_v2&display_name=%E5%86%85%E7%BD%AE%E9%9F%B3%E8%89%B2%201" `
   --data-binary "@voices\builtin_1_v2.gguf" -H "Content-Type: application/octet-stream"
-# 也支持 multipart：-F "name=..." -F "file=@...gguf"
+# 只改显示名（JSON body，UTF-8）
+curl.exe -sS -X PUT "http://10.84.116.224:8080/v1/voices/builtin_1_v2" `
+  -H "Content-Type: application/json" --data-binary "{\"displayName\":\"内置音色 1\"}"
+# 也支持 multipart：-F "name=..." -F "display_name=..." -F "file=@...gguf"
 ```
 
-- 同名已注册时返回 200 + `already_present`，所以"同步"可以反复点。
-- 名字只允许 `A-Za-z0-9._-`（它会被当作文件名），大小上限 16 MiB（实际音色约 40 KB）。
+- 同名已注册时返回 200 + `already_present`；如果同时带了 `display_name`，会更新显示名，所以"同步"可以反复点。
+- 稳定 id 只允许 `A-Za-z0-9._-`（它会被当作文件名），大小上限 16 MiB（实际音色约 40 KB）；显示名可以是中文/空格，保存在 `names.json`，不参与文件名。
 - 落盘目录由 `--voice-dir` 指定（`run-server.ps1` 传 `voices/`），因此**重启后依然在**：
   脚本启动时会把 `voices/*.gguf` 全部映射成 `--voice-prompt`。
-- 这个接口是本仓库对上游 checkout 的**本地补丁**（`D:\cosyvoice-server\src\tools\server\`：
-  `POST /v1/voices` + `--voice-dir`）；旧版服务端会返回 404，App 会提示"电脑端不支持音色上传"。
+- 这套接口是本仓库对上游 checkout 的**本地补丁**（`D:\cosyvoice-server\src\tools\server\`：
+  清单/下载/改名 + `POST /v1/voices` + `--voice-dir`）；改完需重新 `cmake --build`，并把
+  `build\bin\cosyvoice-server.exe`/`cosyvoice.dll` 复制到 `tools/.work/cosyvoice-server/bin`。
+  旧版服务端会返回 404，App 会降级为“只上传”并明确提示。
 
 ### 8.1 铁律：参考文本必须是参考音频的转写
 

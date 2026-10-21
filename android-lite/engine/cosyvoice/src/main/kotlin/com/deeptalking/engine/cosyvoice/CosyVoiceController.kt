@@ -131,6 +131,21 @@ class CosyVoiceController(private val context: Context) : TtsSpeaker {
         info
     }
 
+    /**
+     * Stores a prompt-speech gguf downloaded from the PC. The remote file is already
+     * encoded with the phone's rules, so it is written verbatim; [displayName] is the
+     * PC-side user-facing name.
+     */
+    fun importDownloadedVoice(id: String, bytes: ByteArray, displayName: String): VoiceInfo? {
+        if (!id.matches(Regex("[A-Za-z0-9._-]{1,128}"))) return null
+        if (bytes.isEmpty() || bytes.size > 16 * 1024 * 1024) return null
+        val file = File(voicesDir, if (id.endsWith(".gguf")) id else "$id.gguf")
+        return runCatching {
+            file.writeBytes(bytes)
+            store.add(file, displayName.ifBlank { file.name.removeSuffix(".gguf") }, builtin = false)
+        }.getOrNull()
+    }
+
     /** Encodes the bundled reference clips once so there are ready-to-use voices. */
     suspend fun ensureDefaultVoices(): Boolean = withContext(Dispatchers.IO) {
         if (!models.isReady()) return@withContext false

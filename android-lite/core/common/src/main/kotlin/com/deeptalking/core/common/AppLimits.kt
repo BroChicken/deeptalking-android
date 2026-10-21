@@ -203,7 +203,6 @@ object AppLimits {
 
     object Agent {
         const val MAX_TOOL_ROUNDS = 5
-        const val MAX_TOOL_CALLS = 12
         const val TOOL_MEMORY_INJECT_LIMIT = 5
     }
 

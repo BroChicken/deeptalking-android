@@ -58,7 +58,7 @@
 - 输出：强制调用 `submit_state`（`tool_choice` 锁定、`reasoning.effort=none`），参数为
   `dynamicState`（除 currentTone）、`quickReplies`（默认开启）、`todos`（带 `proposer`，create 走 `validateTodoCreation`）、`promiseUpdates`。
 - 输入额外包含 `【当前待办】` 与 `【当前约定】`（带 ID），用于完成/取消/改期的指认。
-- 强制调用失败（模型未发调用 / 参数不是合法 JSON）时退化为解析文本 JSON；仍失败则保留旧状态，只记失败指标，不重试整轮。
+- 强制调用失败（请求失败 / 模型未发调用 / 参数不是合法 JSON）时先退化为解析文本 JSON；仍失败则自动按 1s/2s 退避重试 2 次。两次重试仍失败才保留旧状态，并在聊天页留红色失败条 + 弹“再试一次 / 先这样”；红字只重跑本轮 worker。局部规则拒绝不触发整轮重试，只记短标签带到下一轮 worker 提示词。
 - 主动开场（无用户消息）：走显式分支「本轮无用户消息（角色主动开场）」，不伪造占位消息，允许来源仅 `assistantMessage.id`。
 - 证据：除 currentTone 外必须有 `sourceMessageIds` + `evidence`，解析不了就丢该字段。
 - 应用：以字段补丁写回（`CharacterRepository.mutate(id)`），不做整对象覆盖；`dynamicStateMeta` 同步写 `updatedAt`。
@@ -88,7 +88,7 @@
 
 - 通道：`turnWorker` / `quickReply` / `critique` 并行；`extraction` / `analysis` / `lorebook` / `scene` 按角色串行。
 - 所有写角色的通道共享 per-character 锁。
-- 重试：worker 失败一次即放弃（下一轮补状态）；记忆类沿用现有指数退避（`MemoryTaskKind`）。
+- 重试：worker 的请求/解析失败自动退避重试 2 次，仍失败转人工（红字 + 弹窗），局部规则拒绝只记短标签带到下一轮；记忆类沿用指数退避，抽取/分析连续 3 次失败弹“重试 / 忽略”，忽略后继续后台重试；世界书连续 3 次失败弹“重试 / 忽略”。
 
 ## 八、指标
 
@@ -107,6 +107,7 @@
 6. worker 失败：正文不受影响，状态保留旧值，指标留痕。
 7. 旧数据：历史 `<MEM_UPDATE>` 不显示；旧 JSON 回复可读。
 8. **强制 function call 实测**：worker 短输入 / 长输入（含 40k 级上下文）各跑若干次，记录是否返回调用、参数是否合法、耗时；结论写回本节。
+   - 2026-10-21，OpenCode Go `deepseek-v4.1-flash`，Responses `/v1/responses`，`tool_choice` 锁定 `submit_state`、`reasoning.effort=none`：短输入 3 次（首次上游 503，后两次 2/2 成功，参数合法，约 1.9s/次）；长输入 203,754 字符 / 36,015 input tokens，3/3 成功，参数合法，耗时 2.4–3.8s。首次短请求的 503 属于可重试的传输错误，现有 429/5xx 重试会覆盖。
 9. **系统上下文**：典型轮 ≤5.5k 字符、满态 ≤8k；不再出现【待跟进承诺】；召回无半句截断（细则见第十一节）。
 10. **消息 ID**：`memory_write` / `upsert_lorebook_entry` 能用真实或合成 ID 通过证据校验。
 11. **群组朗读**：每段都有成员语气，缺失时回退到群组语气（第二期）。

@@ -21,16 +21,24 @@ import com.deeptalking.core.model.TASK_CHAT_MAIN
 import com.deeptalking.core.model.TASK_CHAT_WORKER
 import com.deeptalking.core.model.TTS_BACKEND_REMOTE
 import com.deeptalking.core.model.TtsPhase
+import com.deeptalking.core.model.withStaticFieldTimestamps
+import com.deeptalking.core.security.BackupCipher
 import com.deeptalking.core.model.SpeechSegment
 import com.deeptalking.core.model.extractSpeechSegments
 import com.deeptalking.core.model.extractSpeechText
+import com.deeptalking.core.model.extractSpeechTextFromSegment
 import com.deeptalking.core.model.convergeLorebookCapacity
+import com.deeptalking.core.model.changedStaticProfileKeys
 import com.deeptalking.core.model.mergeCharacterChanges
+import com.deeptalking.core.model.mergeMemberCardEdits
+import com.deeptalking.core.model.mergeStaticProfile
+import com.deeptalking.core.model.mergeTodos
 import com.deeptalking.core.model.restoreArchivedLorebookEntry
 import com.deeptalking.core.model.trimMetricsPerTaskType
 import com.deeptalking.domain.agent.HotTopicCounters
 import com.deeptalking.domain.agent.HotTopicPolicy
 import com.deeptalking.domain.agent.OrchestratorResult
+import com.deeptalking.domain.agent.background.MemoryTaskKind
 import com.deeptalking.domain.agent.prompts.buildShortTermBlock
 import com.deeptalking.domain.memory.TodoPolicy
 import com.deeptalking.domain.memory.archiveToFit
@@ -41,6 +49,7 @@ import com.deeptalking.engine.ondevice.TokenUsage
 import com.deeptalking.engine.ondevice.TtsSpeaker
 import com.deeptalking.engine.ondevice.TtsTurn
 import com.deeptalking.engine.remote.RemoteTtsProbe
+import com.deeptalking.engine.remote.RemoteVoiceInfo
 import com.deeptalking.engine.remote.RemoteVoiceUpload
 import com.deeptalking.feature.characters.CharacterParity
 import kotlinx.coroutines.CancellationException
@@ -66,8 +75,12 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
@@ -87,6 +100,15 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     val config: StateFlow<AppConfig> =
         core.data.config.observe()
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), AppConfig())
+
+    /**
+     * Rolling per-request metrics, read straight from the independent metrics store
+     * (`:core:data` `MetricsRepository`, its own DataStore file). `AppConfig.requestMetrics`
+     * is only a legacy backup field now, so the panels must not read it.
+     */
+    val metrics: StateFlow<List<RequestMetric>> =
+        core.data.metrics.observe()
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     private val activeIdState = MutableStateFlow<String?>(null)
     val activeId: StateFlow<String?> = activeIdState
@@ -112,6 +134,47 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
 
     private val quickRepliesState = MutableStateFlow<List<String>>(emptyList())
     val quickReplies: StateFlow<List<String>> = quickRepliesState
+
+    /** A failed turn worker waiting for the user's red-bar retry / dialog decision. */
+    private val workerFailureState = MutableStateFlow<WorkerFailureUi?>(null)
+    val workerFailure: StateFlow<WorkerFailureUi?> = workerFailureState
+    private val workerRetryState = MutableStateFlow(false)
+    val workerRetryInProgress: StateFlow<Boolean> = workerRetryState
+    private val workerRetryCharacterState = MutableStateFlow<String?>(null)
+    val workerRetryCharacterId: StateFlow<String?> = workerRetryCharacterState
+    private var workerRetryJob: Job? = null
+    private var workerRetryToken = 0L
+    /** Bumped whenever a character starts a new turn; stale retries must not write back. */
+    private val turnGenerations = mutableMapOf<String, Long>()
+
+    private fun bumpTurnGeneration(id: String): Long {
+        val next = (turnGenerations[id] ?: 0L) + 1L
+        turnGenerations[id] = next
+        return next
+    }
+
+    private fun turnGeneration(id: String): Long = turnGenerations[id] ?: 0L
+
+    private val memoryRetryPromptState = MutableStateFlow<MemoryRetryUi?>(null)
+    val memoryRetryPrompt: StateFlow<MemoryRetryUi?> = memoryRetryPromptState
+    private val memoryRetryQueue = ArrayDeque<MemoryRetryUi>()
+    private var memoryPromptsRestored = false
+
+    private fun enqueueMemoryRetry(prompt: MemoryRetryUi) {
+        val current = memoryRetryPromptState.value
+        if (current?.let { it.kind == prompt.kind && it.characterId == prompt.characterId } == true) return
+        if (memoryRetryQueue.any { it.kind == prompt.kind && it.characterId == prompt.characterId }) return
+        if (current == null) {
+            memoryRetryPromptState.value = prompt
+        } else {
+            memoryRetryQueue.addLast(prompt)
+        }
+    }
+
+    private fun showNextMemoryRetry() {
+        if (memoryRetryPromptState.value != null) return
+        memoryRetryPromptState.value = memoryRetryQueue.removeFirstOrNull()
+    }
 
     private val sendingState = MutableStateFlow(false)
     val isSending: StateFlow<Boolean> = sendingState
@@ -262,6 +325,131 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 }
             } else {
                 eventsState.tryEmit(UiEvent("世界书已整理完成"))
+            }
+        }
+    }
+
+    // ------------------------------------------------------- turn-worker retry
+
+    /** "先这样": keep the red bar but stop asking. A new turn clears both. */
+    fun dismissWorkerFailureDialog() {
+        workerFailureState.value = workerFailureState.value?.copy(showDialog = false)
+    }
+
+    /** Red bar / "再试一次": rerun only the turn worker, never the assistant reply. */
+    fun retryWorkerTurn() {
+        val failure = workerFailureState.value ?: return
+        if (workerRetryJob?.isActive == true) return
+        val generation = turnGeneration(failure.characterId)
+        val token = ++workerRetryToken
+        workerRetryState.value = true
+        workerRetryCharacterState.value = failure.characterId
+        workerFailureState.value = failure.copy(showDialog = false)
+        val job = viewModelScope.launch {
+            try {
+                val current = core.data.characters.get(failure.characterId) ?: return@launch
+                if (!isSameWorkerTurn(failure, generation)) return@launch
+                val cfg = core.currentConfig()
+                val orchestrator = core.createOrchestrator(
+                    cfg,
+                    onStatus = { if (isActiveWorkerTurn(failure, generation)) statusState.value = it },
+                )
+                val result = orchestrator.retryWorker(
+                    character = current,
+                    userText = failure.userText,
+                    reply = failure.reply,
+                    replyId = failure.replyId,
+                    proactive = failure.proactive,
+                    onStatus = { if (isActiveWorkerTurn(failure, generation)) statusState.value = it },
+                )
+                if (!isSameWorkerTurn(failure, generation)) return@launch
+                if (result.ok) {
+                    writeCharacterChanges(current, result.character.copy(workerIssues = result.issues))
+                    if (isActiveWorkerTurn(failure, generation) && result.quickReplies.isNotEmpty()) {
+                        quickRepliesState.value = result.quickReplies
+                    }
+                    if (workerFailureState.value?.replyId == failure.replyId) {
+                        workerFailureState.value = null
+                    }
+                    if (isActiveWorkerTurn(failure, generation)) {
+                        statusState.value = ""
+                        eventsState.tryEmit(UiEvent("整理已补上"))
+                    }
+                } else {
+                    if (workerFailureState.value?.replyId == failure.replyId) {
+                        workerFailureState.value = failure.copy(
+                            reason = result.failure.ifBlank { "整理失败" },
+                            showDialog = false,
+                        )
+                    }
+                    if (isActiveWorkerTurn(failure, generation)) statusState.value = ""
+                }
+            } catch (error: Exception) {
+                if (error !is CancellationException && isSameWorkerTurn(failure, generation)) {
+                    if (workerFailureState.value?.replyId == failure.replyId) {
+                        workerFailureState.value = failure.copy(reason = "请求失败", showDialog = false)
+                    }
+                    if (isActiveWorkerTurn(failure, generation)) statusState.value = ""
+                }
+            } finally {
+                if (workerRetryToken == token) {
+                    workerRetryState.value = false
+                    workerRetryCharacterState.value = null
+                    workerRetryJob = null
+                }
+            }
+        }
+        workerRetryJob = job
+    }
+
+    /** True while [failure] is still the same turn and its reply is still the latest answer. */
+    private suspend fun isSameWorkerTurn(failure: WorkerFailureUi, generation: Long): Boolean {
+        if (turnGeneration(failure.characterId) != generation) return false
+        val messages = core.data.chat.getMessages(failure.characterId)
+        val latestReply = messages.lastOrNull { it.role == Role.Assistant && it.content.isNotBlank() }
+        return latestReply?.id == failure.assistantRowId
+    }
+
+    private fun isActiveWorkerTurn(failure: WorkerFailureUi, generation: Long): Boolean =
+        activeIdState.value == failure.characterId && turnGeneration(failure.characterId) == generation
+
+    /** "忽略" on extraction/analysis: stop prompting; the background backoff continues. */
+    fun dismissMemoryRetry() {
+        val prompt = memoryRetryPromptState.value ?: return
+        memoryRetryPromptState.value = null
+        viewModelScope.launch {
+            runCatching { core.markMemoryRetryAcked(prompt.characterId, prompt.kind) }
+        }
+        showNextMemoryRetry()
+    }
+
+    /** "重试" on extraction/analysis: run one pass immediately, ignoring the backoff. */
+    fun retryMemoryNow() {
+        val prompt = memoryRetryPromptState.value ?: return
+        memoryRetryPromptState.value = null
+        viewModelScope.launch {
+            // Answering "重试" also acknowledges this streak; a failed retry re-opens the
+            // prompt once, but later background failures must not ask again.
+            runCatching { core.markMemoryRetryAcked(prompt.characterId, prompt.kind) }
+            val cfg = runCatching { core.currentConfig() }.getOrNull()
+            if (cfg == null) {
+                memoryRetryPromptState.value = prompt.copy(reason = "读取配置失败")
+                return@launch
+            }
+            val outcome = runCatching {
+                core.retryPendingMemory(cfg, prompt.characterId, prompt.kind)
+            }.getOrElse { MemoryRetryOutcome(ok = false, reason = it.message ?: "请求失败") }
+            if (outcome.ok) {
+                eventsState.tryEmit(
+                    UiEvent(
+                        if (outcome.noop) outcome.reason else "${prompt.title}已恢复",
+                    ),
+                )
+                showNextMemoryRetry()
+            } else {
+                // The batch is still there; keep the prompt open with the new short reason.
+                memoryRetryPromptState.value = prompt.copy(reason = outcome.reason.take(80))
+                eventsState.tryEmit(UiEvent("${prompt.title}仍未成功"))
             }
         }
     }
@@ -596,6 +784,8 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         if (activeIdState.value != id) {
             activeIdState.value = id
             quickRepliesState.value = emptyList()
+            // Keep worker failure/retry for the character it belongs to: the red bar and
+            // dialog are filtered by `characterId`, so switching away must not lose it.
             streamingState.value = null
             lastUserActivityAt.value = System.currentTimeMillis()
         }
@@ -832,6 +1022,15 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     }
 
     fun deleteCharacter(id: String) {
+        if (workerFailureState.value?.characterId == id) {
+            workerRetryJob?.cancel()
+            workerRetryJob = null
+            workerRetryToken++
+            workerRetryState.value = false
+            workerRetryCharacterState.value = null
+            workerFailureState.value = null
+        }
+        turnGenerations.remove(id)
         viewModelScope.launch {
             core.data.characters.delete(id)
             core.data.chat.clear(id)
@@ -1521,6 +1720,16 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         val images = pendingImagesState.value
         if (sendingState.value) return completedJob()
         if (!proactive && !skipUserAppend && text.isBlank() && images.isEmpty()) return completedJob()
+        // A new turn supersedes any manual worker retry for the same character.
+        if (workerFailureState.value?.characterId == id) {
+            workerRetryJob?.cancel()
+            workerRetryJob = null
+            workerRetryToken++
+            workerRetryState.value = false
+            workerRetryCharacterState.value = null
+            workerFailureState.value = null
+        }
+        bumpTurnGeneration(id)
         return viewModelScope.launch {
             sendingState.value = true
             statusState.value = "思考中…"
@@ -1610,26 +1819,29 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                     // The FINAL phase already retried the empty round twice; record the
                     // failed turn once so the per-request rows stay truthful.
                     runCatching {
-                        appendMetric { metrics ->
-                            metrics + RequestMetric(
-                                at = Instant.now().toString(),
-                                characterId = id,
-                                taskType = TASK_CHAT_MAIN,
-                                model = cfg.modelName,
-                                platform = cfg.apiPlatform,
-                                phase = "empty-reply",
-                                status = "failed",
-                                durationMs = System.currentTimeMillis() - requestStartedAt,
-                            )
-                        }
+                        appendMetric(
+                            listOf(
+                                RequestMetric(
+                                    at = Instant.now().toString(),
+                                    characterId = id,
+                                    taskType = TASK_CHAT_MAIN,
+                                    model = cfg.modelName,
+                                    platform = cfg.apiPlatform,
+                                    phase = "empty-reply",
+                                    status = "failed",
+                                    durationMs = System.currentTimeMillis() - requestStartedAt,
+                                ),
+                            ),
+                        )
                     }
                     eventsState.tryEmit(UiEvent("收到空回复，请重试。你的消息已保留。"))
                     return@launch
                 }
+                val assistantRowId = UUID.randomUUID().toString()
                 core.data.chat.append(
                     id,
                     ChatMessage(
-                        id = UUID.randomUUID().toString(),
+                        id = assistantRowId,
                         role = Role.Assistant,
                         content = finalResult.reply,
                         timestamp = Instant.now().toString(),
@@ -1656,7 +1868,22 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 // anything a background pass changed while the model was answering (and a
                 // background world-book write would be rolled back likewise).
                 writeCharacterChanges(character, withConfirmations)
-                quickRepliesState.value = finalResult.quickReplies
+                if (finalResult.quickReplies.isNotEmpty()) {
+                    quickRepliesState.value = finalResult.quickReplies
+                }
+                if (finalResult.workerRan && !finalResult.workerOk) {
+                    workerFailureState.value = WorkerFailureUi(
+                        characterId = id,
+                        userText = text.trim(),
+                        reply = finalResult.reply,
+                        replyId = finalResult.workerReplyId,
+                        assistantRowId = assistantRowId,
+                        proactive = proactive,
+                        reason = finalResult.workerFailure.ifBlank { "整理失败" },
+                    )
+                } else if (workerFailureState.value?.characterId == id) {
+                    workerFailureState.value = null
+                }
                 statusState.value = ""
                 recordMetrics(
                     cfg,
@@ -1666,7 +1893,9 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                     buildShortTermBlock(character),
                     System.currentTimeMillis() - requestStartedAt,
                 )
-                if (cfg.ttsEnabled && cfg.ttsAutoRead) speakReply(finalResult.reply, finalResult.updatedCharacter)
+                if (cfg.ttsEnabled && cfg.ttsAutoRead) {
+                    speakReply(finalResult.segments, finalResult.reply, finalResult.updatedCharacter)
+                }
             } catch (error: Exception) {
                 streamingState.value = null
                 statusState.value = ""
@@ -1675,18 +1904,20 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                     // this row the settings panel cannot explain "为什么这次没回".
                     val failedCfg = core.currentConfig()
                     runCatching {
-                        appendMetric { metrics ->
-                            metrics + RequestMetric(
-                                at = Instant.now().toString(),
-                                characterId = id,
-                                taskType = TASK_CHAT_MAIN,
-                                model = failedCfg.modelName,
-                                platform = failedCfg.apiPlatform,
-                                phase = (error.message ?: error.toString()).replace(Regex("\\s+"), " ").trim().take(160),
-                                status = "failed",
-                                durationMs = System.currentTimeMillis() - turnStartedAt,
-                            )
-                        }
+                        appendMetric(
+                            listOf(
+                                RequestMetric(
+                                    at = Instant.now().toString(),
+                                    characterId = id,
+                                    taskType = TASK_CHAT_MAIN,
+                                    model = failedCfg.modelName,
+                                    platform = failedCfg.apiPlatform,
+                                    phase = (error.message ?: error.toString()).replace(Regex("\\s+"), " ").trim().take(160),
+                                    status = "failed",
+                                    durationMs = System.currentTimeMillis() - turnStartedAt,
+                                ),
+                            ),
+                        )
                     }
                 }
                 eventsState.tryEmit(UiEvent("回复失败：${error.message ?: error}。你的消息已保留，可稍后重试。"))
@@ -1762,9 +1993,6 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
 
     /** Already-completed [Job] for the no-op branches of [submitTurn]. */
     private fun completedJob(): Job = Job().apply { complete() }
-
-    /** Serializes concurrent `requestMetrics`/`cacheStats` column writes. */
-    private val metricsMutex = Mutex()
 
     /** Per-character prefix snapshots backing the request trace (legacy `requestPrefixSnapshots`). */
     private val requestPrefixSnapshots = mutableMapOf<String, PrefixSnapshot>()
@@ -1883,7 +2111,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                     )
                 }
             }
-            workerMetric(at, cfg, characterId, result)?.let { rows += it }
+            workerMetricRow(at, cfg, characterId, result)?.let { rows += it }
         }
         // The per-round durations are not reported by the backend; the turn total lands
         // on the last main row so the list stays honest without inventing per-round values.
@@ -1924,7 +2152,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             put("fullText", last.rawReply.take(2000))
             putJsonArray("quickReplies") { last.quickReplies.forEach { add(it) } }
         }.toString()
-        appendMetric(cacheStats = cacheStats, lastReplyDebug = debug) { it + rows }
+        appendMetric(rows, cacheStats = cacheStats, lastReplyDebug = debug)
     }
 
     /** One `chat.main` row (one model request of the turn). */
@@ -1952,37 +2180,8 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             prefixChange = trace?.prefixChange,
             commonHistoryMessages = trace?.commonHistoryMessages,
             contextChars = result.contextChars,
+            sectionChars = metricSectionChars(result),
             inputChars = trace?.inputChars,
-            inputTokens = usage?.inputTokens?.takeIf { it > 0 },
-            outputTokens = usage?.outputTokens?.takeIf { parts.hasUsage },
-            hitTokens = parts.hit,
-            missTokens = parts.miss,
-            hitRate = parts.rate,
-        )
-    }
-
-    /**
-     * The turn worker's row. Written when it reported usage **or** failed (a failed forced
-     * call still costs a request and must be visible as `status=failed`); nothing is
-     * written when the worker did not run at all and reported nothing.
-     */
-    private fun workerMetric(
-        at: String,
-        cfg: AppConfig,
-        characterId: String,
-        result: OrchestratorResult,
-    ): RequestMetric? {
-        val usage = result.workerUsage
-        if (usage == null && result.workerOk) return null
-        val parts = usageParts(usage)
-        return RequestMetric(
-            at = at,
-            taskType = TASK_CHAT_WORKER,
-            characterId = characterId,
-            model = cfg.modelName,
-            platform = cfg.apiPlatform,
-            status = if (result.workerOk) "completed" else "failed",
-            phase = if (result.workerOk) "" else "worker-failed",
             inputTokens = usage?.inputTokens?.takeIf { it > 0 },
             outputTokens = usage?.outputTokens?.takeIf { parts.hasUsage },
             hitTokens = parts.hit,
@@ -2003,28 +2202,32 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     }
 
     /**
-     * Serializes the read-modify-write of the rolling metrics/cache columns so a
-     * background auxiliary usage report cannot be clobbered by a concurrent chat
-     * write (both used to overwrite the whole `AppConfig` from a stale snapshot).
+     * Appends [rows] to the independent metrics store and, when given, refreshes the
+     * header's `cacheStats` / reply-debug columns.
+     *
+     * The metric rows go to `:core:data`'s `MetricsRepository`, whose append is one atomic
+     * read-modify-write on its own DataStore file — so concurrent writers can no longer
+     * clobber each other, and no in-process mutex is needed. The config columns are only
+     * written when a chat turn actually produces them (one turn at a time), never by
+     * auxiliary calls.
      */
     private suspend fun appendMetric(
+        rows: List<RequestMetric> = emptyList(),
         cacheStats: CacheStats? = null,
         lastReplyDebug: String? = null,
-        append: (List<RequestMetric>) -> List<RequestMetric>,
     ) {
-        metricsMutex.withLock {
+        if (rows.isNotEmpty()) {
+            runCatching { core.data.metrics.appendAll(rows) }
+        }
+        if (cacheStats == null && lastReplyDebug == null) return
+        runCatching {
             val current = core.data.config.current()
-            runCatching {
-                core.data.config.update(
-                    current.copy(
-                        // Trimmed **per taskType**: a turn's tool rounds must not evict
-                        // the worker/background rows (nor the other way round).
-                        requestMetrics = append(current.requestMetrics).trimMetricsPerTaskType(),
-                        cacheStats = cacheStats ?: current.cacheStats,
-                        lastReplyDebug = lastReplyDebug ?: current.lastReplyDebug,
-                    ),
-                )
-            }
+            core.data.config.update(
+                current.copy(
+                    cacheStats = cacheStats ?: current.cacheStats,
+                    lastReplyDebug = lastReplyDebug ?: current.lastReplyDebug,
+                ),
+            )
         }
     }
 
@@ -2050,7 +2253,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 missTokens = miss,
                 hitRate = if (hasUsage) (cachedOrZero(usage)).toDouble() / usage.inputTokens else null,
             )
-            appendMetric { it + metric }
+            appendMetric(listOf(metric))
         }
     }
 
@@ -2160,24 +2363,61 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
 
     // ----------------------------------------------------------- import/export
 
-    fun exportJson(onReady: (String) -> Unit) {
+    private val backupJson = Json { prettyPrint = true; encodeDefaults = true }
+
+    /** True when the selected backup carries the encrypted secret bundle. */
+    fun backupNeedsPassword(json: String): Boolean =
+        runCatching { backupJson.parseToJsonElement(json).jsonObject.containsKey("secrets") }
+            .getOrDefault(false)
+
+    fun exportJson(password: String, onReady: (String) -> Unit) {
+        if (password.isEmpty()) {
+            eventsState.tryEmit(UiEvent("请设置备份密码"))
+            return
+        }
         viewModelScope.launch {
             val activeId = activeIdState.value
-            val json = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                core.backup.exportJson(activeId)
+            val withSecrets = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                val json = core.backup.exportJson(activeId)
+                // Keep the backup shape unchanged and put the encrypted secret bundle at the
+                // root. Only API keys and the remote-TTS token are inside the ciphertext.
+                val root = backupJson.parseToJsonElement(json).jsonObject
+                val encrypted = BackupCipher.encrypt(core.secrets.snapshot(), password)
+                JsonObject(root + ("secrets" to backupJson.parseToJsonElement(encrypted)))
             }
-            onReady(json)
+            onReady(backupJson.encodeToString(JsonElement.serializer(), withSecrets))
         }
     }
 
-    fun importJson(json: String) {
+    fun importJson(json: String, password: String) {
         viewModelScope.launch {
+            val secretNode = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                runCatching {
+                    backupJson.parseToJsonElement(json).jsonObject["secrets"]
+                }.getOrNull()
+            }
+            val secrets = if (secretNode != null) {
+                if (password.isEmpty()) {
+                    eventsState.tryEmit(UiEvent("这个备份包含密钥，请输入备份密码"))
+                    return@launch
+                }
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    BackupCipher.decrypt(secretNode.toString(), password)
+                } ?: run {
+                    eventsState.tryEmit(UiEvent("备份密码错误，或密钥数据已损坏"))
+                    return@launch
+                }
+            } else {
+                null
+            }
             val summary = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                 runCatching { core.backup.importJson(json) }
             }.getOrElse { error ->
                 eventsState.tryEmit(UiEvent("导入失败：${error.message ?: error}"))
                 return@launch
             }
+            secrets?.let { core.secrets.restore(it) }
+            normalizeImportedTtsVoice()
             val all = core.data.characters.observeAll().first()
             val restored = summary.activeCharacterId?.takeIf { id -> all.any { it.id == id } }
             activeIdState.value = restored ?: all.firstOrNull()?.id
@@ -2190,6 +2430,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                     },
                 ),
             )
+            refreshTtsState(core.currentConfig())
             // Legacy runs silent static-field completion + migration prompts after import.
             runCatching { core.runStartupMigrations() }.onFailure { DeepTalkingApp.recordError(it) }
             runCatching { core.runMemoryRepair() }.onFailure { DeepTalkingApp.recordError(it) }
@@ -2207,6 +2448,24 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             runCatching { runMemoryCleanupChunk(AppLimits.Memory.CLEANUP_BATCHES_PER_RUN) }
                 .onFailure { DeepTalkingApp.recordError(it) }
             autoRepairAvatars()
+        }
+    }
+
+    /**
+     * A backup stores the voice path, which is device-specific. Resolve it by file name
+     * against the local catalog; a missing voice becomes an empty selection instead of a
+     * dead absolute path from another phone.
+     */
+    private suspend fun normalizeImportedTtsVoice() {
+        val cfg = core.data.config.current()
+        val fileName = cfg.ttsVoiceFile.takeIf { it.isNotBlank() }?.let { java.io.File(it).name }
+        val match = fileName?.let { name ->
+            runCatching { core.cosyVoice.listVoices() }.getOrDefault(emptyList())
+                .firstOrNull { it.file == name }
+        }
+        val path = match?.let { core.cosyVoice.voiceFileFor(it.file)?.absolutePath }.orEmpty()
+        if (cfg.ttsVoiceFile != path) {
+            core.data.config.update(cfg.copy(ttsVoiceFile = path))
         }
     }
 
@@ -2413,13 +2672,24 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             val cfg = core.currentConfig()
             val probe = runCatching { core.testTtsConnection(cfg) }
                 .getOrElse { RemoteTtsProbe(ok = false, message = "测试失败：${it.message}") }
+            val manifest = if (probe.ok) {
+                runCatching { core.listTtsVoices(cfg) }.getOrDefault(emptyList())
+            } else {
+                emptyList()
+            }
             if (probe.sampleRate > 0) {
                 core.data.config.update(core.currentConfig().copy(ttsRemoteSampleRate = probe.sampleRate))
             }
             ttsState.value = ttsState.value.copy(
                 busy = false,
                 remoteStatus = probe.message,
-                remoteVoices = if (probe.speakers.isEmpty()) ttsState.value.remoteVoices else probe.speakers,
+                remoteVoices = if (manifest.isNotEmpty()) manifest.map { it.id }
+                else if (probe.speakers.isEmpty()) ttsState.value.remoteVoices else probe.speakers,
+                remoteVoiceNames = if (manifest.isNotEmpty()) {
+                    manifest.associate { it.id to it.name }
+                } else {
+                    ttsState.value.remoteVoiceNames
+                },
             )
             refreshTtsState(core.currentConfig())
         }
@@ -2451,7 +2721,12 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                     continue
                 }
                 val result = runCatching {
-                    core.uploadTtsVoice(config, voice.file.removeSuffix(".gguf"), bytes)
+                    core.uploadTtsVoice(
+                        config,
+                        voice.file.removeSuffix(".gguf"),
+                        bytes,
+                        displayName = voice.name,
+                    )
                 }.getOrElse { RemoteVoiceUpload(voice.file, ok = false, message = it.message ?: "上传失败") }
                 if (result.ok) uploaded++ else failures += "${voice.name}：${result.message}"
             }
@@ -2467,6 +2742,206 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             )
             refreshTtsState(core.currentConfig())
         }
+    }
+
+    /**
+     * One-tap voice sync. Stable file IDs identify a voice; display names are the
+     * user-facing field and the phone always wins a name conflict. Same-ID files with
+     * different content are reported, never overwritten. PC-only files are downloaded;
+     * phone-only files are uploaded. A name collision gets `_1`/`_2` on the side that
+     * loses the base name.
+     */
+    fun syncTtsVoices() {
+        if (ttsState.value.busy) return
+        if (ttsState.value.remoteUrl.isBlank()) {
+            ttsState.value = ttsState.value.copy(remoteStatus = "请先配置电脑端服务器地址")
+            return
+        }
+        ttsState.value = ttsState.value.copy(busy = true, remoteStatus = "正在同步音色和名称…")
+        viewModelScope.launch {
+            val cfg = core.currentConfig()
+            val local = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                runCatching { core.cosyVoice.listVoices() }.getOrDefault(emptyList())
+            }
+            val remote = runCatching { core.listTtsVoices(cfg) }.getOrDefault(emptyList())
+            val remoteConfig = core.remoteTtsConfig(cfg)
+            var uploaded = 0
+            var downloaded = 0
+            var renamed = 0
+            val skipped = mutableListOf<String>()
+            val usedRemoteNames = remote.map { it.name }.toMutableList()
+            val remoteNamesById = remote.associate { it.id to it.name }.toMutableMap()
+
+            suspend fun renameRemote(id: String, name: String): Boolean {
+                val target = uniqueVoiceName(name, usedRemoteNames)
+                val error = core.renameTtsVoice(cfg, id, target)
+                if (error != null) {
+                    skipped += "$id：重命名失败（$error）"
+                    return false
+                }
+                val old = remoteNamesById[id]
+                if (old != null) usedRemoteNames.remove(old)
+                usedRemoteNames += target
+                remoteNamesById[id] = target
+                renamed++
+                return true
+            }
+
+            if (remote.isEmpty()) {
+                // Older PC server: no manifest, so only the existing upload direction works.
+                for (voice in local) {
+                    val file = core.cosyVoice.voiceFileFor(voice.file) ?: continue
+                    val bytes = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        runCatching { file.readBytes() }.getOrNull()
+                    } ?: continue
+                    val result = runCatching {
+                        core.uploadTtsVoice(
+                            remoteConfig,
+                            voice.file.removeSuffix(".gguf"),
+                            bytes,
+                            displayName = voice.name,
+                        )
+                    }.getOrElse { RemoteVoiceUpload(voice.file, false, it.message ?: "上传失败") }
+                    if (result.ok) uploaded++ else skipped += "${voice.name}：${result.message}"
+                }
+                val refreshed = runCatching { core.listTtsVoices(core.currentConfig()) }.getOrDefault(emptyList())
+                ttsState.value = ttsState.value.copy(
+                    busy = false,
+                    remoteVoices = refreshed.map { it.id },
+                    remoteVoiceNames = refreshed.associate { it.id to it.name },
+                    remoteStatus = "电脑端未提供音色清单，已上传 $uploaded/${local.size} 个；升级电脑端后可双向同步名称",
+                )
+                refreshTtsState(core.currentConfig())
+                return@launch
+            }
+
+            // Phone-side voices: upload missing ones and let the phone's name win.
+            for (voice in local) {
+                val id = voice.file.removeSuffix(".gguf")
+                val remoteVoice = remote.firstOrNull { it.id == id }
+                val localFile = core.cosyVoice.voiceFileFor(voice.file)
+                val bytes = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    localFile?.let { runCatching { it.readBytes() }.getOrNull() }
+                }
+                if (bytes == null) {
+                    skipped += "${voice.name}：本机文件缺失"
+                    continue
+                }
+                if (remoteVoice == null) {
+                    // A different PC voice may already own this display name; the phone
+                    // wins the base name, so move the PC one to _1/_2 first.
+                    remote.filter { it.id != id && remoteNamesById[it.id] == voice.name }
+                        .forEach { conflict -> renameRemote(conflict.id, voice.name) }
+                    val result = runCatching {
+                        core.uploadTtsVoice(remoteConfig, id, bytes, displayName = voice.name)
+                    }.getOrElse { RemoteVoiceUpload(id, false, it.message ?: "上传失败") }
+                    if (result.ok) {
+                        uploaded++
+                        usedRemoteNames += voice.name
+                    } else {
+                        skipped += "${voice.name}：${result.message}"
+                    }
+                    continue
+                }
+                val sameBytes = if (remoteVoice.hash.isNotEmpty()) {
+                    remoteVoice.hash == fnv1aHex(bytes)
+                } else {
+                    remoteVoice.size == bytes.size.toLong()
+                }
+                if (!sameBytes) {
+                    skipped += "${voice.name}：两端文件内容不同，已保留两端"
+                    continue
+                }
+                if (remoteVoice.name != voice.name) {
+                    // Free the phone's base name first: another PC voice may already own it.
+                    remote.filter { it.id != id && remoteNamesById[it.id] == voice.name }
+                        .forEach { conflict -> renameRemote(conflict.id, voice.name) }
+                    renameRemote(id, voice.name)
+                }
+            }
+
+            // The rename pass above may have changed several PC names. Refresh the manifest
+            // before downloading so suffixes are computed from the actual current names.
+            val remoteAfterLocal = runCatching { core.listTtsVoices(core.currentConfig()) }
+                .getOrDefault(remote)
+            usedRemoteNames.clear()
+            usedRemoteNames.addAll(remoteAfterLocal.map { it.name })
+            remoteNamesById.clear()
+            remoteNamesById.putAll(remoteAfterLocal.associate { it.id to it.name })
+
+            // PC-only voices: download them and suffix the display name if it collides.
+            val localNames = local.map { it.name }.toMutableSet()
+            val localIds = local.map { it.file.removeSuffix(".gguf") }.toSet()
+            for (voice in remoteAfterLocal) {
+                if (voice.id in localIds) continue
+                val bytes = runCatching { core.downloadTtsVoice(cfg, voice.id) }.getOrNull()
+                if (bytes == null) {
+                    skipped += "${voice.name}：下载失败"
+                    continue
+                }
+                val name = uniqueVoiceName(voice.name, localNames)
+                if (name != voice.name) {
+                    // Keep the PC side in sync with the suffixed name we are about to store
+                    // locally; otherwise the two ends would show different names.
+                    renameRemote(voice.id, name)
+                }
+                val imported = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    runCatching { core.cosyVoice.importDownloadedVoice(voice.id, bytes, name) }.getOrNull()
+                }
+                if (imported == null) {
+                    skipped += "${voice.name}：写入本机失败"
+                } else {
+                    localNames += name
+                    downloaded++
+                }
+            }
+
+            val refreshed = runCatching { core.listTtsVoices(core.currentConfig()) }.getOrDefault(remote)
+            ttsState.value = ttsState.value.copy(
+                busy = false,
+                remoteVoices = refreshed.map { it.id },
+                remoteVoiceNames = refreshed.associate { it.id to it.name },
+                remoteStatus = buildString {
+                    append("同步完成：上传 $uploaded，下载 $downloaded，改名 $renamed")
+                    if (skipped.isNotEmpty()) append("；未处理：").append(skipped.joinToString("、"))
+                },
+            )
+            refreshTtsState(core.currentConfig())
+        }
+    }
+
+    /** Renames a server-side display name without changing its speaker ID. */
+    fun renameRemoteVoice(id: String, name: String) {
+        val trimmed = name.trim()
+        if (id.isBlank() || trimmed.isEmpty()) return
+        viewModelScope.launch {
+            val error = runCatching { core.renameTtsVoice(core.currentConfig(), id, trimmed) }
+                .getOrElse { it.message ?: "重命名失败" }
+            ttsState.value = if (error == null) {
+                ttsState.value.copy(
+                    remoteVoiceNames = ttsState.value.remoteVoiceNames + (id to trimmed),
+                    remoteStatus = "已重命名电脑音色：$trimmed",
+                )
+            } else {
+                ttsState.value.copy(remoteStatus = "重命名失败：$error")
+            }
+        }
+    }
+
+    private fun uniqueVoiceName(base: String, used: Collection<String>): String {
+        if (base !in used) return base
+        var index = 1
+        while ("${base}_$index" in used) index++
+        return "${base}_$index"
+    }
+
+    private fun fnv1aHex(bytes: ByteArray): String {
+        var hash = 1469598103934665603uL
+        for (byte in bytes) {
+            hash = hash xor (byte.toInt() and 0xff).toULong()
+            hash *= 1099511628211uL
+        }
+        return hash.toString(16).padStart(16, '0')
     }
 
     /** "自动发现": sweeps the phone's own subnets for the server and stores the address. */
@@ -2598,7 +3073,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
      * time; starting a new one preempts the previous.
      */
     fun speakMessage(message: ChatMessage, character: Character?) {
-        val segments = buildSpeechSegments(message.content, character)
+        val segments = buildSpeechSegments(message.content, character, message.segments)
         if (segments.isEmpty()) {
             eventsState.tryEmit(UiEvent("这条消息没有可朗读的内容"))
             return
@@ -2616,33 +3091,41 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     fun speakText(text: String) {
         val speech = text.trim()
         if (speech.isEmpty()) return
-        startSpeak(null, listOf(SpeechSegment(null, speech)), null)
+        startSpeak(null, listOf(SpeechSegment(speaker = "", text = speech)), null)
     }
 
     /** Auto-reads a freshly generated reply (no bubble highlight). */
-    private fun speakReply(reply: String, character: Character?) {
-        val segments = buildSpeechSegments(reply, character)
+    private fun speakReply(persisted: List<SpeechSegment>, reply: String, character: Character?) {
+        val segments = buildSpeechSegments(reply, character, persisted)
         if (segments.isEmpty()) return
         startSpeak(null, segments, character)
     }
 
     /** Splits a reply into speakable turns: per member for groups, else one turn. */
-    private fun buildSpeechSegments(content: String, character: Character?): List<SpeechSegment> =
-        if (character != null && character.isGroup) {
-            extractSpeechSegments(content, character.members.map { it.name })
-        } else {
-            val speech = extractSpeechText(content)
-            if (speech.isEmpty()) emptyList() else listOf(SpeechSegment(null, speech))
+    private fun buildSpeechSegments(
+        content: String,
+        character: Character?,
+        persisted: List<SpeechSegment> = emptyList(),
+    ): List<SpeechSegment> {
+        if (persisted.isNotEmpty()) {
+            return persisted.mapNotNull { segment ->
+                val speech = extractSpeechTextFromSegment(segment.text)
+                if (speech.isEmpty()) null else SpeechSegment(segment.speaker, speech)
+            }
         }
+        if (character != null && character.isGroup) {
+            return extractSpeechSegments(content, character.members.map { it.name })
+        }
+        val speech = extractSpeechText(content)
+        return if (speech.isEmpty()) emptyList() else listOf(SpeechSegment(speaker = "", text = speech))
+    }
 
     /** Tone instruction for one spoken turn: the speaker's `currentTone`. */
     private fun toneFor(segment: SpeechSegment, character: Character?): String? {
-        val raw = if (segment.speaker != null) {
+        val raw = if (segment.speaker.isNotBlank()) {
             val memberTone = character?.members
                 ?.firstOrNull { it.name == segment.speaker }
                 ?.dynamicState?.currentTone
-                // Second phase: per-member tone. Until the worker writes it, fall back to
-                // the group-wide tone so a group reply never goes silent.
                 .orEmpty().ifBlank { character?.dynamicState?.currentTone.orEmpty() }
             memberTone
         } else {
@@ -2754,10 +3237,54 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 )
             }
         }
+        core.onMemoryRetryNeeded = { kind, characterId, reason ->
+            viewModelScope.launch {
+                val name = core.data.characters.get(characterId)?.name.orEmpty()
+                enqueueMemoryRetry(
+                    MemoryRetryUi(
+                        kind = kind,
+                        characterId = characterId,
+                        characterName = name.ifBlank { "该角色" },
+                        reason = reason.ifBlank { "请求失败" },
+                    ),
+                )
+            }
+        }
         viewModelScope.launch {
             core.data.characters.observeAll().collect { list ->
                 if (activeIdState.value == null && list.isNotEmpty()) {
                     activeIdState.value = list.first().id
+                }
+                if (!memoryPromptsRestored && list.isNotEmpty()) {
+                    memoryPromptsRestored = true
+                    list.forEach { character ->
+                        if (character.counters.extractionFailures >= 3 &&
+                            !character.counters.extractionPromptAcked
+                        ) {
+                            enqueueMemoryRetry(
+                                MemoryRetryUi(
+                                    kind = MemoryTaskKind.Extraction,
+                                    characterId = character.id,
+                                    characterName = character.name.ifBlank { "该角色" },
+                                    reason = "请求失败",
+                                ),
+                            )
+                        }
+                        if (character.counters.analysisFailures >= 3 &&
+                            !character.counters.analysisPromptAcked
+                        ) {
+                            enqueueMemoryRetry(
+                                MemoryRetryUi(
+                                    kind = MemoryTaskKind.Analysis,
+                                    characterId = character.id,
+                                    characterName = character.name.ifBlank { "该角色" },
+                                    reason = character.counters.analysisLastError
+                                        .ifBlank { "请求失败" }
+                                        .take(80),
+                                ),
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -2772,6 +3299,15 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         // 自动清理超过保留期的已完成 / 已取消待办（与长期记忆无关）。
         viewModelScope.launch {
             runCatching { pruneClosedTodos() }.onFailure { DeepTalkingApp.recordError(it) }
+        }
+        // Adopt the legacy `AppConfig.requestMetrics` into the independent metrics store
+        // **once** (no-op once the store has been written). After this, the config field is
+        // only ever read by backups/migration — never written at runtime.
+        viewModelScope.launch {
+            runCatching {
+                val cfg = core.data.config.observe().first()
+                core.data.metrics.migrateLegacy(cfg.requestMetrics)
+            }.onFailure { DeepTalkingApp.recordError(it) }
         }
         // Legacy one-time relative-time → absolute migration (no key required).
         viewModelScope.launch {
@@ -2816,4 +3352,65 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             refreshTtsState(core.currentConfig())
         }
     }
+}
+
+/**
+ * Phase label of the `chat.worker` metric row.
+ *
+ * A failed worker keeps the `worker-failed` marker; every note the worker produced (a todo
+ * rejected by [TodoPolicy], a malformed `quickReplies` count, an unparseable forced call)
+ * is appended, so an item the worker silently dropped is still traceable from the settings
+ * debug log. A successful worker with no notes leaves the phase empty.
+ */
+internal fun workerPhase(result: OrchestratorResult): String {
+    val notes = result.workerNotes.joinToString("；")
+    return when {
+        !result.workerOk -> if (notes.isEmpty()) "worker-failed" else "worker-failed：$notes"
+        notes.isEmpty() -> ""
+        else -> "worker-note：$notes"
+    }
+}
+
+/**
+ * The turn worker's `chat.worker` row.
+ *
+ * Written when the worker reported usage, failed, **or** left any note: a failed forced call
+ * still costs a request and a dropped todo/quick-reply is a real outcome, so neither may
+ * vanish. Nothing is written only when the worker did not run and reported nothing.
+ */
+internal fun workerMetricRow(
+    at: String,
+    cfg: AppConfig,
+    characterId: String,
+    result: OrchestratorResult,
+): RequestMetric? {
+    val usage = result.workerUsage
+    if (usage == null && result.workerOk && result.workerNotes.isEmpty()) return null
+    val input = usage?.inputTokens?.takeIf { it > 0 }
+    val hit = if (input != null) (usage?.cachedTokens ?: 0).coerceAtLeast(0) else null
+    val miss = if (input != null && hit != null) (input - hit).coerceAtLeast(0) else null
+    return RequestMetric(
+        at = at,
+        taskType = TASK_CHAT_WORKER,
+        characterId = characterId,
+        model = cfg.modelName,
+        platform = cfg.apiPlatform,
+        status = if (result.workerOk) "completed" else "failed",
+        phase = workerPhase(result),
+        inputTokens = input,
+        outputTokens = if (input != null) usage?.outputTokens else null,
+        hitTokens = hit,
+        missTokens = miss,
+        hitRate = if (input != null && hit != null) hit.toDouble() / input else null,
+    )
+}
+
+/**
+ * `RequestMetric.sectionChars` of a turn: the volatile-context sections the request really
+ * carried (`ChatOrchestrator` already omits dropped ones). Empty → `null`, so legacy rows
+ * and turns without prompt assembly stay distinguishable from a genuinely measured turn.
+ */
+internal fun metricSectionChars(result: OrchestratorResult): Map<String, Int>? {
+    val kept = result.sectionChars.filterValues { it > 0 }
+    return kept.ifEmpty { null }
 }

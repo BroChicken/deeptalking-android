@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -36,6 +37,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -59,6 +61,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -100,9 +104,13 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
     val activeId by vm.activeId.collectAsState()
     val messages by vm.messages.collectAsState()
     val quickReplies by vm.quickReplies.collectAsState()
+    val workerFailure by vm.workerFailure.collectAsState()
+    val workerRetryInProgress by vm.workerRetryInProgress.collectAsState()
+    val workerRetryCharacterId by vm.workerRetryCharacterId.collectAsState()
     val isSending by vm.isSending.collectAsState()
     val status by vm.status.collectAsState()
     val config by vm.config.collectAsState()
+    val metrics by vm.metrics.collectAsState()
     val pendingImages by vm.pendingImages.collectAsState()
     val generating by vm.isGenerating.collectAsState()
     val fieldMigrationCount by vm.fieldMigrationPrompt.collectAsState()
@@ -116,6 +124,7 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
     val lorebookRebuildPrompt by vm.lorebookRebuildPrompt.collectAsState()
     val lorebookRebuild by vm.lorebookRebuild.collectAsState()
     val lorebookRetryPrompt by vm.lorebookRetryPrompt.collectAsState()
+    val memoryRetryPrompt by vm.memoryRetryPrompt.collectAsState()
     val tts by vm.tts.collectAsState()
 
     val activeCharacter = characters.firstOrNull { it.id == activeId }
@@ -146,23 +155,30 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
+    var exportPasswordPrompt by remember { mutableStateOf(false) }
+    var exportPassword by remember { mutableStateOf("") }
+    var importPassword by remember { mutableStateOf("") }
     val exportLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/json"),
     ) { uri ->
         if (uri != null) {
-            vm.exportJson { json ->
+            vm.exportJson(exportPassword) { json ->
                 scope.launch {
                     runCatching {
                         kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                             context.contentResolver.openOutputStream(uri)?.use { it.write(json.toByteArray()) }
                         }
-                    }.onSuccess { snackbarHostState.showSnackbar("已导出备份") }
+                    }.onSuccess { snackbarHostState.showSnackbar("已导出备份（密钥已加密）") }
                         .onFailure { snackbarHostState.showSnackbar("导出失败：${it.message}") }
                 }
             }
+            exportPassword = ""
+        } else {
+            exportPassword = ""
         }
     }
     var pendingImport by remember { mutableStateOf<String?>(null) }
+    var pendingImportHasSecrets by remember { mutableStateOf(false) }
     val importLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument(),
     ) { uri ->
@@ -177,12 +193,23 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                         bytes?.let { decodeImportBytes(it) }
                     }
                 }.getOrNull()
-                if (text != null) pendingImport = text else snackbarHostState.showSnackbar("文件读取失败")
+                if (text != null) {
+                    pendingImportHasSecrets = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        vm.backupNeedsPassword(text)
+                    }
+                    pendingImport = text
+                } else {
+                    snackbarHostState.showSnackbar("文件读取失败")
+                }
             }
         }
     }
-    val export = { exportLauncher.launch("deeptalking_backup_" + java.time.LocalDate.now() + ".json") }
-    val import = { importLauncher.launch(arrayOf("application/json", "text/*", "*/*")) }
+    val export = { exportPasswordPrompt = true }
+    val import = {
+        importPassword = ""
+        pendingImportHasSecrets = false
+        importLauncher.launch(arrayOf("application/json", "text/*", "*/*"))
+    }
 
     ModalNavigationDrawer(
         drawerState = drawerState,
@@ -224,6 +251,7 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                 } else {
                     SettingsScreen(
                         config = config,
+                        metrics = metrics,
                         hasApiKey = vm.hasApiKey(config.apiPlatform),
                         loadApiKey = { platform -> vm.storedApiKey(platform) },
                         testResult = vm.testResult.collectAsState().value,
@@ -259,6 +287,7 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                         ttsRemoteToken = tts.remoteToken,
                         ttsRemoteStatus = tts.remoteStatus,
                         ttsRemoteVoices = tts.remoteVoices,
+                        ttsRemoteVoiceNames = tts.remoteVoiceNames,
                         ttsAdvanced = com.deeptalking.feature.settings.TtsAdvanced.fromStored(
                             chunkTokens = tts.remoteChunkTokens,
                             temperature = tts.remoteTemperature,
@@ -288,6 +317,8 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                         onSaveTtsRemoteToken = vm::saveTtsToken,
                         onDiscoverTtsRemote = vm::discoverTtsServer,
                         onUploadTtsVoices = vm::uploadVoicesToRemote,
+                        onSyncTtsVoices = vm::syncTtsVoices,
+                        onRenameTtsRemoteVoice = vm::renameRemoteVoice,
                     )
                 }
             }
@@ -303,7 +334,7 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                     activeCharacter = activeCharacter,
                     currentThemeId = config.activeTheme,
                     version = BuildConfig.VERSION_NAME,
-                    config = config,
+                    metrics = metrics,
                     onOpenDrawer = { scope.launch { drawerState.open() } },
                     onSelectTheme = vm::setTheme,
                 )
@@ -322,6 +353,10 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                     character = activeCharacter,
                     messages = messages,
                     quickReplies = quickReplies,
+                    workerFailure = workerFailure?.takeIf { it.characterId == activeId }?.reason,
+                    workerFailureMessageId = workerFailure?.takeIf { it.characterId == activeId }?.assistantRowId,
+                    onRetryWorker = vm::retryWorkerTurn,
+                    workerRetryInProgress = workerRetryInProgress && workerRetryCharacterId == activeId,
                     isSending = isSending,
                     status = status,
                     pendingImages = pendingImages,
@@ -497,11 +532,31 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
         )
     }
 
+    memoryRetryPrompt?.let { prompt ->
+        AlertDialog(
+            onDismissRequest = { vm.dismissMemoryRetry() },
+            title = { Text(prompt.title) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("「${prompt.characterName}」连续 3 次没有整理成功。")
+                    if (prompt.reason.isNotBlank()) {
+                        Text("原因：${prompt.reason}", fontSize = 13.sp)
+                    }
+                    Text("重试会立刻再跑一次；忽略则不再提示，但后台仍会按退避继续尝试，不会丢数据。", fontSize = 13.sp)
+                }
+            },
+            confirmButton = { TextButton(onClick = { vm.retryMemoryNow() }) { Text("重试") } },
+            dismissButton = { TextButton(onClick = { vm.dismissMemoryRetry() }) { Text("忽略") } },
+        )
+    }
+
     // A world-book pass failed repeatedly: the batch is held in memory (it would otherwise
     // be dropped with the short-term entries the analysis consumed), so the user decides.
     lorebookRetryPrompt?.let { prompt ->
         AlertDialog(
-            onDismissRequest = { vm.dismissLorebookRetry() },
+            // Tapping outside / back must not throw the held batch away; only the
+            // explicit "忽略并丢弃" button does that.
+            onDismissRequest = {},
             title = { Text("世界书整理失败") },
             text = {
                 Column {
@@ -518,7 +573,7 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                 }
             },
             confirmButton = { TextButton(onClick = { vm.retryLorebookNow() }) { Text("重试") } },
-            dismissButton = { TextButton(onClick = { vm.dismissLorebookRetry() }) { Text("忽略") } },
+            dismissButton = { TextButton(onClick = { vm.dismissLorebookRetry() }) { Text("忽略并丢弃") } },
         )
     }
 
@@ -663,15 +718,102 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
         )
     }
 
-    pendingImport?.let { text ->
+    workerFailure?.takeIf { it.characterId == activeId && it.showDialog }?.let { failure ->
         AlertDialog(
-            onDismissRequest = { pendingImport = null },
-            title = { Text("导入备份") },
-            text = { Text("导入会覆盖当前所有角色与对话，且不可撤销。确定继续吗？") },
-            confirmButton = {
-                TextButton(onClick = { pendingImport = null; vm.importJson(text) }) { Text("覆盖导入") }
+            onDismissRequest = { vm.dismissWorkerFailureDialog() },
+            title = { Text("本轮整理失败") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("角色回复已经完成，但状态、待办或快捷回应没有整理成功。")
+                    Text("原因：${failure.reason}", fontSize = 13.sp)
+                    Text("可以只重试本轮整理，不会重新生成回复。", fontSize = 13.sp)
+                }
             },
-            dismissButton = { TextButton(onClick = { pendingImport = null }) { Text("取消") } },
+            confirmButton = {
+                val retrying = workerRetryInProgress && workerRetryCharacterId == failure.characterId
+                TextButton(
+                    enabled = !retrying,
+                    onClick = { vm.retryWorkerTurn() },
+                ) { Text(if (retrying) "正在重试…" else "再试一次") }
+            },
+            dismissButton = {
+                TextButton(onClick = { vm.dismissWorkerFailureDialog() }) { Text("先这样") }
+            },
+        )
+    }
+
+    pendingImport?.let { text ->
+        val encrypted = pendingImportHasSecrets
+        AlertDialog(
+            onDismissRequest = { pendingImport = null; pendingImportHasSecrets = false },
+            title = { Text("导入备份") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("导入会覆盖当前所有角色与对话，且不可撤销。确定继续吗？")
+                    if (encrypted) {
+                        Text("这个备份包含加密的 API key / 远程朗读口令，请输入导出时设置的密码。")
+                        OutlinedTextField(
+                            value = importPassword,
+                            onValueChange = { importPassword = it },
+                            label = { Text("备份密码") },
+                            singleLine = true,
+                            visualTransformation = PasswordVisualTransformation(),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = !encrypted || importPassword.isNotEmpty(),
+                    onClick = {
+                        val password = importPassword
+                        pendingImport = null
+                        pendingImportHasSecrets = false
+                        importPassword = ""
+                        vm.importJson(text, password)
+                    },
+                ) { Text("覆盖导入") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    pendingImport = null
+                    pendingImportHasSecrets = false
+                    importPassword = ""
+                }) { Text("取消") }
+            },
+        )
+    }
+
+    if (exportPasswordPrompt) {
+        AlertDialog(
+            onDismissRequest = { exportPasswordPrompt = false; exportPassword = "" },
+            title = { Text("设置备份密码") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("备份里的 API key 和远程朗读口令会用这个密码加密。密码不会被保存，忘记后无法恢复。")
+                    OutlinedTextField(
+                        value = exportPassword,
+                        onValueChange = { exportPassword = it },
+                        label = { Text("备份密码") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = exportPassword.isNotEmpty(),
+                    onClick = {
+                        exportPasswordPrompt = false
+                        exportLauncher.launch("deeptalking_backup_" + java.time.LocalDate.now() + ".json")
+                    },
+                ) { Text("导出") }
+            },
+            dismissButton = {
+                TextButton(onClick = { exportPasswordPrompt = false; exportPassword = "" }) { Text("取消") }
+            },
         )
     }
 }
@@ -722,7 +864,7 @@ private fun AppHeader(
     activeCharacter: com.deeptalking.core.model.Character?,
     currentThemeId: String,
     version: String,
-    config: com.deeptalking.core.model.AppConfig,
+    metrics: List<RequestMetric>,
     onOpenDrawer: () -> Unit,
     onSelectTheme: (String) -> Unit,
 ) {
@@ -774,7 +916,7 @@ private fun AppHeader(
                 color = legacy.textMuted,
                 modifier = Modifier.padding(end = 2.dp),
             )
-            CacheMenu(config)
+            CacheMenu(metrics)
             ThemeMenu(currentThemeId = currentThemeId, onSelect = onSelectTheme)
         }
         Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(legacy.border).align(Alignment.BottomStart))
@@ -804,8 +946,10 @@ private fun cacheLine(label: String, rows: List<RequestMetric>): CacheLine {
  * Rows without a round are legacy data; they deliberately produce no line rather than
  * falling back to a single request.
  */
-private fun latestMainTurn(metrics: List<RequestMetric>): List<RequestMetric> {
-    val main = metrics.filter { it.taskType == "chat.main" }
+internal fun latestMainTurn(metrics: List<RequestMetric>): List<RequestMetric> {
+    // A failed request has no token usage and no round; counting it would blank the cache row
+    // of the last successful turn. Failures stay in the debug list, not in the cache summary.
+    val main = metrics.filter { it.taskType == "chat.main" && it.status == "completed" }
     if (main.isEmpty() || main.last().round == null) return emptyList()
     val rows = ArrayDeque<RequestMetric>()
     for (row in main.asReversed()) {
@@ -815,28 +959,28 @@ private fun latestMainTurn(metrics: List<RequestMetric>): List<RequestMetric> {
     return if (rows.firstOrNull()?.round == 1) rows.toList() else emptyList()
 }
 
-private fun latestTaskRows(metrics: List<RequestMetric>, taskType: String): List<RequestMetric> =
-    listOfNotNull(metrics.lastOrNull { it.taskType == taskType })
+internal fun latestTaskRows(metrics: List<RequestMetric>, taskType: String): List<RequestMetric> =
+    listOfNotNull(metrics.lastOrNull { it.taskType == taskType && it.status == "completed" })
 
 /** Small triangle next to the version; opens the cache summary, not a persistent pill. */
 @Composable
-private fun CacheMenu(config: com.deeptalking.core.model.AppConfig) {
+private fun CacheMenu(metrics: List<RequestMetric>) {
     var open by remember { mutableStateOf(false) }
     val legacy = MaterialTheme.legacy
-    val main = remember(config.requestMetrics) {
-        cacheLine("主聊天", latestMainTurn(config.requestMetrics))
+    val main = remember(metrics) {
+        cacheLine("主聊天", latestMainTurn(metrics))
     }
-    val worker = remember(config.requestMetrics) {
-        cacheLine("后台处理", latestTaskRows(config.requestMetrics, "chat.worker"))
+    val worker = remember(metrics) {
+        cacheLine("后台处理", latestTaskRows(metrics, "chat.worker"))
     }
-    val extraction = remember(config.requestMetrics) {
-        cacheLine("短期提取", latestTaskRows(config.requestMetrics, "extraction"))
+    val extraction = remember(metrics) {
+        cacheLine("短期提取", latestTaskRows(metrics, "extraction"))
     }
-    val analysis = remember(config.requestMetrics) {
-        cacheLine("记忆整理", latestTaskRows(config.requestMetrics, "analysis"))
+    val analysis = remember(metrics) {
+        cacheLine("记忆整理", latestTaskRows(metrics, "analysis"))
     }
-    val lorebook = remember(config.requestMetrics) {
-        cacheLine("世界书整理", latestTaskRows(config.requestMetrics, "lorebook"))
+    val lorebook = remember(metrics) {
+        cacheLine("世界书整理", latestTaskRows(metrics, "lorebook"))
     }
 
     Box {
@@ -889,7 +1033,11 @@ private fun CacheLineRow(line: CacheLine) {
 }
 
 @Composable
-private fun CachePill(config: com.deeptalking.core.model.AppConfig, modifier: Modifier = Modifier) {
+private fun CachePill(
+    config: com.deeptalking.core.model.AppConfig,
+    metrics: List<RequestMetric>,
+    modifier: Modifier = Modifier,
+) {
     val legacy = MaterialTheme.legacy
     // Legacy `renderCacheStats` (`stickers.js:266-288`): the pill reads
     // `config.cacheStats`, shows `缓存 --` when unset, and averages the last 10
@@ -903,7 +1051,7 @@ private fun CachePill(config: com.deeptalking.core.model.AppConfig, modifier: Mo
             val miss = stats.missTokens ?: 0
             val total = hit + miss
             val rate = if (total > 0) Math.round(hit * 100.0 / total).toInt() else 0
-            val recent = config.requestMetrics
+            val recent = metrics
                 .filter { it.taskType.startsWith("chat") && it.hitRate != null }
                 .takeLast(10)
             val average = if (recent.isNotEmpty()) {
@@ -975,7 +1123,7 @@ private fun compactTokens(value: Int): String = when {
  * kinds (`memory.*`, `lorebook.*`, legacy `chat`/`auxiliary`...), all shown as stored.
  */
 @Composable
-private fun MetricBreakdownButton(config: com.deeptalking.core.model.AppConfig) {
+private fun MetricBreakdownButton(metrics: List<RequestMetric>) {
     var open by remember { mutableStateOf(false) }
     val legacy = MaterialTheme.legacy
     Text(
@@ -992,7 +1140,7 @@ private fun MetricBreakdownButton(config: com.deeptalking.core.model.AppConfig) 
             .padding(horizontal = 5.dp, vertical = 2.dp),
     )
     if (open) {
-        val groups = metricGroups(config.requestMetrics)
+        val groups = metricGroups(metrics)
         Dialog(onDismissRequest = { open = false }) {
             Surface(
                 shape = RoundedCornerShape(12.dp),

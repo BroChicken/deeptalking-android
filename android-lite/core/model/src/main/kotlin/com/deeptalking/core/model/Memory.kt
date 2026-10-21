@@ -299,6 +299,10 @@ data class MemoryCounters(
      * diagnosed instead of silently retrying forever.
      */
     val analysisLastError: String = "",
+    /** True after the user chose "忽略" on the third extraction failure. */
+    val extractionPromptAcked: Boolean = false,
+    /** True after the user chose "忽略" on the third analysis failure. */
+    val analysisPromptAcked: Boolean = false,
 )
 
 /** Latest chat cache-usage snapshot (legacy `config.cacheStats`). */

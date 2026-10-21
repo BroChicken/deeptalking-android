@@ -11,8 +11,9 @@
 - **INV-4 前缀缓存稳定**：system 固定在前、历史原样递增、volatile 只挂当前用户消息；任何"每轮变化的文本塞进 system 前缀"都会击穿缓存。
 - **INV-5 FINAL 相无工具**：`AUTO` 拿不到正文就转 `FINAL`（`tools` 为空、`toolChoice=Auto`、`reasoning.effort=none`），FINAL 空回合最多重试 2 次；回合只在这两相之间流转。
 - **INV-6 待办与长期记忆独立，准入须「明确日期 + 双方同意」**（`TodoPolicy.validateTodoCreation` / worker 的 `submit_state.todos`）；`promises` 是叙事记忆、仍需用户原话证据（`isValidAutomaticMemory`）。
-- **INV-7 正文优先，不为 quickReplies 重发**：主调用只产出纯文本 + `【语气】` 行；快速回应由 turn worker 生产（可选，失败不影响正文），后台换位生成只作兜底。
-- **INV-8 快速回应必须是用户视角**：`StyleGuard.detectQuickReplyIssues` 校验，失败由 `BackgroundTasks.repairQuickReplies`（换位生成）重写；不得覆盖已显示的正文。
+- **INV-7 正文优先，不为 quickReplies 重发**：主调用只产出纯文本 + `【语气】` 行；快速回应由 turn worker 生产（**恰好 2 条**，多则留前两条、少则整组弃用），失败不影响正文；后台换位生成**只在 worker 未成功时**兜底。
+- **INV-8 快速回应必须是用户视角**：`StyleGuard.detectQuickReplyIssues` 校验，worker 未成功时由 `BackgroundTasks.repairQuickReplies`（换位生成）重写；不得覆盖已显示的正文。
+- **INV-9 群组分段不改历史**：`ChatMessage.segments` 只服务渲染/朗读，`content` 始终是全文；历史与 `instant` 窗口把一轮群聊当**一条**消息。
 
 ## 1. 核心机制链（主链）
 
@@ -28,14 +29,15 @@
         ▼
   ParsedTurn { reply, tone }                    正文立即显示
         │
+        ├─ groupSpeechSegments（群组）→ ChatMessage.segments（逐成员气泡；content 仍是全文）
         ├─ AgentLoop.salvageText（空文本时）→ extractResponsesText / 内嵌 reply JSON / extractAnyResponseText
         │
         ▼
   TurnWorker.parse(result)                      强制 function call：submit_state
-        ├─ dynamicState（不含 currentTone） → applyDynamicStateFields
-        ├─ memberDynamicState（群组）        → 对应成员 dynamicState
-        ├─ quickReplies                      → 快速回应按钮（失败则无按钮）
-        ├─ todos                             → TodoPolicy.validateTodoCreation / applyTodoUpdate
+        ├─ dynamicState（本体不含 currentTone） → applyDynamicStateFields
+        ├─ memberDynamicState（群组）        → 对应成员 dynamicState（含成员 currentTone）
+        ├─ quickReplies（恰好 2 条）          → 快速回应按钮（不足 2 条则弃用、无按钮）
+        ├─ todos                             → TodoPolicy.validateTodoCreation / applyTodoUpdate（detail 可空）
         └─ promiseUpdates                    → applyPromiseUpdate
         │
         ▼
@@ -74,7 +76,9 @@ STATIC_PROFILE_FIELDS ─┬─► TurnWorker 不含静态字段（成员/本体
                        └─► LegacyMapper 的旧字段迁移（worldView→background 等）
 ```
 
-> 原生 `DYNAMIC_STATE_FIELDS` 为 **6 项**：`currentSituation` / `currentLocation` / `currentMood` / `currentOccupation` / `currentGoal` / `currentTone`。其中前 5 项由 turn worker 写（群组成员走 `memberDynamicState`），`currentTone` 只来自主调用末尾的 `【语气】` 行、免证据门。
+> 原生 `DYNAMIC_STATE_FIELDS` 为 **6 项**：`currentSituation` / `currentLocation` / `currentMood` / `currentOccupation` / `currentGoal` / `currentTone`。本体：前 5 项由 turn worker 写，`currentTone` 来自主调用末尾的 `【语气】` 行；群组：共享状态只有 `currentSituation` / `currentLocation`，成员的完整状态（**含各自 `currentTone`**）由 `memberDynamicState` 写入。所有 `currentTone` 都免证据门。
+>
+> 群组分段不走 `parseJsonLenient`：`parseGroupSpeechSegments`（`:core:model` 的 `GroupSpeech.kt`）是纯文本行解析，只切气泡/发言人，失败也只退化成单个无语气段，不影响正文、历史与窗口。
 
 ## 4. 已知脆弱点与对应加固
 
@@ -101,7 +105,7 @@ STATIC_PROFILE_FIELDS ─┬─► TurnWorker 不含静态字段（成员/本体
   tool_choice: 'auto'
 }
 ```
-- **AUTO 相（正常路径）**：`tools = Tools.defaultTools()`（8 个），`tool_choice: Auto`。模型若发起工具调用，**这一轮的正文丢弃**，只执行工具、回传结果、`continue`。
+- **AUTO 相（正常路径）**：`tools = Tools.defaultTools()`（8 个），`tool_choice: Auto`。模型若发起工具调用，**这一轮的正文丢弃**，只执行工具、回传结果、`continue`。**同一条响应里的全部 `tool_calls` 都在本轮执行**（每一条都必须配一个 `function_call_output`，否则下一轮会带着孤立的 `function_call`）；`MAX_TOOL_ROUNDS`(5) 按**响应数**计，`MAX_TOOL_CALLS`(12) 目前不参与判定。
 - **FINAL 相（唯一收尾相）**：`tools` 为空（传输层省略 `tools`），`tool_choice: Auto`，`reasoning.effort='none'`；正文以纯文本返回。AUTO 拿不到正文、或工具轮达上限时转入。
 - turn worker 是**另一条请求**：`tools=[submit_state]`、`tool_choice={type:'function', name:'submit_state'}`、`stream=false`、`reasoning.effort='none'`、`auxiliary=true`。
 
@@ -113,13 +117,14 @@ STATIC_PROFILE_FIELDS ─┬─► TurnWorker 不含静态字段（成员/本体
         └─ 只取 reply 与 tone，其余字段照旧落盘
 空回合：FINAL 无正文 → 重试（≤2 次）→ 仍空则本轮失败提示
 ```
-- quickReplies 由 turn worker 的 `submit_state` 提供（恰好两条、用户视角）；`StyleGuard.detectQuickReplyIssues` 校验不过时由 `BackgroundTasks.repairQuickReplies` 换位重写，失败就不出按钮。
+- quickReplies 由 turn worker 的 `submit_state` 提供（恰好两条、用户视角；多则留前两条、少则整组弃用并记 note）；**worker 未成功时**才由 `BackgroundTasks.repairQuickReplies` 换位重写（`quickReplyRepairEnabled = config.quickReplyRepair && !worker.ok`），失败就不出按钮。
+- 群组回复在同一条消息上附带 `segments`（`parseGroupSpeechSegments`）：只用于逐成员气泡与朗读，`content` 与历史序列化保持不变。
 - 主调用不写 `longTerm` / `shortTerm`：记忆只由后台抽取/分析与 `memory_write` 工具产生。
 
 ## 4.6 待办（todo）准入原则
 
 - **定义**：待办 = 用户与角色之间、**有明确日期**且**双方同意**的一件待办；是**独立实体**（`Character.todos`），与长期记忆互相独立。
-- **准入**（`TodoPolicy.validateTodoCreation`，唯一入口是 turn worker 的 `submit_state.todos` 里 `op=create`）：①期限必填且能在对话原话里定位；②用户发起→用户原话含期限与提议；③角色发起→必须附**用户应答的原话**，且该原话不得是明确拒绝（`isUserRefusal` 否决，`isUserAgreement` 只作正向信号；**同意与否以模型的判断为主，关键词只做一环**）。`sourceMessageIds`+`evidence` 经 `MemoryEvidence.hasValidUserEvidence` 校验。
+- **准入**（`TodoPolicy.validateTodoCreation`，唯一入口是 turn worker 的 `submit_state.todos` 里 `op=create`）：①期限必填且能在对话原话里定位；②用户发起→用户原话含期限与提议；③角色发起→必须附**用户应答的原话**，且该原话不得是明确拒绝（`isUserRefusal` 否决，`isUserAgreement` 只作正向信号；**同意与否以模型的判断为主，关键词只做一环**）。`title` 是唯一必填文本，`detail` 可空（空时用 `title` 补位，整条不会因此被丢）；`sourceMessageIds`+`evidence` 经 `MemoryEvidence.hasValidUserEvidence` 校验。
 - **禁止**：没有明确日期、期限定位不到、或角色单方叮嘱而用户没答应的，一律拒绝（`applyWorkerTodo` 跳过该条）。
 - **生命周期**：改期/完成/取消由同一 `submit_state.todos` 的 `reschedule`/`done`/`cancel` 处理（须引用户原话，改期还要能定位，走 `applyTodoUpdate`）；角色编辑页待办 tab 提供「完成 / 取消 / 删除」手动兜底。
 - **与 promises 区分**：`promises` 是叙事记忆，走 `isValidAutomaticMemory`（来源须为用户消息），**不产生待办**。
@@ -134,6 +139,7 @@ STATIC_PROFILE_FIELDS ─┬─► TurnWorker 不含静态字段（成员/本体
 - [ ] 是否改请求体阶段（`RequestBuilder`/`ResponsesLlmBackend`）？→ 核对 FINAL 相 tools 为空、`tool_choice=auto`（INV-5）。
 - [ ] 是否改待办（todo）准入？→ 必须保留「明确日期 + 双方同意」约束（INV-6）；改 promises 自动写入则保留"用户原话证据"约束。
 - [ ] 是否改 `submit_state` 字段？→ 同步 `TurnWorker.SCHEMA`、`TurnWorker.parse`、`ChatOrchestrator.runTurnWorker` 与 `OUTBOUND_CALLS_V2.md` 附录 B-1。
+- [ ] 是否改群组回复格式（`成员名：内容`）？→ 同步 `parseGroupSpeechSegments`（气泡）与 `extractSpeechSegments`（朗读），并确认历史/窗口仍按**一条**消息计数（INV-9）。
 
 ## 6. GRAPH（YAML 镜像）
 
@@ -145,8 +151,9 @@ invariants:
   INV-4: {rule: prefix-cache-stability}
   INV-5: {rule: final-phase-has-no-tools, why: 'FINAL terminates the turn with plain text; an empty FINAL round is retried at most twice'}
   INV-6: {rule: todo-requires-date-and-mutual-agreement, why: 'todo is independent of long-term memory; a character instruction with no user agreement must not become a to-do'}
-  INV-7: {rule: body-first-never-refetch-for-quickReplies, why: 'quick replies come from the turn worker, never from an extra main-call round'}
+  INV-7: {rule: body-first-never-refetch-for-quickReplies, why: 'quick replies come from the turn worker (exactly 2), never from an extra main-call round; the legacy repair round only runs when the worker did not succeed'}
   INV-8: {rule: quickReplies-must-be-user-viewpoint, guard: StyleGuard.detectQuickReplyIssues, repair: BackgroundTasks.repairQuickReplies}
+  INV-9: {rule: group-segments-never-change-history, why: 'ChatMessage.segments only drives bubbles/read-aloud; content stays the full text and the window counts one reply as one message'}
 
 nodes:
   parseJsonLenient:        {kind: function, role: hub, risk: high}
@@ -157,12 +164,16 @@ nodes:
   parseTurnFromText:       {kind: function, role: main-reply, risk: high}
   buildTurn:               {kind: function, role: legacy-json-compat, risk: medium}
   ToneText.split:          {kind: function, role: reply-tone-split, risk: high}
+  parseGroupSpeechSegments:{kind: function, role: group-bubble-split, risk: medium}
+  extractSpeechSegments:   {kind: function, role: group-tts-split, risk: medium}
   TurnWorker.parse:        {kind: function, role: worker-output, risk: high}
   StreamText.extractReplyFromJson:{kind: function, role: stream-bubble, risk: medium}
   ChatOrchestrator.applyMemory:{kind: function, role: memory-write, risk: high}
   ChatOrchestrator.runTurnWorker:{kind: function, role: worker-apply, risk: high}
   applyDynamicStateFields: {kind: function, role: dynamic-write, risk: medium}
+  applyMemberDynamicState: {kind: function, role: member-dynamic-write, risk: medium}
   FieldRevision.detect:    {kind: function, role: static-field-revise, risk: medium}
+  FieldEditRegistry:       {kind: object, role: focused-field-guard, risk: medium}
   DYNAMIC_STATE_FIELDS:    {kind: const, role: field-set, risk: high}
   STATIC_PROFILE_FIELDS:   {kind: const, role: field-set, risk: high}
 
@@ -174,6 +185,11 @@ edges:
   - {from: TurnWorker.parse,         to: parseJsonLenient}
   - {from: ChatOrchestrator.runTurnWorker, to: TurnWorker.parse}
   - {from: ChatOrchestrator.runTurnWorker, to: applyDynamicStateFields}
+  - {from: ChatOrchestrator.runTurnWorker, to: applyMemberDynamicState, note: 'group members, currentTone included'}
+  - {from: parseTurnFromText,        to: parseGroupSpeechSegments, note: 'groups only; display bubbles'}
+  - {from: parseGroupSpeechSegments, to: 'ChatMessage.segments'}
+  - {from: parseGroupSpeechSegments, to: extractSpeechSegments, note: 'read-aloud re-splits and cleans the text'}
+  - {from: FieldEditRegistry,        to: [applyDynamicStateFields, applyMemberDynamicState, FieldRevision.detect, autoFillStaticFields], note: 'focused fields are skipped'}
   - {from: parseJsonLenient,         to: StreamText.extractReplyFromJson}
   - {from: parseJsonLenient,         to: 'LegacyMapper.field-migration'}
   - {from: parseJsonLenient,         to: 'CharacterParity.generate/fill/upgrade'}
@@ -195,3 +211,5 @@ failure_modes:
 {"reply":"x","quickReplies":["a","b"],"dynamicState":{"currentMood":{"value":"ok","evidence":"quote "here""},"currentGoal":{"value":"g"}}}
 ```
 期望：`parseJsonLenient` 能修复为**对象**且 `quickReplies==["a","b"]`（修复前会返回数组，`quickReplies` 为空）。对应的回归用例在 `:domain:agent` 的 `ResponseParserTest` / `ResponseParserSalvageTest`。
+
+群组分段样例（改 `parseGroupSpeechSegments` 后必跑）：`"张三：走吧。\n（雨更大了）\n李四：再等等。"` → 两个段（`张三` / `李四`），`（雨更大了）` 留在第一段的文本里；把成员名换成一个不存在的名字 → 只有一个空 speaker 的段，且 `content` 不受影响。回归用例在 `:core:model` 的 `GroupSpeechTest` / `SpeechTextTest`。

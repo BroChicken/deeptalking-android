@@ -5,6 +5,8 @@ import com.deeptalking.core.common.AppLimits
 import com.deeptalking.core.data.CharacterRepository
 import com.deeptalking.core.data.ChatRepository
 import com.deeptalking.core.data.ConfigRepository
+import com.deeptalking.core.data.MetricsRepository
+import com.deeptalking.core.data.MetricsStore
 import com.deeptalking.core.database.CharacterDao
 import com.deeptalking.core.database.CharacterEntity
 import com.deeptalking.core.database.ConfigDao
@@ -14,16 +16,19 @@ import com.deeptalking.core.database.MessageEntity
 import com.deeptalking.core.model.AppConfig
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
+import com.deeptalking.core.model.GroupMember
 import com.deeptalking.core.model.LongTermMemory
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.LorebookOrigin
 import com.deeptalking.core.model.MemoryCategory
 import com.deeptalking.core.model.MemorySubject
 import com.deeptalking.core.model.PromiseStatus
+import com.deeptalking.core.model.RequestMetric
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.SceneState
 import com.deeptalking.core.model.SceneSummary
 import com.deeptalking.core.model.ShortTermMemory
+import com.deeptalking.core.model.SpeechSegment
 import com.deeptalking.core.model.StaticFillMeta
 import com.deeptalking.core.model.Todo
 import com.deeptalking.core.model.TodoProposer
@@ -364,6 +369,92 @@ class LegacyMapperTest {
         val summary = fresh.importJson(exported)
         assertEquals(1, summary.characters)
         assertEquals(1, summary.stickers)
+    }
+
+    @Test
+    fun backupRoundTripsGroupSegments() = runTest {
+        val characters = CharacterRepository(FakeCharacterDao())
+        val chat = ChatRepository(FakeMessageDao())
+        val config = ConfigRepository(FakeConfigDao())
+        characters.upsert(
+            Character(
+                id = "g1",
+                name = "小队",
+                emoji = "👥",
+                members = listOf(
+                    GroupMember(id = "m1", name = "张三", emoji = "🦊"),
+                    GroupMember(id = "m2", name = "李四", emoji = "🐼"),
+                ),
+            ),
+        )
+        chat.append(
+            "g1",
+            ChatMessage(
+                id = "msg1",
+                role = Role.Assistant,
+                content = "张三：早\n李四：早啊",
+                timestamp = "2026-01-01T00:00:00Z",
+                segments = listOf(
+                    SpeechSegment(speaker = "张三", text = "早"),
+                    SpeechSegment(speaker = "李四", text = "早啊"),
+                ),
+            ),
+        )
+
+        val exported = BackupService(characters, chat, config).exportJson(activeCharacterId = "g1")
+        val root = Json { ignoreUnknownKeys = true }.parseToJsonElement(exported) as JsonObject
+        val history = ((root["characters"] as JsonObject).getValue("g1") as JsonObject).getValue("history") as JsonArray
+        val segments = (history[0] as JsonObject).getValue("segments") as JsonArray
+        assertEquals(2, segments.size)
+        assertEquals("张三", ((segments[0] as JsonObject).getValue("speaker") as JsonPrimitive).content)
+        assertEquals("早啊", ((segments[1] as JsonObject).getValue("text") as JsonPrimitive).content)
+
+        // Restoring into a fresh store keeps the turns (and the single-message layout).
+        val freshMessages = FakeMessageDao()
+        LegacyImportService(
+            CharacterRepository(FakeCharacterDao()),
+            ChatRepository(freshMessages),
+            ConfigRepository(FakeConfigDao()),
+            null,
+        ).importJson(exported)
+        val restored = ChatRepository(freshMessages).getMessages("g1").single()
+        assertEquals("张三：早\n李四：早啊", restored.content)
+        assertEquals(
+            listOf(SpeechSegment("张三", "早"), SpeechSegment("李四", "早啊")),
+            restored.segments,
+        )
+    }
+
+    @Test
+    fun messageWithoutSegmentsImportsAsEmpty() {
+        // Older backups and WebView exports have no `segments`: nothing is invented.
+        val messages = mapInstantMessages(
+            listOf(LegacyInstantMessage(id = "m1", role = "assistant", content = "旧消息")),
+            null,
+        )
+        assertTrue(messages.single().segments.isEmpty())
+        assertEquals("旧消息", messages.single().content)
+
+        // Blank texts are dropped rather than persisted as empty bubbles.
+        val partial = mapInstantMessages(
+            listOf(
+                LegacyInstantMessage(
+                    id = "m2",
+                    role = "assistant",
+                    content = "x",
+                    segments = listOf(
+                        LegacySpeechSegment(speaker = "张三", text = "早"),
+                        LegacySpeechSegment(speaker = "李四", text = "  "),
+                        LegacySpeechSegment(speaker = null, text = "旁白"),
+                    ),
+                ),
+            ),
+            null,
+        )
+        assertEquals(
+            listOf(SpeechSegment("张三", "早"), SpeechSegment("", "旁白")),
+            partial.single().segments,
+        )
     }
 
     @Test
@@ -859,6 +950,64 @@ class LegacyMapperTest {
     }
 
     @Test
+    fun nativeBackupRestoresTtsSettingsAndValues() = runTest {
+        val config = ConfigRepository(FakeConfigDao())
+        config.update(AppConfig(ttsEnabled = false, ttsSpeed = 1.0f, ttsRemoteUrl = "http://old:8080"))
+        val service = LegacyImportService(
+            CharacterRepository(FakeCharacterDao()),
+            ChatRepository(FakeMessageDao()),
+            config,
+            null,
+        )
+        service.importJson(
+            """
+            {
+              "config": {
+                "apiPlatform": "deepseek",
+                "ttsEnabled": true,
+                "ttsAutoRead": true,
+                "ttsVoiceFile": "voice-a.gguf",
+                "ttsStyle": "温柔",
+                "ttsSpeed": 1.4,
+                "ttsBackend": "remote",
+                "ttsRemoteUrl": "http://10.0.0.2:8080",
+                "ttsRemoteModel": "cosyvoice-3",
+                "ttsRemoteVoice": "builtin_1_v2",
+                "ttsRemoteSampleRate": 24000,
+                "ttsRemoteChunkTokens": 32,
+                "ttsRemoteTemperature": 0.7,
+                "ttsRemoteTopK": 20,
+                "ttsRemoteTopP": 0.9,
+                "ttsWinSize": 8,
+                "ttsTauR": 0.2,
+                "ttsMinTokenTextRatio": 2.5,
+                "ttsMaxTokenTextRatio": 18.0
+              }
+            }
+            """.trimIndent(),
+        )
+
+        val stored = config.current()
+        assertTrue(stored.ttsEnabled)
+        assertTrue(stored.ttsAutoRead)
+        assertEquals("voice-a.gguf", stored.ttsVoiceFile)
+        assertEquals("温柔", stored.ttsStyle)
+        assertEquals(1.4f, stored.ttsSpeed, 0.0001f)
+        assertEquals("remote", stored.ttsBackend)
+        assertEquals("http://10.0.0.2:8080", stored.ttsRemoteUrl)
+        assertEquals("builtin_1_v2", stored.ttsRemoteVoice)
+        assertEquals(24000, stored.ttsRemoteSampleRate)
+        assertEquals(32, stored.ttsRemoteChunkTokens)
+        assertEquals(0.7, stored.ttsRemoteTemperature, 0.0001)
+        assertEquals(20, stored.ttsRemoteTopK)
+        assertEquals(0.9, stored.ttsRemoteTopP, 0.0001)
+        assertEquals(8, stored.ttsWinSize)
+        assertEquals(0.2, stored.ttsTauR, 0.0001)
+        assertEquals(2.5, stored.ttsMinTokenTextRatio, 0.0001)
+        assertEquals(18.0, stored.ttsMaxTokenTextRatio, 0.0001)
+    }
+
+    @Test
     fun importReportsSkippedCharactersInsteadOfSilentlyDropping() = runTest {
         val json = """{ "characters": { "ok": { "id": "ok", "basicInfo": { "name": "A" } }, "bad": { "id": "bad", "basicInfo": 5 } } }"""
         val service = LegacyImportService(
@@ -1103,6 +1252,95 @@ class LegacyMapperTest {
     }
 
     @Test
+    fun backupCarriesIndependentMetricsWithRoundAndSections() = runTest {
+        val metrics = MetricsRepository(FakeMetricsStore())
+        metrics.append(
+            RequestMetric(
+                at = "2026-01-01T00:00:00Z",
+                taskType = "chat.main",
+                round = 2,
+                sectionChars = mapOf("time" to 5, "state" to 7),
+            ),
+        )
+        metrics.append(RequestMetric(at = "2026-01-01T00:00:01Z", taskType = "chat.worker", phase = "worker-note：x"))
+
+        val backup = BackupService(
+            CharacterRepository(FakeCharacterDao()),
+            ChatRepository(FakeMessageDao()),
+            ConfigRepository(FakeConfigDao()),
+            metrics = metrics,
+        )
+        val root = Json { ignoreUnknownKeys = true }.parseToJsonElement(backup.exportJson()) as JsonObject
+        val exportedMetrics = root["requestMetrics"] as JsonArray
+        assertEquals(2, exportedMetrics.size)
+        val first = exportedMetrics[0] as JsonObject
+        assertEquals("2", first["round"].toString())
+        val sections = first["sectionChars"] as JsonObject
+        assertEquals("5", sections["time"].toString())
+        assertEquals("7", sections["state"].toString())
+
+        // Restoring into a fresh device restores the rows (round/sectionChars included).
+        val restored = MetricsRepository(FakeMetricsStore())
+        LegacyImportService(
+            CharacterRepository(FakeCharacterDao()),
+            ChatRepository(FakeMessageDao()),
+            ConfigRepository(FakeConfigDao()),
+            null,
+            restored,
+        ).importJson(backup.exportJson())
+        assertEquals(metrics.all(), restored.all())
+    }
+
+    @Test
+    fun importWithoutMetricsKeepsTheStoredRows() = runTest {
+        val metrics = MetricsRepository(FakeMetricsStore())
+        metrics.append(RequestMetric(at = "keep", taskType = "chat.main", round = 1))
+
+        // A WebView-era backup has no root `requestMetrics` and no config rows: the import
+        // must leave the device's own recording untouched, never clear it.
+        LegacyImportService(
+            CharacterRepository(FakeCharacterDao()),
+            ChatRepository(FakeMessageDao()),
+            ConfigRepository(FakeConfigDao()),
+            null,
+            metrics,
+        ).importJson(singleJson)
+
+        assertEquals(listOf("keep"), metrics.all().map { it.at })
+    }
+
+    @Test
+    fun legacyMetricsAreMigratedOnlyOnce() = runTest {
+        val metrics = MetricsRepository(FakeMetricsStore())
+        val legacy = """
+            {
+              "config": {
+                "requestMetrics": [
+                  { "at": "old", "taskType": "chat.main", "round": 1,
+                    "sectionChars": { "time": 3 } }
+                ]
+              },
+              "activeTheme": "theme-blue"
+            }
+        """.trimIndent()
+        val service = LegacyImportService(
+            CharacterRepository(FakeCharacterDao()),
+            ChatRepository(FakeMessageDao()),
+            ConfigRepository(FakeConfigDao()),
+            null,
+            metrics,
+        )
+        service.importJson(legacy)
+        assertEquals(1, metrics.all().size)
+        assertEquals(mapOf("time" to 3), metrics.all().single().sectionChars)
+
+        // Importing the same old file again must not append a second copy.
+        service.importJson(legacy)
+        assertEquals(1, metrics.all().size)
+        assertEquals("old", metrics.all().single().at)
+    }
+
+    @Test
     fun characterRepositoryReportsCorruptRowsOnce() = runTest {
         val dao = FakeCharacterDao()
         dao.rows["bad"] = CharacterEntity(id = "bad", updatedAt = "2026-01-01T00:00:00Z", payload = "{not json")
@@ -1114,6 +1352,15 @@ class LegacyMapperTest {
         assertEquals(1, reported.size)
         assertEquals("bad", reported.single().first)
         assertEquals("{not json", reported.single().second)
+    }
+
+    /** In-memory [MetricsStore]; `null` means "never written" (unlike an empty array blob). */
+    private class FakeMetricsStore(initial: String? = null) : MetricsStore {
+        private val state = MutableStateFlow(initial)
+        override fun observeRaw(): Flow<String?> = state
+        override suspend fun updateRaw(transform: (String?) -> String) {
+            state.value = transform(state.value)
+        }
     }
 
     private class FakeCharacterDao : CharacterDao {

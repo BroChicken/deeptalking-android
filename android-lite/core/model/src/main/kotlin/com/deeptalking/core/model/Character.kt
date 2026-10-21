@@ -118,6 +118,13 @@ data class Character(
     val updatedAt: String? = null,
     /** Memory revision counter, bumped when a branch is discarded (legacy `memory.revision`). */
     val revision: Int = 0,
+    /**
+     * Short labels for things the turn worker submitted but local rules rejected
+     * (`待办：期限不明`, `情绪：证据不符`). They are fed to the next turn's worker as
+     * "last round did not land" hints, then replaced by that turn's own issues.
+     * Deliberately short: the full diagnostic stays in the request metrics.
+     */
+    val workerIssues: List<String> = emptyList(),
 )
 
 @Serializable

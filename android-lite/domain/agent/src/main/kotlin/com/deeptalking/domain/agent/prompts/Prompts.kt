@@ -767,8 +767,9 @@ fun buildShortTermBlock(character: Character): String {
 //   1 时间 · 2 当前状态 · 3 未完成事项 · 4 世界书 · 5 场景概要 · 6 记忆召回
 //   7 成员私人记忆（群组） · 8 本轮写法 · 9 可选话题 · 10 本轮指令
 //   11 消息时间元数据
-// It is part of the main request body, so it carries the plan's budget (hard 8k): when
-// over, optional sections are dropped in the 11.1 order — 可选话题 → 场景概要 → 世界书 → 记忆召回;
+// It is part of the main request body, so it carries the plan's budget: a typical turn
+// targets [VOLATILE_TARGET_CHARS] (5.5k, diagnostic only) and the hard cap is 8k. When over
+// the hard cap, optional sections are dropped in the 11.1 order — 可选话题 → 场景概要 → 世界书 → 记忆召回;
 // 时间 / 当前状态 / 未完成事项 / 本轮写法 are never dropped.
 // ---------------------------------------------------------------------------
 
@@ -780,6 +781,14 @@ internal const val RECALL_LINE_CHARS = 1200
 
 /** Hard cap for the whole volatile section (plan §11.1). */
 internal const val VOLATILE_HARD_CHARS = 8000
+
+/**
+ * Target size for a typical turn (plan §11.1). Purely a diagnostic/budget goal: a
+ * [VolatileContextResult.totalChars] above it is reported via
+ * [VolatileContextResult.overTarget] so assembly can be tuned, but nothing is dropped
+ * for exceeding it — only [VOLATILE_HARD_CHARS] triggers the drop order below.
+ */
+internal const val VOLATILE_TARGET_CHARS = 5500
 
 /** Whole 【本轮写法】 cap. */
 internal const val WRITING_BLOCK_CHARS = 500
@@ -943,15 +952,26 @@ private fun selectPrivateMemoryMembers(character: Character, query: String): Lis
     val named = members.filter { query.contains(it.name.trim()) }
     if (named.isNotEmpty()) return named
     val lastReply = character.instant
-        .filter { it.role == Role.Assistant && !it.isLoading && it.content.isNotBlank() }
+        .filter { it.role == Role.Assistant && !it.isLoading && (it.content.isNotBlank() || it.segments.isNotEmpty()) }
         .lastOrNull()
-        ?.content
         ?: return members
-    val speakers = extractSpeechSegments(lastReply, members.map { it.name.trim() })
-        .mapNotNull { it.speaker }
-        .toSet()
+    val speakers = replySpeakers(lastReply, members)
     val bySpeaker = members.filter { it.name.trim() in speakers }
     return if (bySpeaker.isNotEmpty()) bySpeaker else members
+}
+
+/**
+ * Speaker names of one assistant turn. The persisted [ChatMessage.segments] are the source of
+ * truth (they carry the speaker the reply was actually rendered with, plan §11.4); only
+ * messages stored without segments — older turns, or before the field was added — are split
+ * from the raw text as a fallback.
+ */
+private fun replySpeakers(reply: ChatMessage, members: List<GroupMember>): Set<String> {
+    val stored = reply.segments.map { it.speaker.trim() }.filter { it.isNotEmpty() }
+    if (stored.isNotEmpty()) return stored.toSet()
+    return extractSpeechSegments(reply.content, members.map { it.name.trim() })
+        .mapNotNull { it.speaker }
+        .toSet()
 }
 
 /** `7 成员私人记忆` (group only): one memory per selected member, ≤300 chars each. */
@@ -1065,8 +1085,46 @@ private fun buildTimelineSection(character: Character): String {
  * rendered** in 【记忆召回】. `ChatOrchestrator` must consume exactly these ids (legacy
  * `memory.lastInjectedRecallIds`) so a pending recall that did not fit the 3-line limit is
  * not silently dropped.
+ *
+ * [recallIds] is empty when the 【记忆召回】 section itself was dropped to fit the 8k cap:
+ * ids of a section the model never saw must not be consumed.
  */
-internal data class VolatileContextResult(val text: String, val recallIds: List<String>)
+internal data class VolatileContextResult(
+    val text: String,
+    val recallIds: List<String>,
+    /** Per-section size of this turn's volatile context, for budget diagnostics. */
+    val sections: List<VolatileSectionSize> = emptyList(),
+    /** [text] length, i.e. what the request actually carries. */
+    val totalChars: Int = text.length,
+    /**
+     * Plan §11.1 typical-turn budget ([VOLATILE_TARGET_CHARS]) exceeded. Diagnostic only:
+     * trimming below the 5.5k target would drop content the model still needs, so the section
+     * assembly only ever reacts to [VOLATILE_HARD_CHARS].
+     */
+    val overTarget: Boolean = totalChars > VOLATILE_TARGET_CHARS,
+)
+
+/** Size of one volatile section; [dropped] means "removed to fit [VOLATILE_HARD_CHARS]". */
+internal data class VolatileSectionSize(
+    val name: String,
+    val chars: Int,
+    val dropped: Boolean = false,
+)
+
+/** Stable section keys, in render order; used by [VolatileContextResult.sections]. */
+internal val VOLATILE_SECTION_KEYS = listOf(
+    "time",
+    "state",
+    "unfinished",
+    "lorebook",
+    "scene",
+    "recall",
+    "privateMemory",
+    "writing",
+    "topics",
+    "instruction",
+    "timeline",
+)
 
 suspend fun buildVolatileContext(
     character: Character,
@@ -1121,13 +1179,31 @@ internal suspend fun buildVolatileContextForTurn(
     )
     fun join() = sections.filter { it.isNotBlank() }.joinToString("\n\n")
     var text = join()
+    val dropped = BooleanArray(sections.size)
     // 11.1 drop order when the hard cap is exceeded: 可选话题 → 场景概要 → 世界书 → 记忆召回.
     for (index in listOf(8, 4, 3, 5)) {
         if (text.length <= VOLATILE_HARD_CHARS) break
+        if (sections[index].isBlank()) continue
         sections[index] = ""
+        dropped[index] = true
         text = join()
     }
-    return VolatileContextResult(text, recallIds.toList())
+    // The recall section is the only consumer of these ids: if the 8k budget dropped it,
+    // the model never saw the memories, so the pending recall must stay pending.
+    val recallIndex = VOLATILE_SECTION_KEYS.indexOf("recall")
+    val keptRecallIds = if (dropped[recallIndex]) emptyList() else recallIds.toList()
+    return VolatileContextResult(
+        text = text,
+        recallIds = keptRecallIds,
+        sections = sections.indices.map { index ->
+            VolatileSectionSize(
+                name = VOLATILE_SECTION_KEYS[index],
+                chars = if (dropped[index]) 0 else sections[index].length,
+                dropped = dropped[index],
+            )
+        },
+        totalChars = text.length,
+    )
 }
 
 // ---------------------------------------------------------------------------

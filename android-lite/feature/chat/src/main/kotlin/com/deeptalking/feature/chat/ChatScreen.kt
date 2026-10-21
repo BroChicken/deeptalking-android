@@ -106,6 +106,7 @@ import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.MessageAttachment
 import com.deeptalking.core.model.Role
+import com.deeptalking.core.model.SpeechSegment
 import com.deeptalking.core.model.Sticker
 import com.deeptalking.core.model.TtsPhase
 import java.util.Locale
@@ -115,6 +116,10 @@ fun ChatScreen(
     character: Character?,
     messages: List<ChatMessage>,
     quickReplies: List<String>,
+    workerFailure: String? = null,
+    workerFailureMessageId: String? = null,
+    onRetryWorker: () -> Unit = {},
+    workerRetryInProgress: Boolean = false,
     isSending: Boolean,
     status: String,
     pendingImages: List<Uri>,
@@ -240,6 +245,14 @@ fun ChatScreen(
                                 // assistant bubble, not as a standalone trailing row.
                                 if (message.id == lastAssistantId && quickReplies.isNotEmpty() && !isSending) {
                                     QuickReplyRow(quickReplies, isSending, bubbleMaxWidth, onQuickReply)
+                                }
+                                if (message.id == workerFailureMessageId && workerFailure != null && !isSending) {
+                                    WorkerFailureRow(
+                                        reason = workerFailure,
+                                        retrying = workerRetryInProgress,
+                                        maxBubbleWidth = bubbleMaxWidth,
+                                        onRetry = onRetryWorker,
+                                    )
                                 }
                             }
                         }
@@ -463,6 +476,32 @@ private fun MessageRow(
     val colors = MaterialTheme.appColors
     val bubbleColor = if (isUser) colors.userBubble else colors.aiBubble
     val contentColor = if (isUser) colors.onUserBubble else colors.onAiBubble
+    // Group replies persist as one message plus per-member turns; draw one bubble per
+    // turn. Without segments (single characters, older messages, in-flight replies) the
+    // single-bubble layout below is unchanged.
+    val segments = if (message.role == Role.Assistant && !message.isLoading) {
+        message.segments.filter { it.text.isNotBlank() }
+    } else {
+        emptyList()
+    }
+    if (segments.isNotEmpty()) {
+        SegmentedMessageRow(
+            message = message,
+            character = character,
+            segments = segments,
+            isSending = isSending,
+            maxBubbleWidth = maxBubbleWidth,
+            onCopy = onCopy,
+            onEditResend = onEditResend,
+            onRegenerate = onRegenerate,
+            onImageClick = onImageClick,
+            onReadAloud = onReadAloud,
+            ttsActiveMessageId = ttsActiveMessageId,
+            ttsPhase = ttsPhase,
+            ttsElapsedMs = ttsElapsedMs,
+        )
+        return
+    }
     // Capsule with a small tail corner pointing at the avatar.
     val shape = if (isUser) {
         RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp, bottomStart = 20.dp, bottomEnd = 6.dp)
@@ -511,6 +550,85 @@ private fun MessageRow(
             }
         }
     }
+}
+
+/**
+ * Group reply: one bubble per persisted [SpeechSegment], each with the speaking
+ * member's avatar and name. Images, change markers, the timestamp and the bubble
+ * actions (copy / read aloud / regenerate) stay on the last bubble, so the reply is
+ * still one message to the rest of the app.
+ */
+@Composable
+private fun SegmentedMessageRow(
+    message: ChatMessage,
+    character: Character,
+    segments: List<SpeechSegment>,
+    isSending: Boolean,
+    maxBubbleWidth: Dp,
+    onCopy: () -> Unit,
+    onEditResend: () -> Unit,
+    onRegenerate: () -> Unit,
+    onImageClick: (String) -> Unit,
+    onReadAloud: () -> Unit,
+    ttsActiveMessageId: String?,
+    ttsPhase: TtsPhase,
+    ttsElapsedMs: Long,
+) {
+    val colors = MaterialTheme.appColors
+    val legacy = MaterialTheme.legacy
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        segments.forEachIndexed { index, segment ->
+            val isLast = index == segments.lastIndex
+            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
+                Avatar(speakerEmoji(character, segment.speaker))
+                Spacer(Modifier.width(8.dp))
+                Column(horizontalAlignment = Alignment.Start) {
+                    if (segment.speaker.isNotBlank()) {
+                        Text(
+                            text = segment.speaker,
+                            fontSize = 11.sp,
+                            color = legacy.textMuted,
+                            modifier = Modifier.padding(start = 6.dp, bottom = 2.dp),
+                        )
+                    }
+                    Surface(
+                        color = colors.aiBubble,
+                        contentColor = colors.onAiBubble,
+                        shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp, bottomStart = 6.dp, bottomEnd = 20.dp),
+                        modifier = Modifier.widthIn(max = maxBubbleWidth),
+                    ) {
+                        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+                            RichText(source = segment.text, isUser = false, onImageClick = onImageClick)
+                            if (isLast) {
+                                MessageImages(message, onImageClick)
+                                message.staticChanges.takeIf { it.isNotEmpty() }?.let {
+                                    Text("⚡ ${it.joinToString(" · ")}已修改", fontSize = 11.sp, color = colors.warning, modifier = Modifier.padding(top = 4.dp))
+                                }
+                                message.lorebookChanges.takeIf { it.isNotEmpty() }?.let {
+                                    Text("📖 ${it.joinToString(" · ")}", fontSize = 11.sp, color = colors.warning, modifier = Modifier.padding(top = 4.dp))
+                                }
+                                if (message.content.isNotBlank()) {
+                                    MessageMeta(
+                                        message, false, isSending, onCopy, onEditResend, onRegenerate, onReadAloud,
+                                        ttsActiveMessageId == message.id, ttsPhase, ttsElapsedMs,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** Avatar for a segment: the member's own emoji, else the group/character emoji. */
+private fun speakerEmoji(character: Character, speaker: String): String {
+    val member = character.members.firstOrNull { it.name == speaker }
+    return (member?.emoji ?: character.emoji).ifBlank { "👤" }
 }
 
 @Composable
@@ -603,6 +721,29 @@ private fun ReadAloudButton(
             IconButton(onClick = onClick, modifier = Modifier.size(30.dp)) {
                 Icon(Icons.Default.VolumeUp, contentDescription = "朗读", tint = tint, modifier = Modifier.size(15.dp))
             }
+        }
+    }
+}
+
+@Composable
+private fun WorkerFailureRow(
+    reason: String,
+    retrying: Boolean,
+    maxBubbleWidth: Dp,
+    onRetry: () -> Unit,
+) {
+    Row(modifier = Modifier.fillMaxWidth()) {
+        Spacer(Modifier.width(38.dp))
+        TextButton(
+            onClick = onRetry,
+            enabled = !retrying,
+            modifier = Modifier.widthIn(max = maxBubbleWidth),
+        ) {
+            Text(
+                if (retrying) "正在重试整理…" else "整理失败：$reason · 点击重试",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.error,
+            )
         }
     }
 }

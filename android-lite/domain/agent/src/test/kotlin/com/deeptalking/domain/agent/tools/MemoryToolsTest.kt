@@ -12,6 +12,7 @@ import com.deeptalking.domain.agent.AgentContext
 import com.deeptalking.domain.agent.ToolRegistry
 import com.deeptalking.engine.ondevice.ToolCall
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.jsonObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -398,6 +399,41 @@ class MemoryToolsTest {
         val created = UpsertLorebookEntryTool().execute(call("upsert_lorebook_entry", noKeywords), context(character))
         assertTrue(created.contentJson.contains("\"ok\":true"))
         assertEquals(listOf("潮汐镇"), created.updatedCharacter!!.lorebook.first().keywords)
+    }
+
+    @Test
+    fun `upsert_lorebook_entry schema exposes the documented timeRef`() {
+        val schema = kotlinx.serialization.json.Json
+            .parseToJsonElement(UpsertLorebookEntryTool().definition.parametersJson)
+            .jsonObject
+        val properties = schema["properties"]!!.jsonObject
+        val timeRef = properties["timeRef"]!!.jsonObject
+        assertEquals("object", (timeRef["type"] as kotlinx.serialization.json.JsonPrimitive).content)
+        assertEquals(false, (timeRef["additionalProperties"] as kotlinx.serialization.json.JsonPrimitive).content.toBoolean())
+        val timeRefProps = timeRef["properties"]!!.jsonObject.keys
+        assertEquals(setOf("anchor", "offsetDays", "weekday", "slot", "explicit"), timeRefProps)
+        // Adding timeRef must not turn it into a required field.
+        val required = (schema["required"] as kotlinx.serialization.json.JsonArray)
+            .map { (it as kotlinx.serialization.json.JsonPrimitive).content }
+        assertEquals(listOf("content", "evidence"), required)
+    }
+
+    @Test
+    fun `upsert_lorebook_entry resolves relative dates through timeRef`() = runBlocking {
+        val character = Character(
+            id = "c1",
+            shortTerm = listOf(ShortTermMemory(id = "s1", content = "潮汐镇终年多雾，是海边小城")),
+        )
+        val args = """
+            {"name":"潮汐镇","content":"潮汐镇明天起封港。","keywords":["潮汐镇"],
+             "timeRef":{"anchor":"today","offsetDays":1},
+             "sourceMessageIds":["s1"],"evidence":"潮汐镇终年多雾"}
+        """.trimIndent()
+        val result = UpsertLorebookEntryTool().execute(call("upsert_lorebook_entry", args), context(character))
+        assertTrue(result.contentJson.contains("\"ok\":true"))
+        val content = result.updatedCharacter!!.lorebook.first().content
+        assertFalse("相对时间词必须换算成绝对日期：$content", content.contains("明天"))
+        assertTrue("换算结果应带绝对日期：$content", Regex("\\d{4}-\\d{2}-\\d{2}").containsMatchIn(content))
     }
 
     // ---- send_sticker ------------------------------------------------------------------

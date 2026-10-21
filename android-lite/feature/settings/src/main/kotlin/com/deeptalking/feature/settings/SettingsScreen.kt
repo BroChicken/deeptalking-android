@@ -47,6 +47,7 @@ import com.deeptalking.core.designsystem.legacy
 import com.deeptalking.core.model.AppConfig
 import com.deeptalking.core.model.BuiltinPlatforms
 import com.deeptalking.core.model.PlatformSlot
+import com.deeptalking.core.model.RequestMetric
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -133,6 +134,7 @@ fun SettingsScreen(
     ttsRemoteToken: String = "",
     ttsRemoteStatus: String = "",
     ttsRemoteVoices: List<String> = emptyList(),
+    ttsRemoteVoiceNames: Map<String, String> = emptyMap(),
     ttsAdvanced: TtsAdvanced = TtsAdvanced(),
     onSelectTtsBackend: (String) -> Unit = {},
     onChangeTtsRemoteUrl: (String) -> Unit = {},
@@ -142,6 +144,14 @@ fun SettingsScreen(
     onSaveTtsRemoteToken: (String?) -> Unit = {},
     onDiscoverTtsRemote: () -> Unit = {},
     onUploadTtsVoices: () -> Unit = {},
+    onSyncTtsVoices: () -> Unit = {},
+    onRenameTtsRemoteVoice: (String, String) -> Unit = { _, _ -> },
+    /**
+     * Rolling request metrics from the independent metrics store (`:core:data`
+     * `MetricsRepository`), used by the debug panel. `config.requestMetrics` is a legacy
+     * backup field only and is never written at runtime.
+     */
+    metrics: List<RequestMetric> = emptyList(),
 ) {
     val context = LocalContext.current
     val legacy = MaterialTheme.legacy
@@ -296,6 +306,7 @@ fun SettingsScreen(
             remoteToken = ttsRemoteToken,
             remoteStatus = ttsRemoteStatus,
             remoteVoices = ttsRemoteVoices,
+            remoteVoiceNames = ttsRemoteVoiceNames,
             advanced = ttsAdvanced,
             onSelectBackend = onSelectTtsBackend,
             onChangeRemoteUrl = onChangeTtsRemoteUrl,
@@ -305,9 +316,11 @@ fun SettingsScreen(
             onSaveRemoteToken = onSaveTtsRemoteToken,
             onDiscoverRemote = onDiscoverTtsRemote,
             onUploadVoices = onUploadTtsVoices,
+            onSyncVoices = onSyncTtsVoices,
+            onRenameRemoteVoice = onRenameTtsRemoteVoice,
         )
 
-        DebugInfoPanel(config, context)
+        DebugInfoPanel(config, metrics, context)
     }
 }
 
@@ -476,11 +489,12 @@ private fun LegacyModelField(value: String, suggestions: List<String>, onValueCh
 }
 
 @Composable
-private fun DebugInfoPanel(config: AppConfig, context: Context) {
+private fun DebugInfoPanel(config: AppConfig, metrics: List<RequestMetric>, context: Context) {
     val legacy = MaterialTheme.legacy
     // Legacy `renderDebugInfo` (`status-settings.js:67-99`): the last reply as a
     // pretty JSON payload plus its raw (pre-processing) text, then the last 12
-    // usage/cache metrics as JSON. `lastReplyDebug` holds the JSON object.
+    // usage/cache metrics as JSON. `lastReplyDebug` holds the JSON object; the metrics
+    // come from the independent store (never from the legacy `config.requestMetrics`).
     val parts = buildList {
         val raw = config.lastReplyDebug
         if (raw.isNotBlank()) {
@@ -493,14 +507,24 @@ private fun DebugInfoPanel(config: AppConfig, context: Context) {
                 add("【最近一次回应】\n" + raw)
             }
         }
-        if (config.requestMetrics.isNotEmpty()) {
+        if (metrics.isNotEmpty()) {
             val array = JSONArray()
-            config.requestMetrics.takeLast(12).forEach { metric ->
+            metrics.takeLast(12).forEach { metric ->
                 val entry = JSONObject()
                 entry.put("at", metric.at)
                 entry.put("taskType", metric.taskType)
                 entry.put("status", metric.status)
                 if (metric.phase.isNotBlank()) entry.put("reason", metric.phase)
+                // 1-based request index inside its turn: tool rounds and retries are their
+                // own rows, so the index is what tells them apart.
+                entry.put("round", metric.round ?: JSONObject.NULL)
+                // Per volatile-context section size (only sections the request carried).
+                entry.put(
+                    "sectionChars",
+                    metric.sectionChars?.let { sections ->
+                        JSONObject().also { obj -> sections.forEach { (name, chars) -> obj.put(name, chars) } }
+                    } ?: JSONObject.NULL,
+                )
                 // Why the request prefix moved this round (`instructions-changed` /
                 // `tools-changed` / `history-rebased` / `history-extended`): the only way
                 // to tell a real cache miss caused by an edit from normal history growth.

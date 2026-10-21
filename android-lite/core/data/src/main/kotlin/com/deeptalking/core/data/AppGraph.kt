@@ -16,6 +16,7 @@ class CoreDataContainer(context: Context) {
     )
     val chat: ChatRepository = ChatRepository(database.messageDao())
     val config: ConfigRepository = ConfigRepository(database.configDao())
+    val metrics: MetricsRepository = MetricsRepository(DataStoreMetricsStore(appContext))
     val settings: SettingsStore = SettingsStore(appContext)
 
     /**

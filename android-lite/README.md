@@ -33,12 +33,13 @@ powershell -File ..\tools\native-build.ps1 -Release      # 签名 release（需 
 `app/build.gradle.kts` 的 `versionName`（`X.Y.Z`）与 `versionCode` 是版本号的唯一来源。**默认开发流程只做本地提交：不出包、不推送、不升版本**；只有明确要发版时才执行：
 
 ```powershell
-powershell -File ..\tools\native-version.ps1 -BumpPatch   # 补丁位 +1、versionCode +1
-powershell -File ..\tools\native-verify.ps1               # 自检全绿
-git commit && git push                                    # 推送触发 CI 出包并发 Release
+powershell -File ..\tools\native-version.ps1 -BumpPatch          # 补丁位 +1、versionCode +1
+powershell -File ..\tools\native-verify.ps1                      # 自检全绿
+powershell -File ..\tools\native-build.ps1 -Release -Publish     # 本机签名出包 + 上传 GitHub Release
+git commit && git push                                           # 提交版本改动并推送
 ```
 
-版本号没变就不要推送：CI 以 `versionName` 当标签，同名 Release 已存在时会覆盖其 APK。
+版本号没变就不要出包：Release 以 `versionName` 当标签，同名 Release 已存在时 `-Publish` 会覆盖已发布的 APK（等于把同版本的包换掉）。
 
 ## CI 与覆盖升级
 

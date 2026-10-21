@@ -27,6 +27,10 @@ $modules = @(
   ':core:network:test',
   ':domain:memory:test',
   ':core:data:testDebugUnitTest',
+  ':core:security:testDebugUnitTest',
+  ':core:model:test',
+  ':app:testDebugUnitTest',
+  ':feature:characters:testDebugUnitTest',
   ':feature:richtext:testDebugUnitTest'
 )
 
@@ -55,7 +59,7 @@ if ($exit -ne 0) {
 }
 
 $total = 0; $fail = 0
-foreach ($m in @('engine\ondevice','domain\agent','core\network','domain\memory','core\data','feature\richtext')) {
+foreach ($m in @('engine\ondevice','domain\agent','core\network','domain\memory','core\data','core\security','app','feature\richtext')) {
   $dir = Join-Path $android ($m + '\build\test-results')
   if (-not (Test-Path -LiteralPath $dir)) { continue }
   Get-ChildItem -LiteralPath $dir -Recurse -Filter 'TEST-*.xml' | ForEach-Object {

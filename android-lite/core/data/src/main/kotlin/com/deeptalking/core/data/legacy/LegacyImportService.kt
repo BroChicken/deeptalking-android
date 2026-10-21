@@ -3,6 +3,7 @@ package com.deeptalking.core.data.legacy
 import com.deeptalking.core.data.CharacterRepository
 import com.deeptalking.core.data.ChatRepository
 import com.deeptalking.core.data.ConfigRepository
+import com.deeptalking.core.data.MetricsRepository
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
 import kotlinx.serialization.json.Json
@@ -35,6 +36,13 @@ class LegacyImportService(
     private val chat: ChatRepository,
     private val config: ConfigRepository,
     private val stickerSink: StickerSink? = null,
+    /**
+     * Independent metrics store. A native backup keeps its rows in a root `requestMetrics`
+     * array; an older/WebView backup keeps them in `config.requestMetrics`, which is then
+     * adopted **once** via [MetricsRepository.migrateLegacy] (an existing store is never
+     * cleared or overwritten by an import).
+     */
+    private val metrics: MetricsRepository? = null,
 ) {
     private val codec = Json {
         ignoreUnknownKeys = true
@@ -124,24 +132,11 @@ class LegacyImportService(
         if (configUpdated) {
             runCatching {
                 val current = config.current()
-                var mapped = configDto?.let(::mapConfig) ?: current
-                // A legacy export has no native-only keys (TTS, reply debug,
-                // simplified metrics), so an import must not wipe them.
+                // Older legacy backups have no TTS fields: mapConfig's per-field fallback
+                // keeps the current device settings. Native backups carry every field and
+                // restore them (including the voice selection and advanced values).
+                var mapped = configDto?.let { mapConfig(it, current) } ?: current
                 mapped = mapped.copy(
-                    ttsEnabled = current.ttsEnabled,
-                    ttsAutoRead = current.ttsAutoRead,
-                    ttsVoiceFile = current.ttsVoiceFile,
-                    ttsStyle = current.ttsStyle,
-                    ttsSpeed = current.ttsSpeed,
-                    ttsBackend = current.ttsBackend,
-                    ttsRemoteUrl = current.ttsRemoteUrl,
-                    ttsRemoteModel = current.ttsRemoteModel,
-                    ttsRemoteVoice = current.ttsRemoteVoice,
-                    ttsRemoteSampleRate = current.ttsRemoteSampleRate,
-                    ttsRemoteChunkTokens = current.ttsRemoteChunkTokens,
-                    ttsRemoteTemperature = current.ttsRemoteTemperature,
-                    ttsRemoteTopK = current.ttsRemoteTopK,
-                    ttsRemoteTopP = current.ttsRemoteTopP,
                     dohEnabled = current.dohEnabled,
                     dohProvider = current.dohProvider,
                     lastReplyDebug = current.lastReplyDebug,
@@ -153,6 +148,21 @@ class LegacyImportService(
                     mapped = mapped.copy(activeTheme = exportedTheme.takeIf { it in LEGACY_THEMES } ?: "")
                 }
                 config.update(mapped)
+            }
+        }
+
+        // Rolling metrics live outside `AppConfig` now. Restore a native backup's root
+        // array as-is; an old backup/WebView file has no root key, so adopt the rows it
+        // carried inside `config.requestMetrics` **once** (no-op when the store already has
+        // data — an import must never wipe or duplicate what the device recorded).
+        val metricStore = metrics
+        if (metricStore != null) {
+            val exportedMetrics = root["requestMetrics"] as? JsonArray
+            if (exportedMetrics != null) {
+                runCatching { metricStore.importJson(exportedMetrics.toString(), merge = false) }
+            } else {
+                val legacyRows = (configDto?.let(::mapConfig) ?: config.current()).requestMetrics
+                runCatching { metricStore.migrateLegacy(legacyRows) }
             }
         }
 

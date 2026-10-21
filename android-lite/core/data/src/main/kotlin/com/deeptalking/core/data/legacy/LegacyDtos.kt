@@ -187,6 +187,15 @@ data class LegacyInstantMessage(
     @SerialName("lorebookChanges") val lorebookChanges: List<String>? = null,
     @SerialName("styleViolations") val styleViolations: List<String>? = null,
     @SerialName("quickReplyIssues") val quickReplyIssues: List<String>? = null,
+    /** Native-only group reply turns; older backups and the WebView build have no such field. */
+    @SerialName("segments") val segments: List<LegacySpeechSegment>? = null,
+)
+
+/** One persisted group turn (`{speaker, text}`) inside a legacy-shaped message. */
+@Serializable
+data class LegacySpeechSegment(
+    @SerialName("speaker") val speaker: String? = null,
+    @SerialName("text") val text: String? = null,
 )
 
 @Serializable
@@ -314,7 +323,49 @@ data class LegacyConfig(
     @SerialName("cacheStats") val cacheStats: JsonElement? = null,
     /** Rolling API usage/cache metrics (legacy `config.requestMetrics`). */
     @SerialName("requestMetrics") val requestMetrics: JsonElement? = null,
+
+    /* Native-only read-aloud settings; absent in legacy/WebView backups. */
+    @SerialName("ttsEnabled") val ttsEnabled: Boolean? = null,
+    @SerialName("ttsAutoRead") val ttsAutoRead: Boolean? = null,
+    @SerialName("ttsVoiceFile") val ttsVoiceFile: String? = null,
+    @SerialName("ttsStyle") val ttsStyle: String? = null,
+    @SerialName("ttsSpeed") val ttsSpeed: Float? = null,
+    @SerialName("ttsBackend") val ttsBackend: String? = null,
+    @SerialName("ttsRemoteUrl") val ttsRemoteUrl: String? = null,
+    @SerialName("ttsRemoteModel") val ttsRemoteModel: String? = null,
+    @SerialName("ttsRemoteVoice") val ttsRemoteVoice: String? = null,
+    @SerialName("ttsRemoteSampleRate") val ttsRemoteSampleRate: Int? = null,
+    @SerialName("ttsRemoteChunkTokens") val ttsRemoteChunkTokens: Int? = null,
+    @SerialName("ttsRemoteTemperature") val ttsRemoteTemperature: Double? = null,
+    @SerialName("ttsRemoteTopK") val ttsRemoteTopK: Int? = null,
+    @SerialName("ttsRemoteTopP") val ttsRemoteTopP: Double? = null,
+    @SerialName("ttsWinSize") val ttsWinSize: Int? = null,
+    @SerialName("ttsTauR") val ttsTauR: Double? = null,
+    @SerialName("ttsMinTokenTextRatio") val ttsMinTokenTextRatio: Double? = null,
+    @SerialName("ttsMaxTokenTextRatio") val ttsMaxTokenTextRatio: Double? = null,
 )
+
+/** True when the backup carries native TTS fields (so it may restore them). */
+fun LegacyConfig.hasTtsSettings(): Boolean = listOfNotNull(
+    ttsEnabled,
+    ttsAutoRead,
+    ttsVoiceFile,
+    ttsStyle,
+    ttsSpeed,
+    ttsBackend,
+    ttsRemoteUrl,
+    ttsRemoteModel,
+    ttsRemoteVoice,
+    ttsRemoteSampleRate,
+    ttsRemoteChunkTokens,
+    ttsRemoteTemperature,
+    ttsRemoteTopK,
+    ttsRemoteTopP,
+    ttsWinSize,
+    ttsTauR,
+    ttsMinTokenTextRatio,
+    ttsMaxTokenTextRatio,
+).isNotEmpty()
 
 @Serializable
 data class LegacyPlatformSlot(

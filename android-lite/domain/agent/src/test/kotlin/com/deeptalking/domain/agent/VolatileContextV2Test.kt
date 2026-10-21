@@ -9,9 +9,11 @@ import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.MemoryCategory
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.SceneSummary
+import com.deeptalking.core.model.SpeechSegment
 import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.core.model.Todo
 import com.deeptalking.domain.agent.prompts.VOLATILE_HARD_CHARS
+import com.deeptalking.domain.agent.prompts.VOLATILE_TARGET_CHARS
 import com.deeptalking.domain.agent.prompts.buildVolatileContext
 import com.deeptalking.domain.agent.prompts.buildVolatileContextForTurn
 import com.deeptalking.domain.memory.MemoryServiceImpl
@@ -261,6 +263,128 @@ class VolatileContextV2Test {
     }
 
     @Test
+    fun `上一轮持久化的 segments 优先于点名集合`() = runBlocking {
+        // The raw text names 小美, but the reply was actually rendered as 小刚's segment:
+        // the persisted segments must win so the injected private memory matches the bubble.
+        val group = Character(
+            id = "g1",
+            name = "合租小屋",
+            isGroup = true,
+            members = listOf(
+                GroupMember(
+                    id = "m_a",
+                    name = "小美",
+                    pendingRecall = listOf(recall("pm_a", "喜欢樱花", "小美 周末去看樱花")),
+                ),
+                GroupMember(
+                    id = "m_b",
+                    name = "小刚",
+                    pendingRecall = listOf(recall("pm_b", "怕黑", "小刚 晚上不敢关灯")),
+                ),
+            ),
+            instant = listOf(
+                ChatMessage(
+                    id = "msg_1",
+                    role = Role.Assistant,
+                    content = "小美：我先去睡了。",
+                    timestamp = "2026-10-14T03:50:00Z",
+                    segments = listOf(SpeechSegment(speaker = "小刚", text = "我先去睡了。")),
+                ),
+                ChatMessage(id = "msg_2", role = Role.User, content = "晚安", timestamp = "2026-10-14T03:59:00Z"),
+            ),
+        )
+        val text = buildVolatileContext(character = group, query = "晚安", memory = memory, now = now)
+        val privateSection = section(text, "【成员私人记忆】")
+        assertTrue(privateSection.contains("[小刚]"))
+        assertFalse(privateSection.contains("[小美]"))
+    }
+
+    @Test
+    fun `没有 segments 的旧消息仍按文本切分点名`() = runBlocking {
+        val group = Character(
+            id = "g1",
+            name = "合租小屋",
+            isGroup = true,
+            members = listOf(
+                GroupMember(
+                    id = "m_a",
+                    name = "小美",
+                    pendingRecall = listOf(recall("pm_a", "喜欢樱花", "小美 周末去看樱花")),
+                ),
+                GroupMember(
+                    id = "m_b",
+                    name = "小刚",
+                    pendingRecall = listOf(recall("pm_b", "怕黑", "小刚 晚上不敢关灯")),
+                ),
+            ),
+            instant = listOf(
+                ChatMessage(id = "msg_1", role = Role.Assistant, content = "小美：晚安啦。", timestamp = "2026-10-14T03:50:00Z"),
+                ChatMessage(id = "msg_2", role = Role.User, content = "晚安", timestamp = "2026-10-14T03:59:00Z"),
+            ),
+        )
+        val text = buildVolatileContext(character = group, query = "晚安", memory = memory, now = now)
+        val privateSection = section(text, "【成员私人记忆】")
+        assertTrue(privateSection.contains("[小美]"))
+        assertFalse(privateSection.contains("[小刚]"))
+    }
+
+    @Test
+    fun `成员私人记忆每人一条且截到三百字`() = runBlocking {
+        val group = Character(
+            id = "g1",
+            name = "合租小屋",
+            isGroup = true,
+            members = listOf(
+                GroupMember(
+                    id = "m_a",
+                    name = "小美",
+                    pendingRecall = listOf(recall("pm_a", "旧事", "好".repeat(600))),
+                ),
+                GroupMember(
+                    id = "m_b",
+                    name = "小刚",
+                    pendingRecall = listOf(recall("pm_b", "又一件旧事", "呀".repeat(600))),
+                ),
+            ),
+            instant = listOf(
+                ChatMessage(id = "msg_1", role = Role.Assistant, content = "小美：晚安啦。", timestamp = "2026-10-14T03:50:00Z"),
+                ChatMessage(id = "msg_2", role = Role.User, content = "晚安", timestamp = "2026-10-14T03:59:00Z"),
+            ),
+        )
+        val text = buildVolatileContext(character = group, query = "晚安", memory = memory, now = now)
+        val lines = section(text, "【成员私人记忆】").lines().filter { it.startsWith("[") }
+        assertEquals(1, lines.size)
+        assertEquals("[小美] " + "好".repeat(300) + "…", lines.first())
+    }
+
+    @Test
+    fun `典型轮 5_5k 目标只作诊断不丢内容`() = runBlocking {
+        assertEquals(5500, VOLATILE_TARGET_CHARS)
+        assertTrue(VOLATILE_TARGET_CHARS < VOLATILE_HARD_CHARS)
+        // A small turn sits under the target.
+        val plain = buildVolatileContextForTurn(character = fullCharacter(), query = "在吗", memory = memory, now = now)
+        assertFalse("总长 ${plain.totalChars}", plain.overTarget)
+        assertEquals(plain.totalChars > VOLATILE_TARGET_CHARS, plain.overTarget)
+
+        // A verbose group turn is over the 5.5k target but under the 8k hard cap: the target
+        // must not trim anything, it is reported only.
+        val members = (1..20).map { index ->
+            GroupMember(
+                id = "m$index",
+                name = "成员$index",
+                pendingRecall = listOf(recall("pm$index", "私事$index", "记".repeat(300))),
+            )
+        }
+        val group = Character(id = "g1", name = "合租小屋", isGroup = true, members = members)
+        val heavy = buildVolatileContextForTurn(character = group, query = "在吗", memory = memory, now = now)
+        assertTrue("总长 ${heavy.totalChars}", heavy.totalChars > VOLATILE_TARGET_CHARS)
+        assertTrue("总长 ${heavy.totalChars}", heavy.totalChars <= VOLATILE_HARD_CHARS)
+        assertTrue(heavy.overTarget)
+        assertTrue("目标不是硬上限，不得丢段", heavy.sections.none { it.dropped })
+        assertEquals(heavy.totalChars, heavy.text.length)
+    }
+
+    @Test
     fun `本轮写法的口吻含风格摘要示例与称呼`() = runBlocking {
         val text = buildVolatileContext(character = fullCharacter(), query = "在吗", memory = memory, now = now)
         assertTrue(text.contains("【本轮写法】"))
@@ -270,5 +394,55 @@ class VolatileContextV2Test {
         assertTrue(text.contains("骨架: "))
         assertFalse(text.contains("【语气回顾】"))
         assertFalse(text.contains("【结尾多样性】"))
+    }
+
+    @Test
+    fun `按段统计字符数且与实际文本一致`() = runBlocking {
+        val result = buildVolatileContextForTurn(
+            character = fullCharacter(),
+            query = "好无聊",
+            memory = memory,
+            now = now,
+            proactiveTurn = true,
+        )
+        assertEquals(result.text.length, result.totalChars)
+        assertEquals(com.deeptalking.domain.agent.prompts.VOLATILE_SECTION_KEYS, result.sections.map { it.name })
+        assertTrue(result.sections.none { it.dropped })
+        val recall = result.sections.first { it.name == "recall" }
+        assertTrue("渲染了召回就该有字符统计", recall.chars > 0)
+        // Sections are joined with "\n\n": per-section sizes must add up to the real text.
+        val kept = result.sections.filter { it.chars > 0 }
+        assertEquals(result.totalChars, kept.sumOf { it.chars } + 2 * (kept.size - 1))
+    }
+
+    @Test
+    fun `记忆召回被八k丢弃时不返回也不消费召回 id`() = runBlocking {
+        // Many members' private memories fill the budget so that everything droppable —
+        // topics/scene/lorebook *and* the recall section — has to go.
+        val members = (1..30).map { index ->
+            GroupMember(
+                id = "m$index",
+                name = "成员$index",
+                pendingRecall = listOf(recall("pm$index", "私事$index", "内容".repeat(150))),
+            )
+        }
+        val group = Character(
+            id = "g1",
+            name = "合租小屋",
+            isGroup = true,
+            members = members,
+            pendingRecall = listOf(recall("r1", "对方喜欢美式", "对方 2026-10-01 说过喜欢美式")),
+        )
+        val result = buildVolatileContextForTurn(character = group, query = "在吗", memory = memory, now = now)
+
+        val recall = result.sections.first { it.name == "recall" }
+        assertTrue("召回段应被硬上限丢弃：$recall", recall.dropped)
+        assertEquals(0, recall.chars)
+        assertFalse("模型没看到召回段", result.text.contains("【记忆召回】"))
+        assertTrue("被丢弃的召回 id 不得交给调用方消费", result.recallIds.isEmpty())
+        // Un-droppable sections stay.
+        assertTrue(result.text.contains("【时间】"))
+        assertTrue(result.text.contains("【成员私人记忆】"))
+        assertEquals(result.text.length, result.totalChars)
     }
 }

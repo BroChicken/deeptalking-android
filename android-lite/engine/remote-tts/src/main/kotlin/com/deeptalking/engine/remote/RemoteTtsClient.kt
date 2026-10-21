@@ -5,15 +5,19 @@ import com.deeptalking.engine.ondevice.AudioChunk
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import java.net.URLEncoder
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.longOrNull
+import kotlinx.serialization.json.put
 import okhttp3.Dns
 import okhttp3.Dispatcher
 import okhttp3.MediaType.Companion.toMediaType
@@ -77,6 +81,14 @@ data class RemoteTtsProbe(
     val sampleRate: Int = 0,
     /** Registered speaker names from `GET /speaker` (WebUI mode only). */
     val speakers: List<String> = emptyList(),
+)
+
+/** One server-side voice: [id] is the stable speaker name, [name] is the editable display name. */
+data class RemoteVoiceInfo(
+    val id: String,
+    val name: String = id,
+    val size: Long = 0L,
+    val hash: String = "",
 )
 
 /** Outcome of pushing one on-device voice to the server (`POST /v1/voices`). */
@@ -256,12 +268,23 @@ class RemoteTtsClient(
      *
      * Never throws; a server that predates the endpoint reports HTTP 404.
      */
-    fun uploadVoice(config: RemoteTtsConfig, name: String, bytes: ByteArray): RemoteVoiceUpload {
+    fun uploadVoice(
+        config: RemoteTtsConfig,
+        name: String,
+        bytes: ByteArray,
+        displayName: String? = null,
+    ): RemoteVoiceUpload {
         val base = config.normalizedBaseUrl
         if (base.isEmpty()) return RemoteVoiceUpload(name, ok = false, message = "未配置服务器地址")
         if (name.isBlank()) return RemoteVoiceUpload(name, ok = false, message = "音色名为空")
+        val url = if (displayName.isNullOrBlank()) {
+            voiceUploadUrl(base, name)
+        } else {
+            voiceUploadUrl(base, name) + "&display_name=" +
+                URLEncoder.encode(displayName, Charsets.UTF_8.name()).replace("+", "%20")
+        }
         val request = Request.Builder()
-            .url(voiceUploadUrl(base, name))
+            .url(url)
             .post(bytes.toRequestBody(OCTET_STREAM_MEDIA_TYPE))
             .header("User-Agent", userAgent)
             .apply { bearerToken(config.token)?.let { header("Authorization", it) } }
@@ -284,6 +307,69 @@ class RemoteTtsClient(
                 }
             }
         }.getOrElse { t -> RemoteVoiceUpload(name, ok = false, message = t.message ?: "上传失败") }
+    }
+
+    /**
+     * Full remote voice manifest (`GET /v1/voices`): stable id, editable display name,
+     * size and a content fingerprint. Empty when the server predates the endpoint.
+     */
+    fun listVoices(config: RemoteTtsConfig): List<RemoteVoiceInfo> {
+        val base = config.normalizedBaseUrl
+        if (base.isEmpty()) return emptyList()
+        val body = getBody(probeClient, "$base/v1/voices", config) ?: return emptyList()
+        return runCatching {
+            json.parseToJsonElement(body).jsonObject["voices"]?.jsonArray.orEmpty().mapNotNull { element ->
+                val obj = element as? kotlinx.serialization.json.JsonObject ?: return@mapNotNull null
+                val id = obj["id"]?.jsonPrimitive?.contentOrNull.orEmpty()
+                if (id.isBlank()) return@mapNotNull null
+                RemoteVoiceInfo(
+                    id = id,
+                    name = obj["name"]?.jsonPrimitive?.contentOrNull.orEmpty().ifBlank { id },
+                    size = obj["size"]?.jsonPrimitive?.longOrNull ?: 0L,
+                    hash = obj["hash"]?.jsonPrimitive?.contentOrNull.orEmpty(),
+                )
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    /** Downloads one prompt-speech gguf (`GET /v1/voices/<id>`); null on any failure. */
+    fun downloadVoice(config: RemoteTtsConfig, id: String): ByteArray? {
+        val base = config.normalizedBaseUrl
+        if (base.isEmpty() || id.isBlank()) return null
+        val url = "$base/v1/voices/${URLEncoder.encode(id, Charsets.UTF_8.name())}"
+        val request = Request.Builder()
+            .url(url)
+            .get()
+            .header("User-Agent", userAgent)
+            .apply { bearerToken(config.token)?.let { header("Authorization", it) } }
+            .build()
+        return runCatching {
+            streamClient.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) return@use null
+                val bytes = response.body?.bytes() ?: return@use null
+                if (bytes.isEmpty() || bytes.size > MAX_VOICE_BYTES) null else bytes
+            }
+        }.getOrNull()
+    }
+
+    /** Renames only the display name (`PUT /v1/voices/<id>`); null on success. */
+    fun renameVoice(config: RemoteTtsConfig, id: String, displayName: String): String? {
+        val base = config.normalizedBaseUrl
+        if (base.isEmpty() || id.isBlank() || displayName.isBlank()) return "音色名不能为空"
+        val body = buildJsonObject { put("displayName", displayName) }.toString()
+        val url = "$base/v1/voices/${URLEncoder.encode(id, Charsets.UTF_8.name())}"
+        val request = Request.Builder()
+            .url(url)
+            .put(body.toRequestBody(JSON_MEDIA_TYPE))
+            .header("User-Agent", userAgent)
+            .apply { bearerToken(config.token)?.let { header("Authorization", it) } }
+            .build()
+        return runCatching {
+            streamClient.newCall(request).execute().use { response ->
+                if (response.isSuccessful) null
+                else "HTTP ${response.code}${errorDetail(response)}"
+            }
+        }.getOrElse { it.message ?: "重命名失败" }
     }
 
     private fun apiProbe(base: String, config: RemoteTtsConfig): RemoteTtsProbe {
@@ -391,6 +477,7 @@ class RemoteTtsClient(
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         val OCTET_STREAM_MEDIA_TYPE = "application/octet-stream".toMediaType()
         const val READ_BUFFER_BYTES = 8192
+        const val MAX_VOICE_BYTES = 16 * 1024 * 1024
         const val MAX_ERROR_CHARS = 300
 
         const val PROBE_CONNECT_TIMEOUT_MS = 4_000L

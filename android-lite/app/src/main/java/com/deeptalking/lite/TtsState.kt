@@ -38,8 +38,10 @@ data class TtsState(
     val remoteToken: String = "",
     /** True when the remote engine has the minimum it needs to speak. */
     val remoteReady: Boolean = false,
-    /** Voice names reported by the server (WebUI mode only), for the picker. */
+    /** Voice IDs reported by the server (API `/v1/voices` or WebUI speaker list), for the picker. */
     val remoteVoices: List<String> = emptyList(),
+    /** Server voice ID -> editable display name (empty = use the ID). */
+    val remoteVoiceNames: Map<String, String> = emptyMap(),
     /** Latest "test connection" / "find server" report. */
     val remoteStatus: String = "",
 

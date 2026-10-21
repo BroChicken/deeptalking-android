@@ -16,8 +16,8 @@ android {
         applicationId = "com.deeptalking.lite"
         minSdk = 26
         targetSdk = 35
-        versionCode = 74
-        versionName = "1.6.10"
+        versionCode = 75
+        versionName = "1.7.0"
     }
 
     compileOptions {
@@ -89,4 +89,6 @@ dependencies {
     implementation(libs.compose.material3)
     implementation(libs.compose.material.icons.extended)
     implementation(libs.compose.ui.tooling.preview)
+
+    testImplementation(libs.junit)
 }

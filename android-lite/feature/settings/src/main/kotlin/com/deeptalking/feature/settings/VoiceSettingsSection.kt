@@ -139,6 +139,7 @@ fun VoiceSettingsSection(
     remoteToken: String = "",
     remoteStatus: String = "",
     remoteVoices: List<String> = emptyList(),
+    remoteVoiceNames: Map<String, String> = emptyMap(),
     advanced: TtsAdvanced = TtsAdvanced(),
     onSelectBackend: (String) -> Unit = {},
     onChangeRemoteUrl: (String) -> Unit = {},
@@ -148,6 +149,8 @@ fun VoiceSettingsSection(
     onSaveRemoteToken: (String?) -> Unit = {},
     onDiscoverRemote: () -> Unit = {},
     onUploadVoices: () -> Unit = {},
+    onSyncVoices: () -> Unit = {},
+    onRenameRemoteVoice: (String, String) -> Unit = { _, _ -> },
 ) {
     val legacy = MaterialTheme.legacy
     val remote = backend == TTS_BACKEND_REMOTE
@@ -161,6 +164,8 @@ fun VoiceSettingsSection(
     var advancedOpen by remember { mutableStateOf(false) }
     var sharedAdvancedOpen by remember { mutableStateOf(false) }
     var renameTarget by remember { mutableStateOf<VoiceOption?>(null) }
+    var remoteRenameId by remember { mutableStateOf("") }
+    var remoteRenameName by remember { mutableStateOf("") }
     var testText by remember { mutableStateOf("你好呀，今天过得怎么样？") }
     var tokenDraft by remember(backend) { mutableStateOf("") }
 
@@ -180,7 +185,7 @@ fun VoiceSettingsSection(
         }
         // Voices that only exist on the PC (registered there, not on the phone).
         remoteVoices.filter { s -> voices.none { it.id.removeSuffix(".gguf") == s } }
-            .forEach { add("$it · 仅服务端" to it) }
+            .forEach { add("${remoteVoiceNames[it] ?: it} · 仅服务端" to it) }
     }
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -208,6 +213,12 @@ fun VoiceSettingsSection(
             backendMenuOpen = false
         },
     )
+
+    Button(
+        onClick = onSyncVoices,
+        enabled = !busy,
+        modifier = Modifier.fillMaxWidth(),
+    ) { Text(if (busy) "同步中…" else "同步音色和名称") }
 
     // Shared synthesis knobs: the very same values are handed to the on-device engine
     // and to the PC request body, so tuning here changes both ends (docs/REMOTE_TTS.md §9).
@@ -320,7 +331,18 @@ fun VoiceSettingsSection(
             onClick = onUploadVoices,
             enabled = !busy,
             modifier = Modifier.fillMaxWidth(),
-        ) { Text("上传本机音色到电脑", fontSize = 12.sp) }
+        ) { Text("只上传本机音色到电脑", fontSize = 12.sp) }
+        TextButton(
+            onClick = {
+                val id = remoteVoice.ifBlank { remoteVoices.firstOrNull().orEmpty() }
+                if (id.isNotEmpty()) {
+                    remoteRenameId = id
+                    remoteRenameName = remoteVoiceNames[id] ?: id
+                }
+            },
+            enabled = !busy && remoteVoices.isNotEmpty(),
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text("重命名电脑音色", fontSize = 12.sp) }
 
     } else {
         if (!modelReady) {
@@ -424,7 +446,7 @@ fun VoiceSettingsSection(
     if (status.isNotBlank()) {
         Text(status, fontSize = 12.sp, color = legacy.textMuted)
     }
-    if (remote && remoteStatus.isNotBlank()) {
+    if (remoteStatus.isNotBlank()) {
         Text(remoteStatus, fontSize = 12.sp, color = legacy.textMuted)
     }
 
@@ -445,6 +467,30 @@ fun VoiceSettingsSection(
                 TextButton(onClick = { onRenameVoice(target.id, draft); renameTarget = null }) { Text("确定") }
             },
             dismissButton = { TextButton(onClick = { renameTarget = null }) { Text("取消") } },
+        )
+    }
+
+    if (remoteRenameId.isNotEmpty()) {
+        AlertDialog(
+            onDismissRequest = { remoteRenameId = "" },
+            title = { Text("重命名电脑音色") },
+            text = {
+                OutlinedTextField(
+                    value = remoteRenameName,
+                    onValueChange = { remoteRenameName = it },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onRenameRemoteVoice(remoteRenameId, remoteRenameName)
+                        remoteRenameId = ""
+                    },
+                ) { Text("确定") }
+            },
+            dismissButton = { TextButton(onClick = { remoteRenameId = "" }) { Text("取消") } },
         )
     }
 }

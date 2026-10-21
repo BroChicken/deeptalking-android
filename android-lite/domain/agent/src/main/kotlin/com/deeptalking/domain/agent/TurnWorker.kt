@@ -16,6 +16,7 @@ import com.deeptalking.engine.ondevice.ToolChoice
 import com.deeptalking.engine.ondevice.ToolDefinition
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
@@ -53,7 +54,7 @@ internal object TurnWorker {
     },
     "memberDynamicState": {
       "type": "array",
-      "description": "仅群组：每位成员自己的动态状态（不含朗读语气）",
+      "description": "仅群组：每位成员自己的动态状态（可含各自朗读语气；群组共享状态不含语气）",
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -67,7 +68,11 @@ internal object TurnWorker {
               "currentLocation": { "${'$'}field": true },
               "currentMood": { "${'$'}field": true },
               "currentOccupation": { "${'$'}field": true },
-              "currentGoal": { "${'$'}field": true }
+              "currentGoal": { "${'$'}field": true },
+              "currentTone": {
+                "type": "string",
+                "description": "仅成员：该成员本轮的朗读语气/情绪/语速（如「压低声音、语速偏快」），只描述怎么念，不写事实内容；没有明显变化就省略"
+              }
             }
           }
         },
@@ -90,16 +95,23 @@ internal object TurnWorker {
         "properties": {
           "op": { "type": "string", "enum": ["create", "done", "cancel", "reschedule"] },
           "todoId": { "type": "string", "description": "done/cancel/reschedule 时必填，取自【当前待办】" },
-          "title": { "type": "string", "description": "create 时必填" },
+          "title": { "type": "string", "description": "create 时必填：一句话的待办标题" },
           "detail": { "type": "string" },
-          "proposer": { "type": "string", "enum": ["user", "character"] },
+          "proposer": {
+            "type": "string",
+            "enum": ["user", "character"],
+            "description": "create 时必填：user=用户提出；character=角色提议且用户已明确答应（此时 evidence 必须引用户答应的原话）"
+          },
           "dueAt": { "type": "string", "description": "create/reschedule 时必填，ISO 时间" },
           "timeRef": { "type": "object", "additionalProperties": false, "properties": {
             "anchor": { "type": "string" }, "offsetDays": { "type": "integer" },
             "weekday": { "type": "string" }, "slot": { "type": "string" },
             "explicit": { "type": "string" } } },
           "sourceMessageIds": { "type": "array", "items": { "type": "string" } },
-          "evidence": { "type": "string" }
+          "evidence": {
+            "type": "string",
+            "description": "必填：用户原句或紧扣原文的概括；完成/取消/改期时要能对上用户确认的原话"
+          }
         },
         "required": ["op", "evidence", "sourceMessageIds"]
       }
@@ -218,6 +230,12 @@ internal object TurnWorker {
             appendLine("【当前约定】")
             appendLine(promises)
             appendLine()
+            if (character.workerIssues.isNotEmpty()) {
+                appendLine("【上轮整理未落地】")
+                character.workerIssues.take(8).forEach { appendLine("- $it") }
+                appendLine("这些是本地上轮拒绝的条目。本轮若仍成立，请重新提交并附正确证据；不成立就忽略，不要编造证据。")
+                appendLine()
+            }
             if (proactive) {
                 appendLine("【本轮无用户消息（角色主动开场）】")
             } else {
@@ -247,7 +265,7 @@ internal object TurnWorker {
             tools = listOf(tool),
             toolChoice = ToolChoice.Function(TOOL_NAME),
             temperature = 0.2,
-            maxOutputTokens = 4096,
+            maxOutputTokens = MAX_OUTPUT_TOKENS,
             stream = false,
             reasoningEffort = "none",
             apiPlatform = config.apiPlatform,
@@ -263,10 +281,26 @@ internal object TurnWorker {
         val root = arguments?.let {
             runCatching { json.parseToJsonElement(it) as? JsonObject }.getOrNull()
         } ?: return Output(ok = false, usage = result.usage)
-        val quickReplies = (root["quickReplies"] as? JsonArray)
+        // The contract is exactly [QUICK_REPLY_COUNT] user-voice lines. Counts that break it
+        // are handled by an explicit rule (never silently truncated without a trace):
+        // too many keeps the first two, too few rejects the whole list as unusable so the
+        // caller's repair/fallback path regenerates it.
+        val parsedReplies = (root["quickReplies"] as? JsonArray)
             ?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf(String::isNotEmpty) }
-            ?.take(2)
+            ?.distinct()
             .orEmpty()
+        val quickReplies = when {
+            parsedReplies.size == QUICK_REPLY_COUNT -> parsedReplies
+            parsedReplies.size > QUICK_REPLY_COUNT -> parsedReplies.take(QUICK_REPLY_COUNT)
+            else -> emptyList()
+        }
+        val quickReplyWarning = when {
+            parsedReplies.size > QUICK_REPLY_COUNT ->
+                "quickReplies 返回 ${parsedReplies.size} 条，超过 $QUICK_REPLY_COUNT 条，只保留前两条"
+            parsedReplies.size < QUICK_REPLY_COUNT ->
+                "quickReplies 只有 ${parsedReplies.size} 条（要求 $QUICK_REPLY_COUNT 条），弃用并由修复流程重建"
+            else -> null
+        }
         return Output(
             dynamicState = root["dynamicState"] as? JsonObject,
             memberDynamicState = root["memberDynamicState"] as? JsonArray,
@@ -275,7 +309,28 @@ internal object TurnWorker {
             promiseUpdates = root["promiseUpdates"] as? JsonArray,
             ok = true,
             usage = result.usage,
+            warnings = listOfNotNull(quickReplyWarning),
         )
+    }
+
+    /**
+     * One `memberDynamicState` element: the member's name plus its state object, untouched.
+     *
+     * `currentTone` is a legitimate **member-only** field (each member reads their own lines
+     * with their own delivery), so unlike the character-level `dynamicState` it must not be
+     * filtered out by the caller. Malformed elements are skipped instead of failing the parse,
+     * matching the previous per-element tolerance.
+     */
+    internal fun memberStates(output: Output): List<Pair<String, JsonObject>> =
+        output.memberDynamicState?.mapNotNull { memberStateOf(it) }.orEmpty()
+
+    /** [memberStates] for a raw element; null when the name or state object is missing. */
+    internal fun memberStateOf(element: JsonElement): Pair<String, JsonObject>? {
+        val obj = element as? JsonObject ?: return null
+        val name = (obj["memberName"] as? JsonPrimitive)?.contentOrNull?.trim().orEmpty()
+        val state = obj["dynamicState"] as? JsonObject ?: return null
+        if (name.isEmpty() || state.isEmpty()) return null
+        return name to state
     }
 
     data class Output(
@@ -286,8 +341,16 @@ internal object TurnWorker {
         val promiseUpdates: JsonArray? = null,
         val ok: Boolean = false,
         val usage: TokenUsage? = null,
+        /**
+         * Non-fatal contract violations (currently `quickReplies` count). The parse still
+         * succeeds; callers may log these instead of guessing why a field was dropped.
+         */
+        val warnings: List<String> = emptyList(),
     )
 
     /** Marker used by tests/tools: the per-request output budget is shared with auxiliary calls. */
     const val MAX_OUTPUT_TOKENS = AppLimits.Api.AUXILIARY_MAX_OUTPUT_TOKENS
+
+    /** The worker contract asks for exactly two user-voice quick replies. */
+    const val QUICK_REPLY_COUNT = 2
 }

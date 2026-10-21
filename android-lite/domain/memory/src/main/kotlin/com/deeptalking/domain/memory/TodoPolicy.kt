@@ -2,17 +2,23 @@ package com.deeptalking.domain.memory
 
 import com.deeptalking.core.common.AppLimits
 import com.deeptalking.core.model.Character
+import com.deeptalking.core.model.LongTermMemory
+import com.deeptalking.core.model.MemoryCategory
 import com.deeptalking.core.model.Todo
 import com.deeptalking.core.model.TodoProposer
 import com.deeptalking.core.model.TodoStatus
+import java.time.Instant
+import java.util.UUID
 
 /**
  * 待办（todo）的独立策略：新建闸门、状态流转、保留窗口。
  *
  * 待办与长期记忆**互相独立**：它不读 `longTerm`，也不写 `longTerm`；只有「对话里出现明确
- * 期限」且「双方同意」时才新增。两条写入路径：
- * - 新增/改期/完成/取消 —— turn worker 的 `submit_state.todos`（[validateTodoCreation] /
+ * 期限」且「双方同意」时才新增。写入路径：
+ * - 对话当轮 —— turn worker 的 `submit_state.todos`（[validateTodoCreation] /
  *   [todoStatusOf] + [dueAtBackedByEvidence]）。
+ * - 记忆整理 — [upsertPromiseTodo] 把「用户确认过、带明确期限」的承诺补成待办；角色
+ *   单方面承诺不进入这里，仍只作为长期信息保留。
  * 角色编辑页的待办 tab 提供「完成 / 取消 / 删除」兜底。
  */
 object TodoPolicy {
@@ -84,6 +90,67 @@ object TodoPolicy {
             return Creation.Rejected("期限核对不了：用户原话里没有可解析的日期/时间词，或与用户说的不是同一天")
         }
         return Creation.Accepted(resolved)
+    }
+
+    /**
+     * 把一条**用户确认过、带明确期限**的长期承诺补成待办。
+     *
+     * 这是记忆整理链路对 turn worker 的补齐：当轮 worker 没来得及提交待办时，分析出的
+     * 用户承诺仍然要能在待办里出现。是否算「用户确认」完全复用
+     * [promisePushDecision]：角色单方面承诺、用户没答应、期限无法从用户原话定位的，都不建。
+     *
+     * 同一承诺可能已经由 worker 建过待办：标题相同，或来源消息与期限相同，就更新那一条，
+     * 不新增重复项。已完成/已取消的旧待办不会被重新打开；只有新的 active 项会被补上。
+     */
+    fun upsertPromiseTodo(
+        character: Character,
+        promise: LongTermMemory,
+        nowIso: String = Instant.now().toString(),
+        sources: Map<String, SourceRef> = knownSources(character),
+    ): Character {
+        if (promise.category != MemoryCategory.Promises) return character
+        val decision = promisePushDecision(character, promise, sources)
+        if (!decision.pushable) return character
+        val dueAt = decision.confirmedDueAt?.takeIf { parseZoned(it) != null } ?: return character
+        val title = promise.key.trim().ifEmpty { promise.value.trim() }.take(100)
+        if (title.isEmpty()) return character
+        val detail = promise.value.trim().take(900)
+        val evidence = promise.evidence.trim().take(300)
+        val sourceIds = promise.sourceMessageIds.map { it.trim() }.filter { it.isNotEmpty() }.distinct().take(8)
+
+        val existing = character.todos.indexOfFirst { todo ->
+            todo.status == TodoStatus.Active && (
+                todo.title.equals(title, ignoreCase = true) ||
+                    (sourceIds.isNotEmpty() && todo.dueAt == dueAt && todo.sourceMessageIds.any { it in sourceIds })
+                )
+        }
+        val todos = if (existing >= 0) {
+            val old = character.todos[existing]
+            character.todos.toMutableList().also {
+                it[existing] = old.copy(
+                    detail = detail,
+                    dueAt = dueAt,
+                    proposer = TodoProposer.User,
+                    sourceMessageIds = (old.sourceMessageIds + sourceIds).distinct().take(8),
+                    evidence = evidence,
+                    updatedAt = nowIso,
+                )
+            }
+        } else {
+            character.todos + Todo(
+                id = UUID.randomUUID().toString(),
+                title = title,
+                detail = detail,
+                dueAt = dueAt,
+                status = TodoStatus.Active,
+                proposer = TodoProposer.User,
+                sourceMessageIds = sourceIds,
+                evidence = evidence,
+                createdAt = nowIso,
+                updatedAt = nowIso,
+            )
+        }
+        return character.copy(todos = todos)
     }
 
     /** Maps a `todoUpdates.status` token to a terminal [TodoStatus], or null when unrecognized. */

@@ -73,7 +73,7 @@ class SpeechTextTest {
     fun segmentsSingleCharacterWhenNoMemberLine() {
         val segments = extractSpeechSegments("你好，（微笑）今天天气不错。", listOf("张三", "李四"))
         assertEquals(1, segments.size)
-        assertEquals(null, segments[0].speaker)
+        assertEquals("", segments[0].speaker)
         assertEquals("你好，今天天气不错。", segments[0].text)
     }
 
@@ -114,12 +114,22 @@ class SpeechTextTest {
         val reply = "大家安静一下，我有话要说。"
         val segments = extractSpeechSegments(reply, listOf("张三", "李四"))
         assertEquals(1, segments.size)
-        assertEquals(null, segments[0].speaker)
+        assertEquals("", segments[0].speaker)
         assertEquals("大家安静一下，我有话要说。", segments[0].text)
     }
 
     @Test
     fun segmentsBlankInputIsEmpty() {
         assertEquals(0, extractSpeechSegments("   ", listOf("张三")).size)
+    }
+
+    @Test
+    fun displaySegmentSpeechTextMatchesTextRebasedSplit() {
+        // A persisted display segment keeps quotes and stage directions verbatim; reading it
+        // must produce the same words as splitting the reply text (quotes trimmed, actions
+        // dropped).
+        assertEquals("今天去哪？", extractSpeechTextFromSegment("\"（笑）今天去哪？\""))
+        assertEquals("早", extractSpeechTextFromSegment("「早」"))
+        assertEquals("", extractSpeechTextFromSegment("（笑）"))
     }
 }

@@ -476,6 +476,76 @@ class BackgroundTasksTest {
         assertTrue(canRunMemoryTask(counters, MemoryTaskKind.Extraction, nowMillis = 0L))
     }
 
+    @Test
+    fun thirdAnalysisFailureRaisesTheRetryPrompt() = runBlocking {
+        val llm = ScriptedLlm(mutableListOf())
+        var prompted = false
+        val background = BackgroundTasks(
+            llm = llm,
+            memory = MemoryServiceImpl(),
+            onMemoryRetryNeeded = { task, characterId ->
+                if (task == MemoryTaskKind.Analysis && characterId == "c1") prompted = true
+            },
+        )
+        val base = analyzableCharacter()
+        val extra = (22..41).map { index ->
+            ShortTermMemory(id = "s$index", content = "补充$index", sourceMessageIds = listOf("u1"))
+        }
+        val character = base.copy(
+            shortTerm = base.shortTerm + extra,
+            counters = base.counters.copy(analysisFailures = 2, analysisRetryAt = null),
+        )
+
+        background.scheduleTurn(
+            character = character,
+            reply = "回复",
+            userText = "用户",
+            currentQuickReplies = emptyList(),
+            messages = emptyList(),
+            critiqueEnabled = false,
+            quickReplyRepairEnabled = false,
+            onCharacterUpdated = {},
+        ).join()
+
+        assertTrue(prompted)
+    }
+
+    @Test
+    fun ackedAnalysisFailureDoesNotRaiseThePromptAgain() = runBlocking {
+        val llm = ScriptedLlm(mutableListOf())
+        var prompted = false
+        val background = BackgroundTasks(
+            llm = llm,
+            memory = MemoryServiceImpl(),
+            onMemoryRetryNeeded = { _, _ -> prompted = true },
+        )
+        val base = analyzableCharacter()
+        val extra = (22..41).map { index ->
+            ShortTermMemory(id = "s$index", content = "补充$index", sourceMessageIds = listOf("u1"))
+        }
+        val character = base.copy(
+            shortTerm = base.shortTerm + extra,
+            counters = base.counters.copy(
+                analysisFailures = 2,
+                analysisRetryAt = null,
+                analysisPromptAcked = true,
+            ),
+        )
+
+        background.scheduleTurn(
+            character = character,
+            reply = "回复",
+            userText = "用户",
+            currentQuickReplies = emptyList(),
+            messages = emptyList(),
+            critiqueEnabled = false,
+            quickReplyRepairEnabled = false,
+            onCharacterUpdated = {},
+        ).join()
+
+        assertFalse(prompted)
+    }
+
     private fun analyzableCharacter(): Character {
         // The source message has already been evicted from `instant`; analysis must
         // resolve it from the short-term item's captured userEvidence. The 20 fillers are
@@ -1190,5 +1260,39 @@ class BackgroundTasksTest {
         assertEquals(listOf("c1"), handoffs)
         assertTrue(store.batch("c1").isNotEmpty())
         assertTrue(store.awaitingUser("c1"))
+    }
+
+    @Test
+    fun `a group scene key reads the shared state`() {
+        val (background, _) = tasks(emptyList())
+        val group = Character(
+            id = "g1",
+            isGroup = true,
+            // The stale per-entity value must not win: groups write the shared field.
+            dynamicState = DynamicState(currentLocation = "旧的地点"),
+            groupSharedDynamic = DynamicState(currentLocation = "天台"),
+        )
+
+        assertEquals("天台", background.sceneKey(group))
+    }
+
+    @Test
+    fun `a single character scene key reads its own state`() {
+        val (background, _) = tasks(emptyList())
+        val character = Character(
+            id = "c1",
+            dynamicState = DynamicState(currentLocation = "美术馆"),
+            groupSharedDynamic = DynamicState(currentLocation = "别的群组场景"),
+        )
+
+        assertEquals("美术馆", background.sceneKey(character))
+    }
+
+    @Test
+    fun `a missing scene location falls back to the placeholder`() {
+        val (background, _) = tasks(emptyList())
+
+        assertEquals("未说明", background.sceneKey(Character(id = "c1")))
+        assertEquals("未说明", background.sceneKey(Character(id = "g1", isGroup = true)))
     }
 }

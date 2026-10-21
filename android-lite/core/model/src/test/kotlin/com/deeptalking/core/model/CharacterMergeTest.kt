@@ -34,6 +34,17 @@ class CharacterMergeTest {
     }
 
     @Test
+    fun workerIssuesFollowTheTurnWriter() {
+        val before = Character(id = "c1", workerIssues = listOf("待办：期限不明"))
+        val after = before.copy(workerIssues = listOf("情绪：证据不符"))
+        val live = before.copy(name = "Alice")
+
+        val merged = mergeCharacterChanges(before, after, live)
+
+        assertEquals(listOf("情绪：证据不符"), merged.workerIssues)
+    }
+
+    @Test
     fun perFieldTimestampsAreMergedByKey() {
         val before = Character(id = "c1")
         val after = before.copy(
@@ -213,5 +224,161 @@ class CharacterMergeTest {
         val merged = mergeCharacterChanges(before, after, live)
 
         assertEquals(listOf("a", "c", "d"), merged.todos.map { it.id }.sorted())
+    }
+
+    // ------------------------------------------------------------ windows / scenes
+
+    private fun message(id: String, content: String = "消息$id") =
+        ChatMessage(id = id, role = Role.User, content = content)
+
+    private fun short(id: String, content: String = "摘要$id") = ShortTermMemory(id = id, content = content)
+
+    private fun scene(id: String) = SceneSummary(id = id, key = id, content = "场景$id")
+
+    @Test
+    fun aFoldConsumingTheWindowDoesNotDropTheTurnJustAppended() {
+        val before = Character(id = "c1", instant = listOf(message("m1"), message("m2")))
+        // The fold consumed m1 while the turn appended m3 to the same window.
+        val after = before.copy(instant = listOf(message("m2")))
+        val live = before.copy(instant = before.instant + message("m3"))
+
+        val merged = mergeCharacterChanges(before, after, live)
+
+        // The consumption of m1 applies, and the turn's m3 is not rolled back.
+        assertEquals(listOf("m2", "m3"), merged.instant.map { it.id })
+    }
+
+    @Test
+    fun shortTermConsumptionKeepsWhatTheTurnAddedMeanwhile() {
+        val before = Character(id = "c1", shortTerm = listOf(short("s1"), short("s2"), short("s3")))
+        // The analysis pass consumed the first two entries …
+        val after = before.copy(shortTerm = listOf(short("s3")))
+        // … while the turn appended a new summary to the window.
+        val live = before.copy(shortTerm = before.shortTerm + short("s4"))
+
+        val merged = mergeCharacterChanges(before, after, live)
+
+        assertEquals(listOf("s3", "s4"), merged.shortTerm.map { it.id })
+    }
+
+    @Test
+    fun sceneSummariesAddedByTwoWritersBothSurvive() {
+        val before = Character(id = "c1")
+        val after = before.copy(scenes = listOf(scene("scene-a")))
+        val live = before.copy(scenes = listOf(scene("scene-b")))
+
+        val merged = mergeCharacterChanges(before, after, live)
+
+        assertEquals(listOf("scene-a", "scene-b"), merged.scenes.map { it.id }.sorted())
+    }
+
+    @Test
+    fun pendingRecallAdditionsBothSurviveAndAReplacementStillDropsTheOldSet() {
+        // A concurrent writer selected a recall item …
+        val before = Character(id = "c1")
+        val live = before.copy(pendingRecall = listOf(memory("theirs")))
+        val after = before.copy(pendingRecall = listOf(memory("ours")))
+
+        val mergedAdditive = mergeCharacterChanges(before, after, live)
+        assertEquals(listOf("ours", "theirs"), mergedAdditive.pendingRecall.map { it.id }.sorted())
+
+        // … and a recall that replaces the set still removes the previous items.
+        val previous = Character(id = "c1", pendingRecall = listOf(memory("old1"), memory("old2")))
+        val recalled = previous.copy(pendingRecall = listOf(memory("fresh")))
+
+        val mergedReplacement = mergeCharacterChanges(previous, recalled, previous)
+
+        assertEquals(listOf("fresh"), mergedReplacement.pendingRecall.map { it.id })
+    }
+
+    @Test
+    fun legacyMessagesWithoutIdsAreStillConsumedAsAGroup() {
+        // 旧数据可能整窗没有 id：它们无法逐条定位，只能作为一组整体被消费。
+        val before = Character(id = "c1", instant = listOf(message(""), message("")))
+        val after = before.copy(instant = emptyList())
+        val live = before.copy(instant = before.instant + message("m9"))
+
+        val merged = mergeCharacterChanges(before, after, live)
+
+        assertEquals(listOf("m9"), merged.instant.map { it.id })
+    }
+
+    @Test
+    fun blankIdsAreNeverCollapsedOntoOneKey() {
+        val blankA = message("", "第一条")
+        val blankB = message("", "第二条")
+        val before = Character(id = "c1", instant = listOf(blankA))
+        // This writer only renamed the character, so it has no opinion on the window.
+        val after = before.copy(name = "改过的名字")
+        val live = before.copy(instant = listOf(blankA, blankB))
+
+        val merged = mergeCharacterChanges(before, after, live)
+
+        assertEquals("改过的名字", merged.name)
+        // Both unlocatable live entries survive; nothing is keyed on "".
+        assertEquals(2, merged.instant.size)
+        assertEquals(listOf("第一条", "第二条"), merged.instant.map { it.content })
+    }
+
+    @Test
+    fun aDuplicatedIdIsNotMergedEntryWise() {
+        val first = message("d", "第一版")
+        val second = message("d", "第二版")
+        val before = Character(id = "c1", instant = listOf(first, second))
+        // The writer dropped one of the two rows sharing the id — it cannot say which.
+        val after = before.copy(instant = listOf(first))
+        val live = before.copy(instant = listOf(first, second, message("other", "别的")))
+
+        val merged = mergeCharacterChanges(before, after, live)
+
+        // The duplicated group is replaced as a whole instead of guessing per row.
+        assertEquals(listOf("第一版", "别的"), merged.instant.map { it.content })
+    }
+
+    @Test
+    fun duplicatesOnlyInTheLiveRowAreNotDropped() {
+        val first = message("d", "第一版")
+        val before = Character(id = "c1", instant = listOf(first))
+        val after = before.copy(name = "改过的名字")
+        val live = before.copy(instant = listOf(first, message("d", "重复的一条")))
+
+        val merged = mergeCharacterChanges(before, after, live)
+
+        assertEquals(2, merged.instant.size)
+    }
+
+    @Test
+    fun memberWindowsMergePerEntryToo() {
+        val member = GroupMember(
+            id = "m1",
+            name = "甲",
+            shortTerm = listOf(short("s1")),
+            instant = listOf(message("m1")),
+            scenes = listOf(scene("scene-1")),
+            pendingRecall = listOf(memory("r1")),
+        )
+        val before = Character(id = "g1", isGroup = true, members = listOf(member))
+        // The fold consumed the member's window while the turn appended a new message.
+        val after = before.copy(
+            members = listOf(member.copy(shortTerm = emptyList(), instant = emptyList())),
+        )
+        val live = before.copy(
+            members = listOf(
+                member.copy(
+                    shortTerm = member.shortTerm + short("s2"),
+                    instant = member.instant + message("m2"),
+                    scenes = member.scenes + scene("scene-2"),
+                    pendingRecall = member.pendingRecall + memory("r2"),
+                ),
+            ),
+        )
+
+        val merged = mergeCharacterChanges(before, after, live)
+        val result = merged.members.single()
+
+        assertEquals(listOf("s2"), result.shortTerm.map { it.id })
+        assertEquals(listOf("m2"), result.instant.map { it.id })
+        assertEquals(listOf("scene-1", "scene-2"), result.scenes.map { it.id })
+        assertEquals(listOf("r1", "r2"), result.pendingRecall.map { it.id }.sorted())
     }
 }

@@ -129,6 +129,13 @@ data class RequestMetric(
     val prefixChange: String? = null,
     val commonHistoryMessages: Int? = null,
     val contextChars: Int? = null,
+    /**
+     * Characters per context section of the request (`static` / `volatile` / `history` /
+     * `tools` …), keyed by the section name used when the prompt was assembled. Only the
+     * reply pipeline's own sections are counted; null on legacy rows and on requests that
+     * did not go through prompt assembly. Used to compare section growth between builds.
+     */
+    val sectionChars: Map<String, Int>? = null,
     val inputChars: Int? = null,
     val inputTokens: Int? = null,
     val outputTokens: Int? = null,

@@ -22,9 +22,12 @@ import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.SceneState
 import com.deeptalking.core.model.SceneSummary
 import com.deeptalking.core.model.ShortTermMemory
+import com.deeptalking.core.model.SpeechSegment
 import com.deeptalking.core.model.StaticFillMeta
 import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.core.model.Sticker
+import com.deeptalking.core.model.TTS_BACKEND_ONDEVICE
+import com.deeptalking.core.model.TTS_BACKEND_REMOTE
 import com.deeptalking.core.model.Todo
 import com.deeptalking.core.model.TodoProposer
 import com.deeptalking.core.model.TodoStatus
@@ -109,6 +112,9 @@ const val MAX_STICKER_TAG_CHARS: Int = 6
 private const val DAY_START_HOUR: Int = 2
 private const val MAX_PARTICIPANTS: Int = 8
 private const val MAX_MEMBERS: Int = 8
+
+/** Cap on per-message group turns restored from a backup file. */
+private const val MAX_SPEECH_SEGMENTS: Int = 60
 
 private fun extractKeywords(element: JsonElement?): List<String> = when (element) {
     null -> emptyList()
@@ -368,6 +374,14 @@ private fun mapInstant(dto: LegacyInstantMessage, imageSink: StickerSink?): Chat
     lorebookChanges = dto.lorebookChanges ?: emptyList(),
     styleViolations = (dto.styleViolations ?: emptyList()).filter { it in STYLE_VIOLATION_LABELS },
     quickReplyIssues = (dto.quickReplyIssues ?: emptyList()).filter { it in QUICK_REPLY_ISSUE_LABELS },
+    // Group turns round-trip verbatim; a backup without the field stays empty, so
+    // older files (and the WebView build) restore as single-bubble replies.
+    segments = (dto.segments ?: emptyList())
+        .take(MAX_SPEECH_SEGMENTS)
+        .mapNotNull { segment ->
+            val text = segment.text?.trim().orEmpty()
+            if (text.isEmpty()) null else SpeechSegment(speaker = segment.speaker?.trim().orEmpty(), text = text)
+        },
 )
 
 /** Normalizes a sticker tag the way `normalizeStickers` does (strip whitespace, cap 6). */
@@ -767,9 +781,14 @@ private val PLATFORM_MODELS: Map<String, String> = mapOf(
     "custom" to "",
 )
 
-/** Maps the legacy config; missing or malformed values fall back to legacy defaults. */
-fun mapConfig(dto: LegacyConfig?): AppConfig {
-    if (dto == null) return AppConfig()
+/**
+ * Maps the legacy config; missing or malformed values fall back to legacy defaults.
+ *
+ * [ttsFallback] supplies native-only read-aloud fields when an older backup has no TTS
+ * section at all. A native backup carries every TTS field, so its values win.
+ */
+fun mapConfig(dto: LegacyConfig?, ttsFallback: AppConfig = AppConfig()): AppConfig {
+    if (dto == null) return ttsFallback
     val efforts = setOf("none", "low", "medium", "high", "max")
     // A null platform defaults; an unknown (or blank) one normalizes to `custom`.
     val platform = dto.apiPlatform?.let { if (it in LEGACY_PLATFORMS) it else "custom" } ?: "deepseek"
@@ -805,6 +824,10 @@ fun mapConfig(dto: LegacyConfig?): AppConfig {
         platformSettings[platform] = updated
     }
 
+    val ttsBackend = dto.ttsBackend
+        ?.takeIf { it == TTS_BACKEND_ONDEVICE || it == TTS_BACKEND_REMOTE }
+        ?: ttsFallback.ttsBackend
+
     return AppConfig(
         apiPlatform = platform,
         apiBaseUrl = apiBaseUrl,
@@ -818,6 +841,28 @@ fun mapConfig(dto: LegacyConfig?): AppConfig {
         cacheStats = mapCacheStats(dto.cacheStats),
         requestMetrics = mapRequestMetrics(dto.requestMetrics),
         platformSettings = platformSettings,
+        ttsEnabled = dto.ttsEnabled ?: ttsFallback.ttsEnabled,
+        ttsAutoRead = dto.ttsAutoRead ?: ttsFallback.ttsAutoRead,
+        ttsVoiceFile = dto.ttsVoiceFile ?: ttsFallback.ttsVoiceFile,
+        ttsStyle = dto.ttsStyle ?: ttsFallback.ttsStyle,
+        ttsSpeed = (dto.ttsSpeed ?: ttsFallback.ttsSpeed).coerceIn(0.5f, 2.0f),
+        ttsBackend = ttsBackend,
+        ttsRemoteUrl = if (dto.ttsRemoteUrl != null) {
+            dto.ttsRemoteUrl.trim().trimEnd('/')
+        } else {
+            ttsFallback.ttsRemoteUrl
+        },
+        ttsRemoteModel = dto.ttsRemoteModel ?: ttsFallback.ttsRemoteModel,
+        ttsRemoteVoice = dto.ttsRemoteVoice ?: ttsFallback.ttsRemoteVoice,
+        ttsRemoteSampleRate = dto.ttsRemoteSampleRate?.takeIf { it >= 0 } ?: ttsFallback.ttsRemoteSampleRate,
+        ttsRemoteChunkTokens = dto.ttsRemoteChunkTokens?.takeIf { it >= 0 } ?: ttsFallback.ttsRemoteChunkTokens,
+        ttsRemoteTemperature = dto.ttsRemoteTemperature?.takeIf { it > 0 } ?: ttsFallback.ttsRemoteTemperature,
+        ttsRemoteTopK = dto.ttsRemoteTopK?.takeIf { it >= 0 } ?: ttsFallback.ttsRemoteTopK,
+        ttsRemoteTopP = dto.ttsRemoteTopP?.takeIf { it in 0.0..1.0 } ?: ttsFallback.ttsRemoteTopP,
+        ttsWinSize = dto.ttsWinSize?.takeIf { it > 0 } ?: ttsFallback.ttsWinSize,
+        ttsTauR = dto.ttsTauR?.takeIf { it >= 0 } ?: ttsFallback.ttsTauR,
+        ttsMinTokenTextRatio = dto.ttsMinTokenTextRatio?.takeIf { it >= 0 } ?: ttsFallback.ttsMinTokenTextRatio,
+        ttsMaxTokenTextRatio = dto.ttsMaxTokenTextRatio?.takeIf { it >= 0 } ?: ttsFallback.ttsMaxTokenTextRatio,
     )
 }
 

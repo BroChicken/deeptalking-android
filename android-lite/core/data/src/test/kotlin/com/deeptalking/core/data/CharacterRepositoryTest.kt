@@ -3,6 +3,8 @@ package com.deeptalking.core.data
 import com.deeptalking.core.database.CharacterDao
 import com.deeptalking.core.database.CharacterEntity
 import com.deeptalking.core.model.Character
+import com.deeptalking.core.model.DynamicState
+import com.deeptalking.core.model.mergeCharacterChanges
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -100,5 +102,31 @@ class CharacterRepositoryTest {
 
         assertEquals(10, repository.get("a")?.revision)
         assertEquals(10, repository.get("b")?.revision)
+    }
+
+    /**
+     * `NativeCore.persistMemory` writes a background pass through `mutate { mergeCharacterChanges }`:
+     * the user's edit made while the pass ran must survive next to what the pass changed.
+     */
+    @Test
+    fun aBackgroundPassMergesOntoTheRowWrittenMeanwhile() = runBlocking {
+        val repository = CharacterRepository(FakeCharacterDao())
+        val original = Character(
+            id = "c1",
+            dynamicState = DynamicState(currentMood = "平静", currentGoal = "值夜班"),
+        )
+        repository.upsert(original)
+        // The user saves a location edit while the pass is still running on its snapshot.
+        repository.mutate("c1") { live ->
+            live.copy(dynamicState = live.dynamicState.copy(currentLocation = "美术馆"))
+        }
+        val passResult = original.copy(dynamicState = original.dynamicState.copy(currentMood = "紧张"))
+
+        repository.mutate(original.id) { fresh -> mergeCharacterChanges(original, passResult, fresh) }
+
+        val stored = repository.get("c1")!!
+        assertEquals("紧张", stored.dynamicState.currentMood)
+        assertEquals("美术馆", stored.dynamicState.currentLocation)
+        assertEquals("值夜班", stored.dynamicState.currentGoal)
     }
 }

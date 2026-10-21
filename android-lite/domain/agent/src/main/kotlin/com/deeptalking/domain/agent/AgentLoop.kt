@@ -23,7 +23,9 @@ import kotlinx.serialization.json.buildJsonArray
 data class LoopOutcome(
     val text: String,
     val submitCall: ToolCall?,
+    /** Number of **tool rounds** (one per model response that carried tool calls), not calls. */
     val rounds: Int,
+    /** Total tool calls actually executed — a single round may execute several. */
     val executedCalls: Int,
     /** Latest character returned by a tool's [AgentToolResult.updatedCharacter], if any. */
     val updatedCharacter: Character? = null,
@@ -63,7 +65,10 @@ class AgentLoop(
      *
      * - `AUTO`: the model may call information tools. Tool rounds are tool-only; any prose
      *   that arrives alongside a call is discarded (the contract says "tool or prose, not
-     *   both"), and the final prose arrives in a later round.
+     *   both"), and the final prose arrives in a later round. A response may carry several
+     *   calls: **all** of them run in the same round (each gets its own
+     *   `function_call_output`), and the hard cap [AppLimits.Agent.MAX_TOOL_ROUNDS] counts
+     *   responses, not calls.
      * - `FINAL`: no tools at all. This is the only phase that can terminate the turn; an
      *   empty FINAL round is retried at most twice and then returns an empty outcome so the
      *   caller (single outer retry loop) owns the "empty reply" UX.
@@ -108,18 +113,21 @@ class AgentLoop(
             val infoCalls = result.toolCalls.filter { it.name != LLM_STATUS_CHUNK_NAME }
 
             if (phase == RequestPhase.AUTO && infoCalls.isNotEmpty()) {
-                if (rounds >= AppLimits.Agent.MAX_TOOL_ROUNDS ||
-                    executedCalls >= AppLimits.Agent.MAX_TOOL_CALLS
-                ) {
-                    onToolActivity("正在整理回复…")
+                // `rounds` counts tool **rounds** (model responses), never individual calls:
+                // one response may carry several parallel calls and every one of them must
+                // be executed, otherwise its `function_call` would be replayed on the next
+                // request without the matching `function_call_output`.
+                if (rounds >= AppLimits.Agent.MAX_TOOL_ROUNDS) {
+                    onToolActivity("工具调用已达上限，正在整理回复…")
                     appendReasoning(messages, result.reasoning, rounds)
                     phase = RequestPhase.FINAL
                     continue
                 }
-                for (call in infoCalls) {
-                    rounds++
+                rounds++
+                val outputs = mutableListOf<Pair<String, String>>()
+                infoCalls.forEachIndexed { index, call ->
                     executedCalls++
-                    val callId = call.id.ifBlank { "call_$rounds" }
+                    val callId = call.id.ifBlank { "call_${rounds}_${index + 1}" }
                     onToolActivity(toolActivityHint(call.name))
                     val toolResult = registry.execute(call, context)
                     toolResult.stickerFileRef?.let { latestSticker = it }
@@ -129,27 +137,29 @@ class AgentLoop(
                         context = AgentContext(character = workingCharacter, activeCharacterId = workingCharacter.id)
                     }
                     messages += ChatMessage(
-                        id = "assistant_${rounds}",
+                        id = "assistant_${rounds}_${index + 1}",
                         role = Role.Assistant,
                         content = "",
                         toolCallId = callId,
                         toolName = call.name,
                         toolArguments = call.arguments,
-                        reasoningJson = reasoningArray(lastReasoning),
+                        // The round's reasoning items precede its calls; attaching the same
+                        // JSON to every call would replay it once per call.
+                        reasoningJson = if (index == 0) reasoningArray(lastReasoning) else null,
                         internalOnly = false,
                         isLoading = false,
                     )
+                    outputs += callId to toolResult.contentJson
+                }
+                // Matches the provider's own output shape: every `function_call` of the
+                // response comes first, then one `function_call_output` per call.
+                outputs.forEach { (callId, content) ->
                     messages += ChatMessage(
                         id = callId,
                         role = Role.Tool,
-                        content = toolResult.contentJson,
+                        content = content,
                         toolCallId = callId,
                     )
-                    if (rounds >= AppLimits.Agent.MAX_TOOL_ROUNDS ||
-                        executedCalls >= AppLimits.Agent.MAX_TOOL_CALLS
-                    ) {
-                        break
-                    }
                 }
                 onToolActivity("工具结果已返回，正在继续推理…")
                 continue

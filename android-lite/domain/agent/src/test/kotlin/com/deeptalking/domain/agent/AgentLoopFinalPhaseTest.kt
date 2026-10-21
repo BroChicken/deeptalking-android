@@ -105,4 +105,76 @@ class AgentLoopFinalPhaseTest {
         val outcome = run(llm, listOf(ProbeTool()))
         assertEquals("真正的回复", outcome.text)
     }
+
+    @Test
+    fun `all calls of one response are executed and answered`() {
+        val calls = (1..3).map { ToolCall(id = "call-$it", name = "probe", arguments = "{}") }
+        val llm = ScriptedLlm(listOf(LlmResult(toolCalls = calls), LlmResult(text = "三件事都查过了")))
+
+        val outcome = run(llm, listOf(ProbeTool()))
+
+        assertEquals("三件事都查过了", outcome.text)
+        assertEquals(3, outcome.executedCalls)
+        // Three calls in one model response are still one tool round.
+        assertEquals(1, outcome.rounds)
+        val followUp = llm.requests[1].input
+        val assistantCalls = followUp.filter { it.role == com.deeptalking.core.model.Role.Assistant && it.toolCallId != null }
+        val outputs = followUp.filter { it.role == com.deeptalking.core.model.Role.Tool }
+        assertEquals(3, assistantCalls.size)
+        assertEquals(3, outputs.size)
+        // Every function_call has exactly one function_call_output with the same call id.
+        assertEquals(
+            assistantCalls.mapNotNull { it.toolCallId }.toSet(),
+            outputs.mapNotNull { it.toolCallId }.toSet(),
+        )
+        // The replay shape is: all calls of the response, then all of their outputs.
+        val firstOutput = followUp.indexOfFirst { it.role == com.deeptalking.core.model.Role.Tool }
+        assertTrue(
+            "function_call items must precede their outputs",
+            assistantCalls.all { followUp.indexOf(it) < firstOutput },
+        )
+    }
+
+    @Test
+    fun `calls without ids still get distinct call ids and outputs`() {
+        val calls = listOf(
+            ToolCall(id = "", name = "probe", arguments = "{}"),
+            ToolCall(id = "", name = "probe", arguments = "{}"),
+        )
+        val llm = ScriptedLlm(listOf(LlmResult(toolCalls = calls), LlmResult(text = "好")))
+
+        val outcome = run(llm, listOf(ProbeTool()))
+
+        assertEquals(2, outcome.executedCalls)
+        val followUp = llm.requests[1].input
+        val assistantIds = followUp
+            .filter { it.role == com.deeptalking.core.model.Role.Assistant && it.toolCallId != null }
+            .mapNotNull { it.toolCallId }
+        val outputIds = followUp
+            .filter { it.role == com.deeptalking.core.model.Role.Tool }
+            .mapNotNull { it.toolCallId }
+        assertEquals(assistantIds.size, assistantIds.distinct().size)
+        assertEquals(assistantIds.toSet(), outputIds.toSet())
+    }
+
+    @Test
+    fun `round cap counts rounds and never truncates a response`() {
+        // Two calls per response, one response more than the cap allows.
+        val calls = listOf(
+            ToolCall(id = "left", name = "probe", arguments = "{}"),
+            ToolCall(id = "right", name = "probe", arguments = "{}"),
+        )
+        val results = (1..com.deeptalking.core.common.AppLimits.Agent.MAX_TOOL_ROUNDS + 1)
+            .map { LlmResult(toolCalls = calls) } + LlmResult(text = "收尾")
+        val llm = ScriptedLlm(results)
+
+        val outcome = run(llm, listOf(ProbeTool()))
+
+        assertEquals("收尾", outcome.text)
+        assertEquals(com.deeptalking.core.common.AppLimits.Agent.MAX_TOOL_ROUNDS, outcome.rounds)
+        // Two calls ran in every admitted round — the cap never cuts a response in half.
+        assertEquals(com.deeptalking.core.common.AppLimits.Agent.MAX_TOOL_ROUNDS * 2, outcome.executedCalls)
+        assertEquals(com.deeptalking.core.common.AppLimits.Agent.MAX_TOOL_ROUNDS + 2, llm.requests.size)
+        assertTrue("the last request must be the tool-less FINAL", llm.requests.last().tools.isEmpty())
+    }
 }

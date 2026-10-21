@@ -4,6 +4,8 @@ import com.deeptalking.core.common.AppLimits
 import com.deeptalking.core.model.AppConfig
 import com.deeptalking.core.model.Character
 import com.deeptalking.core.model.ChatMessage
+import com.deeptalking.core.model.FieldEditRegistry
+import com.deeptalking.core.model.FieldSection
 import com.deeptalking.core.model.GroupMember
 import com.deeptalking.core.model.LongTermMemory
 import com.deeptalking.core.model.LorebookEntry
@@ -56,6 +58,7 @@ import com.deeptalking.domain.memory.selfLearnMemoryImportance
 import com.deeptalking.domain.memory.parseRelativeText
 import com.deeptalking.domain.memory.resolveTimeRef
 import com.deeptalking.domain.memory.TimeRef
+import com.deeptalking.domain.memory.TodoPolicy
 import com.deeptalking.domain.memory.upsertLongTermMemory
 import com.deeptalking.domain.memory.upsertLorebookEntry
 import com.deeptalking.domain.memory.upsertLorebookEntryForCharacter
@@ -194,11 +197,9 @@ enum class MemoryTaskKind { Extraction, Analysis, Scene, Lorebook }
 
 /**
  * Retry counters for the background memory sub-tasks (legacy
- * `memory.counters.<task>Failures` / `<task>RetryAt`). Exposed so a caller that
- * can persist them keeps the backoff across turns.
- *
- * GAP: [Character] has no `counters` field, so these cannot be stored on the
- * character yet; [BackgroundTasks] keeps them for the lifetime of one instance.
+ * `memory.counters.<task>Failures` / `<task>RetryAt`). These are copied to/from
+ * [Character.counters] so the backoff and the third-failure acknowledgment survive
+ * turns and process restarts.
  */
 data class MemoryTaskCounters(
     val extractionFailures: Int = 0,
@@ -211,6 +212,9 @@ data class MemoryTaskCounters(
     val lorebookRetryAt: String? = null,
     /** Diagnostic for the last analysis failure (see `MemoryCounters.analysisLastError`). */
     val analysisLastError: String = "",
+    /** Persisted "user already answered the third-failure prompt" flags. */
+    val extractionPromptAcked: Boolean = false,
+    val analysisPromptAcked: Boolean = false,
 ) {
     fun failuresOf(task: MemoryTaskKind): Int = when (task) {
         MemoryTaskKind.Extraction -> extractionFailures
@@ -227,8 +231,17 @@ data class MemoryTaskCounters(
     }
 
     fun with(task: MemoryTaskKind, failures: Int, retryAt: String?): MemoryTaskCounters = when (task) {
-        MemoryTaskKind.Extraction -> copy(extractionFailures = failures, extractionRetryAt = retryAt)
-        MemoryTaskKind.Analysis -> copy(analysisFailures = failures, analysisRetryAt = retryAt)
+        MemoryTaskKind.Extraction -> copy(
+            extractionFailures = failures,
+            extractionRetryAt = retryAt,
+            // A successful pass clears the answered flag so a later streak asks again.
+            extractionPromptAcked = if (failures == 0) false else extractionPromptAcked,
+        )
+        MemoryTaskKind.Analysis -> copy(
+            analysisFailures = failures,
+            analysisRetryAt = retryAt,
+            analysisPromptAcked = if (failures == 0) false else analysisPromptAcked,
+        )
         MemoryTaskKind.Scene -> copy(sceneFailures = failures, sceneRetryAt = retryAt)
         MemoryTaskKind.Lorebook -> copy(lorebookFailures = failures, lorebookRetryAt = retryAt)
     }
@@ -270,6 +283,13 @@ data class MemoryTaskGuard(
 
 /** Outcome of one backlog-drain pass: the updated character plus whether it consumed a batch. */
 data class DrainOutcome(val character: Character, val progressed: Boolean)
+
+/**
+ * Raw scene location: a group keeps it in `groupSharedDynamic`, a single character in
+ * `dynamicState`. Kept top-level so the scene-key rule is directly testable.
+ */
+internal fun sceneLocation(character: Character): String =
+    if (character.isGroup) character.groupSharedDynamic.currentLocation else character.dynamicState.currentLocation
 
 class BackgroundTasks(
     private val llm: LlmBackend,
@@ -313,7 +333,28 @@ class BackgroundTasks(
      * again for the same batch until it is cleared or dropped.
      */
     private val onLorebookRetryNeeded: (String) -> Unit = {},
+    /**
+     * Raised on the third consecutive failure of short-term extraction or long-term
+     * analysis. "Ignore" in the UI does not drop the batch; the ordinary backoff gate
+     * keeps trying.
+     */
+    private val onMemoryRetryNeeded: (MemoryTaskKind, String) -> Unit = { _, _ -> },
 ) {
+
+    /**
+     * Ask when a streak has reached three failures and the user has not answered this
+     * streak's prompt yet. The ack flag is persisted on [Character.counters], so a
+     * process restart can re-raise a prompt the user never saw, while "忽略" stays quiet.
+     */
+    private fun maybeAskMemoryRetry(task: MemoryTaskKind, characterId: String, counters: MemoryTaskCounters) {
+        if (counters.failuresOf(task) < 3) return
+        val acked = when (task) {
+            MemoryTaskKind.Extraction -> counters.extractionPromptAcked
+            MemoryTaskKind.Analysis -> counters.analysisPromptAcked
+            else -> true
+        }
+        if (!acked) onMemoryRetryNeeded(task, characterId)
+    }
 
     private val json = Json {
         ignoreUnknownKeys = true
@@ -332,6 +373,8 @@ class BackgroundTasks(
         lorebookFailures = character.counters.lorebookFailures,
         lorebookRetryAt = character.counters.lorebookRetryAt,
         analysisLastError = character.counters.analysisLastError,
+        extractionPromptAcked = character.counters.extractionPromptAcked,
+        analysisPromptAcked = character.counters.analysisPromptAcked,
     )
 
     private fun Character.withCounters(counters: MemoryTaskCounters): Character = copy(
@@ -345,6 +388,8 @@ class BackgroundTasks(
             lorebookFailures = counters.lorebookFailures,
             lorebookRetryAt = counters.lorebookRetryAt,
             analysisLastError = counters.analysisLastError,
+            extractionPromptAcked = counters.extractionPromptAcked,
+            analysisPromptAcked = counters.analysisPromptAcked,
         ),
     )
 
@@ -571,6 +616,40 @@ class BackgroundTasks(
         analyzeShortToLongTermTask(character)
 
     /**
+     * One immediate retry for the "重试" button on a failed extraction/analysis prompt.
+     * Unlike [scheduleTurn] it ignores the backoff and the size watermark; a failure
+     * still increments the ordinary counter and keeps the data for the next pass.
+     */
+    suspend fun retryMemoryTask(
+        character: Character,
+        task: MemoryTaskKind,
+        messages: List<ChatMessage> = character.instant,
+    ): Pair<TaskStatus, Character> {
+        val nowMillis = System.currentTimeMillis()
+        return when (task) {
+            MemoryTaskKind.Extraction -> {
+                val (status, updated) = extractMemoryStatus(character, messages)
+                val counters = when (status) {
+                    TaskStatus.Success -> resetMemoryRetry(countersOf(updated), MemoryTaskKind.Extraction)
+                    TaskStatus.Failure -> scheduleMemoryRetry(countersOf(updated), MemoryTaskKind.Extraction, nowMillis)
+                    TaskStatus.Stale -> countersOf(updated)
+                }
+                status to updated.withCounters(counters)
+            }
+            MemoryTaskKind.Analysis -> {
+                val outcome = analyzeShortToLongTermStatus(character)
+                val counters = when (outcome.status) {
+                    TaskStatus.Success -> resetMemoryRetry(countersOf(outcome.character), MemoryTaskKind.Analysis)
+                    TaskStatus.Failure -> scheduleMemoryRetry(countersOf(outcome.character), MemoryTaskKind.Analysis, nowMillis)
+                    TaskStatus.Stale -> countersOf(outcome.character)
+                }
+                outcome.status to outcome.character.withCounters(counters)
+            }
+            else -> TaskStatus.Failure to character
+        }
+    }
+
+    /**
      * One backlog-drain pass for the cleanup: force an analysis batch (ignoring the size
      * trigger and the retry backoff), then run the rest of the maintenance on that same
      * batch. The window is consumed by position, so a pass that reads a batch drops it —
@@ -737,6 +816,7 @@ class BackgroundTasks(
         }
 
         var working = character
+        val nowIso = Instant.now().toString()
         for (entry in prepared) {
             val (newList, ok) = upsertLongTermMemory(
                 character = working,
@@ -747,6 +827,11 @@ class BackgroundTasks(
             )
             if (!ok) continue
             working = working.copy(longTerm = newList)
+            // A user-confirmed promise with a date is an action item, not just a fact. The
+            // turn worker may already have created the todo this turn; this is the durable
+            // path that catches it when the worker did not. Character self-promises are
+            // rejected by the confirmation gate inside.
+            working = TodoPolicy.upsertPromiseTodo(working, entry.item, nowIso, sources)
         }
 
         // Consume the batch: drop exactly what this pass read. The live row is the base for
@@ -828,9 +913,17 @@ class BackgroundTasks(
         return live.revision == guard.revision && live.instant.lastOrNull()?.id == guard.lastMessageId
     }
 
-    /** Current scene key = trimmed current location, or "未说明" (legacy `getSceneKey`). */
-    fun sceneKey(character: Character): String =
-        trimText(character.dynamicState.currentLocation.trim().ifEmpty { "未说明" }, 80)
+    /**
+     * Current scene key = trimmed current location, or "未说明" (legacy `getSceneKey`).
+     *
+     * A group's location lives in `groupSharedDynamic` (the turn worker and the editor write
+     * it there); a single character's lives in `dynamicState`. Reading the wrong one froze a
+     * group's scene key at "未说明", so summaries never noticed a scene change.
+     */
+    fun sceneKey(character: Character): String {
+        val location = sceneLocation(character).trim()
+        return trimText(location.ifEmpty { "未说明" }, 80)
+    }
 
     /**
      * Scene-summary trigger + execution (legacy `checkMemoryTriggers` scene branch).
@@ -1297,6 +1390,8 @@ class BackgroundTasks(
         val sources = knownSources(character)
         val nowBase = ZonedDateTime.now()
         DYNAMIC_STATE_FIELDS.forEach { (key, _) ->
+            // The user may be typing this field in the card editor: the draft is the truth.
+            if (FieldEditRegistry.isFocused(character.id, null, FieldSection.Dynamic, key)) return@forEach
             val obj = dynamic[key] as? JsonObject ?: return@forEach
             val raw = obj.string("value").trim()
             if (raw.isEmpty()) return@forEach
@@ -1419,6 +1514,8 @@ class BackgroundTasks(
         var filled = 0
         missing.forEach { key ->
             if (com.deeptalking.domain.agent.prompts.staticProfileValue(profile, key).isNotBlank()) return@forEach
+            // Never fill over a field the user is typing right now.
+            if (FieldEditRegistry.isFocused(character.id, null, FieldSection.Static, key)) return@forEach
             val value = data?.string(key)?.trim().orEmpty()
             if (value.isEmpty()) return@forEach
             val cleaned = if (key == "userAddress") {
@@ -1507,6 +1604,8 @@ class BackgroundTasks(
         var profile = member.staticProfile
         missing.forEach { key ->
             if (com.deeptalking.domain.agent.prompts.staticProfileValue(profile, key).isNotBlank()) return@forEach
+            // Never fill over a field the user is typing right now.
+            if (FieldEditRegistry.isFocused(group.id, member.id, FieldSection.Static, key)) return@forEach
             val value = data?.string(key)?.trim().orEmpty()
             if (value.isEmpty()) return@forEach
             val cleaned = if (key == "userAddress") {
@@ -1768,7 +1867,11 @@ class BackgroundTasks(
             }
             counters = when (status) {
                 TaskStatus.Success -> resetMemoryRetry(counters, MemoryTaskKind.Extraction)
-                TaskStatus.Failure -> scheduleMemoryRetry(counters, MemoryTaskKind.Extraction, nowMillis)
+                TaskStatus.Failure -> {
+                    val next = scheduleMemoryRetry(counters, MemoryTaskKind.Extraction, nowMillis)
+                    maybeAskMemoryRetry(MemoryTaskKind.Extraction, working.id, next)
+                    next
+                }
                 TaskStatus.Stale -> counters
             }
         } else if (working.instant.size >= AppLimits.Memory.INSTANT &&
@@ -1784,7 +1887,10 @@ class BackgroundTasks(
                     newlyExtracted = working.shortTerm.filterNot { it.id in hadIds }
                     counters = resetMemoryRetry(counters, MemoryTaskKind.Extraction)
                 }
-                TaskStatus.Failure -> counters = scheduleMemoryRetry(counters, MemoryTaskKind.Extraction, nowMillis)
+                TaskStatus.Failure -> {
+                    counters = scheduleMemoryRetry(counters, MemoryTaskKind.Extraction, nowMillis)
+                    maybeAskMemoryRetry(MemoryTaskKind.Extraction, working.id, counters)
+                }
                 TaskStatus.Stale -> Unit
             }
         }
@@ -1832,7 +1938,10 @@ class BackgroundTasks(
                     working = outcome.character
                     counters = resetMemoryRetry(counters, MemoryTaskKind.Analysis)
                 }
-                TaskStatus.Failure -> counters = scheduleMemoryRetry(counters, MemoryTaskKind.Analysis, nowMillis)
+                TaskStatus.Failure -> {
+                    counters = scheduleMemoryRetry(counters, MemoryTaskKind.Analysis, nowMillis)
+                    maybeAskMemoryRetry(MemoryTaskKind.Analysis, working.id, counters)
+                }
                 TaskStatus.Stale -> Unit
             }
         }

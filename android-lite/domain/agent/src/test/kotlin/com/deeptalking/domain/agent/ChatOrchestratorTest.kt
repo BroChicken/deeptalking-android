@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -44,6 +45,16 @@ class ChatOrchestratorTest {
     }
 
     private fun character() = Character(id = "c1", name = "Alice", emoji = "🙂")
+
+    private fun group() = Character(
+        id = "g1",
+        name = "三人行",
+        isGroup = true,
+        members = listOf(
+            com.deeptalking.core.model.GroupMember(id = "gm1", name = "张三"),
+            com.deeptalking.core.model.GroupMember(id = "gm2", name = "李四"),
+        ),
+    )
 
     private fun orchestrator(llm: LlmBackend, config: AppConfig = AppConfig()) = ChatOrchestrator(
         llm = llm,
@@ -167,8 +178,7 @@ class ChatOrchestratorTest {
     }
 
     @Test
-    fun `short-term window is injected before the history, volatile last`() = runBlocking {
-        val requests = mutableListOf<LlmRequest>()
+    fun `short-term window is injected before the history, volatile last`() = runBlocking {        val requests = mutableListOf<LlmRequest>()
         val llm = object : LlmBackend {
             override val id = "recording"
             override fun stream(request: LlmRequest): Flow<LlmChunk> = flow {
@@ -211,5 +221,116 @@ class ChatOrchestratorTest {
             "the volatile context stays last",
             input.last().content.startsWith("【系统提供的本轮上下文"),
         )
+    }
+
+    @Test
+    fun `proactive opening sends no empty placeholder user message`() = runBlocking {
+        val requests = mutableListOf<LlmRequest>()
+        val llm = object : LlmBackend {
+            override val id = "recording"
+            override fun stream(request: LlmRequest): Flow<LlmChunk> = flow {
+                requests += request
+                emit(LlmChunk.Completed(LlmResult(text = "我先开口。")))
+            }
+            override suspend fun complete(request: LlmRequest): LlmResult {
+                requests += request
+                return LlmResult(text = "我先开口。")
+            }
+        }
+        val history = listOf(
+            ChatMessage(id = "m1", role = Role.User, content = "在吗"),
+            ChatMessage(id = "m2", role = Role.Assistant, content = "在的"),
+        )
+        orchestrator(llm).run(
+            character = character(),
+            history = history,
+            userText = "",
+            proactive = true,
+        )
+
+        val input = requests.first().input
+        assertTrue(
+            "a proactive turn has no user text, so no fake empty user message may be appended",
+            input.none { it.role == Role.User && it.content.isEmpty() },
+        )
+        // The real (user-less) shape survives: the last thing before the volatile context is
+        // the previous assistant turn, not a placeholder.
+        assertEquals(Role.Assistant, input[input.lastIndex - 1].role)
+        assertEquals("在的", input[input.lastIndex - 1].content)
+    }
+
+    @Test
+    fun `tone is restamped even when the value is unchanged`() = runBlocking {
+        val before = character().copy(
+            dynamicState = com.deeptalking.core.model.DynamicState(currentTone = "温柔含笑"),
+            dynamicStateMeta = mapOf(
+                "currentTone" to com.deeptalking.core.model.DynamicStateMeta(updatedAt = "2020-01-01T00:00:00Z"),
+            ),
+        )
+        val result = orchestrator(ScriptedLlm("嗯，我在。\n\n【语气】温柔含笑")).run(
+            character = before,
+            history = listOf(ChatMessage(id = "m1", role = Role.User, content = "在吗")),
+            userText = "在吗",
+        )
+
+        assertEquals("温柔含笑", result.updatedCharacter.dynamicState.currentTone)
+        assertNotEquals(
+            "the same tone still refreshes its timestamp",
+            "2020-01-01T00:00:00Z",
+            result.updatedCharacter.dynamicStateMeta["currentTone"]?.updatedAt,
+        )
+    }
+
+    @Test
+    fun `group reply carries per-member segments while staying one message`() = runBlocking {
+        val reply = "张三：早\n李四：早啊"
+        val result = orchestrator(ScriptedLlm(reply)).run(
+            character = group(),
+            history = listOf(ChatMessage(id = "m1", role = Role.User, content = "早")),
+            userText = "早",
+        )
+
+        assertEquals(reply, result.reply)
+        assertEquals(listOf("张三", "李四"), result.segments.map { it.speaker })
+        assertEquals(listOf("早", "早啊"), result.segments.map { it.text })
+        // Still one assistant message in the instant window, with the segments attached.
+        val assistants = result.updatedCharacter.instant.filter { it.role == Role.Assistant }
+        assertEquals(1, assistants.size)
+        assertEquals(reply, assistants.single().content)
+        assertEquals(2, assistants.single().segments.size)
+    }
+
+    @Test
+    fun `single character reply has no segments`() = runBlocking {
+        val result = orchestrator(ScriptedLlm("张三：这不是群聊\n只是正文")).run(
+            character = character(),
+            history = listOf(ChatMessage(id = "m1", role = Role.User, content = "在吗")),
+            userText = "在吗",
+        )
+
+        assertTrue(result.segments.isEmpty())
+        assertTrue(result.updatedCharacter.instant.last { it.role == Role.Assistant }.segments.isEmpty())
+        assertEquals(emptyList<com.deeptalking.core.model.SpeechSegment>(), groupSpeechSegments(character(), "任意"))
+    }
+
+    @Test
+    fun `quick reply repair only runs when the worker did not hand back two lines`() {
+        assertTrue(quickReplyRepairEnabled(AppConfig(quickReplyRepair = true), workerOk = false, quickReplyCount = 0))
+        assertFalse(
+            "a successful worker with two lines is the only producer; no repair round",
+            quickReplyRepairEnabled(AppConfig(quickReplyRepair = true), workerOk = true, quickReplyCount = 2),
+        )
+        assertTrue(
+            "a successful worker with fewer than two lines still needs the repair",
+            quickReplyRepairEnabled(AppConfig(quickReplyRepair = true), workerOk = true, quickReplyCount = 0),
+        )
+        assertFalse(quickReplyRepairEnabled(AppConfig(quickReplyRepair = false), workerOk = false, quickReplyCount = 0))
+    }
+
+    @Test
+    fun `worker notes are empty when no worker ran`() = runBlocking {
+        val result = orchestrator(ScriptedLlm("嗯。")).run(character(), emptyList(), "hi")
+        assertFalse(result.workerOk)
+        assertTrue("no worker, no worker-specific notes", result.workerNotes.isEmpty())
     }
 }

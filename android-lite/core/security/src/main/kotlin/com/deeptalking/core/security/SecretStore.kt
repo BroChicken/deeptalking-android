@@ -50,6 +50,27 @@ class SecretStore(context: Context) {
         }.apply()
     }
 
+    /**
+     * Snapshot of every managed secret for an encrypted backup. Only the global/per-platform
+     * API key slots and the remote-TTS token are included; unrelated preferences never are.
+     */
+    fun snapshot(): Map<String, String> = prefs.all.entries
+        .filter { (key, value) -> isManagedKey(key) && value is String && value.isNotEmpty() }
+        .associate { (key, value) -> key to value as String }
+
+    /** Replaces every managed secret with [values]; unknown/unmanaged keys are untouched. */
+    fun restore(values: Map<String, String>) {
+        val editor = prefs.edit()
+        prefs.all.keys.filter(::isManagedKey).forEach(editor::remove)
+        values.forEach { (key, value) ->
+            if (isManagedKey(key) && value.isNotEmpty()) editor.putString(key, value)
+        }
+        editor.apply()
+    }
+
+    private fun isManagedKey(key: String): Boolean =
+        key == KEY_API_KEY || key == KEY_TTS_TOKEN || key.startsWith(KEY_API_KEY + "_")
+
     fun clear() {
         prefs.edit().clear().apply()
     }

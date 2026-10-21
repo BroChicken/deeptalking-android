@@ -42,6 +42,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -51,6 +52,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -60,10 +62,15 @@ import androidx.compose.ui.unit.sp
 import com.deeptalking.core.common.AppLimits
 import com.deeptalking.core.designsystem.legacy
 import com.deeptalking.core.model.Character
+import com.deeptalking.core.model.FieldEditRegistry
+import com.deeptalking.core.model.FieldKey
+import com.deeptalking.core.model.FieldSection
 import com.deeptalking.core.model.GroupMember
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.LorebookOrigin
 import com.deeptalking.core.model.StaticProfile
+import java.util.UUID
+
 private val STATIC_FIELDS = listOf(
     "gender" to "性别",
     "age" to "年龄",
@@ -564,18 +571,32 @@ fun CharacterEditorDialog(
         pendingNotices = emptyList()
     }
 
+    // 焦点保护：本编辑器实例登记用户正在输入的字段，后台任务/字段修订就不会用旧快照
+    // 覆盖它们。关闭、保存或切页签时清掉本 owner 的登记（不会影响别的编辑器实例）。
+    val focusOwner = remember(character.id) { UUID.randomUUID().toString() }
+    fun releaseFocus() = FieldEditRegistry.clearOwner(focusOwner)
+    DisposableEffect(character.id) {
+        onDispose { FieldEditRegistry.clearOwner(focusOwner) }
+    }
+
     val title = when {
         editingMember != null -> "编辑成员: ${editingMember.name}"
         else -> "编辑: ${character.name}"
     }
 
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = {
+            releaseFocus()
+            onDismiss()
+        },
         containerColor = legacy.panel,
         title = {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 if (editingMember != null) {
-                    IconButton(onClick = { memberIndex = null }) { Text("←", color = legacy.textSecondary) }
+                    IconButton(onClick = {
+                        releaseFocus()
+                        memberIndex = null
+                    }) { Text("←", color = legacy.textSecondary) }
                 }
                 Text(title, color = legacy.text)
             }
@@ -583,12 +604,12 @@ fun CharacterEditorDialog(
         text = {
             Column(modifier = Modifier.fillMaxWidth().heightIn(max = 480.dp)) {
                 Row(modifier = Modifier.fillMaxWidth()) {
-                    ModalTab("基础设定", tab == 0, Modifier.weight(1f)) { tab = 0 }
-                    ModalTab("当前状态", tab == 1, Modifier.weight(1f)) { tab = 1 }
-                    ModalTab("世界书", tab == 2, Modifier.weight(1f)) { tab = 2 }
+                    ModalTab("基础设定", tab == 0, Modifier.weight(1f)) { releaseFocus(); tab = 0 }
+                    ModalTab("当前状态", tab == 1, Modifier.weight(1f)) { releaseFocus(); tab = 1 }
+                    ModalTab("世界书", tab == 2, Modifier.weight(1f)) { releaseFocus(); tab = 2 }
                     // 待办只挂在角色本体上（成员页签不显示）。
                     if (editingMember == null) {
-                        ModalTab("待办", tab == 3, Modifier.weight(1f)) { tab = 3 }
+                        ModalTab("待办", tab == 3, Modifier.weight(1f)) { releaseFocus(); tab = 3 }
                     }
                 }
                 Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(legacy.border))
@@ -603,12 +624,18 @@ fun CharacterEditorDialog(
                         0 -> BasicTab(
                             draft = draft,
                             memberIndex = memberIndex,
+                            focusOwner = focusOwner,
                             onDraft = ::applyDraft,
                             onGenerateAvatar = onGenerateAvatar,
                             onRegenerateField = onRegenerateField,
                             onFillMember = onFillMember,
                         )
-                        1 -> StateTab(draft = draft, memberIndex = memberIndex, onDraft = ::applyDraft)
+                        1 -> StateTab(
+                            draft = draft,
+                            memberIndex = memberIndex,
+                            focusOwner = focusOwner,
+                            onDraft = ::applyDraft,
+                        )
                         2 -> LorebookTab(
                             draft = draft,
                             memberId = editingMemberId,
@@ -685,13 +712,19 @@ fun CharacterEditorDialog(
                 // （applyDraft 清空提示）就重新提示，绝不静默改掉用户手写的内容。
                 if (result.notices.isEmpty() || pendingNotices.isNotEmpty()) {
                     onUpdate(result.character)
+                    releaseFocus()
                     onDismiss()
                 } else {
                     pendingNotices = result.notices
                 }
             }) { Text(if (pendingNotices.isEmpty()) "保存修改" else "继续保存") }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+        dismissButton = {
+            TextButton(onClick = {
+                releaseFocus()
+                onDismiss()
+            }) { Text("取消") }
+        },
     )
 }
 
@@ -823,12 +856,22 @@ private fun ModalTab(label: String, selected: Boolean, modifier: Modifier = Modi
 private fun BasicTab(
     draft: Character,
     memberIndex: Int?,
+    focusOwner: String,
     onDraft: (Character) -> Unit,
     onGenerateAvatar: (Character, (String?) -> Unit) -> Unit,
     onRegenerateField: (Character, Int?, String, String, (String?) -> Unit) -> Unit,
     onFillMember: (Character, Int, String) -> Unit,
 ) {
     val member = memberIndex?.let { draft.members.getOrNull(it) }
+
+    /** Registers the field while it has focus, so background writers leave the user's text alone. */
+    fun focusModifier(section: FieldSection, field: String): Modifier {
+        val key = FieldKey.of(draft.id, member?.id, section, field)
+        return Modifier.onFocusChanged { state ->
+            if (state.isFocused) FieldEditRegistry.focus(key, focusOwner)
+            else FieldEditRegistry.blur(key, focusOwner)
+        }
+    }
     var fillHint by remember { mutableStateOf("") }
     var regenField by rememberSaveable { mutableStateOf("emoji") }
     var regenHint by rememberSaveable { mutableStateOf("") }
@@ -882,6 +925,7 @@ private fun BasicTab(
                     onValueChange = { updateProfile(withStatic(profile, key, it)) },
                     label = label,
                     minLines = if (key == "background") 2 else 1,
+                    fieldModifier = focusModifier(FieldSection.Static, key),
                 )
             }
             if (member != null) {
@@ -944,7 +988,7 @@ private fun BasicTab(
 }
 
 @Composable
-private fun StateTab(draft: Character, memberIndex: Int?, onDraft: (Character) -> Unit) {
+private fun StateTab(draft: Character, memberIndex: Int?, focusOwner: String, onDraft: (Character) -> Unit) {
     val member = memberIndex?.let { draft.members.getOrNull(it) }
     val isGroupEntity = draft.isGroup && member == null
     val state = when {
@@ -956,6 +1000,15 @@ private fun StateTab(draft: Character, memberIndex: Int?, onDraft: (Character) -
         DYNAMIC_FIELDS.filter { it.first == "currentSituation" || it.first == "currentLocation" }
     } else {
         DYNAMIC_FIELDS
+    }
+
+    /** Registers the field while it has focus, so background writers leave the user's text alone. */
+    fun focusModifier(field: String): Modifier {
+        val key = FieldKey.of(draft.id, member?.id, FieldSection.Dynamic, field)
+        return Modifier.onFocusChanged { focusState ->
+            if (focusState.isFocused) FieldEditRegistry.focus(key, focusOwner)
+            else FieldEditRegistry.blur(key, focusOwner)
+        }
     }
 
     fun update(newState: com.deeptalking.core.model.DynamicState) {
@@ -973,6 +1026,7 @@ private fun StateTab(draft: Character, memberIndex: Int?, onDraft: (Character) -
                 onValueChange = { update(withDynamic(state, key, it)) },
                 label = label,
                 minLines = if (key == "currentSituation") 3 else 1,
+                fieldModifier = focusModifier(key),
             )
         }
     }
@@ -1201,6 +1255,8 @@ private fun LegacyField(
     label: String? = null,
     placeholder: String? = null,
     minLines: Int = 1,
+    /** Extra modifier for the text input itself (focus tracking); not applied to the label. */
+    fieldModifier: Modifier = Modifier,
 ) {
     val legacy = MaterialTheme.legacy
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(3.dp)) {
@@ -1224,7 +1280,7 @@ private fun LegacyField(
                 textStyle = TextStyle(fontSize = 13.sp, color = legacy.text),
                 cursorBrush = SolidColor(legacy.accent),
                 minLines = minLines,
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().then(fieldModifier),
             )
         }
     }

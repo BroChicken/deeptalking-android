@@ -51,6 +51,13 @@ data class ChatMessage(
      * turn's `function_call` (DeepSeek thinking continuity). Null when none.
      */
     val reasoningJson: String? = null,
+    /**
+     * Group replies only: the per-member turns of this single assistant message
+     * (`成员名：内容`), so the UI can draw one bubble per member while history and the
+     * `instant` window still count the reply as one message. Empty for single
+     * characters and for older messages (see [parseGroupSpeechSegments]).
+     */
+    val segments: List<SpeechSegment> = emptyList(),
 )
 
 @Serializable

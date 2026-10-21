@@ -73,9 +73,6 @@ private fun stripParentheticals(source: String): String {
     return sb.toString()
 }
 
-/** One spoken turn: [speaker] is the member name in a group reply, or null for a single character. */
-data class SpeechSegment(val speaker: String?, val text: String)
-
 private val LEADING_QUOTES = "「『\"'“‘"
 private val TRAILING_QUOTES = "」』\"'”’"
 
@@ -86,6 +83,9 @@ private val TRAILING_QUOTES = "」』\"'”’"
  * several lines until the next speaker line. Falls back to a single
  * speaker-less segment when no member line is found (or [memberNames] is empty),
  * which is also the path used for single characters.
+ *
+ * This is the **speech** side of the split: the text is cleaned by [extractSpeechText].
+ * Display bubbles use [parseGroupSpeechSegments], which keeps the reply verbatim.
  */
 fun extractSpeechSegments(source: String, memberNames: List<String>): List<SpeechSegment> {
     if (source.isBlank()) return emptyList()
@@ -93,10 +93,10 @@ fun extractSpeechSegments(source: String, memberNames: List<String>): List<Speec
         .sortedByDescending { it.length }
     if (names.isEmpty()) {
         val text = extractSpeechText(source)
-        return if (text.isEmpty()) emptyList() else listOf(SpeechSegment(null, text))
+        return if (text.isEmpty()) emptyList() else listOf(SpeechSegment(text = text))
     }
 
-    data class Pending(val speaker: String?, val body: StringBuilder)
+    data class Pending(val speaker: String, val body: StringBuilder)
     val pending = mutableListOf<Pending>()
 
     for (rawLine in source.lines()) {
@@ -108,7 +108,7 @@ fun extractSpeechSegments(source: String, memberNames: List<String>): List<Speec
             pending += Pending(speaker, StringBuilder(line.substring(speaker.length + 1).trimStart()))
         } else {
             val last = pending.lastOrNull()
-            if (last == null) pending += Pending(null, StringBuilder(line))
+            if (last == null) pending += Pending("", StringBuilder(line))
             else if (line.isNotEmpty()) {
                 if (last.body.isNotEmpty()) last.body.append('\n')
                 last.body.append(line)
@@ -122,7 +122,7 @@ fun extractSpeechSegments(source: String, memberNames: List<String>): List<Speec
     }
     if (segments.isNotEmpty()) return segments
     val fallback = extractSpeechText(source)
-    return if (fallback.isEmpty()) emptyList() else listOf(SpeechSegment(null, fallback))
+    return if (fallback.isEmpty()) emptyList() else listOf(SpeechSegment(text = fallback))
 }
 
 private fun trimQuotes(value: String): String {
@@ -131,6 +131,15 @@ private fun trimQuotes(value: String): String {
     if (text.isNotEmpty() && text.last() in TRAILING_QUOTES) text = text.dropLast(1).trim()
     return text
 }
+
+/**
+ * Speech text for one **display** segment (a [SpeechSegment] produced by
+ * [parseGroupSpeechSegments]): the surrounding quotes are dropped and the rest runs through
+ * [extractSpeechText], exactly like a reply re-parsed by [extractSpeechSegments]. Persisted
+ * segments therefore read aloud the same way whether they are split from the text or taken
+ * from the message.
+ */
+fun extractSpeechTextFromSegment(text: String): String = extractSpeechText(trimQuotes(text))
 
 /** Inserts a single space when a removed group sat between ASCII word characters. */
 private fun appendSeparatorIfAscii(sb: StringBuilder, next: Char?) {
