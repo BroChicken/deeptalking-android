@@ -431,8 +431,48 @@ private fun CreateDialog(
                         Text("群组至少需要两名成员", fontSize = 12.sp, color = legacy.warning)
                     }
                 } else {
-                    LegacyField(value = personality, onValueChange = { personality = it }, label = "性格简述", minLines = 2)
-                    LegacyField(value = background, onValueChange = { background = it }, label = "背景故事", minLines = 3)
+                    val generated = generatedDraft
+                    if (generated == null) {
+                        LegacyField(value = personality, onValueChange = { personality = it }, label = "性格简述", minLines = 2)
+                        LegacyField(value = background, onValueChange = { background = it }, label = "背景故事", minLines = 3)
+                    } else {
+                        Text("生成结果 · 全部字段可直接修改", fontSize = 13.sp, color = legacy.textSecondary)
+                        STATIC_FIELDS.forEach { (key, label) ->
+                            LegacyField(
+                                value = staticValue(generated.staticProfile, key),
+                                onValueChange = { value ->
+                                    generatedDraft = generated.copy(
+                                        staticProfile = withStatic(generated.staticProfile, key, value),
+                                    )
+                                    if (key == "personality") personality = value
+                                    if (key == "background") background = value
+                                },
+                                label = label,
+                                minLines = if (key == "background") 3 else 1,
+                            )
+                        }
+                        Text("当前状态", fontSize = 13.sp, color = legacy.textSecondary)
+                        DYNAMIC_FIELDS.forEach { (key, label) ->
+                            LegacyField(
+                                value = dynamicValue(generated.dynamicState, key),
+                                onValueChange = { value ->
+                                    generatedDraft = generated.copy(
+                                        dynamicState = withDynamic(generated.dynamicState, key, value),
+                                    )
+                                },
+                                label = label,
+                                minLines = if (key == "currentSituation" || key == "currentLocation") 2 else 1,
+                            )
+                        }
+                        if (generated.lorebook.isNotEmpty()) {
+                            Text(
+                                "世界书 " + generated.lorebook.size + " 条：" +
+                                    generated.lorebook.joinToString("、") { it.name },
+                                fontSize = 12.sp,
+                                color = legacy.textMuted,
+                            )
+                        }
+                    }
                 }
             }
         },
@@ -470,6 +510,7 @@ object CharacterEditorHost {
         onArchiveLorebook: (String, String?, String) -> Unit,
         onRestoreLorebook: (String, String?, String) -> Unit,
         onGenerateAvatar: (Character, (String?) -> Unit) -> Unit,
+        onRegenerateField: (Character, Int?, String, String, (String?) -> Unit) -> Unit,
         onFillMember: (Character, Int, String) -> Unit,
         initialMemberIndex: Int? = null,
     ) = CharacterEditorDialog(
@@ -482,6 +523,7 @@ object CharacterEditorHost {
         onArchiveLorebook = onArchiveLorebook,
         onRestoreLorebook = onRestoreLorebook,
         onGenerateAvatar = onGenerateAvatar,
+        onRegenerateField = onRegenerateField,
         onFillMember = onFillMember,
         initialMemberIndex = initialMemberIndex,
     )
@@ -498,6 +540,7 @@ fun CharacterEditorDialog(
     onArchiveLorebook: (String, String?, String) -> Unit,
     onRestoreLorebook: (String, String?, String) -> Unit,
     onGenerateAvatar: (Character, (String?) -> Unit) -> Unit,
+    onRegenerateField: (Character, Int?, String, String, (String?) -> Unit) -> Unit,
     onFillMember: (Character, Int, String) -> Unit,
     initialMemberIndex: Int? = null,
 ) {
@@ -562,6 +605,7 @@ fun CharacterEditorDialog(
                             memberIndex = memberIndex,
                             onDraft = ::applyDraft,
                             onGenerateAvatar = onGenerateAvatar,
+                            onRegenerateField = onRegenerateField,
                             onFillMember = onFillMember,
                         )
                         1 -> StateTab(draft = draft, memberIndex = memberIndex, onDraft = ::applyDraft)
@@ -781,10 +825,15 @@ private fun BasicTab(
     memberIndex: Int?,
     onDraft: (Character) -> Unit,
     onGenerateAvatar: (Character, (String?) -> Unit) -> Unit,
+    onRegenerateField: (Character, Int?, String, String, (String?) -> Unit) -> Unit,
     onFillMember: (Character, Int, String) -> Unit,
 ) {
     val member = memberIndex?.let { draft.members.getOrNull(it) }
     var fillHint by remember { mutableStateOf("") }
+    var regenField by rememberSaveable { mutableStateOf("emoji") }
+    var regenHint by rememberSaveable { mutableStateOf("") }
+    var regenExpanded by rememberSaveable { mutableStateOf(false) }
+    var regenBusy by remember { mutableStateOf(false) }
 
     fun updateProfile(profile: StaticProfile) {
         if (member == null) onDraft(draft.copy(staticProfile = profile))
@@ -846,6 +895,23 @@ private fun BasicTab(
             }
         }
 
+        Text("重新生成字段", fontSize = 13.sp, color = MaterialTheme.legacy.textSecondary)
+        val fieldOptions = listOf("emoji" to "头像 emoji") + STATIC_FIELDS
+        LegacyDropdown(
+            selected = fieldOptions.firstOrNull { it.first == regenField }?.second ?: "头像 emoji",
+            options = fieldOptions,
+            expanded = regenExpanded,
+            onExpandedChange = { regenExpanded = it },
+            onSelect = { key ->
+                regenField = key
+                regenExpanded = false
+            },
+        )
+        LegacyField(
+            value = regenHint,
+            onValueChange = { regenHint = it },
+            placeholder = "修改意见（可选），例如：更冷淡、保留医生身份",
+        )
         Row(verticalAlignment = Alignment.CenterVertically) {
             Surface(shape = CircleShape, color = MaterialTheme.legacy.accentBg, modifier = Modifier.size(40.dp)) {
                 Box(contentAlignment = Alignment.Center) {
@@ -853,11 +919,26 @@ private fun BasicTab(
                 }
             }
             Spacer(Modifier.width(8.dp))
-            LegacyButton("AI 生成 emoji 头像", primary = false, modifier = Modifier.width(160.dp), onClick = {
-                onGenerateAvatar(draft) { emoji ->
-                    if (!emoji.isNullOrBlank()) updateEmoji(emoji)
-                }
-            })
+            LegacyButton(
+                label = if (regenBusy) "生成中…" else "重新生成",
+                primary = false,
+                modifier = Modifier.width(120.dp),
+                onClick = {
+                    if (regenBusy) return@LegacyButton
+                    val key = regenField
+                    regenBusy = true
+                    onRegenerateField(draft, memberIndex, key, regenHint) { value ->
+                        regenBusy = false
+                        if (!value.isNullOrBlank()) {
+                            if (key == "emoji") {
+                                updateEmoji(value)
+                            } else {
+                                updateProfile(withStatic(member?.staticProfile ?: draft.staticProfile, key, value))
+                            }
+                        }
+                    }
+                },
+            )
         }
     }
 }

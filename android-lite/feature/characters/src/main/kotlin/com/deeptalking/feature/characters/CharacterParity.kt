@@ -82,14 +82,14 @@ object CharacterParity {
         append("\"members\":[{\"name\":\"成员名\",\"avatar\":\"emoji\",\"gender\":\"性别\",\"age\":\"年龄\",\"race\":\"种族\",\"appearance\":\"外貌\",\"personality\":\"性格\",\"fears\":\"恐惧或弱点\",\"background\":\"背景\",\"speakingStyle\":\"说话风格\",\"language\":\"语言\",\"userAddress\":\"该成员对用户的称呼（一个短称呼词）\",\"roleInGroup\":\"群内定位\",\"dynamicState\":{\"currentSituation\":\"当前处境\",\"currentLocation\":\"当前位置\",\"currentMood\":\"当前情绪\",\"currentOccupation\":\"当前职业/身份\",\"currentGoal\":\"当前目标\",\"currentTone\":\"当前语气（供朗读的播报指令，可短可长，通常约60字内）\"}}]}。")
         append("群组的 description/scene 是全体成员共用的前提，必须填写；**世界层设定（时代/世界观、地点、组织、专有名词、历史、规则）一律写进 lorebook（2-4 条），绝不能塞进 description 或成员的 background**；")
         append("lorebook 条目要能被日后复用，keywords 写剧情里可能出现的称呼（常驻内容把 alwaysActive 设为 true），content 只写该条目本身的信息。")
-        append("至少生成两名成员；每名成员必须尽可能填满所有字段，不能只返回名称和性格；成员之间的说话方式必须显著不同（看台词就能分辨是谁）。")
+        append("至少生成两名成员；每名成员的所有字段都必须填写，不能返回空字符串；成员之间的说话方式必须显著不同（看台词就能分辨是谁）。")
     }
 
     private val CHARACTER_PROMPT_PREFIX = buildString {
-        append("根据以下描述，生成一个角色设定。返回JSON格式，包含这些字段: entityType, name, avatar(emoji), gender, age, race, appearance, personality, fears, background(角色个人经历，不要写世界观), speakingStyle, language, userAddress(角色对用户的称呼，只填一个短称呼词), ")
+        append("根据以下描述生成一个角色设定。只返回一个 JSON 对象，字段齐全且全部非空：entityType, name, avatar(emoji), gender, age, race, appearance, personality, fears, background(角色个人经历，不要写世界观), speakingStyle, language, userAddress(角色对用户的称呼，只填一个短称呼词), ")
         append("dynamicState(对象，包含 currentSituation、currentLocation、currentMood、currentOccupation、currentGoal、currentTone), ")
         append("lorebook(数组，2-4 条世界层设定条目，每条 {\"name\":\"条目名\",\"keywords\":[\"触发词\"],\"content\":\"命中后注入的世界层设定\",\"alwaysActive\":false})。")
-        append("**世界层设定（时代/世界观、地点、组织、专有名词、历史、规则）一律写进 lorebook，不要写进 background。**")
+        append("任何字段都不能返回空字符串；世界层设定（时代/世界观、地点、组织、专有名词、历史、规则）一律写进 lorebook，不要写进 background。")
     }
 
     // ---------------------------------------------------------------- parsing
@@ -364,16 +364,16 @@ object CharacterParity {
     }
 
     private fun normalizeStaticProfile(profile: StaticProfile, base: ZonedDateTime, zone: ZoneId): StaticProfile = profile.copy(
-        gender = FieldCleaning.normalizeStaticFieldValue("gender", profile.gender, base, zone),
-        age = FieldCleaning.normalizeStaticFieldValue("age", profile.age, base, zone),
-        race = FieldCleaning.normalizeStaticFieldValue("race", profile.race, base, zone),
-        appearance = FieldCleaning.normalizeStaticFieldValue("appearance", profile.appearance, base, zone),
-        personality = FieldCleaning.normalizeStaticFieldValue("personality", profile.personality, base, zone),
-        fears = FieldCleaning.normalizeStaticFieldValue("fears", profile.fears, base, zone),
-        background = FieldCleaning.normalizeStaticFieldValue("background", profile.background, base, zone),
-        speakingStyle = FieldCleaning.normalizeStaticFieldValue("speakingStyle", profile.speakingStyle, base, zone),
-        language = FieldCleaning.normalizeStaticFieldValue("language", profile.language, base, zone),
-        userAddress = FieldCleaning.normalizeStaticFieldValue("userAddress", profile.userAddress, base, zone),
+        gender = FieldCleaning.normalizeGeneratedFieldValue("gender", profile.gender, base, zone),
+        age = FieldCleaning.normalizeGeneratedFieldValue("age", profile.age, base, zone),
+        race = FieldCleaning.normalizeGeneratedFieldValue("race", profile.race, base, zone),
+        appearance = FieldCleaning.normalizeGeneratedFieldValue("appearance", profile.appearance, base, zone),
+        personality = FieldCleaning.normalizeGeneratedFieldValue("personality", profile.personality, base, zone),
+        fears = FieldCleaning.normalizeGeneratedFieldValue("fears", profile.fears, base, zone),
+        background = FieldCleaning.normalizeGeneratedFieldValue("background", profile.background, base, zone),
+        speakingStyle = FieldCleaning.normalizeGeneratedFieldValue("speakingStyle", profile.speakingStyle, base, zone),
+        language = FieldCleaning.normalizeGeneratedFieldValue("language", profile.language, base, zone),
+        userAddress = FieldCleaning.normalizeGeneratedFieldValue("userAddress", profile.userAddress, base, zone),
     )
 
     private fun normalizeDynamicState(state: DynamicState, base: ZonedDateTime, zone: ZoneId): DynamicState = state.copy(

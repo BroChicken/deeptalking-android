@@ -210,6 +210,22 @@ object FieldCleaning {
         if (key == "userAddress") normalizeUserAddress(value) else cleanFieldValue(key, parseRelativeText(value, base, zone))
 
     /**
+     * 建卡 / AI 生成字段通道：只做前缀、说明括号、空白和长度规范化，**不因对比句清空
+     * 整个字段**。生成出来的背景、性格经常天然带「不是…而是…」，旧通道会把它们整段
+     * 丢掉，用户看到的就是“缺字段”。
+     */
+    fun normalizeGeneratedFieldValue(
+        key: String,
+        value: String?,
+        base: ZonedDateTime,
+        zone: ZoneId = base.zone,
+    ): String {
+        val parsed = parseRelativeText(value, base, zone)
+        val cleaned = cleanUserWrittenField(key, parsed).value
+        return if (key == "userAddress") normalizeUserAddress(cleaned) else StaticFieldRules.clamp(key, cleaned)
+    }
+
+    /**
      * 模型 / 建卡 / AI 补全通道：Port of legacy `cleanFieldValue` (`src/js/memory/time.js`)。
      * **对比句拒收 + 按 40/120/250 收敛**这两条语义只在这个通道里保留。
      */

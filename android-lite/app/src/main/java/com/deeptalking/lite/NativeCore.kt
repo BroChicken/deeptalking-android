@@ -978,6 +978,91 @@ class NativeCore(context: Context) {
             com.deeptalking.feature.characters.CharacterParity.buildAvatarDescription(member, parent),
         )
 
+    /**
+     * Rewrites one **static** card field from the current card plus the user's edit note.
+     * The editor applies the returned value to its draft; nothing is persisted here.
+     * An empty model reply is a failure — there is no silent fallback.
+     */
+    suspend fun regenerateCharacterField(
+        config: AppConfig,
+        character: Character,
+        memberIndex: Int?,
+        fieldKey: String,
+        instruction: String,
+    ): String? {
+        val member = memberIndex?.let { character.members.getOrNull(it) }
+        val profile = member?.staticProfile ?: character.staticProfile
+        val label = staticFieldLabel(fieldKey) ?: return null
+        val current = staticFieldValue(profile, fieldKey)
+        val card = buildString {
+            appendLine("姓名：${member?.name ?: character.name}")
+            appendLine("性别：${profile.gender}")
+            appendLine("年龄：${profile.age}")
+            appendLine("种族：${profile.race}")
+            appendLine("外貌：${profile.appearance}")
+            appendLine("性格：${profile.personality}")
+            appendLine("恐惧/弱点：${profile.fears}")
+            appendLine("背景：${profile.background}")
+            appendLine("说话风格：${profile.speakingStyle}")
+            appendLine("语言：${profile.language}")
+            appendLine("对用户的称呼：${profile.userAddress}")
+            if (member != null) appendLine("群内定位：${member.roleInGroup}")
+        }
+        val result = trackedComplete(
+            config,
+            "auxiliary",
+            LlmRequest(
+                model = config.modelName,
+                instructions = "你是角色卡字段编辑器。只重写用户指定的一个静态字段，只输出该字段的新内容，不要字段名、引号、解释、Markdown 或 HTML；内容必须非空并符合字段用途。",
+                input = listOf(
+                    ChatMessage(
+                        role = Role.User,
+                        content = "字段：$label\n当前值：${current.ifBlank { "(空)" }}\n修改意见：${instruction.ifBlank { "按角色卡统一风格重写" }}\n角色卡：\n$card",
+                    ),
+                ),
+                temperature = 0.8,
+                maxOutputTokens = 600,
+                reasoningEffort = "none",
+                apiPlatform = config.apiPlatform,
+                sessionId = "deeptalking-general",
+                auxiliary = true,
+            ),
+        )
+        val raw = result.text.trim()
+        if (raw.isEmpty()) return null
+        return com.deeptalking.feature.characters.FieldCleaning
+            .normalizeGeneratedFieldValue(fieldKey, raw, java.time.ZonedDateTime.now())
+            .takeIf { it.isNotBlank() }
+    }
+
+    private fun staticFieldLabel(key: String): String? = when (key) {
+        "gender" -> "性别"
+        "age" -> "年龄"
+        "race" -> "种族"
+        "appearance" -> "外貌特征"
+        "personality" -> "性格特征"
+        "fears" -> "恐惧/弱点"
+        "background" -> "个人背景"
+        "speakingStyle" -> "说话风格"
+        "language" -> "语言/方言"
+        "userAddress" -> "对用户的称呼"
+        else -> null
+    }
+
+    private fun staticFieldValue(profile: StaticProfile, key: String): String = when (key) {
+        "gender" -> profile.gender
+        "age" -> profile.age
+        "race" -> profile.race
+        "appearance" -> profile.appearance
+        "personality" -> profile.personality
+        "fears" -> profile.fears
+        "background" -> profile.background
+        "speakingStyle" -> profile.speakingStyle
+        "language" -> profile.language
+        "userAddress" -> profile.userAddress
+        else -> ""
+    }
+
     private suspend fun requestEmojiAvatar(config: AppConfig, description: String): String? {
         val result = trackedComplete(
             config,

@@ -266,7 +266,7 @@ class CharacterParityTest {
     }
 
     @Test
-    fun buildChannelStillRejectsContrastAndClamps() {
+    fun buildChannelKeepsContrastAndClampsGeneratedFields() {
         val character = Character(
             id = "c",
             name = "林晚",
@@ -278,7 +278,8 @@ class CharacterParityTest {
 
         val normalized = CharacterParity.normalizeEditedDraft(character, null, base, zone)
 
-        assertEquals("", normalized.staticProfile.personality)
+        assertEquals("他不是冷漠，而是懒得解释。", normalized.staticProfile.personality)
+        assertTrue(normalized.staticProfile.background.isNotEmpty())
         assertTrue(normalized.staticProfile.background.length <= AppLimits.StaticProfile.BACKGROUND_CHARS)
     }
 

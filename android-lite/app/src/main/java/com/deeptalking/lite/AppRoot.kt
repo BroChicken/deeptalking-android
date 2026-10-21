@@ -303,11 +303,21 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                     activeCharacter = activeCharacter,
                     currentThemeId = config.activeTheme,
                     version = BuildConfig.VERSION_NAME,
-                    status = status,
                     config = config,
                     onOpenDrawer = { scope.launch { drawerState.open() } },
                     onSelectTheme = vm::setTheme,
                 )
+                if (status.isNotBlank()) {
+                    Text(
+                        status,
+                        fontSize = 11.sp,
+                        color = legacy.accent,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.End,
+                        modifier = Modifier.fillMaxWidth().padding(end = 12.dp, top = 2.dp),
+                    )
+                }
                 ChatScreen(
                     character = activeCharacter,
                     messages = messages,
@@ -361,6 +371,9 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                 else vm.restoreMemberLorebookEntry(characterId, memberId, entryId)
             },
             onGenerateAvatar = { char, cb -> vm.generateEmojiAvatar(char, cb) },
+            onRegenerateField = { char, memberIndex, fieldKey, hint, cb ->
+                vm.regenerateCharacterField(char, memberIndex, fieldKey, hint, cb)
+            },
             onFillMember = { char, index, hint -> vm.fillGroupMember(char, index, hint) },
             initialMemberIndex = editingMemberIndex,
         )
@@ -709,7 +722,6 @@ private fun AppHeader(
     activeCharacter: com.deeptalking.core.model.Character?,
     currentThemeId: String,
     version: String,
-    status: String,
     config: com.deeptalking.core.model.AppConfig,
     onOpenDrawer: () -> Unit,
     onSelectTheme: (String) -> Unit,
@@ -756,30 +768,123 @@ private fun AppHeader(
                 }
             }
             Spacer(Modifier.weight(1f))
-            // Legacy `#activityStatusBar` and `#cacheStatsBar` are mutually exclusive
-            // siblings in the header row; keep both inline so nothing overlaps.
-            if (status.isNotBlank()) {
-                Text(
-                    status,
-                    fontSize = 11.sp,
-                    color = legacy.accent,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.padding(end = 6.dp),
-                )
-            } else {
-                CachePill(config, Modifier.padding(end = 6.dp))
-            }
-            MetricBreakdownButton(config)
-            ThemeMenu(currentThemeId = currentThemeId, onSelect = onSelectTheme)
             Text(
                 "v" + version,
                 fontSize = 10.sp,
                 color = legacy.textMuted,
-                modifier = Modifier.padding(start = 4.dp),
+                modifier = Modifier.padding(end = 2.dp),
             )
+            CacheMenu(config)
+            ThemeMenu(currentThemeId = currentThemeId, onSelect = onSelectTheme)
         }
         Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(legacy.border).align(Alignment.BottomStart))
+    }
+}
+
+/** One cache row in the header popover. */
+private data class CacheLine(
+    val label: String,
+    val hitTokens: Int?,
+    val inputTokens: Int?,
+)
+
+private fun cacheLine(label: String, rows: List<RequestMetric>): CacheLine {
+    val usable = rows.filter { (it.inputTokens ?: 0) > 0 }
+    if (usable.isEmpty()) return CacheLine(label, null, null)
+    return CacheLine(
+        label = label,
+        hitTokens = usable.sumOf { it.hitTokens ?: 0 },
+        inputTokens = usable.sumOf { it.inputTokens ?: 0 },
+    )
+}
+
+/**
+ * The newest chat turn: walk the `chat.main` rows backwards until `round == 1`, so tool
+ * rounds of the same turn are aggregated instead of showing only the last request.
+ * Rows without a round are legacy data; they deliberately produce no line rather than
+ * falling back to a single request.
+ */
+private fun latestMainTurn(metrics: List<RequestMetric>): List<RequestMetric> {
+    val main = metrics.filter { it.taskType == "chat.main" }
+    if (main.isEmpty() || main.last().round == null) return emptyList()
+    val rows = ArrayDeque<RequestMetric>()
+    for (row in main.asReversed()) {
+        rows.addFirst(row)
+        if (row.round == 1) break
+    }
+    return if (rows.firstOrNull()?.round == 1) rows.toList() else emptyList()
+}
+
+private fun latestTaskRows(metrics: List<RequestMetric>, taskType: String): List<RequestMetric> =
+    listOfNotNull(metrics.lastOrNull { it.taskType == taskType })
+
+/** Small triangle next to the version; opens the cache summary, not a persistent pill. */
+@Composable
+private fun CacheMenu(config: com.deeptalking.core.model.AppConfig) {
+    var open by remember { mutableStateOf(false) }
+    val legacy = MaterialTheme.legacy
+    val main = remember(config.requestMetrics) {
+        cacheLine("主聊天", latestMainTurn(config.requestMetrics))
+    }
+    val worker = remember(config.requestMetrics) {
+        cacheLine("后台处理", latestTaskRows(config.requestMetrics, "chat.worker"))
+    }
+    val extraction = remember(config.requestMetrics) {
+        cacheLine("短期提取", latestTaskRows(config.requestMetrics, "extraction"))
+    }
+    val analysis = remember(config.requestMetrics) {
+        cacheLine("记忆整理", latestTaskRows(config.requestMetrics, "analysis"))
+    }
+    val lorebook = remember(config.requestMetrics) {
+        cacheLine("世界书整理", latestTaskRows(config.requestMetrics, "lorebook"))
+    }
+
+    Box {
+        Text(
+            "▾",
+            fontSize = 14.sp,
+            color = legacy.textSecondary,
+            modifier = Modifier
+                .clip(RoundedCornerShape(4.dp))
+                .clickable { open = true }
+                .padding(horizontal = 6.dp, vertical = 2.dp),
+        )
+        androidx.compose.material3.DropdownMenu(
+            expanded = open,
+            onDismissRequest = { open = false },
+        ) {
+            Column(
+                modifier = Modifier
+                    .widthIn(min = 230.dp)
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Text("缓存命中率", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = legacy.text)
+                CacheLineRow(main)
+                CacheLineRow(worker)
+                Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(legacy.border))
+                CacheLineRow(extraction)
+                CacheLineRow(analysis)
+                CacheLineRow(lorebook)
+            }
+        }
+    }
+}
+
+@Composable
+private fun CacheLineRow(line: CacheLine) {
+    val legacy = MaterialTheme.legacy
+    val hit = line.hitTokens
+    val input = line.inputTokens
+    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(line.label, fontSize = 11.sp, color = legacy.textSecondary, modifier = Modifier.width(68.dp))
+        val text = if (hit == null || input == null || input <= 0) {
+            "缓存 --"
+        } else {
+            val rate = Math.round(hit * 100.0 / input).toInt()
+            "缓存命中 $rate%  ${compactTokens(hit)}/${compactTokens(input)}"
+        }
+        Text(text, fontSize = 11.sp, color = legacy.text, modifier = Modifier.weight(1f))
     }
 }
 

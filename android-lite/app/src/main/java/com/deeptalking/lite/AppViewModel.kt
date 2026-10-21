@@ -622,8 +622,8 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             }
             val cleanProfile = cleaned?.staticProfile ?: StaticProfile()
             val profile = cleanProfile.copy(
-                personality = personality.ifBlank { cleanProfile.personality },
-                background = background.ifBlank { cleanProfile.background },
+                personality = personality,
+                background = background,
             )
             val character = Character(
                 id = UUID.randomUUID().toString(),
@@ -1001,6 +1001,40 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             val emoji = runCatching { core.generateEmojiAvatar(cfg, character) }.getOrNull()
             if (emoji.isNullOrBlank()) eventsState.tryEmit(UiEvent("emoji 头像生成失败"))
             onResult(emoji)
+        }
+    }
+
+    /**
+     * Regenerates exactly one field of the editor draft. Emoji keeps using the dedicated
+     * avatar call; every other key is a static profile field. Nothing is persisted here.
+     */
+    fun regenerateCharacterField(
+        character: Character,
+        memberIndex: Int?,
+        fieldKey: String,
+        instruction: String,
+        onResult: (String?) -> Unit,
+    ) {
+        viewModelScope.launch {
+            val cfg = runCatching { core.currentConfig() }.getOrNull()
+            if (cfg == null || core.secrets.getApiKey().isNullOrBlank()) {
+                eventsState.tryEmit(UiEvent("请先在设置页配置 API Key"))
+                onResult(null)
+                return@launch
+            }
+            val member = memberIndex?.let { character.members.getOrNull(it) }
+            val value = runCatching {
+                if (fieldKey == "emoji") {
+                    if (member != null) core.generateEmojiAvatar(cfg, member, character)
+                    else core.generateEmojiAvatar(cfg, character)
+                } else {
+                    core.regenerateCharacterField(cfg, character, memberIndex, fieldKey, instruction)
+                }
+            }.getOrNull()
+            if (value.isNullOrBlank()) {
+                eventsState.tryEmit(UiEvent("字段生成失败，请重试"))
+            }
+            onResult(value)
         }
     }
 
