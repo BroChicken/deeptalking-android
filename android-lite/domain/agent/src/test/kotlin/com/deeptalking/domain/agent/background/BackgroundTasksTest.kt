@@ -1026,6 +1026,42 @@ class BackgroundTasksTest {
     }
 
     @Test
+    fun extractionKeepsSourcesWhenTheLiveWindowMovesDuringTheRequest() = runBlocking {
+        val response = """[{"content":"用户2026-08-01下午在家看书","eventTime":"2026-08-01T15:00:00Z",""" +
+            """"participants":["用户"],"location":"家"}]"""
+        val llm = ScriptedLlm(mutableListOf(response))
+        val instant = buildList {
+            repeat(AppLimits.Memory.INSTANT - 2) { i ->
+                add(
+                    ChatMessage(
+                        id = "old$i",
+                        role = Role.User,
+                        content = "旧消息$i",
+                        timestamp = "2026-08-01T10:00:00Z",
+                    ),
+                )
+            }
+            add(ChatMessage(id = "m2", role = Role.User, content = "我今天在家看书", timestamp = "2026-08-01T15:00:00Z"))
+            add(ChatMessage(id = "m3", role = Role.Assistant, content = "嗯，挺好的", timestamp = "2026-08-01T15:01:00Z"))
+        }
+        val captured = Character(id = "c1", instant = instant)
+        // Simulate a turn that advanced the window while the extraction request was in
+        // flight: only the assistant row remains, so a lookup against live alone would
+        // find none of the user citations used by this summary.
+        val live = captured.copy(instant = listOf(instant.last()))
+        val background = BackgroundTasks(llm, MemoryServiceImpl(), liveCharacter = { live })
+
+        val (status, updated) = background.extractMemoryStatus(captured, instant)
+
+        assertEquals(BackgroundTasks.TaskStatus.Success, status)
+        val entry = updated.shortTerm.single()
+        assertEquals(listOf("m2"), entry.sourceMessageIds)
+        assertEquals(listOf("user"), entry.sourceRoles)
+        assertEquals(listOf("m2"), entry.userEvidence.map { it.sourceMessageId })
+        assertTrue(entry.userEvidence.single().text.contains("看书"))
+    }
+
+    @Test
     fun analysisSendsTheBatchAndCarriesTheLowWaterEntriesAsContext() = runBlocking {
         // 21 entries: the oldest one is the batch, the newest 20 ride along as context
         // (`analyzed: true`) and are never consumed.

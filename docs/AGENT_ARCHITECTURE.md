@@ -189,7 +189,7 @@ BackgroundTasks.scheduleTurn       后台：文风校对、快速回应校验/�
 
 - subject 仅限 `user` / `relationship` / `world` / `character`（`legacy` 仅作历史兼容，不再写入）。
 - `MemoryEvidence.isValidAutomaticMemory()` 校验来源引用与证据逐字摘录，防止模型编造记忆。
-- 短期记忆在捕获时写入 `sourceRoles` 与 `userEvidence`（用户消息逐字摘录，`[{sourceMessageId,text}]`），短期→长期分析据此在源消息滚出 `instant` 后仍能校验 `evidence` 逐字来自声明的用户消息。**`sourceRoles` 与 `sourceMessageIds` 是逐位对齐的平行数组**：合并来源必须走 `:core:model` 的 `alignSources`/`mergeSources` 逐位重建——把它当集合去重会让来源 role 塌缩，之后所有来源都变无 role、校验直接失败。
+- 短期记忆在捕获时写入 `sourceRoles` 与 `userEvidence`（用户消息逐字摘录，`[{sourceMessageId,text}]`），短期→长期分析据此在源消息滚出 `instant` 后仍能校验 `evidence` 逐字来自声明的用户消息。**来源以折叠开始时读到的整批对话为准**：请求返回后可能已有新消息把窗口推进，不能拿“实时窗口”去否定这批摘要的来源；实时窗口只用于合并已有条目。**`sourceRoles` 与 `sourceMessageIds` 是逐位对齐的平行数组**：合并来源必须逐位重建；旧条目缺 role 时保留来源 id（role 可空），不能因为 role 缺失把 id 一起丢掉。
 - 主对话（纯文本协议）**不再自动写长期记忆**：正常轮次里 `longTerm` 由后台抽取/分析产生；记忆的修正与删除只走 `memory_write` 工具（`MemoryPolicy` / `MemoryEvidence.hasValidUserEvidence` 校验）。旧结构本身是完整 JSON 的兼容路径仍会经 `ChatOrchestrator.applyMemory` → `MemoryPolicy.upsertLongTermMemory` 落盘。
 - **短期记忆不由主对话写**：主调用没有任何记忆字段，窗口唯一的写入者是整窗抽取（`BackgroundTasks.analyzeShortTermBatch`）。这样窗口在两次折叠之间不会被写在中部或提前压缩，注入块才能保持逐字稳定。
 - **短期条目可被修正/删除**：`memory_write` 支持 `short_` 前缀 ID（`op=update` 支持 `value`/`eventTime`；改正后 `revision+1` 并移到队尾，等下一轮折叠写进长期记忆）；`search_memory` 的关键词召回也返回 `shortTerm` 命中。
@@ -503,7 +503,7 @@ tools: AUTO 阶段 8 个工具 / FINAL 阶段无 tools（tool_choice 恒为 auto
 - **后台写回只改自己动过的字段**：`CharacterRepository.mutate(id)` 用 **per-id 锁**做读-改-写，`NativeCore.persistMemory(original, updated)` 与 `AppViewModel.writeCharacterChanges` 都在这个锁里用 `mergeCharacterChanges` 只把自己动过的字段并到**最新行**；编辑器保存（`AppViewModel.saveCharacterEdit`）同样是字段级合并：静态字段只写用户真正改过的 key（并给这些 key 盖 `staticFieldMeta`，后台补全/字段修订同时写入的其它字段保留实时值）、待办按 id 逐条合并、成员静态字段（`staticProfile`/姓名/emoji/`roleInGroup`）逐个成员按 id 合并，成员世界书与记忆窗口保持实时值。因此并发写入不会互相回滚，也不会用旧快照覆盖 `updatedAt`。
 - **焦点保护（`FieldEditRegistry`）**：编辑器把用户正在输入的字段登记为聚焦（键 = 角色 id + 成员 id + 分区 static/dynamic + 字段），登记带 owner，关闭/保存/切换只清自己那份。写入方在落盘前逐字段询问：turn worker 的动态状态、主调用的 `【语气】`（`applyTone`）、成员动态状态、`FieldRevision.apply` 的单字段修订、后台 `autoFillStaticFields` / 成员补全、旧格式记忆里的 `dynamicState` 更新——**被用户占用的那个字段跳过，其余字段照常写入**。这样后台拿着"开编辑器之前"的快照算出的值不会覆盖正在输入的文字，编辑框里的草稿也不会被后台写回吞掉。
 - **共享 HTML 工具**：HTML 实体解码/去标签/可读文本抽取是同一份实现，避免多处漂移。
-- **导入/导出归一化**：`LegacyImportService` / `BackupService` 逐字段校验（世界书、场景概要、场景状态、计数器、来源数组、**待办 `todos`**、**提示 ack / `workerIssues` / `memoryRepairVersion`**），坏角色跳过并计入 `ImportSummary.skipped`。新版备份恢复原生 TTS 设置与数值（旧备份缺字段时沿用当前值，音色路径按文件名匹配本机），API key 与远程朗读口令放在根级 `secrets`，用用户设置的备份密码做 PBKDF2-HMAC-SHA256 + AES-256-GCM 对称加密；密码错误不导入、不修改当前密钥。若备份的 `memory.instant` 低于低水位而 `history` 足够，导入时用 `history` 尾部重建工作窗口（修复旧版/失败回合留下的单条合成回复）。
+- **导入/导出归一化**：`LegacyImportService` / `BackupService` 逐字段校验（世界书、场景概要、场景状态、计数器、来源数组、**待办 `todos`**、**提示 ack / `workerIssues` / `memoryRepairVersion`**），坏角色跳过并计入 `ImportSummary.skipped`。新版备份恢复原生 TTS 设置与数值（旧备份缺字段时沿用当前值，音色路径按文件名匹配本机），API key 与远程朗读口令放在根级 `secrets`，用用户设置的备份密码做 PBKDF2-HMAC-SHA256 + AES-256-GCM 对称加密；密码错误不导入、不修改当前密钥。若备份的 `memory.instant` 低于低水位而 `history` 足够，导入时用 `history` 尾部重建工作窗口（修复旧版/失败回合留下的单条合成回复）。**导入归一化只在主题/内容确实是同一件事时合并短期/长期条目**：仅同一时段但内容不同的事件保持独立；真正重复的合并保留完整正文和双方全部来源 id（缺 role 也保留 id），不再按时段批量合并、不再截断正文。
 - **版本号单一来源**：`android-lite/app/build.gradle.kts` 的 `versionName` / `versionCode`，应用内版本徽标读 `BuildConfig`；改动用 `tools/native-version.ps1`。
 
 ## 九、关键常量速查

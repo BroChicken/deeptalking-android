@@ -541,34 +541,69 @@ class LegacyMapperTest {
     }
 
     @Test
-    fun reconcileLegacyMemoriesMergesMatchingEventIdentity() {
+    fun reconcileLegacyMemoriesMergesOnlyTheSameEvent() {
         val early = "2026-01-01T10:00:00Z"
         val late = "2026-06-01T10:00:00Z"
         val character = Character(
             id = "c1",
             shortTerm = listOf(
                 ShortTermMemory(id = "a", content = "first", eventTime = early, sourceMessageIds = listOf("m1")),
-                ShortTermMemory(id = "b", content = "second", eventTime = early, sourceMessageIds = listOf("m2")),
-                ShortTermMemory(id = "c", content = "other", eventTime = late),
+                ShortTermMemory(id = "b", content = "first", eventTime = early, sourceMessageIds = listOf("m2")),
+                ShortTermMemory(id = "c", content = "other", eventTime = early),
             ),
             longTerm = listOf(
-                LongTermMemory(id = "e1", category = MemoryCategory.Events, value = "one", eventTime = early, tags = listOf("t1"), participants = listOf("A"), location = "x"),
-                LongTermMemory(id = "e2", category = MemoryCategory.Events, value = "two", eventTime = early, tags = listOf("t2"), participants = listOf("B"), location = "y"),
+                LongTermMemory(id = "e1", category = MemoryCategory.Events, key = "same", value = "one", eventTime = early, tags = listOf("t1"), participants = listOf("A"), location = "x"),
+                LongTermMemory(id = "e2", category = MemoryCategory.Events, key = "same", value = "two", eventTime = early, tags = listOf("t2"), participants = listOf("B"), location = "y", sourceMessageIds = listOf("m2")),
+                // Same calendar slot, different event: it must stay a separate memory.
+                LongTermMemory(id = "e3", category = MemoryCategory.Events, key = "other", value = "else", eventTime = early),
                 LongTermMemory(id = "p1", category = MemoryCategory.Promises, value = "keep", eventTime = early),
             ),
         )
         val result = reconcileLegacyMemories(character)
         assertEquals(2, result.repaired)
         assertEquals(2, result.character.shortTerm.size)
-        assertEquals(2, result.character.longTerm.size)
+        assertEquals(3, result.character.longTerm.size)
         val mergedShort = result.character.shortTerm.first { it.id == "a" }
-        assertTrue(mergedShort.content.contains("first"))
-        assertTrue(mergedShort.content.contains("second"))
+        assertEquals(listOf("m1", "m2"), mergedShort.sourceMessageIds)
         val mergedEvent = result.character.longTerm.first { it.id == "e1" }
         assertEquals(setOf("t1", "t2"), mergedEvent.tags.toSet())
         assertEquals(setOf("A", "B"), mergedEvent.participants.toSet())
+        assertEquals(listOf("m2"), mergedEvent.sourceMessageIds)
+        assertNotNull(result.character.longTerm.firstOrNull { it.id == "e3" })
         assertNotNull(result.character.longTerm.firstOrNull { it.id == "p1" })
         assertTrue(eventIdentity(null, emptyList(), "") == "")
+    }
+
+    @Test
+    fun reconcileMergesDuplicateEventWithoutTruncatingOrDroppingSources() {
+        val early = "2026-01-01T10:00:00Z"
+        val first = "甲".repeat(950)
+        val second = "乙".repeat(950)
+        val character = Character(
+            id = "c1",
+            longTerm = listOf(
+                LongTermMemory(
+                    id = "e1",
+                    category = MemoryCategory.Events,
+                    key = "same",
+                    value = first,
+                    eventTime = early,
+                    sourceMessageIds = listOf("m1"),
+                ),
+                LongTermMemory(
+                    id = "e2",
+                    category = MemoryCategory.Events,
+                    key = "same",
+                    value = second,
+                    eventTime = early,
+                    sourceMessageIds = listOf("m2"),
+                ),
+            ),
+        )
+        val merged = reconcileLegacyMemories(character).character.longTerm.single()
+        assertTrue(merged.value.contains(first))
+        assertTrue(merged.value.contains(second))
+        assertEquals(listOf("m1", "m2"), merged.sourceMessageIds)
     }
 
     @Test

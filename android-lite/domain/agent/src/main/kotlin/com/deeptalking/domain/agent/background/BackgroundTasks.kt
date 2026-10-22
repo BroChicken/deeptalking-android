@@ -48,6 +48,7 @@ import com.deeptalking.domain.memory.evidenceMatchesSource
 import com.deeptalking.domain.memory.formatAbsoluteDate
 import com.deeptalking.domain.memory.getTimeSlot
 import com.deeptalking.domain.memory.isValidAutomaticMemory
+import com.deeptalking.domain.memory.SourceRef
 import com.deeptalking.domain.memory.knownSources
 import com.deeptalking.domain.memory.logicalDay
 import com.deeptalking.domain.memory.lorebookOverflow
@@ -552,6 +553,22 @@ class BackgroundTasks(
         val liveIds = live.instant.mapTo(HashSet()) { it.id }
         if (sourceMessages.none { it.id in liveIds }) return TaskStatus.Stale to character
 
+        // Citations belong to the batch that was just summarized, not to whatever
+        // happens to be left in the live window when the model returns. A turn can
+        // advance the window while the request is in flight, so resolving only
+        // against `live` silently stripped every source from the new summaries.
+        // The captured batch is authoritative for this pass; live sources still
+        // resolve pre-existing entries when a summary merges into one of them.
+        val capturedSources = sourceMessages.associate { message ->
+            message.id to SourceRef(
+                id = message.id,
+                role = message.role.name.lowercase(),
+                text = message.content,
+                timestamp = message.timestamp,
+            )
+        }
+        val sources = knownSources(live) + capturedSources
+
         val nowIso = Instant.now().toString()
         var working = live
         var accepted = 0
@@ -574,7 +591,7 @@ class BackgroundTasks(
                     location = point.location,
                 ),
                 timestamp = pointTime,
-                sources = knownSources(working),
+                sources = sources,
             )
             if (result.accepted) {
                 working = working.copy(shortTerm = result.list)

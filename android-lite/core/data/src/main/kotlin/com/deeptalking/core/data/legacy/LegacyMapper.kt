@@ -22,6 +22,7 @@ import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.SceneState
 import com.deeptalking.core.model.SceneSummary
 import com.deeptalking.core.model.ShortTermMemory
+import com.deeptalking.core.model.SourceEvidence
 import com.deeptalking.core.model.SpeechSegment
 import com.deeptalking.core.model.StaticFillMeta
 import com.deeptalking.core.model.StaticProfile
@@ -32,7 +33,6 @@ import com.deeptalking.core.model.Todo
 import com.deeptalking.core.model.TodoProposer
 import com.deeptalking.core.model.TodoStatus
 import com.deeptalking.core.model.convergeLorebookCapacity
-import com.deeptalking.core.model.mergeSources
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -895,39 +895,43 @@ fun reconcileLegacyMemories(character: Character): MemoryReconciliation {
     var repaired = 0
 
     val short = character.shortTerm.toMutableList()
-    val seen = HashMap<String, Pair<Int, ShortTermMemory>>()
+    val shortGroups = HashMap<String, MutableList<Int>>()
     val droppedShort = HashSet<Int>()
     short.forEachIndexed { index, item ->
         val identity = eventIdentity(item.eventTime, item.participants, item.location)
         if (identity.isEmpty()) return@forEachIndexed
-        val primary = seen[identity]
-        if (primary == null) {
-            seen[identity] = index to item
+        val candidates = shortGroups.getOrPut(identity) { mutableListOf() }
+        // Time proximity is only a candidate filter. Merging every entry that shares a
+        // calendar slot turned unrelated beats into one summary (and its evidence was
+        // often discarded when the old entry had no role metadata). Only merge entries
+        // whose actual text is the same event.
+        val primaryIndex = candidates.firstOrNull { sameShortTermEvent(short[it], item) }
+        if (primaryIndex == null) {
+            candidates += index
             return@forEachIndexed
         }
-        val old = primary.second
-        val mergedSources = mergeSources(
-            Triple(old.sourceMessageIds, old.sourceRoles, old.userEvidence),
-            Triple(item.sourceMessageIds, item.sourceRoles, item.userEvidence),
-            limit = 8,
+        val old = short[primaryIndex]
+        val mergedSources = mergeLegacySources(
+            old.sourceMessageIds, old.sourceRoles, old.userEvidence,
+            item.sourceMessageIds, item.sourceRoles, item.userEvidence,
         )
         val merged = ShortTermMemory(
             id = old.id,
             content = mergeTimelineContent(old.eventTime, old.content, item.eventTime, item.content),
-            sourceMessageIds = mergedSources.sourceMessageIds,
+            sourceMessageIds = mergedSources.ids,
             timeRef = old.timeRef,
             eventTime = earlierTimestamp(old.eventTime, item.eventTime),
             createdAt = earlierTimestamp(old.createdAt, item.createdAt),
             participants = mergeParticipants(old.participants, item.participants),
             location = mergeLocations(old.location, item.location),
-            sourceRoles = mergedSources.sourceRoles,
-            userEvidence = mergedSources.userEvidence,
+            sourceRoles = mergedSources.roles,
+            sourceTs = old.sourceTs ?: item.sourceTs,
+            userEvidence = mergedSources.evidence,
             // The window is consumed by position, so the merged text simply gets read by
             // the next pass; a bump keeps an in-flight request from dropping it.
             revision = old.revision + 1,
         )
-        short[primary.first] = merged
-        seen[identity] = primary.first to merged
+        short[primaryIndex] = merged
         droppedShort += index
         repaired++
     }
@@ -943,28 +947,31 @@ fun reconcileLegacyMemories(character: Character): MemoryReconciliation {
     }
     val droppedLong = HashSet<Int>()
     for (group in groups.values) {
-        if (group.size < 2) continue
-        val primaryIndex = group.first()
-        for (entryIndex in group.drop(1)) {
+        val primaries = mutableListOf<Int>()
+        for (entryIndex in group) {
+            val primaryIndex = primaries.firstOrNull { sameLongTermEvent(long[it], long[entryIndex]) }
+            if (primaryIndex == null) {
+                primaries += entryIndex
+                continue
+            }
             val old = long[primaryIndex]
             val newer = long[entryIndex]
-            val mergedLongSources = mergeSources(
-                Triple(old.sourceMessageIds, old.sourceRoles, old.userEvidence),
-                Triple(newer.sourceMessageIds, newer.sourceRoles, newer.userEvidence),
-                limit = 8,
+            val mergedSources = mergeLegacySources(
+                old.sourceMessageIds, old.sourceRoles, old.userEvidence,
+                newer.sourceMessageIds, newer.sourceRoles, newer.userEvidence,
             )
             long[primaryIndex] = old.copy(
                 value = mergeTimelineContent(old.eventTime, old.value, newer.eventTime, newer.value),
                 tags = (old.tags + newer.tags).distinct().take(8),
                 importance = maxOf(old.importance, newer.importance),
-                sourceMessageIds = mergedLongSources.sourceMessageIds,
+                sourceMessageIds = mergedSources.ids,
                 evidence = old.evidence.ifEmpty { newer.evidence },
                 eventTime = earlierTimestamp(old.eventTime, newer.eventTime),
                 participants = mergeParticipants(old.participants, newer.participants),
                 location = mergeLocations(old.location, newer.location),
                 updatedAt = newer.updatedAt ?: old.updatedAt,
-                sourceRoles = mergedLongSources.sourceRoles,
-                userEvidence = mergedLongSources.userEvidence,
+                sourceRoles = mergedSources.roles,
+                userEvidence = mergedSources.evidence,
             )
             droppedLong += entryIndex
             repaired++
@@ -976,6 +983,76 @@ fun reconcileLegacyMemories(character: Character): MemoryReconciliation {
         character = character.copy(shortTerm = reconciledShort, longTerm = reconciledLong),
         repaired = repaired,
     )
+}
+
+/** Aligned source metadata used while merging two legacy memory entries. */
+private data class LegacySources(
+    val ids: List<String>,
+    val roles: List<String>,
+    val evidence: List<SourceEvidence>,
+)
+
+private val RECONCILE_NOISE = Regex("[\\s\\u3000，。！？、；：,.!?;:'\"“”‘’（）()【】\\[\\]{}]")
+
+private fun reconcileText(value: String?): String =
+    value.orEmpty().lowercase().replace(RECONCILE_NOISE, "")
+
+/** Same short-term event means the summaries describe the same beat, not merely the same slot. */
+private fun sameShortTermEvent(a: ShortTermMemory, b: ShortTermMemory): Boolean {
+    val aText = reconcileText(a.content)
+    val bText = reconcileText(b.content)
+    return aText.isNotEmpty() && aText == bText
+}
+
+/**
+ * Same long-term event means the same topic/event identity. A shared calendar slot is not
+ * enough: multiple different events can happen in one afternoon. Equal keys or identical
+ * values are safe evidence of duplication; different wording is kept separate.
+ */
+private fun sameLongTermEvent(a: LongTermMemory, b: LongTermMemory): Boolean {
+    val aKey = a.key.trim().lowercase()
+    val bKey = b.key.trim().lowercase()
+    if (aKey.isNotEmpty() && aKey == bKey) return true
+    val aValue = reconcileText(a.value)
+    val bValue = reconcileText(b.value)
+    return aValue.isNotEmpty() && aValue == bValue
+}
+
+/**
+ * Union two aligned source triples without dropping ids merely because an old entry lacks
+ * `sourceRoles` metadata. Roles may be blank; the id and evidence are still durable.
+ */
+private fun mergeLegacySources(
+    firstIds: List<String>,
+    firstRoles: List<String>,
+    firstEvidence: List<SourceEvidence>,
+    secondIds: List<String>,
+    secondRoles: List<String>,
+    secondEvidence: List<SourceEvidence>,
+    limit: Int = 8,
+): LegacySources {
+    val roleById = LinkedHashMap<String, String>()
+    fun addRoles(ids: List<String>, roles: List<String>) {
+        ids.forEachIndexed { index, id ->
+            val clean = id.trim()
+            if (clean.isEmpty()) return@forEachIndexed
+            val role = roles.getOrNull(index).orEmpty().trim()
+            if (role.isNotEmpty()) roleById.putIfAbsent(clean, role)
+        }
+    }
+    addRoles(firstIds, firstRoles)
+    addRoles(secondIds, secondRoles)
+    val ids = (firstIds + secondIds)
+        .map { it.trim() }
+        .filter { it.isNotEmpty() }
+        .distinct()
+        .takeLast(limit)
+    val roles = ids.map { roleById[it].orEmpty() }
+    val evidence = (firstEvidence + secondEvidence)
+        .distinct()
+        .filter { it.sourceMessageId in ids }
+        .takeLast(limit)
+    return LegacySources(ids = ids, roles = roles, evidence = evidence)
 }
 
 /**
@@ -1056,9 +1133,10 @@ private fun timeSlot(hourOfDay: Double): String = when {
 private fun mergeTimelineContent(aEvent: String?, aContent: String, bEvent: String?, bContent: String): String {
     val aTime = parseInstant(aEvent)?.toEpochMilli() ?: 0L
     val bTime = parseInstant(bEvent)?.toEpochMilli() ?: 0L
-    val first = if (aTime <= bTime) aContent else bContent
-    val second = if (aTime <= bTime) bContent else aContent
-    return clampText(first, 900) + "\n" + clampText(second, 900)
+    val first = (if (aTime <= bTime) aContent else bContent).trim()
+    val second = (if (aTime <= bTime) bContent else aContent).trim()
+    if (first == second) return first
+    return listOf(first, second).filter { it.isNotEmpty() }.joinToString("\n")
 }
 
 private fun earlierTimestamp(a: String?, b: String?): String? {
