@@ -65,17 +65,6 @@ class MemoryEvidenceTest {
     }
 
     @Test
-    fun staticEditIntentRequiresExplicitUserRequest() {
-        val change = listOf(SourceRef("u1", "user", "Please change your speaking style to formal English."))
-        val mention = listOf(SourceRef("u2", "user", "I enjoy formal English."))
-        val deny = listOf(SourceRef("u3", "user", "不要修改我的说话风格"))
-        assertTrue(hasStaticEditIntent("speakingStyle", change))
-        assertFalse(hasStaticEditIntent("personality", mention))
-        assertFalse(hasStaticEditIntent("speakingStyle", deny))
-        assertFalse(hasStaticEditIntent("unknownField", change))
-    }
-
-    @Test
     fun memoriesSemanticallyDifferDetectsConflicts() {
         assertTrue(memoriesSemanticallyDiffer("用户喜欢咖啡", "用户害怕打雷"))
         assertFalse(memoriesSemanticallyDiffer("用户每天早晨跑步", "用户每天早上跑步"))

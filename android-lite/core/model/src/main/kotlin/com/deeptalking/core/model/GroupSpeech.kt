@@ -81,3 +81,21 @@ fun parseGroupSpeechSegments(source: String, memberNames: List<String>): List<Sp
         .filter { it.text.isNotEmpty() }
     return segments.ifEmpty { listOf(SpeechSegment(text = source.trim())) }
 }
+
+/**
+ * Segments the chat UI should draw for one message.
+ *
+ * New assistant rows persist [ChatMessage.segments]. Rows written before that field was
+ * persisted (or imported without it) fall back to parsing the raw `成员名：内容` text;
+ * the fallback is only enabled when at least one known member is attributed, otherwise
+ * the normal single-bubble layout stays in place. Single characters and in-flight rows
+ * never get segments.
+ */
+fun displaySpeechSegments(message: ChatMessage, character: Character): List<SpeechSegment> {
+    if (message.role != Role.Assistant || message.isLoading) return emptyList()
+    val stored = message.segments.filter { it.text.isNotBlank() }
+    if (stored.isNotEmpty()) return stored
+    if (!character.isGroup || message.content.isBlank()) return emptyList()
+    val parsed = parseGroupSpeechSegments(message.content, character.members.map { it.name })
+    return if (parsed.any { it.speaker.isNotBlank() }) parsed else emptyList()
+}

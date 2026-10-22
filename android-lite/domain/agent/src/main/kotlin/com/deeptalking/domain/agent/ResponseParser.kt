@@ -54,7 +54,6 @@ data class ParsedTurn(
     /** `timeRef` token for each long-term item, aligned by index with [longTerm]. */
     val longTermTimeRefs: List<TimeRef?> = emptyList(),
     val dynamicState: JsonObject? = null,
-    val staticFields: JsonObject? = null,
     val memberDynamicState: List<MemberDynamicStateUpdate> = emptyList(),
     val promiseUpdates: List<PromiseUpdate> = emptyList(),
     val todoUpdates: List<TodoUpdate> = emptyList(),
@@ -189,7 +188,6 @@ object ResponseParser {
             longTerm = longTerm,
             longTermTimeRefs = longTermTimeRefs,
             dynamicState = root["dynamicState"] as? JsonObject,
-            staticFields = root["staticFields"] as? JsonObject,
             memberDynamicState = memberDynamicState,
             promiseUpdates = promiseUpdates,
             todoUpdates = todoUpdates,

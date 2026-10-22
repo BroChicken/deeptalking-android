@@ -33,7 +33,7 @@ data class ChatMessage(
     val styleViolations: List<String> = emptyList(),
     /** Quick-reply issues detected on this assistant turn. */
     val quickReplyIssues: List<String> = emptyList(),
-    /** Static profile field labels auto-adjusted after this assistant turn (legacy `staticChanges`). */
+    /** Legacy-only: old turns may carry static-field labels; new turns never write this. */
     val staticChanges: List<String> = emptyList(),
     /** Lorebook entry names created/updated after this assistant turn (legacy `lorebookChanges`). */
     val lorebookChanges: List<String> = emptyList(),

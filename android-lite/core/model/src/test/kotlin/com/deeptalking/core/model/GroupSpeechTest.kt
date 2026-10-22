@@ -131,4 +131,55 @@ class GroupSpeechTest {
         assertEquals("", segments.single().speaker)
         assertEquals("你好。", segments.single().text)
     }
+
+    @Test
+    fun displaySegmentsFallBackToRawTextForLegacyGroupMessages() {
+        val group = Character(
+            id = "g1",
+            isGroup = true,
+            members = listOf(GroupMember(id = "m1", name = "张三"), GroupMember(id = "m2", name = "李四")),
+        )
+        val message = ChatMessage(
+            id = "a1",
+            role = Role.Assistant,
+            content = "张三：早\n李四：早啊",
+        )
+
+        assertEquals(
+            listOf(SpeechSegment("张三", "早"), SpeechSegment("李四", "早啊")),
+            displaySpeechSegments(message, group),
+        )
+    }
+
+    @Test
+    fun displaySegmentsDoesNotSplitSingletonsOrUnattributedGroups() {
+        val single = Character(id = "c1", name = "Alice")
+        val group = Character(
+            id = "g1",
+            isGroup = true,
+            members = listOf(GroupMember(id = "m1", name = "张三")),
+        )
+        val text = ChatMessage(id = "a1", role = Role.Assistant, content = "张三：早")
+
+        assertTrue(displaySpeechSegments(text, single).isEmpty())
+        assertTrue(displaySpeechSegments(text.copy(content = "没有成员名"), group).isEmpty())
+    }
+
+    @Test
+    fun displaySegmentsPreferPersistedSegments() {
+        val group = Character(
+            id = "g1",
+            isGroup = true,
+            members = listOf(GroupMember(id = "m1", name = "张三")),
+        )
+        val persisted = listOf(SpeechSegment("张三", "存下来的"))
+        val message = ChatMessage(
+            id = "a1",
+            role = Role.Assistant,
+            content = "张三：原文",
+            segments = persisted,
+        )
+
+        assertEquals(persisted, displaySpeechSegments(message, group))
+    }
 }

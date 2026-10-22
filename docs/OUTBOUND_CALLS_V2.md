@@ -440,24 +440,26 @@ tool: { content: <工具结果 JSON>, toolCallId }
 
 输出（客户端按字段校验后落盘）：`dynamicState`（不含朗读语气）、`memberDynamicState`（仅群组，成员的 `dynamicState` 可含 `currentTone`）、`quickReplies`、`todos`、`promiseUpdates`。群组时 `dynamicState` 只写共享的 `currentSituation` / `currentLocation`，成员各自的状态写进 `memberDynamicState[{ memberName, dynamicState }]`（`dynamicState` 字段结构同 `$field`，额外允许 `currentTone`）。共享 `currentTone` 由主调用正文末尾的 `【语气】` 行给出；成员自己的语气由 worker 写入。`todos` 的 `create` 走 `TodoPolicy.validateTodoCreation`，其余变更走 `applyTodoUpdate`；任一字段校验不过只跳过该条，并把短标签（如 `待办：期限不明`）写进 `Character.workerIssues` 供下一轮提示词。**整轮失败**（请求失败 / 无结果 / 解析失败）自动按 1s/2s 退避重试 2 次；仍失败则保留旧状态，聊天页显示红色「整理失败：<原因> · 点击重试」并弹「再试一次 / 先这样」。红字只重跑 worker，不重新生成正文。非瞬态 HTTP 错误不自动重试。
 
-## 三、字段修订（角色卡）
+## 三、字段重生成（角色卡编辑器，手动）
+
+> 只在角色卡编辑器选择字段并点「重新生成」时发送；聊天回合不会自动触发字段改写。结果只回到编辑框草稿，点保存才落盘。
 
 ### system
 
 ```text
-你是角色卡字段修订助手。只输出指定字段改写后的内容，不要解释、不要 JSON、不要引号包裹。
+你是角色卡字段编辑器。只重写用户指定的一个静态字段，只输出该字段的新内容，不要字段名、引号、解释、Markdown 或 HTML；内容必须非空并符合字段用途。
 ```
 
 ### user
 
 ```text
-字段：<字段中文名>（<字段键>）
-当前内容：<当前值；空值写「（未设置）」>
-修改要求：<用户输入的修改意见>
+字段：<字段中文名>
+当前值：<当前值；空值写「(空)」>
+修改意见：<用户输入的修改意见；为空时写「按角色卡统一风格重写」>
 角色卡：
-<JSON：name、entityType、全部静态字段、currentSituation、currentLocation>
+<姓名、全部静态字段；成员场景另含群内定位>
 
-只输出该字段的新内容。（不超过 <字段上限> 字；写成明确的简短陈述句，不要解释、不要对比句。）
+只输出该字段的新内容。
 ```
 
 ## 四、即时对话 → 短期事件（extraction）

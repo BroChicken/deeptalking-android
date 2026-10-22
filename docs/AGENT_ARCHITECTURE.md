@@ -10,7 +10,7 @@
 |---|---|
 | 宿主接线（回合、状态、指标、主动开口） | `:app` 的 `AppViewModel`（`submitTurn` / `proactiveLoop` / `recordMetrics` / `armHotTopicTurn`）、`NativeCore`（装配 `ChatOrchestrator`、后台任务、辅助调用） |
 | Agent 循环 | `:domain:agent` 的 `AgentLoop`（`run` / `collectStream` / `collectResultWithRetry` / `salvageText` / `toolActivityHint`），阶段枚举 `prompts/RequestPhase` |
-| 回合编排与落盘 | `:domain:agent` 的 `ChatOrchestrator.run`（`runTurnWorker` / `applyMemberDynamicState` / `applyWorkerTodo` / `applyMemory` / `applyDynamicStateFields` / `applyPromiseUpdate`）、`FieldRevision`（静态字段修订）、`:core:model` 的 `FieldEditRegistry`（聚焦字段保护） |
+| 回合编排与落盘 | `:domain:agent` 的 `ChatOrchestrator.run`（`runTurnWorker` / `applyMemberDynamicState` / `applyWorkerTodo` / `applyMemory` / `applyDynamicStateFields` / `applyPromiseUpdate`）、`:core:model` 的 `FieldEditRegistry`（聚焦字段保护）；静态字段不进聊天回合，只能从角色卡编辑器修改 |
 | 工具注册 | `:domain:agent` 的 `Tools.defaultTools`（+ `tools/*Tool.kt`） |
 | 回合 worker | `:domain:agent` 的 `TurnWorker`（强制 `submit_state`：动态状态 / 快速回应 / 待办 / 约定） |
 | 工具实现 | `:domain:agent` 的 `tools/*`（`SearchMemoryTool` / `MemoryWriteTool` 等） |
@@ -56,7 +56,7 @@ ResponseParser.parseTurnFromText   正文 / 语气拆分（历史 JSON 仅在整
    │
    ▼
 TurnWorker.run（runTurnWorker）    强制 submit_state：dynamicState / memberDynamicState（成员含 currentTone）/ quickReplies / todos / promiseUpdates
-FieldRevision                      用户显式改字段时单字段修订
+   │                              静态字段不在聊天回合写入（只在角色卡编辑器手动修改/重新生成）
    │
    ▼
 BackgroundTasks.scheduleTurn       后台：文风校对、快速回应校验/换位（仅 worker 未成功时）、记忆抽取/分析、场景概要、世界书整理、空字段补全
@@ -111,7 +111,7 @@ BackgroundTasks.scheduleTurn       后台：文风校对、快速回应校验/�
 - **工具回传**：`reasoning` 必须先于 `function_call`、再跟配对的 `function_call_output`。DeepSeek thinking 模式**不支持并行 `function_call` 回传（会 400）**，因此**同一条响应里的全部 `tool_calls` 都在本轮执行**（`executedCalls` 只作统计），随后一次性按序补上各自的 `function_call_output`——漏执行任何一条都会让未配对的 `function_call` 留在下一轮请求里。`reasoningJson` 只挂在轮内第一条调用上，保证上下文不断裂又不会重复回放。**`web_search` 是本地 function 工具**（DeepSeek Responses 会静默忽略内置 `web_search`）：本地注册同名工具，经 `HttpWebContentProvider.searchWeb()` 实际检索 RSS 后回传结果。
 - **空回合重试**：循环只有 `AUTO` 与 `FINAL` 两相；`FINAL` 阶段无正文时最多重试 2 次（`emptyAttempts < 2`），之后返回空结果，由外层 `AppViewModel` 的回合重试/失败提示接管。
 - **状态显示**：循环内所有右上角文案经 `onToolActivity` 回调驱动（`AppViewModel.statusState`）；工具提示来自纯函数 `AgentLoop.toolActivityHint(name)`。
-- **正文之后由 worker 补结构化字段**：收尾阶段结束后，`ChatOrchestrator` 先落历史与正文，再跑 turn worker（见下）与字段修订；后台任务只做记忆维护与文风/快速回应校验，不改写已显示的正文。
+- **正文之后由 worker 补结构化字段**：收尾阶段结束后，`ChatOrchestrator` 先落历史与正文，再跑 turn worker（见下）；后台任务只做记忆维护与文风/快速回应校验，不改写已显示的正文。静态角色卡字段不参与这条自动链路。
 
 ### 5. 输出协议（纯文本 + 语气行）
 
@@ -141,9 +141,9 @@ BackgroundTasks.scheduleTurn       后台：文风校对、快速回应校验/�
 
 - **一条消息，多个气泡**：群组的一轮回复仍然只有**一条** assistant 消息——历史、`instant` 窗口、折叠节奏都按一条算——`ChatMessage.segments` 只是附带的逐成员分段，供界面画多个气泡、供朗读拿真实发言人。`content` 始终是**全文**（请求历史、编辑重发、复制都用它）。
 - **解析**：`groupSpeechSegments` → `parseGroupSpeechSegments(reply, 成员名列表)`。只认**行首的成员名 + 全角 `：`/半角 `:`**（最长名字优先，`张三丰` 不会被读成 `张三`）；发言人之后直到下一个发言人行的内容归该段，引号、`（动作）`、Markdown 原样保留。**归属绝不猜**：没有一行以已知成员名开头时，整条回复变成**一个空 speaker 的段**；成员名列表为空时同样整段成一个无归属段；只写了成员名前缀的回复回退成整段原文，不静默丢字。
-- **渲染**：`:feature:chat` 对 assistant 消息优先按 `segments` 逐个画气泡（无 segments 的旧消息/单角色仍画单气泡）。
+- **渲染**：`:feature:chat` 对 assistant 消息优先按 `segments` 逐个画气泡；群组旧消息没有 `segments` 时，按正文现场解析（只接受已列出的成员名，解析到至少一个成员才启用多气泡），所以旧记录也会用各成员自己的头像和名字；单角色仍画单气泡。
 - **朗读**：`extractSpeechSegments` 是**另一条**清洗路径（去括号动作/引用记号，只留台词），按同一套成员名切段；每段的语气取说话成员的 `currentTone`，为空/成员缺失才回退群组语气。
-- **持久化/备份**：`segments` 随消息落库并随备份导出/导入往返（导入时最多 60 段、丢弃空文本）；没有该字段的旧备份还原成单气泡。
+- **持久化/备份**：新增 assistant 消息落库时同时写入 `segments`（界面读的是落库行，不写就会退回单气泡）；`segments` 随备份导出/导入往返（导入时最多 60 段、丢弃空文本）；没有该字段的旧备份/旧消息由渲染层按正文回退解析。
 - **单角色**：不生成 segments（`groupSpeechSegments` 对非群组直接返回空）。
 
 ### 8. 右上角状态显示（全分支）
@@ -156,7 +156,7 @@ BackgroundTasks.scheduleTurn       后台：文风校对、快速回应校验/�
 | `final-empty` | FINAL 阶段没有正文 | 重试（≤2 次） | `正在重新生成…` |
 | `empty` | 重试后仍无正文 | 失败 | 外层提示"收到空回复，请重试。你的消息已保留。" |
 
-工具提示（`AgentLoop.toolActivityHint`）：`search_memory`→`正在回忆…`、`web_search`→`正在搜索…`、`web_fetch`→`正在读取网页…`、`search`→`正在搜索…`、`hot_board`→`正在看热榜…`、`memory_write`→`正在更新记忆…`、`upsert_lorebook_entry`→`已更新世界书…`、`send_sticker`→`正在挑表情…`，未知工具回退 `正在处理…`；字段修订另有 `正在调整设定…`。
+工具提示（`AgentLoop.toolActivityHint`）：`search_memory`→`正在回忆…`、`web_search`→`正在搜索…`、`web_fetch`→`正在读取网页…`、`search`→`正在搜索…`、`hot_board`→`正在看热榜…`、`memory_write`→`正在更新记忆…`、`upsert_lorebook_entry`→`已更新世界书…`、`send_sticker`→`正在挑表情…`，未知工具回退 `正在处理…`。
 
 > `quickReplies` 不是收尾门槛：worker 失败或只给出不足两条时没有按钮，正文照常显示；后台换位生成在**开关开启且 worker 未成功、或成功但不足两条**时运行，结果通过 `detectQuickReplyIssues` 才补上。worker 已给出两条时不再跑，避免抢写。
 
@@ -224,7 +224,7 @@ BackgroundTasks.scheduleTurn       后台：文风校对、快速回应校验/�
 
 **短期摘要按位置消费（没有逐条标记）**：短期窗口是高低水位对（40 → 20），**位置就是状态**——比最新 20 条更老的那一段（每批最多 `ANALYSIS_BATCH`(40) 条）就是本批要消化的，分析成功即**原样丢掉这一批**，最新 20 条留作下一批（以及注入块）的上下文。因此不需要 `analyzedAt`/`analyzedRevision` 这类"两个消费者都确认才允许裁剪"的记账（一旦和位置错位就会死锁：标记说"都处理过" → 每轮都判"没有待办" → 窗口只涨不降）。`revision` 只剩一个用途：条目被 `memory_write` 改写时自增，用来把**请求飞行期间刚改过**的条目扣在窗口里、下一轮再读。
 
-**证据与时间精度**：`MemoryEvidence.evidenceMatchesSummary()` 要求证据与实际回复有 ≥2 个双字片段重叠（≥35%），不"满 8 字即采信"；静态字段修订（`FieldRevision`）与动态状态写入都额外要求 `hasStaticEditIntent()` / `hasValidUserEvidence()`（用户原话提到该字段且是修改意图）。`TimeUtils.resolveTimeRef` 对带时分秒的 explicit ISO 原样保留（含时区偏移），只给"仅日期有理"的结果补时段起点。
+**证据与时间精度**：`MemoryEvidence.evidenceMatchesSummary()` 要求证据与实际回复有 ≥2 个双字片段重叠（≥35%），不"满 8 字即采信"；动态状态写入仍要求 `hasValidUserEvidence()`（用户原话逐字支撑）。静态字段不参与聊天回合写入。`TimeUtils.resolveTimeRef` 对带时分秒的 explicit ISO 原样保留（含时区偏移），只给"仅日期有理"的结果补时段起点。
 
 ### 基础设定字段（10 字段）
 
@@ -232,19 +232,19 @@ BackgroundTasks.scheduleTurn       后台：文风校对、快速回应校验/�
 
 **只留"人本身"的设定**：原本还有「价值观」与「关键过往」两项，它们分别与「性格特征」「背景故事」重叠（后者只是前者加时间线），**已删除**——设定越少、越不易互相矛盾，注入也更省。旧页面的这两个字段由 `:core:data` 的 `RetiredStaticFields` 在**读取时并入幸存字段**（性格 ← 价值观、背景 ← 关键过往）并摘掉退休键；旧备份走 `LegacyMapper` 的同一条合并规则，所以升级不丢人设。
 
-**写作规则**（`core:model` 的 `StaticFieldRules`，两条写入路径共用——`FieldRevision` 单字段修订与界面/建卡）：
+**写作规则**（`core:model` 的 `StaticFieldRules`，角色卡编辑器的保存/重新生成与建卡共用）：
 
 - **只写明确的简短陈述句**：禁止「不是 A 而是 B」这类对比句（`contrastReason` 命中即**拒收**，工具会回一条明确错误让模型当场改写；它不静默截断也不偷改语义）。
 - **按字段收敛**（`AppLimits.StaticProfile`）：短字段（性别/年龄/种族/语言/称呼）**40 字**、叙述字段（外貌/性格/恐惧弱点/说话风格）**120 字**、背景故事**250 字**；超长按句末标点回退截断（`clamp`）。动态状态等非基础设定字段不受这些上限约束。
 - **两条通道语义不同**（`:feature:characters` 的 `FieldCleaning`）：**模型 / 建卡通道**（`MemoryToolSupport.cleanFieldValue`、`FieldCleaning.cleanFieldValue`）保留上面两条严格规则；**用户手写通道**（编辑器保存，`FieldCleaning.cleanUserWrittenField`）**对比句原样保留、不截断**，只去字段名前缀 / 括号说明，并把每一条处理作为可见提示回报给用户。注入侧另有单字段 600（背景 800）、整段 8000 字上限兜底，所以卡片存更长的文本不会撑大提示词。
 
-**模型侧的写入方式：单字段修订，没有工具**。`FieldRevision.detect(userText)` 只在用户**显式要求改字段**时命中（别名表 + 意图词，否定句不命中），随后：
+**静态字段只有手动写入路径，没有工具，也不在聊天回合自动改写**。角色卡编辑器提供：
+1. **手动编辑**：保存时只提交真正改过的字段，并给这些字段盖 `staticFieldMeta[key].updatedAt`；
+2. **重新生成字段**（手动点按钮）：`NativeCore.regenerateCharacterField` 发一次 `auxiliary` 小调用，只重写用户点名的一个字段；结果先回到编辑框草稿，点保存才落盘。
 
-1. 用一次 `auxiliary` 小调用（`FieldRevision.buildRequest`，`stream=false`、`reasoningEffort=none`、`temperature=0.3`）只重写那一个字段；
-2. `FieldRevision.clean(key, raw)` 按 `StaticFieldRules` 清洗（对比句拒收、按字段长度上限收敛）；
-3. 写回 `staticProfile` 并把 `staticFieldMeta[key].updatedAt` 置为当前时间。
+聊天回合即使出现“以后叫我…/把性格改成…”也不会再自动修改角色卡；旧 JSON 回复里的 `staticFields` 同样被忽略。群组不维护本体基础设定字段；成员字段仍只在该成员卡片上编辑。
 
-群组不维护本体基础设定字段；成员字段仍只在该成员卡片上编辑。
+**空字段补全**是另一条独立路径：只填空白字段，绝不覆盖已有内容（见 `BackgroundTasks.autoFillStaticFields`）。
 
 ### 动态状态（6 字段）
 
@@ -478,7 +478,7 @@ tools: AUTO 阶段 8 个工具 / FINAL 阶段无 tools（tool_choice 恒为 auto
 | 文风校对（critique） | `BackgroundTasks` | **只改文风、不改剧情**；不得复述规则；只返回 `{"reply":"…"}`；空结果或长度比例异常一律回退原文；**引用段落（「」『』《》〈〉/引号）与世界书条目名/角色名/成员名/称呼被改动也整体回退** |
 | 快速回应换位生成 `repairQuickReplies` | `BackgroundTasks` | 身份是**用户本人**；只输出 `{"quickReplies":[...]}`；结果再过一遍 `detectQuickReplyIssues`，不通过就放弃 |
 | 回合整理 `submit_state`（turn worker） | `TurnWorker` | 强制 function call、`stream=false`、`reasoningEffort=none`；只写本轮有依据的增量；动态字段须带 `sourceMessageIds` + `evidence`（成员 `currentTone` 除外，免证据门）；快速回应恰好两条；待办新建须可定位期限 + 双方同意（`detail` 可空）；约定只在用户明确完成/取消时更新 |
-| 字段修订 `FieldRevision` | `FieldRevision` | 只重写用户点名的那一个静态字段，输出纯文本；`cleanFieldValue` 拒收对比句并按字段上限收敛；群组不做 |
+| 字段重生成（手动） | `NativeCore.regenerateCharacterField` | 只在角色卡编辑器点“重新生成”时运行，只重写用户点名的一个静态字段；结果先回编辑框草稿，保存才落盘；聊天回合不触发 |
 | 其他 | emoji 头像（`NativeCore.requestEmojiAvatar`）、字段重排（`remapFields`）、贴图标签（`NativeCore.tagSticker`） | 低价值路径，未做经验对齐 |
 
 ## 八、健壮性
@@ -500,10 +500,10 @@ tools: AUTO 阶段 8 个工具 / FINAL 阶段无 tools（tool_choice 恒为 auto
 - **快速回应可回退**：换位生成失败（或结果仍不过校验）时保留 worker 已给的两条；回来太晚（已被下一轮覆盖）直接丢弃，不会覆盖新一轮。
 - **后台任务互不排队、写回合并**：`BackgroundTaskQueue` 不设共享锁（一次补课不会把场景/世界书/快速回应堵住），各任务用 `mergeCharacterChanges` 只并自己那份，所以交错执行也不会写坏同一份角色状态；都不阻塞正文显示。
 - **正文即终稿**：主调用拿到正文就直接采用，worker 只在正文之后补结构化字段；整轮整理失败会自动重试 2 次，仍失败保留旧状态并给红字/弹窗，局部规则拒绝带短标签到下一轮，绝不改写已显示的正文。
-- **后台写回只改自己动过的字段**：`CharacterRepository.mutate(id)` 用 **per-id 锁**做读-改-写，`NativeCore.persistMemory(original, updated)` 与 `AppViewModel.writeCharacterChanges` 都在这个锁里用 `mergeCharacterChanges` 只把自己动过的字段并到**最新行**；编辑器保存（`AppViewModel.saveCharacterEdit`）同样是字段级合并：静态字段只写用户真正改过的 key（并给这些 key 盖 `staticFieldMeta`，后台补全/字段修订同时写入的其它字段保留实时值）、待办按 id 逐条合并、成员静态字段（`staticProfile`/姓名/emoji/`roleInGroup`）逐个成员按 id 合并，成员世界书与记忆窗口保持实时值。因此并发写入不会互相回滚，也不会用旧快照覆盖 `updatedAt`。
-- **焦点保护（`FieldEditRegistry`）**：编辑器把用户正在输入的字段登记为聚焦（键 = 角色 id + 成员 id + 分区 static/dynamic + 字段），登记带 owner，关闭/保存/切换只清自己那份。写入方在落盘前逐字段询问：turn worker 的动态状态、主调用的 `【语气】`（`applyTone`）、成员动态状态、`FieldRevision.apply` 的单字段修订、后台 `autoFillStaticFields` / 成员补全、旧格式记忆里的 `dynamicState` 更新——**被用户占用的那个字段跳过，其余字段照常写入**。这样后台拿着"开编辑器之前"的快照算出的值不会覆盖正在输入的文字，编辑框里的草稿也不会被后台写回吞掉。
+- **后台写回只改自己动过的字段**：`CharacterRepository.mutate(id)` 用 **per-id 锁**做读-改-写，`NativeCore.persistMemory(original, updated)` 与 `AppViewModel.writeCharacterChanges` 都在这个锁里用 `mergeCharacterChanges` 只把自己动过的字段并到**最新行**；编辑器保存（`AppViewModel.saveCharacterEdit`）同样是字段级合并：静态字段只写用户真正改过的 key（并给这些 key 盖 `staticFieldMeta`，后台补全同时写入的其它字段保留实时值）、待办按 id 逐条合并、成员静态字段（`staticProfile`/姓名/emoji/`roleInGroup`）逐个成员按 id 合并，成员世界书与记忆窗口保持实时值。因此并发写入不会互相回滚，也不会用旧快照覆盖 `updatedAt`。
+- **焦点保护（`FieldEditRegistry`）**：编辑器把用户正在输入的字段登记为聚焦（键 = 角色 id + 成员 id + 分区 static/dynamic + 字段），登记带 owner，关闭/保存/切换只清自己那份。写入方在落盘前逐字段询问：turn worker 的动态状态、主调用的 `【语气】`（`applyTone`）、成员动态状态、后台 `autoFillStaticFields` / 成员补全、旧格式记忆里的 `dynamicState` 更新——**被用户占用的那个字段跳过，其余字段照常写入**。这样后台拿着"开编辑器之前"的快照算出的值不会覆盖正在输入的文字，编辑框里的草稿也不会被后台写回吞掉。
 - **共享 HTML 工具**：HTML 实体解码/去标签/可读文本抽取是同一份实现，避免多处漂移。
-- **导入/导出归一化**：`LegacyImportService` / `BackupService` 逐字段校验（世界书、场景概要、场景状态、计数器、来源数组、**待办 `todos`**、**提示 ack / `workerIssues` / `memoryRepairVersion`**），坏角色跳过并计入 `ImportSummary.skipped`。新版备份恢复原生 TTS 设置与数值（旧备份缺字段时沿用当前值，音色路径按文件名匹配本机），API key 与远程朗读口令放在根级 `secrets`，用用户设置的备份密码做 PBKDF2-HMAC-SHA256 + AES-256-GCM 对称加密；密码错误不导入、不修改当前密钥。若备份的 `memory.instant` 低于低水位而 `history` 足够，导入时用 `history` 尾部重建工作窗口（修复旧版/失败回合留下的单条合成回复）。**导入归一化用多信号加权判断长期事件是否同一件**：主题/key 0.28、正文 0.38、来源重合 0.24、参与者 0.06、地点 0.04（缺失维度重新归一），相反结果/人物/地点明确冲突一票否决；总分 **严格 >0.70** 才自动合并，合并保留完整正文和双方全部来源 id（缺 role 也保留 id），不再按时段批量合并、不再截断正文。
+- **导入/导出归一化**：`LegacyImportService` / `BackupService` 逐字段校验（世界书、场景概要、场景状态、计数器、来源数组、**待办 `todos`**、**提示 ack / `workerIssues` / `memoryRepairVersion`**），坏角色跳过并计入 `ImportSummary.skipped`。新版备份恢复原生 TTS 设置与数值（旧备份缺字段时沿用当前值，音色路径按文件名匹配本机），API key 与远程朗读口令放在根级 `secrets`，用用户设置的备份密码做 PBKDF2-HMAC-SHA256 + AES-256-GCM 对称加密；密码错误不导入、不修改当前密钥。导入/导出的备份密码输入框为明文（仅用于本次加解密，不保存）。若备份的 `memory.instant` 低于低水位而 `history` 足够，导入时用 `history` 尾部重建工作窗口（修复旧版/失败回合留下的单条合成回复）。**导入归一化用多信号加权判断长期事件是否同一件**：主题/key 0.28、正文 0.38、来源重合 0.24、参与者 0.06、地点 0.04（缺失维度重新归一），相反结果/人物/地点明确冲突一票否决；总分 **严格 >0.70** 才自动合并，合并保留完整正文和双方全部来源 id（缺 role 也保留 id），不再按时段批量合并、不再截断正文。
 - **版本号单一来源**：`android-lite/app/build.gradle.kts` 的 `versionName` / `versionCode`，应用内版本徽标读 `BuildConfig`；改动用 `tools/native-version.ps1`。
 
 ## 九、关键常量速查

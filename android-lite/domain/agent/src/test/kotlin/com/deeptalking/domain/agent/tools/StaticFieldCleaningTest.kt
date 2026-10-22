@@ -7,7 +7,7 @@ import org.junit.Test
 
 /**
  * `cleanFieldValue` 对基础设定字段的两条新约束：只写明确的简短陈述句（禁对比句）、
- * 按字段上限收敛。模型自己改字段（工具与 `submit_response.staticFields`）都走这里。
+ * 按字段上限收敛。角色卡编辑器的手动重新生成与建卡通道都走这里。
  */
 class StaticFieldCleaningTest {
 

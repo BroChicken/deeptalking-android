@@ -131,35 +131,6 @@ fun hasValidUserEvidence(
     return resolved
 }
 
-private val STATIC_FIELD_ALIASES: Map<String, Regex> = mapOf(
-    "gender" to Regex("性别|gender"),
-    "age" to Regex("年龄|岁|age"),
-    "race" to Regex("种族|race|species"),
-    "appearance" to Regex("外貌|长相|头发|衣服|appearance"),
-    "personality" to Regex("性格|personality"),
-    "fears" to Regex("恐惧|弱点|害怕|fears"),
-    "background" to Regex("背景|经历|background"),
-    "speakingStyle" to Regex("说话|语气|口吻|风格|speaking.style|tone"),
-    "language" to Regex("语言|方言|中文|英文|language"),
-    "userAddress" to Regex("叫我|称呼|喊我|call.me|address"),
-)
-
-private val EDIT_INTENT = Regex(
-    "改|修改|设置|设定|换|叫我|喊我|别叫|不要|说话.{0,12}(点|些|一点)|用.{0,12}(说|讲)|请.{0,16}(说|讲)|change|set|call.me|speak|use ",
-)
-
-private val EDIT_INTENT_DENY = Regex("不要(?:修改|改变|改|换)|别(?:修改|改|换)|do not change|don't change", RegexOption.IGNORE_CASE)
-
-/** True when a user source explicitly requests a change to [fieldKey]. */
-fun hasStaticEditIntent(fieldKey: String, resolved: List<SourceRef>): Boolean {
-    val alias = STATIC_FIELD_ALIASES[fieldKey] ?: return false
-    return resolved.any { entry ->
-        val text = entry.text
-        if (EDIT_INTENT_DENY.containsMatchIn(text)) return@any false
-        entry.role == "user" && alias.containsMatchIn(text.lowercase()) && EDIT_INTENT.containsMatchIn(text)
-    }
-}
-
 /**
  * Resolves the sources backing a promise entry (legacy `resolvePromiseSources`).
  * A character promise may cite `current_response` (validated against

@@ -1381,8 +1381,8 @@ class BackgroundTasks(
      * the source-evidence gate. Short-term writes are deliberately *not* handled here:
      * the window is only appended to by the single whole-window extraction pass (see
      * `scheduleTurn`), so `shortTerm` in a model reply update is ignored.
-     * `staticFields` / `memberDynamicState` / `promiseUpdates` are handled by the
-     * orchestrator, not here.
+     * `staticFields` are ignored (静态字段只由角色卡编辑器写), while
+     * `memberDynamicState` / `promiseUpdates` are handled by the orchestrator, not here.
      */
     fun applyMemoryUpdate(
         character: Character,

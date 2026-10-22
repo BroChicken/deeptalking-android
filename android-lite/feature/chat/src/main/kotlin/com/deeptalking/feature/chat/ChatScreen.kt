@@ -107,6 +107,7 @@ import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.MessageAttachment
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.SpeechSegment
+import com.deeptalking.core.model.displaySpeechSegments
 import com.deeptalking.core.model.Sticker
 import com.deeptalking.core.model.TtsPhase
 import java.util.Locale
@@ -477,13 +478,9 @@ private fun MessageRow(
     val bubbleColor = if (isUser) colors.userBubble else colors.aiBubble
     val contentColor = if (isUser) colors.onUserBubble else colors.onAiBubble
     // Group replies persist as one message plus per-member turns; draw one bubble per
-    // turn. Without segments (single characters, older messages, in-flight replies) the
-    // single-bubble layout below is unchanged.
-    val segments = if (message.role == Role.Assistant && !message.isLoading) {
-        message.segments.filter { it.text.isNotBlank() }
-    } else {
-        emptyList()
-    }
+    // turn. Stored segments win; legacy group messages without them are parsed from the
+    // raw text. Single characters and in-flight replies keep the single-bubble layout.
+    val segments = displaySpeechSegments(message, character)
     if (segments.isNotEmpty()) {
         SegmentedMessageRow(
             message = message,
@@ -625,10 +622,11 @@ private fun SegmentedMessageRow(
     }
 }
 
-/** Avatar for a segment: the member's own emoji, else the group/character emoji. */
+/** Avatar for a segment: the member's own emoji; only an unknown speaker uses the group emoji. */
 private fun speakerEmoji(character: Character, speaker: String): String {
-    val member = character.members.firstOrNull { it.name == speaker }
-    return (member?.emoji ?: character.emoji).ifBlank { "👤" }
+    val member = character.members.firstOrNull { it.name.trim() == speaker.trim() }
+    if (member != null) return member.emoji.ifBlank { "👤" }
+    return character.emoji.ifBlank { "👤" }
 }
 
 @Composable

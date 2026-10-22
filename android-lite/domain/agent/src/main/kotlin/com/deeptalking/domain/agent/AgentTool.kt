@@ -14,9 +14,8 @@ data class AgentContext(
  * Result of executing a tool; [contentJson] is fed back to the model.
  *
  * [updatedCharacter] lets a tool persist a mutated character (e.g.
- * `update_character_field` / `upsert_lorebook_entry`); the loop applies the
- * latest non-null value at the end of the run. Side-effect only — it is not
- * shown to the model.
+ * `upsert_lorebook_entry`); the loop applies the latest non-null value at the end
+ * of the run. Side-effect only — it is not shown to the model.
  */
 data class AgentToolResult(
     val contentJson: String,

@@ -41,7 +41,7 @@
         └─ promiseUpdates                    → applyPromiseUpdate
         │
         ▼
-  FieldRevision.detect → 单字段修订（用户显式改字段时）
+  assistant 消息落库（带 segments；静态字段不在聊天回合写入）
 ```
 
 ## 2. 全部调用方（谁受 `parseJsonLenient` 影响）
@@ -69,10 +69,9 @@ DYNAMIC_STATE_FIELDS ──┬─► TurnWorker SCHEMA（submit_state 的 dynami
                        └─► 生成/补全/升级提示词里的字段清单（CharacterParity）
 
 STATIC_PROFILE_FIELDS ─┬─► TurnWorker 不含静态字段（成员/本体字段都不由 worker 写）
-                       ├─► FieldRevision.detect 的别名表 / FieldRevision.revise（单字段修订）
+                       ├─► 角色编辑器「基础」页签（手动编辑 / 手动重新生成字段）
                        ├─► buildSystemPrompt（角色卡注入与成员块）
                        ├─► buildVolatileContext 的话题库 / BackgroundTasks.autoFillStaticFields
-                       ├─► 角色编辑器「基础」页签
                        └─► LegacyMapper 的旧字段迁移（worldView→background 等）
 ```
 
@@ -172,7 +171,6 @@ nodes:
   ChatOrchestrator.runTurnWorker:{kind: function, role: worker-apply, risk: high}
   applyDynamicStateFields: {kind: function, role: dynamic-write, risk: medium}
   applyMemberDynamicState: {kind: function, role: member-dynamic-write, risk: medium}
-  FieldRevision.detect:    {kind: function, role: static-field-revise, risk: medium}
   FieldEditRegistry:       {kind: object, role: focused-field-guard, risk: medium}
   DYNAMIC_STATE_FIELDS:    {kind: const, role: field-set, risk: high}
   STATIC_PROFILE_FIELDS:   {kind: const, role: field-set, risk: high}
@@ -189,7 +187,7 @@ edges:
   - {from: parseTurnFromText,        to: parseGroupSpeechSegments, note: 'groups only; display bubbles'}
   - {from: parseGroupSpeechSegments, to: 'ChatMessage.segments'}
   - {from: parseGroupSpeechSegments, to: extractSpeechSegments, note: 'read-aloud re-splits and cleans the text'}
-  - {from: FieldEditRegistry,        to: [applyDynamicStateFields, applyMemberDynamicState, FieldRevision.detect, autoFillStaticFields], note: 'focused fields are skipped'}
+  - {from: FieldEditRegistry,        to: [applyDynamicStateFields, applyMemberDynamicState, autoFillStaticFields], note: 'focused fields are skipped'}
   - {from: parseJsonLenient,         to: StreamText.extractReplyFromJson}
   - {from: parseJsonLenient,         to: 'LegacyMapper.field-migration'}
   - {from: parseJsonLenient,         to: 'CharacterParity.generate/fill/upgrade'}
@@ -197,7 +195,7 @@ edges:
   - {from: parseTurnFromText,        to: ChatOrchestrator.applyMemory}
   - {from: ChatOrchestrator.applyMemory, to: applyDynamicStateFields}
   - {from: DYNAMIC_STATE_FIELDS,     to: [TurnWorker.SCHEMA, applyDynamicStateFields, FieldCleaning.cleanFieldValue, buildVolatileContext, LegacyMapper.mapDynamicState, editor-state-tab, prompts]}
-  - {from: STATIC_PROFILE_FIELDS,    to: [FieldRevision.detect, buildSystemPrompt, buildVolatileContext, autoFillStaticFields, editor-basic-tab, LegacyMapper]}
+  - {from: STATIC_PROFILE_FIELDS,    to: [buildSystemPrompt, buildVolatileContext, autoFillStaticFields, editor-basic-tab, LegacyMapper]}
 
 failure_modes:
   F1: {cause: unescaped-quote-then-brace, effect: premature-field-cut, cascade: 'json-invalid -> array-returned -> quickReplies-lost'}

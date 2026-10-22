@@ -97,6 +97,36 @@ class ChatOrchestratorTest {
     }
 
     @Test
+    fun `explicit address request no longer rewrites the static card`() = runBlocking {
+        val before = character().copy(
+            staticProfile = com.deeptalking.core.model.StaticProfile(userAddress = "旧称呼"),
+        )
+        val result = orchestrator(ScriptedLlm("好，我记住了。")).run(
+            character = before,
+            history = listOf(ChatMessage(id = "m1", role = Role.User, content = "以后叫我明明")),
+            userText = "以后叫我明明",
+        )
+
+        assertEquals("旧称呼", result.updatedCharacter.staticProfile.userAddress)
+    }
+
+    @Test
+    fun `legacy JSON staticFields are ignored`() = runBlocking {
+        val json = """{"reply":"好","staticFields":{"userAddress":{"value":"明明"}}}"""
+        val before = character().copy(
+            staticProfile = com.deeptalking.core.model.StaticProfile(userAddress = "旧称呼"),
+        )
+        val result = orchestrator(ScriptedLlm(json)).run(
+            character = before,
+            history = listOf(ChatMessage(id = "m1", role = Role.User, content = "以后叫我明明")),
+            userText = "以后叫我明明",
+        )
+
+        assertEquals("好", result.reply)
+        assertEquals("旧称呼", result.updatedCharacter.staticProfile.userAddress)
+    }
+
+    @Test
     fun `main call no longer writes structured memory fields`() = runBlocking {
         val json = """
             {"reply":"你好呀","quickReplies":["还不错","有点累"],

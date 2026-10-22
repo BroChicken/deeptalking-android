@@ -158,11 +158,11 @@ fun changedStaticProfileKeys(before: StaticProfile, after: StaticProfile): Set<S
 }
 
 /**
- * Stamps [keys] into `staticFieldMeta` with a fresh `{"updatedAt": now}` entry — the same
- * shape [com.deeptalking.domain.agent.FieldRevision] writes — keeping every other key.
+ * Stamps [keys] into `staticFieldMeta` with a fresh `{"updatedAt": now}` entry, keeping
+ * every other key. Manual editor saves and the manual per-field regenerate path use this
+ * shape; auto-fill must not overwrite a field the user already touched.
  *
- * A field the user edited by hand must not be filled over by auto-fill / revision later, so
- * only the keys that actually changed may be stamped (never the whole map).
+ * Only the keys that actually changed may be stamped (never the whole map).
  */
 fun withStaticFieldTimestamps(
     meta: Map<String, JsonElement>,

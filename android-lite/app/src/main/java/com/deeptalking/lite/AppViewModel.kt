@@ -1856,7 +1856,10 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                         content = finalResult.reply,
                         timestamp = Instant.now().toString(),
                         internalOnly = false,
-                        staticChanges = finalResult.staticChanges,
+                        // The chat list is loaded from this row, not from the in-memory
+                        // instant window: keep the per-member turns or the group reply
+                        // collapses back to one bubble with raw speaker prefixes.
+                        segments = finalResult.segments,
                         lorebookChanges = finalResult.lorebookChanges,
                     ),
                 )

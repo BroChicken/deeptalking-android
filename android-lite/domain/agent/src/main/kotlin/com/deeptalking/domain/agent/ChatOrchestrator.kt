@@ -14,7 +14,6 @@ import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.SpeechSegment
-import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.core.model.Todo
 import com.deeptalking.core.model.TodoProposer
 import com.deeptalking.core.model.TodoStatus
@@ -22,11 +21,9 @@ import com.deeptalking.core.model.parseGroupSpeechSegments
 import com.deeptalking.domain.agent.prompts.DYNAMIC_STATE_FIELDS
 import com.deeptalking.domain.agent.prompts.PersonaInputs
 import com.deeptalking.domain.agent.prompts.RequestBuilder
-import com.deeptalking.domain.agent.prompts.STATIC_PROFILE_FIELDS
 import com.deeptalking.domain.agent.prompts.buildShortTermBlock
 import com.deeptalking.domain.agent.prompts.buildSystemPrompt
 import com.deeptalking.domain.agent.prompts.withDynamicField
-import com.deeptalking.domain.agent.prompts.withStaticField
 import com.deeptalking.domain.agent.background.BackgroundTasks
 import com.deeptalking.domain.agent.background.STYLE_GUARD
 import com.deeptalking.domain.agent.background.dedupeRepeatedEnding
@@ -41,7 +38,6 @@ import com.deeptalking.domain.memory.consumeInjectedRecalls
 import com.deeptalking.domain.memory.SourceRef
 import com.deeptalking.domain.memory.TodoPolicy
 import com.deeptalking.domain.memory.dueAtBackedByEvidence
-import com.deeptalking.domain.memory.hasStaticEditIntent
 import com.deeptalking.domain.memory.hasValidUserEvidence
 import com.deeptalking.domain.memory.knownSources
 import com.deeptalking.domain.memory.parseRelativeText
@@ -72,8 +68,6 @@ data class OrchestratorResult(
     val updatedCharacter: Character,
     /** True when this turn was a proactive (unprompted) opening. */
     val proactive: Boolean = false,
-    /** Static profile field labels auto-adjusted this turn (legacy `staticChanges`). */
-    val staticChanges: List<String> = emptyList(),
     /** Lorebook entry names created/updated this turn (legacy `lorebookChanges`). */
     val lorebookChanges: List<String> = emptyList(),
     /** File ref of a sticker the character chose to send this turn, if any. */
@@ -140,13 +134,12 @@ data class OrchestratorResult(
  * High-level turn orchestrator: assemble prompts, run the tool loop, parse the
  * structured turn, and fold memory updates onto the character.
  *
- * SIMPLIFIED: static/dynamic/member state are applied through the shared
- * evidence gates ([hasValidUserEvidence], [resolveDynamicStateSources],
- * [hasStaticEditIntent]) and long-term writes through [upsertLongTermMemory],
- * mirroring the legacy `applyMemoryUpdate`; promise updates go through
- * [MemoryService.updateMemory]. The legacy background tasks (prose memory
- * extraction, quick-reply repair, style critique) are dispatched through
- * [BackgroundTasks] when one is supplied.
+ * Dynamic/member state is applied through the shared evidence gates
+ * ([hasValidUserEvidence], [resolveDynamicStateSources]) and long-term writes through
+ * [upsertLongTermMemory], mirroring the legacy `applyMemoryUpdate`; promise updates go
+ * through [MemoryService.updateMemory]. Static profile fields are never written from a
+ * chat turn. The legacy background tasks (prose memory extraction, quick-reply repair,
+ * style critique) are dispatched through [BackgroundTasks] when one is supplied.
  */
 class ChatOrchestrator(
     private val llm: LlmBackend,
@@ -331,23 +324,13 @@ class ChatOrchestrator(
         } else {
             WorkerResult(character = characterWithInstant)
         }
-        val finalCharacter = run {
-            var current = worker.character
-            // Static-field revision call (replaces the deleted update_character_field tool).
-            if (!character.isGroup) {
-                FieldRevision.detect(userText)?.let { key ->
-                    onToolActivity("正在调整设定…")
-                    FieldRevision.revise(llm, config, current, key, userText)?.let { value ->
-                        current = FieldRevision.apply(current, key, value, Instant.now().toString())
-                    }
-                }
-            }
-            // A successful worker replaces the previous turn's hints; a failed one
-            // keeps them (the next attempt still needs the same reminders).
-            current.copy(
-                workerIssues = if (worker.ok) worker.issues else current.workerIssues,
-            )
-        }
+        // A successful worker replaces the previous turn's hints; a failed one keeps
+        // them (the next attempt still needs the same reminders). Static profile fields
+        // are deliberately not written from a chat turn: they change only through the
+        // character editor (including its manual per-field regenerate button).
+        val finalCharacter = worker.character.copy(
+            workerIssues = if (worker.ok) worker.issues else worker.character.workerIssues,
+        )
 
         if (backgroundTasks != null && runBackgroundTasks) {
             backgroundTasks.scheduleTurn(
@@ -374,7 +357,6 @@ class ChatOrchestrator(
             quickReplies = worker.quickReplies,
             updatedCharacter = finalCharacter,
             proactive = proactive,
-            staticChanges = diffStaticChanges(character, finalCharacter),
             lorebookChanges = diffLorebookChanges(character, finalCharacter),
             stickerFileRef = outcome.stickerFileRef,
             rawReply = outcome.text,
@@ -439,14 +421,6 @@ class ChatOrchestrator(
         return hash.toString(16)
     }
 
-    /** Labels of static profile fields whose value changed during the turn. */
-    private fun diffStaticChanges(before: Character, after: Character): List<String> {
-        if (after.isGroup) return emptyList()
-        return STATIC_PROFILE_FIELDS.filter { (key, _) ->
-            staticValue(before.staticProfile, key) != staticValue(after.staticProfile, key)
-        }.map { it.second }
-    }
-
     /** Names of lorebook entries added or whose content/keywords changed. */
     private fun diffLorebookChanges(before: Character, after: Character): List<String> {
         val beforeById = before.lorebook.associateBy { it.id }
@@ -471,20 +445,6 @@ class ChatOrchestrator(
             lorebook = bump(character.lorebook),
             members = character.members.map { it.copy(lorebook = bump(it.lorebook)) },
         )
-    }
-
-    private fun staticValue(profile: StaticProfile, key: String): String = when (key) {
-        "gender" -> profile.gender
-        "age" -> profile.age
-        "race" -> profile.race
-        "appearance" -> profile.appearance
-        "personality" -> profile.personality
-        "fears" -> profile.fears
-        "background" -> profile.background
-        "speakingStyle" -> profile.speakingStyle
-        "language" -> profile.language
-        "userAddress" -> profile.userAddress
-        else -> ""
     }
 
     private fun applyMemory(
@@ -513,22 +473,9 @@ class ChatOrchestrator(
             updated = memory.setPendingRecall(updated, recall.category, recall.tags)
         }
 
-        parsed.staticFields?.let { fields ->
-            var profile = updated.staticProfile
-            fields.forEach { (key, element) ->
-                if (STATIC_PROFILE_FIELDS.none { it.first == key }) return@forEach
-                val obj = fieldObject(element)
-                val raw = fieldValue(element)
-                if (raw.isEmpty()) return@forEach
-                val value = MemoryToolSupport.cleanFieldValue(key, parseRelativeText(raw, resolveFieldBase(obj, nowBase)))
-                if (value.isEmpty()) return@forEach
-                val resolved = hasValidUserEvidence(updated, fieldSourceIds(obj), fieldEvidence(obj), sources)
-                    ?: return@forEach
-                if (!hasStaticEditIntent(key, resolved)) return@forEach
-                profile = withStaticField(profile, key, value)
-            }
-            updated = updated.copy(staticProfile = profile)
-        }
+        // Static profile fields are intentionally ignored here. Legacy JSON replies may
+        // still carry `staticFields`, but they must not change the card behind the user's
+        // back; the card editor (and its manual regenerate button) is the only write path.
 
         parsed.dynamicState?.let { state ->
             val dynamic = applyDynamicStateFields(

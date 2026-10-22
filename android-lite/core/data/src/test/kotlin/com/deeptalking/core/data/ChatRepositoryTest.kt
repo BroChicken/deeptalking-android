@@ -5,6 +5,7 @@ import com.deeptalking.core.database.MessageDao
 import com.deeptalking.core.database.MessageEntity
 import com.deeptalking.core.model.ChatMessage
 import com.deeptalking.core.model.Role
+import com.deeptalking.core.model.SpeechSegment
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.runBlocking
@@ -47,6 +48,28 @@ private class FakeMessageDao : MessageDao {
 }
 
 class ChatRepositoryTest {
+
+    @Test
+    fun appendAndReadPreservesGroupSegments() = runBlocking {
+        val dao = FakeMessageDao()
+        val repository = ChatRepository(dao)
+        repository.append(
+            "g1",
+            ChatMessage(
+                id = "m1",
+                role = Role.Assistant,
+                content = "张三：早\n李四：早啊",
+                segments = listOf(
+                    SpeechSegment("张三", "早"),
+                    SpeechSegment("李四", "早啊"),
+                ),
+            ),
+        )
+
+        val stored = repository.getMessages("g1").single()
+        assertEquals(listOf("张三", "李四"), stored.segments.map { it.speaker })
+        assertEquals(listOf("早", "早啊"), stored.segments.map { it.text })
+    }
 
     @Test
     fun appendCapsTheArchiveAndKeepsSequencesMonotonic() = runBlocking {
