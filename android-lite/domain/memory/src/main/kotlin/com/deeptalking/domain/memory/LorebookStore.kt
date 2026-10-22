@@ -281,14 +281,29 @@ fun upsertLorebookEntryForCharacter(
 }
 
 /**
+ * Result of [dedupeLorebookWithArchive]: the compacted live list plus the entries
+ * that were replaced by a later near-duplicate. Callers that own a character keep
+ * [archived] so the earlier content remains restorable instead of disappearing.
+ */
+data class LorebookDedupResult(
+    val kept: List<LorebookEntry>,
+    val archived: List<LorebookEntry> = emptyList(),
+)
+
+/**
  * Local near-duplicate compaction for AI entries: within a cluster of similar
  * model entries only the **latest** one survives (its position stays that of the
  * first), with the earlier entries' keywords unioned in so nothing becomes
- * unhittable. Content is taken from the latest entry wholesale — no appending.
+ * unhittable. Content is taken from the latest entry wholesale, no appending.
  * User-written entries are never touched.
+ *
+ * [LorebookDedupResult.archived] contains every replaced earlier entry (deduped by id),
+ * so a caller that has a `lorebookArchive` can preserve the discarded text. The plain
+ * [dedupeLorebook] wrapper exists for pure callers/tests that only need the kept list.
  */
-fun dedupeLorebook(list: List<LorebookEntry>): List<LorebookEntry> {
+fun dedupeLorebookWithArchive(list: List<LorebookEntry>): LorebookDedupResult {
     val kept = mutableListOf<LorebookEntry>()
+    val archived = mutableListOf<LorebookEntry>()
     for (entry in list) {
         if (entry.origin != LorebookOrigin.Model) {
             kept += entry
@@ -299,14 +314,19 @@ fun dedupeLorebook(list: List<LorebookEntry>): List<LorebookEntry> {
             kept += entry
         } else {
             val previous = kept[target]
+            if (previous.id != entry.id) archived += previous
             kept[target] = entry.copy(
                 keywords = (entry.keywords + previous.keywords).distinct().take(AppLimits.Lorebook.KEYWORDS_PER_ENTRY),
                 alwaysActive = entry.alwaysActive,
             )
         }
     }
-    return kept
+    return LorebookDedupResult(kept = kept, archived = archived.distinctBy { it.id })
 }
+
+/** Kept-only variant of [dedupeLorebookWithArchive] for callers without an archive. */
+fun dedupeLorebook(list: List<LorebookEntry>): List<LorebookEntry> =
+    dedupeLorebookWithArchive(list).kept
 
 /** True when an AI entry is over the per-entry cap and still needs the one-time rewrite. */
 fun needsLorebookRewrite(entry: LorebookEntry): Boolean =

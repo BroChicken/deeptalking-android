@@ -1,5 +1,6 @@
 package com.deeptalking.core.data.legacy
 
+import com.deeptalking.core.common.AppLimits
 import com.deeptalking.core.data.CharacterRepository
 import com.deeptalking.core.data.ChatRepository
 import com.deeptalking.core.data.ConfigRepository
@@ -68,12 +69,18 @@ class LegacyImportService(
                 }
                 runCatching { mapCharacter(dto.copy(id = dto.id ?: key), stickerSink) }
                     .onSuccess { character ->
-                        mapped.add(character)
                         // `history` is the split-format archive (A). Every older backup
                         // put the whole chat in `memory.instant`, which is then the
                         // archive as well as the window, so old files still restore.
                         val archive = if (dto.history != null) dto.history else dto.memory?.instant
-                        archives[character.id] = mapInstantMessages(archive, stickerSink)
+                        val mappedArchive = mapInstantMessages(archive, stickerSink)
+                        // A window below the low-water mark is not a valid post-fold
+                        // state. Older exports could persist a single synthetic reply
+                        // after a failed turn; rebuild the working window from the
+                        // archive instead of restoring that unusable one-message state.
+                        val restored = repairImportedInstant(character, mappedArchive)
+                        mapped.add(restored)
+                        archives[restored.id] = mappedArchive
                     }
                     .onFailure { skipped++ }
             }
@@ -168,4 +175,22 @@ class LegacyImportService(
 
         return ImportSummary(characterCount, messageCount, stickerCount, configUpdated, activeCharacterId, skipped)
     }
+}
+
+/**
+ * Restores a usable working window for a backup whose persisted `memory.instant`
+ * is below the low-water mark. A normal fold always leaves at least
+ * [AppLimits.Memory.INSTANT_TRIM_FLOOR] messages; a smaller non-empty window is a
+ * partial/failed write (the known case is one synthetic assistant message). The
+ * chat archive is the source of truth here, and sequence numbers are re-derived.
+ */
+private fun repairImportedInstant(
+    character: Character,
+    archive: List<ChatMessage>,
+): Character {
+    if (character.instant.size >= AppLimits.Memory.INSTANT_TRIM_FLOOR) return character
+    if (archive.size < AppLimits.Memory.INSTANT_TRIM_FLOOR) return character
+    return repairMessageSequences(
+        character.copy(instant = archive.takeLast(AppLimits.Memory.INSTANT)),
+    )
 }

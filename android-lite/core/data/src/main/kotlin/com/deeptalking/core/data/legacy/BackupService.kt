@@ -212,6 +212,15 @@ class BackupService(
             put("staticFieldMeta", JsonObject(character.staticFieldMeta))
         }
         character.lorebookMigratedAt?.let { put("lorebookMigratedAt", it) }
+        // Durable native-only state that a restore must not silently reset. Worker hints
+        // are included because they are the only remaining context for a failed turn's
+        // next worker call; an old backup simply has no such key.
+        if (character.memoryRepairVersion > 0) {
+            put("memoryRepairVersion", character.memoryRepairVersion)
+        }
+        if (character.workerIssues.isNotEmpty()) {
+            putJsonArray("workerIssues") { character.workerIssues.forEach { add(it) } }
+        }
         if (character.isGroup) {
             putJsonObject("groupInfo") {
                 put("name", character.name)
@@ -334,6 +343,10 @@ class BackupService(
         put("lorebookFailures", counters.lorebookFailures)
         put("lorebookScannedCount", counters.lorebookScannedCount)
         put("messageSequence", counters.messageSequence)
+        // Always write the acknowledgements (including false) so a backup can distinguish
+        // "user never saw the prompt" from "the field was dropped by an older export".
+        put("extractionPromptAcked", counters.extractionPromptAcked)
+        put("analysisPromptAcked", counters.analysisPromptAcked)
         if (counters.analysisLastError.isNotBlank()) put("analysisLastError", counters.analysisLastError)
     }
 

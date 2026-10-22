@@ -21,6 +21,7 @@ import com.deeptalking.core.model.LongTermMemory
 import com.deeptalking.core.model.LorebookEntry
 import com.deeptalking.core.model.LorebookOrigin
 import com.deeptalking.core.model.MemoryCategory
+import com.deeptalking.core.model.MemoryCounters
 import com.deeptalking.core.model.MemorySubject
 import com.deeptalking.core.model.PromiseStatus
 import com.deeptalking.core.model.RequestMetric
@@ -647,6 +648,95 @@ class LegacyMapperTest {
         assertEquals("forest", restored.scenes.single().key)
         assertEquals("hi", restored.instant.single().content)
         assertEquals(2, restored.staticFillMeta?.failures)
+    }
+
+    @Test
+    fun backupRoundTripsPromptAcksWorkerIssuesAndRepairVersion() = runTest {
+        val characterDao = FakeCharacterDao()
+        val characters = CharacterRepository(characterDao)
+        val chat = ChatRepository(FakeMessageDao())
+        val config = ConfigRepository(FakeConfigDao())
+        characters.upsert(
+            Character(
+                id = "c1",
+                name = "Aria",
+                counters = MemoryCounters(
+                    extractionFailures = 3,
+                    analysisFailures = 3,
+                    extractionPromptAcked = true,
+                    analysisPromptAcked = true,
+                    analysisLastError = "解析失败",
+                ),
+                workerIssues = listOf("待办：期限不明", "快捷回复：条数不足"),
+                memoryRepairVersion = 3,
+            ),
+        )
+
+        val exported = BackupService(characters, chat, config).exportJson(activeCharacterId = "c1")
+        val root = Json { ignoreUnknownKeys = true }.parseToJsonElement(exported) as JsonObject
+        val characterJson = (root["characters"] as JsonObject)["c1"] as JsonObject
+        assertEquals("3", characterJson["memoryRepairVersion"].toString())
+        assertEquals(
+            listOf("待办：期限不明", "快捷回复：条数不足"),
+            (characterJson["workerIssues"] as JsonArray).map { (it as JsonPrimitive).content },
+        )
+        val counters = (characterJson["memory"] as JsonObject)["counters"] as JsonObject
+        assertEquals("true", counters["extractionPromptAcked"].toString())
+        assertEquals("true", counters["analysisPromptAcked"].toString())
+
+        val freshDao = FakeCharacterDao()
+        LegacyImportService(
+            CharacterRepository(freshDao),
+            ChatRepository(FakeMessageDao()),
+            ConfigRepository(FakeConfigDao()),
+            null,
+        ).importJson(exported)
+        val restored = CharacterRepository(freshDao).get("c1")!!
+        assertTrue(restored.counters.extractionPromptAcked)
+        assertTrue(restored.counters.analysisPromptAcked)
+        assertEquals(listOf("待办：期限不明", "快捷回复：条数不足"), restored.workerIssues)
+        assertEquals(3, restored.memoryRepairVersion)
+        assertEquals("解析失败", restored.counters.analysisLastError)
+    }
+
+    @Test
+    fun importRepairsCollapsedInstantWindowFromHistory() = runTest {
+        val history = (1..AppLimits.Memory.INSTANT).joinToString(",") { index ->
+            val role = if (index % 2 == 0) "assistant" else "user"
+            """{"id":"m$index","role":"$role","content":"line $index","sequence":${1000 + index},"timestamp":"2026-01-01T00:00:00Z"}"""
+        }
+        val json = """
+            {
+              "characters": {
+                "c1": {
+                  "id": "c1",
+                  "basicInfo": { "name": "Aria" },
+                  "history": [$history],
+                  "memory": {
+                    "instant": [
+                      {"id":"assistant_c1","role":"assistant","content":"orphan","sequence":1000}
+                    ],
+                    "counters": { "messageSequence": 1000 }
+                  }
+                }
+              }
+            }
+        """.trimIndent()
+
+        val characterDao = FakeCharacterDao()
+        LegacyImportService(
+            CharacterRepository(characterDao),
+            ChatRepository(FakeMessageDao()),
+            ConfigRepository(FakeConfigDao()),
+            null,
+        ).importJson(json)
+
+        val restored = CharacterRepository(characterDao).get("c1")!!
+        assertEquals(AppLimits.Memory.INSTANT, restored.instant.size)
+        assertEquals("m${AppLimits.Memory.INSTANT}", restored.instant.last().id)
+        assertTrue(restored.instant.none { it.id == "assistant_c1" })
+        assertTrue(restored.instant.zipWithNext().all { (a, b) -> a.sequence < b.sequence })
+        assertEquals(1000 + AppLimits.Memory.INSTANT, restored.counters.messageSequence)
     }
 
     @Test

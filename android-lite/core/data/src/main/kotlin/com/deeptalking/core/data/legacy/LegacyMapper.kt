@@ -38,6 +38,7 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.decodeFromJsonElement
 import java.time.Instant
 import java.time.LocalDateTime
@@ -647,6 +648,12 @@ fun mapCharacter(dto: LegacyCharacter, stickerSink: StickerSink?): Character {
         staticFieldMeta = mapStaticFieldMeta(dto.staticFieldMeta),
         timeParseVersion = (dto.timeParseVersion ?: 0).coerceAtLeast(0),
         lorebookMigratedAt = dto.lorebookMigratedAt,
+        memoryRepairVersion = (dto.memoryRepairVersion ?: 0).coerceAtLeast(0),
+        workerIssues = dto.workerIssues.orEmpty()
+            .map { it.trim().take(120) }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .take(8),
         revision = (memory?.revision ?: 0).coerceAtLeast(0),
     )
     // One-time convergence: a legacy/backup row may carry more live entries than the ceiling
@@ -699,12 +706,17 @@ private fun mapCounters(element: JsonElement?): MemoryCounters {
         lorebookFailures = (obj.intLenient("lorebookFailures") ?: 0).coerceAtLeast(0),
         lorebookScannedCount = (obj.intLenient("lorebookScannedCount") ?: 0).coerceAtLeast(0),
         messageSequence = (obj.intLenient("messageSequence") ?: 0).coerceAtLeast(0),
+        extractionPromptAcked = obj.booleanOrFalse("extractionPromptAcked"),
+        analysisPromptAcked = obj.booleanOrFalse("analysisPromptAcked"),
         analysisLastError = obj.stringOrNull("analysisLastError").orEmpty().take(240),
     )
 }
 
 private fun JsonObject.stringOrNull(key: String): String? =
     (this[key] as? JsonPrimitive)?.takeIf { it.isString }?.content
+
+private fun JsonObject.booleanOrFalse(key: String): Boolean =
+    (this[key] as? JsonPrimitive)?.booleanOrNull ?: false
 
 /** Lenient number read (`Number(...)`): numeric strings are accepted. */
 private fun JsonObject.intLenient(key: String): Int? =

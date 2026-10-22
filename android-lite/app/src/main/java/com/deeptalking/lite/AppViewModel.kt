@@ -1766,7 +1766,17 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 // turn instead would slide the window by one message per turn, which is
                 // exactly what made the cached request prefix miss on every request.
                 val stored = core.data.characters.get(id) ?: return@launch
-                val character = stored.copy(instant = growInstantWindow(stored.instant, history))
+                val grownInstant = growInstantWindow(stored.instant, history)
+                val character = stored.copy(instant = grownInstant)
+                // A collapsed window (e.g. one synthetic reply left by a failed turn)
+                // cannot be repaired by the normal three-way merge: the merge never
+                // resurrects ids the writer's `before` already had. Persist the rebuilt
+                // window before the turn so the next write starts from a usable state.
+                if (stored.instant.size < AppLimits.Memory.INSTANT_TRIM_FLOOR &&
+                    grownInstant.size >= AppLimits.Memory.INSTANT_TRIM_FLOOR
+                ) {
+                    core.data.characters.mutate(id) { live -> live.copy(instant = grownInstant) }
+                }
                 statusState.value = "生成中…"
                 streamingState.value = ""
 
@@ -1927,35 +1937,6 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         }
     }
 
-    /**
-     * Materialises the persisted `character.instant` window as an append-only tail of the
-     * live chat: the window content is the state (the fold pass compacts it down to the
-     * low watermark), and a turn only appends the messages the window has not seen yet.
-     *
-     * Entries that are not (yet) rows of the chat table — the in-flight synthetic
-     * assistant turn — are dropped first, so the window stays an ordered subset of the
-     * chat tail and the reply cannot appear twice (once synthetic, once as its row).
-     */
-    private fun growInstantWindow(instant: List<ChatMessage>, room: List<ChatMessage>): List<ChatMessage> {
-        if (instant.isEmpty()) {
-            return if (room.size > AppLimits.Memory.INSTANT) room.takeLast(AppLimits.Memory.INSTANT) else room
-        }
-        val roomIndex = room.withIndex().associate { it.value.id to it.index }
-        // The persisted window is authoritative: keep its content and append only the
-        // chat rows it has not seen yet. Re-deriving the window from the archive (the
-        // old behaviour) silently undid every fold, because the archive never drops a
-        // row that the fold trimmed away, so the window could only ever grow.
-        val kept = instant.filter { it.id in roomIndex }
-        if (kept.isEmpty()) {
-            return if (room.size > AppLimits.Memory.INSTANT) room.takeLast(AppLimits.Memory.INSTANT) else room
-        }
-        val lastSeen = kept.maxOf { roomIndex.getValue(it.id) }
-        val seen = kept.mapTo(HashSet()) { it.id }
-        val appended = room.drop(lastSeen + 1).filter { it.id !in seen }
-        // Safety clamp: an imported/legacy window can be far larger than the watermark
-        // (the archive never drops rows). Only the recent slice is the working window.
-        return (kept + appended).takeLast(AppLimits.Memory.INSTANT)
-    }
 
     /**
      * Records the **confirmation conclusion** for the active character's promises: a promise
@@ -2463,10 +2444,15 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             runCatching { core.cosyVoice.listVoices() }.getOrDefault(emptyList())
                 .firstOrNull { it.file == name }
         }
-        val path = match?.let { core.cosyVoice.voiceFileFor(it.file)?.absolutePath }.orEmpty()
+        val resolved = match?.let { core.cosyVoice.voiceFileFor(it.file) }
+        val path = resolved?.absolutePath.orEmpty()
         if (cfg.ttsVoiceFile != path) {
             core.data.config.update(cfg.copy(ttsVoiceFile = path))
         }
+        // The config is the persisted selection, but the engine keeps its own active
+        // voice field. Apply it now so read-aloud immediately after an import uses the
+        // restored voice instead of the previous device's selection.
+        core.cosyVoice.setVoiceFile(resolved)
     }
 
     // -------------------------------------------------------------- proactive

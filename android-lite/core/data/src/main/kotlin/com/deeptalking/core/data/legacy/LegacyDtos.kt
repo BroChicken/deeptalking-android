@@ -399,6 +399,10 @@ data class LegacyCharacter(
     @SerialName("staticFieldMeta") val staticFieldMeta: JsonElement? = null,
     @SerialName("timeParseVersion") val timeParseVersion: Int? = null,
     @SerialName("lorebookMigratedAt") val lorebookMigratedAt: String? = null,
+    /** Native-only guard for the one-time deterministic memory repair. */
+    @SerialName("memoryRepairVersion") val memoryRepairVersion: Int? = null,
+    /** Native-only short hints for the next turn worker after a rejected batch. */
+    @SerialName("workerIssues") val workerIssues: List<String>? = null,
     /** Flattened variant: dynamic fields hoisted to the character root. */
     @SerialName("fields") val fields: LegacyFieldBag? = null,
     /** 待办事项（native-only；旧 WebView 备份里没有该键）。 */

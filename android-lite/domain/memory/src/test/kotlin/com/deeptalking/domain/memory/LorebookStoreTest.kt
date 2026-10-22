@@ -339,6 +339,19 @@ class LorebookStoreTest {
     }
 
     @Test
+    fun dedupeKeepsReplacedModelEntryInArchive() {
+        val list = listOf(
+            LorebookEntry(id = "a", name = "王都", content = "北方的都城。", origin = LorebookOrigin.Model, keywords = listOf("王都", "旧词")),
+            LorebookEntry(id = "b", name = "王都", content = "都城有钟楼。", origin = LorebookOrigin.Model, keywords = listOf("王都", "新词")),
+        )
+        val result = dedupeLorebookWithArchive(list)
+        assertEquals(1, result.kept.size)
+        assertEquals("b", result.kept.single().id)
+        assertEquals(listOf("a"), result.archived.map { it.id })
+        assertEquals("北方的都城。", result.archived.single().content)
+    }
+
+    @Test
     fun needsLorebookRewriteOnlyForOverCapModelEntries() {
         val overCap = LorebookEntry(
             id = "ai",

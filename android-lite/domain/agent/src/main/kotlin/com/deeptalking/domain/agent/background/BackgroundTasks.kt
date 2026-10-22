@@ -41,7 +41,7 @@ import com.deeptalking.domain.memory.ShortTermDraft
 import com.deeptalking.domain.memory.addShortTermMemory
 import com.deeptalking.domain.memory.applyMemoryDecay
 import com.deeptalking.domain.memory.archiveToFit
-import com.deeptalking.domain.memory.dedupeLorebook
+import com.deeptalking.domain.memory.dedupeLorebookWithArchive
 import com.deeptalking.domain.memory.dedupeShortTerm
 import com.deeptalking.domain.memory.ensureMessageSequences
 import com.deeptalking.domain.memory.evidenceMatchesSource
@@ -1155,9 +1155,20 @@ class BackgroundTasks(
         }
 
         // De-duplicate first so a merged near-duplicate does not claim a second slot.
+        // The replaced earlier entries go into the archive: an automatic merge must not
+        // look like the user deleted their world-book text.
+        val ownDedup = dedupeLorebookWithArchive(working.lorebook)
+        val memberDedups = working.members.map { dedupeLorebookWithArchive(it.lorebook) }
         working = working.copy(
-            lorebook = dedupeLorebook(working.lorebook),
-            members = working.members.map { it.copy(lorebook = dedupeLorebook(it.lorebook)) },
+            lorebook = ownDedup.kept,
+            lorebookArchive = (working.lorebookArchive + ownDedup.archived).distinctBy { it.id },
+            members = working.members.mapIndexed { index, member ->
+                val dedup = memberDedups[index]
+                member.copy(
+                    lorebook = dedup.kept,
+                    lorebookArchive = (member.lorebookArchive + dedup.archived).distinctBy { it.id },
+                )
+            },
         )
 
         val archived = mutableListOf<LorebookEntry>()
