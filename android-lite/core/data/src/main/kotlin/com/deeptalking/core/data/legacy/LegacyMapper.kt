@@ -947,33 +947,27 @@ fun reconcileLegacyMemories(character: Character): MemoryReconciliation {
     }
     val droppedLong = HashSet<Int>()
     for (group in groups.values) {
-        val primaries = mutableListOf<Int>()
-        for (entryIndex in group) {
-            val primaryIndex = primaries.firstOrNull { sameLongTermEvent(long[it], long[entryIndex]) }
-            if (primaryIndex == null) {
-                primaries += entryIndex
-                continue
+        // Merge the strongest pair first, then re-score the merged entry against the
+        // rest. The threshold is strict: exactly 0.70 does not merge.
+        while (true) {
+            var bestScore = 0.0
+            var bestFirst = -1
+            var bestSecond = -1
+            for (first in group) {
+                if (first in droppedLong) continue
+                for (second in group) {
+                    if (second <= first || second in droppedLong) continue
+                    val score = longTermMergeScore(long[first], long[second])
+                    if (score > bestScore) {
+                        bestScore = score
+                        bestFirst = first
+                        bestSecond = second
+                    }
+                }
             }
-            val old = long[primaryIndex]
-            val newer = long[entryIndex]
-            val mergedSources = mergeLegacySources(
-                old.sourceMessageIds, old.sourceRoles, old.userEvidence,
-                newer.sourceMessageIds, newer.sourceRoles, newer.userEvidence,
-            )
-            long[primaryIndex] = old.copy(
-                value = mergeTimelineContent(old.eventTime, old.value, newer.eventTime, newer.value),
-                tags = (old.tags + newer.tags).distinct().take(8),
-                importance = maxOf(old.importance, newer.importance),
-                sourceMessageIds = mergedSources.ids,
-                evidence = old.evidence.ifEmpty { newer.evidence },
-                eventTime = earlierTimestamp(old.eventTime, newer.eventTime),
-                participants = mergeParticipants(old.participants, newer.participants),
-                location = mergeLocations(old.location, newer.location),
-                updatedAt = newer.updatedAt ?: old.updatedAt,
-                sourceRoles = mergedSources.roles,
-                userEvidence = mergedSources.evidence,
-            )
-            droppedLong += entryIndex
+            if (bestScore <= LONG_TERM_MERGE_THRESHOLD) break
+            long[bestFirst] = mergeLongTermEntries(long[bestFirst], long[bestSecond])
+            droppedLong += bestSecond
             repaired++
         }
     }
@@ -1004,18 +998,144 @@ private fun sameShortTermEvent(a: ShortTermMemory, b: ShortTermMemory): Boolean 
     return aText.isNotEmpty() && aText == bText
 }
 
+/** Strictly greater than this weighted score triggers an automatic merge. */
+private const val LONG_TERM_MERGE_THRESHOLD = 0.70
+
+private const val EVENT_KEY_WEIGHT = 0.28
+private const val EVENT_VALUE_WEIGHT = 0.38
+private const val EVENT_SOURCE_WEIGHT = 0.24
+private const val EVENT_PARTICIPANT_WEIGHT = 0.06
+private const val EVENT_LOCATION_WEIGHT = 0.04
+
+private val EVENT_CONTRADICTIONS: List<Pair<String, String>> = listOf(
+    "答应" to "拒绝",
+    "同意" to "拒绝",
+    "接受" to "拒绝",
+    "成功" to "失败",
+    "记得" to "忘记",
+    "开始" to "结束",
+)
+
+private fun bigramsOfNormalized(value: String): Set<String> {
+    if (value.isEmpty()) return emptySet()
+    if (value.length < 2) return setOf(value)
+    return buildSet {
+        for (index in 0 until value.length - 1) add(value.substring(index, index + 2))
+    }
+}
+
+/** Jaccard over character bigrams, with the smaller side's containment as a fallback. */
+private fun textSimilarity(a: String, b: String): Double {
+    val left = reconcileText(a)
+    val right = reconcileText(b)
+    if (left.isEmpty() || right.isEmpty()) return 0.0
+    if (left == right) return 1.0
+    val aGrams = bigramsOfNormalized(left)
+    val bGrams = bigramsOfNormalized(right)
+    if (aGrams.isEmpty() || bGrams.isEmpty()) return 0.0
+    val intersection = aGrams.count { it in bGrams }
+    val union = aGrams.size + bGrams.size - intersection
+    val jaccard = if (union == 0) 0.0 else intersection.toDouble() / union
+    val containment = intersection.toDouble() / minOf(aGrams.size, bGrams.size)
+    return maxOf(jaccard, containment * 0.9)
+}
+
+private fun setSimilarity(a: Collection<String>, b: Collection<String>): Double {
+    val left = a.map { reconcileText(it) }.filter { it.isNotEmpty() }.toSet()
+    val right = b.map { reconcileText(it) }.filter { it.isNotEmpty() }.toSet()
+    if (left.isEmpty() || right.isEmpty()) return 0.0
+    val intersection = left.count { it in right }
+    return intersection.toDouble() / (left.size + right.size - intersection)
+}
+
+private fun eventContradicts(a: LongTermMemory, b: LongTermMemory): Boolean {
+    val left = reconcileText(a.value)
+    val right = reconcileText(b.value)
+    return EVENT_CONTRADICTIONS.any { (positive, negative) ->
+        (left.contains(positive) && right.contains(negative)) ||
+            (right.contains(positive) && left.contains(negative))
+    }
+}
+
+private fun participantsConflict(a: LongTermMemory, b: LongTermMemory): Boolean {
+    val left = a.participants.map { reconcileText(it) }.filter { it.isNotEmpty() }.toSet()
+    val right = b.participants.map { reconcileText(it) }.filter { it.isNotEmpty() }.toSet()
+    return left.isNotEmpty() && right.isNotEmpty() && left.none { it in right }
+}
+
+private fun locationsConflict(a: LongTermMemory, b: LongTermMemory): Boolean {
+    val left = reconcileText(a.location)
+    val right = reconcileText(b.location)
+    return left.isNotEmpty() && right.isNotEmpty() &&
+        !left.contains(right) && !right.contains(left)
+}
+
 /**
- * Same long-term event means the same topic/event identity. A shared calendar slot is not
- * enough: multiple different events can happen in one afternoon. Equal keys or identical
- * values are safe evidence of duplication; different wording is kept separate.
+ * Weighted same-event score. The calendar slot is only the candidate bucket; this score
+ * decides whether two event memories really describe the same beat. Missing dimensions are
+ * omitted (weights renormalised), so old entries without source/participant metadata are
+ * not punished. Contradictory outcomes and explicitly different casts/places are vetoes.
  */
-private fun sameLongTermEvent(a: LongTermMemory, b: LongTermMemory): Boolean {
-    val aKey = a.key.trim().lowercase()
-    val bKey = b.key.trim().lowercase()
-    if (aKey.isNotEmpty() && aKey == bKey) return true
-    val aValue = reconcileText(a.value)
-    val bValue = reconcileText(b.value)
-    return aValue.isNotEmpty() && aValue == bValue
+private fun longTermMergeScore(a: LongTermMemory, b: LongTermMemory): Double {
+    if (eventContradicts(a, b)) return 0.0
+    if (participantsConflict(a, b)) return 0.0
+    if (locationsConflict(a, b)) return 0.0
+
+    var weighted = 0.0
+    var totalWeight = 0.0
+    fun add(value: Double, weight: Double) {
+        weighted += value * weight
+        totalWeight += weight
+    }
+    add(textSimilarity(a.key, b.key), EVENT_KEY_WEIGHT)
+    add(textSimilarity(a.value, b.value), EVENT_VALUE_WEIGHT)
+    if (a.sourceMessageIds.isNotEmpty() && b.sourceMessageIds.isNotEmpty()) {
+        add(setSimilarity(a.sourceMessageIds, b.sourceMessageIds), EVENT_SOURCE_WEIGHT)
+    }
+    if (a.participants.isNotEmpty() && b.participants.isNotEmpty()) {
+        add(setSimilarity(a.participants, b.participants), EVENT_PARTICIPANT_WEIGHT)
+    }
+    if (a.location.isNotBlank() && b.location.isNotBlank()) {
+        val left = reconcileText(a.location)
+        val right = reconcileText(b.location)
+        add(if (left.contains(right) || right.contains(left)) 1.0 else 0.0, EVENT_LOCATION_WEIGHT)
+    }
+    return if (totalWeight == 0.0) 0.0 else weighted / totalWeight
+}
+
+private fun eventTimeMillis(value: String?): Long = parseInstant(value)?.toEpochMilli() ?: 0L
+
+private fun laterTimestamp(a: String?, b: String?): String? {
+    val at = parseInstant(a)
+    val bt = parseInstant(b)
+    if (at == null) return b ?: a
+    if (bt == null) return a ?: b
+    return if (at >= bt) a else b
+}
+
+private fun mergeLongTermEntries(a: LongTermMemory, b: LongTermMemory): LongTermMemory {
+    val primary = if (eventTimeMillis(a.eventTime) <= eventTimeMillis(b.eventTime)) a else b
+    val secondary = if (primary === a) b else a
+    val mergedSources = mergeLegacySources(
+        primary.sourceMessageIds, primary.sourceRoles, primary.userEvidence,
+        secondary.sourceMessageIds, secondary.sourceRoles, secondary.userEvidence,
+    )
+    return primary.copy(
+        value = mergeTimelineContent(primary.eventTime, primary.value, secondary.eventTime, secondary.value),
+        tags = (primary.tags + secondary.tags).distinct().take(8),
+        importance = maxOf(primary.importance, secondary.importance),
+        sourceMessageIds = mergedSources.ids,
+        evidence = primary.evidence.ifEmpty { secondary.evidence },
+        eventTime = earlierTimestamp(primary.eventTime, secondary.eventTime),
+        participants = mergeParticipants(primary.participants, secondary.participants),
+        location = mergeLocations(primary.location, secondary.location),
+        createdAt = earlierTimestamp(primary.createdAt, secondary.createdAt),
+        updatedAt = laterTimestamp(primary.updatedAt, secondary.updatedAt),
+        lastRecalled = laterTimestamp(primary.lastRecalled, secondary.lastRecalled),
+        recordedAt = earlierTimestamp(primary.recordedAt, secondary.recordedAt),
+        sourceRoles = mergedSources.roles,
+        userEvidence = mergedSources.evidence,
+    )
 }
 
 /**

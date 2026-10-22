@@ -552,8 +552,8 @@ class LegacyMapperTest {
                 ShortTermMemory(id = "c", content = "other", eventTime = early),
             ),
             longTerm = listOf(
-                LongTermMemory(id = "e1", category = MemoryCategory.Events, key = "same", value = "one", eventTime = early, tags = listOf("t1"), participants = listOf("A"), location = "x"),
-                LongTermMemory(id = "e2", category = MemoryCategory.Events, key = "same", value = "two", eventTime = early, tags = listOf("t2"), participants = listOf("B"), location = "y", sourceMessageIds = listOf("m2")),
+                LongTermMemory(id = "e1", category = MemoryCategory.Events, key = "same", value = "one", eventTime = early, tags = listOf("t1"), participants = listOf("A"), location = "x", sourceMessageIds = listOf("m1")),
+                LongTermMemory(id = "e2", category = MemoryCategory.Events, key = "same", value = "one", eventTime = early, tags = listOf("t2"), participants = listOf("A"), location = "x", sourceMessageIds = listOf("m2")),
                 // Same calendar slot, different event: it must stay a separate memory.
                 LongTermMemory(id = "e3", category = MemoryCategory.Events, key = "other", value = "else", eventTime = early),
                 LongTermMemory(id = "p1", category = MemoryCategory.Promises, value = "keep", eventTime = early),
@@ -567,8 +567,8 @@ class LegacyMapperTest {
         assertEquals(listOf("m1", "m2"), mergedShort.sourceMessageIds)
         val mergedEvent = result.character.longTerm.first { it.id == "e1" }
         assertEquals(setOf("t1", "t2"), mergedEvent.tags.toSet())
-        assertEquals(setOf("A", "B"), mergedEvent.participants.toSet())
-        assertEquals(listOf("m2"), mergedEvent.sourceMessageIds)
+        assertEquals(setOf("A"), mergedEvent.participants.toSet())
+        assertEquals(listOf("m1", "m2"), mergedEvent.sourceMessageIds)
         assertNotNull(result.character.longTerm.firstOrNull { it.id == "e3" })
         assertNotNull(result.character.longTerm.firstOrNull { it.id == "p1" })
         assertTrue(eventIdentity(null, emptyList(), "") == "")
@@ -577,8 +577,9 @@ class LegacyMapperTest {
     @Test
     fun reconcileMergesDuplicateEventWithoutTruncatingOrDroppingSources() {
         val early = "2026-01-01T10:00:00Z"
-        val first = "甲".repeat(950)
-        val second = "乙".repeat(950)
+        val common = "天地玄黄宇宙洪荒日月盈昃辰宿列张".repeat(20)
+        val first = common + "甲".repeat(300)
+        val second = common + "乙".repeat(300)
         val character = Character(
             id = "c1",
             longTerm = listOf(
@@ -589,6 +590,8 @@ class LegacyMapperTest {
                     value = first,
                     eventTime = early,
                     sourceMessageIds = listOf("m1"),
+                    participants = listOf("A"),
+                    location = "x",
                 ),
                 LongTermMemory(
                     id = "e2",
@@ -596,7 +599,9 @@ class LegacyMapperTest {
                     key = "same",
                     value = second,
                     eventTime = early,
-                    sourceMessageIds = listOf("m2"),
+                    sourceMessageIds = listOf("m1", "m2"),
+                    participants = listOf("A"),
+                    location = "x",
                 ),
             ),
         )
@@ -604,6 +609,66 @@ class LegacyMapperTest {
         assertTrue(merged.value.contains(first))
         assertTrue(merged.value.contains(second))
         assertEquals(listOf("m1", "m2"), merged.sourceMessageIds)
+    }
+
+    @Test
+    fun reconcileDoesNotMergeSameKeyWithUnrelatedBody() {
+        val early = "2026-01-01T10:00:00Z"
+        val character = Character(
+            id = "c1",
+            longTerm = listOf(
+                LongTermMemory(
+                    id = "e1",
+                    category = MemoryCategory.Events,
+                    key = "same key",
+                    value = "第一件完全不同的事",
+                    eventTime = early,
+                ),
+                LongTermMemory(
+                    id = "e2",
+                    category = MemoryCategory.Events,
+                    key = "same key",
+                    value = "第二件毫不相干的事",
+                    eventTime = early,
+                ),
+            ),
+        )
+        val result = reconcileLegacyMemories(character)
+        assertEquals(2, result.character.longTerm.size)
+        assertEquals(0, result.repaired)
+    }
+
+    @Test
+    fun reconcileNeverMergesOppositeOutcomes() {
+        val early = "2026-01-01T10:00:00Z"
+        val character = Character(
+            id = "c1",
+            longTerm = listOf(
+                LongTermMemory(
+                    id = "e1",
+                    category = MemoryCategory.Events,
+                    key = "same request",
+                    value = "用户答应了这个请求",
+                    eventTime = early,
+                    sourceMessageIds = listOf("m1"),
+                    participants = listOf("A", "B"),
+                    location = "x",
+                ),
+                LongTermMemory(
+                    id = "e2",
+                    category = MemoryCategory.Events,
+                    key = "same request",
+                    value = "用户拒绝了这个请求",
+                    eventTime = early,
+                    sourceMessageIds = listOf("m1"),
+                    participants = listOf("A", "B"),
+                    location = "x",
+                ),
+            ),
+        )
+        val result = reconcileLegacyMemories(character)
+        assertEquals(2, result.character.longTerm.size)
+        assertEquals(0, result.repaired)
     }
 
     @Test
