@@ -670,9 +670,9 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         core.data.settings.putBoolean(MEMORY_CLEANUP_PENDING_KEY, false)
         when {
             drain.lastAnalysisError.isNotBlank() ->
-                eventsState.tryEmit(UiEvent("短期记忆整理失败：${drain.lastAnalysisError}"))
+                eventsState.tryEmit(UiEvent("短期记忆生成失败：${drain.lastAnalysisError}"))
             drain.passes > 0 ->
-                eventsState.tryEmit(UiEvent("短期记忆已整理到 ${remaining?.shortTermTotal ?: 0} 条"))
+                eventsState.tryEmit(UiEvent("短期记忆现有 ${remaining?.shortTermTotal ?: 0} 条"))
         }
         return false
     }
@@ -696,9 +696,9 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         if (removedImages > 0) parts += "清理了 $removedImages 张旧图片"
         if (drain.passes > 0) parts += "整理了 ${drain.passes} 批短期记忆"
         if (!canAnalyze) {
-            parts += "短期记忆需要 API Key 才能整理"
+            parts += "短期记忆需要 API Key 才能生成"
         } else if (drain.passes == 0 && drain.lastAnalysisError.isNotBlank()) {
-            parts += "短期记忆整理失败：${drain.lastAnalysisError}"
+            parts += "短期记忆生成失败：${drain.lastAnalysisError}"
         }
         if (parts.isEmpty()) parts += "没有需要清理的内容"
         val tail = when {
@@ -1794,8 +1794,6 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                     onStatus = { statusState.value = it },
                     onAuxiliaryUsage = { taskType, usage -> recordAuxiliaryUsage(taskType, usage) },
                 )
-                val priorCache = cfg.cacheStats
-                val hadCacheMiss = priorCache != null && priorCache.hitTokens == 0 && (priorCache.promptTokens ?: 0) > 0
                 val requestStartedAt = System.currentTimeMillis()
                 // The empty-round retry now lives in AgentLoop's FINAL phase (2 retries).
                 // A second retry loop here would multiply the request count (3 × 3), so the
@@ -1803,7 +1801,10 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 var result: OrchestratorResult? = null
                 val attemptResults = mutableListOf<OrchestratorResult>()
                 var receiveLogged = false
-                statusState.value = if (hadCacheMiss) "缓存未命中，正在更新队列…" else "正在请求 API…"
+                // The next phase assembles system/history/volatile/tools and then sends the
+                // request. Cache stats describe the previous turn and are not a prediction
+                // for this one, so they no longer drive the activity hint.
+                statusState.value = "正在拼接上下文…"
                 val outcome = orchestrator.run(
                     character = character,
                     history = character.instant,
@@ -2122,8 +2123,8 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             promptTokens = firstUsage?.inputTokens?.takeIf { it > 0 },
             updatedAt = at,
         )
-        // Legacy `DEBUG_REPLY_STORAGE_KEY`: a JSON object with the config snapshot,
-        // display/full text and quick replies, rendered as two sections in Settings.
+        // Last-turn metadata for the human-readable debug panel. The reply/raw text is
+        // deliberately not stored: Settings shows fields and statistics, not the prose.
         val debug = buildJsonObject {
             put("at", at)
             putJsonObject("config") {
@@ -2132,8 +2133,6 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 put("model", cfg.modelName)
             }
             put("durationMs", durationMs)
-            put("displayText", last.reply.take(2000))
-            put("fullText", last.rawReply.take(2000))
             putJsonArray("quickReplies") { last.quickReplies.forEach { add(it) } }
         }.toString()
         appendMetric(rows, cacheStats = cacheStats, lastReplyDebug = debug)

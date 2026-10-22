@@ -156,7 +156,7 @@ BackgroundTasks.scheduleTurn       后台：文风校对、快速回应校验/�
 | `final-empty` | FINAL 阶段没有正文 | 重试（≤2 次） | `正在重新生成…` |
 | `empty` | 重试后仍无正文 | 失败 | 外层提示"收到空回复，请重试。你的消息已保留。" |
 
-工具提示（`AgentLoop.toolActivityHint`）：`search_memory`→`正在回忆…`、`web_search`→`正在搜索…`、`web_fetch`→`正在读取网页…`、`search`→`正在搜索…`、`hot_board`→`正在看热榜…`、`memory_write`→`正在更新记忆…`、`upsert_lorebook_entry`→`已更新世界书…`、`send_sticker`→`正在挑表情…`，未知工具回退 `正在处理…`。
+工具提示（`AgentLoop.toolActivityHint`）：`search_memory`→`正在回忆…`、`web_search`→`正在搜索…`、`web_fetch`→`正在读取网页…`、`search`→`正在搜索…`、`hot_board`→`正在看热榜…`、`memory_write`→`正在更新记忆…`、`upsert_lorebook_entry`→`正在更新世界书…`、`send_sticker`→`正在挑表情…`，未知工具回退 `正在处理…`。发请求前的上下文组装阶段显示 `正在拼接上下文…`。
 
 > `quickReplies` 不是收尾门槛：worker 失败或只给出不足两条时没有按钮，正文照常显示；后台换位生成在**开关开启且 worker 未成功、或成功但不足两条**时运行，结果通过 `detectQuickReplyIssues` 才补上。worker 已给出两条时不再跑，避免抢写。
 
@@ -385,9 +385,9 @@ tools: AUTO 阶段 8 个工具 / FINAL 阶段无 tools（tool_choice 恒为 auto
 
 - **每条请求一行**：主对话用 `chat.main`——工具轮、FINAL 轮、外层重试的每一轮都是独立一行；turn worker 用 `chat.worker`（有用量、失败、或留下任何 note 才写；`phase` 为 `worker-failed: <原因>` 或 `worker-note: <原因>`）。后台（抽取/分析/场景/世界书/字段补全/快速回应）用自己的 taskType，不计入面板的主聊天行。
 - **失败也留痕**：空回复写一条 `chat.main` + `status=failed`、`phase=empty-reply`；异常轮把错误摘要写进 `phase`；辅助调用失败同样 `status=failed`。
-- **`cacheStats` 快照**在每个完成的回合写一次（取本轮**第一条** `chat.main` 的用量），只用于下一次发请求前的状态提示（命中为 0 时显示「缓存未命中，正在更新队列…」）；面板不读它，自己按 `requestMetrics` 现算。
-- **缓存面板（▾）**固定五行中文：**主聊天 / 后台处理 / 短期提取 / 记忆整理 / 世界书整理**（`CacheMenu`）。主聊天按 `round` 回溯到本回合的第一条 `chat.main` 并把各工具轮加总（没有 `round` 的旧行不显示，绝不拿单次请求冒充整轮）；其余四行各取该 taskType **最新的成功行**。失败请求仍留在调试明细，但**不参与缓存面板/命中率**，避免一条没有用量的失败行把上一次正常数据顶成「缓存 --」。没有用量时该行写「缓存 --」。
-- **逐请求明细**在设置页「调试信息」：复制出的 JSON 带最近 12 条 `RequestMetric`（`round`、`sectionChars`、`prefixChange`、tokens、`hitRate`），用于判断"这次破缓存是我改了设定、历史自然增长，还是某一段在膨胀"。
+- **`cacheStats` 快照**在每个完成的回合写一次（取本轮**第一条** `chat.main` 的用量），只作为兼容/诊断数据保留；它描述上一轮，不再驱动右上角状态。右上角在发请求前显示 `正在拼接上下文…`。
+- **缓存面板（▾）**固定两行中文：**主聊天 / 后台处理**（`CacheMenu`）。主聊天按 `round` 回溯到本回合的第一条 `chat.main` 并把各工具轮加总（没有 `round` 的旧行不显示，绝不拿单次请求冒充整轮）；后台处理取 `chat.worker` 最新的成功行。短期/长期/世界书等后台任务不放进缓存面板，避免用单次一次性请求的 0% 干扰判断。失败请求仍留在调试明细，但**不参与缓存面板/命中率**，避免一条没有用量的失败行把上一次正常数据顶成「缓存 --」。没有用量时该行写「缓存 --」。
+- **逐请求明细**在设置页「调试信息」：中文分字段展示最近 12 条 `RequestMetric`（类型、状态、耗时、输入/输出、命中/未命中、命中率、`contextChars`、`inputChars`、`prefixChange`、`commonHistoryMessages`、逐段 `sectionChars` 及合计），用于判断"这次破缓存是我改了设定、历史自然增长，还是某一段在膨胀"。回复原文不再放进调试信息。
 
 ## 七、人格与 Prompt
 

@@ -18,8 +18,8 @@ data class MemoryRetryUi(
 ) {
     val title: String
         get() = when (kind) {
-            MemoryTaskKind.Extraction -> "短期记忆整理失败"
-            MemoryTaskKind.Analysis -> "长期记忆整理失败"
+            MemoryTaskKind.Extraction -> "短期记忆生成失败"
+            MemoryTaskKind.Analysis -> "长期记忆生成失败"
             else -> "记忆整理失败"
         }
 }

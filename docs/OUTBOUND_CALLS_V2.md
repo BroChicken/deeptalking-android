@@ -496,7 +496,7 @@ tool: { content: <工具结果 JSON>, toolCallId }
 <对话 JSON：[{"id","role","content","timestamp"}]>
 ```
 
-失败退避：抽取失败按 `MemoryTaskKind.Extraction` 走 `scheduleMemoryRetry`/`canRunMemoryTask`（5/10/20… 分钟，封顶 30 分钟），连续第 3 次失败弹「短期记忆整理失败」，可选「重试 / 忽略」；忽略只关提示，后台继续退避重试，不丢批次。用户应答后把 `extractionPromptAcked` 持久化到 `Character.counters`，同一失败连击不再重复问；成功后清计数并复位，下一次连击会重新提示。手动重试只使用 `character.instant`（60 条窗口），窗口不足时返回“暂无可整理的新对话”且不递增失败数。
+失败退避：抽取失败按 `MemoryTaskKind.Extraction` 走 `scheduleMemoryRetry`/`canRunMemoryTask`（5/10/20… 分钟，封顶 30 分钟），连续第 3 次失败弹「短期记忆生成失败」，可选「重试 / 忽略」；忽略只关提示，后台继续退避重试，不丢批次。用户应答后把 `extractionPromptAcked` 持久化到 `Character.counters`，同一失败连击不再重复问；成功后清计数并复位，下一次连击会重新提示。手动重试只使用 `character.instant`（60 条窗口），窗口不足时返回“暂无可整理的新对话”且不递增失败数。
 
 ## 五、短期事件 → 长期记忆（analysis）
 
@@ -519,7 +519,7 @@ tool: { content: <工具结果 JSON>, toolCallId }
 category 可选: userProfile, relationship, events, promises, habits。value 必须写明主体：用户写“用户”，角色写角色名（群组写具体成员名），禁止“我/你/TA”。key 与 value 的时间一律写绝对日期（YYYY-MM-DD 或 YYYY-MM-DD 时段），禁止相对时间词。此处只提取用户的约定（promises 的 promisor=user，promisor 与 promisee 只能是 user 或 character）；角色单方承诺由主对话记录。
 ```
 
-失败退避：分析失败按 `MemoryTaskKind.Analysis` 走同一套指数退避，连续第 3 次失败弹「长期记忆整理失败」，可选「重试 / 忽略」；忽略只关提示，后台继续退避重试，不丢批次。用户应答后把 `analysisPromptAcked` 持久化到 `Character.counters`，同一失败连击不再重复问；成功后复位。
+失败退避：分析失败按 `MemoryTaskKind.Analysis` 走同一套指数退避，连续第 3 次失败弹「长期记忆生成失败」，可选「重试 / 忽略」；忽略只关提示，后台继续退避重试，不丢批次。用户应答后把 `analysisPromptAcked` 持久化到 `Character.counters`，同一失败连击不再重复问；成功后复位。
 
 ## 六、场景概要（scene）
 

@@ -535,7 +535,7 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
             title = { Text(prompt.title) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("「${prompt.characterName}」连续 3 次没有整理成功。")
+                    Text("「${prompt.characterName}」连续 3 次没有生成成功。")
                     if (prompt.reason.isNotBlank()) {
                         Text("原因：${prompt.reason}", fontSize = 13.sp)
                     }
@@ -966,15 +966,6 @@ private fun CacheMenu(metrics: List<RequestMetric>) {
     val worker = remember(metrics) {
         cacheLine("后台处理", latestTaskRows(metrics, "chat.worker"))
     }
-    val extraction = remember(metrics) {
-        cacheLine("短期提取", latestTaskRows(metrics, "extraction"))
-    }
-    val analysis = remember(metrics) {
-        cacheLine("记忆整理", latestTaskRows(metrics, "analysis"))
-    }
-    val lorebook = remember(metrics) {
-        cacheLine("世界书整理", latestTaskRows(metrics, "lorebook"))
-    }
 
     Box {
         Text(
@@ -999,10 +990,6 @@ private fun CacheMenu(metrics: List<RequestMetric>) {
                 Text("缓存命中率", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = legacy.text)
                 CacheLineRow(main)
                 CacheLineRow(worker)
-                Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(legacy.border))
-                CacheLineRow(extraction)
-                CacheLineRow(analysis)
-                CacheLineRow(lorebook)
             }
         }
     }
@@ -1019,7 +1006,7 @@ private fun CacheLineRow(line: CacheLine) {
             "缓存 --"
         } else {
             val rate = Math.round(hit * 100.0 / input).toInt()
-            "缓存命中 $rate%  ${compactTokens(hit)}/${compactTokens(input)}"
+            "命中率 $rate% · 命中 ${compactTokens(hit)} / 输入 ${compactTokens(input)}"
         }
         Text(text, fontSize = 11.sp, color = legacy.text, modifier = Modifier.weight(1f))
     }

@@ -48,8 +48,6 @@ import com.deeptalking.core.model.AppConfig
 import com.deeptalking.core.model.BuiltinPlatforms
 import com.deeptalking.core.model.PlatformSlot
 import com.deeptalking.core.model.RequestMetric
-import org.json.JSONArray
-import org.json.JSONObject
 
 private val THINKING_LEVELS = listOf(
     "none" to "无",
@@ -491,54 +489,9 @@ private fun LegacyModelField(value: String, suggestions: List<String>, onValueCh
 @Composable
 private fun DebugInfoPanel(config: AppConfig, metrics: List<RequestMetric>, context: Context) {
     val legacy = MaterialTheme.legacy
-    // Legacy `renderDebugInfo` (`status-settings.js:67-99`): the last reply as a
-    // pretty JSON payload plus its raw (pre-processing) text, then the last 12
-    // usage/cache metrics as JSON. `lastReplyDebug` holds the JSON object; the metrics
-    // come from the independent store (never from the legacy `config.requestMetrics`).
-    val parts = buildList {
-        val raw = config.lastReplyDebug
-        if (raw.isNotBlank()) {
-            val obj = runCatching { JSONObject(raw) }.getOrNull()
-            if (obj != null && obj.has("displayText")) {
-                add("【最近一次回应】\n" + obj.toString(2))
-                val full = obj.optString("fullText")
-                if (full.isNotBlank()) add("【原始回应（未处理）】\n" + full)
-            } else {
-                add("【最近一次回应】\n" + raw)
-            }
-        }
-        if (metrics.isNotEmpty()) {
-            val array = JSONArray()
-            metrics.takeLast(12).forEach { metric ->
-                val entry = JSONObject()
-                entry.put("at", metric.at)
-                entry.put("taskType", metric.taskType)
-                entry.put("status", metric.status)
-                if (metric.phase.isNotBlank()) entry.put("reason", metric.phase)
-                // 1-based request index inside its turn: tool rounds and retries are their
-                // own rows, so the index is what tells them apart.
-                entry.put("round", metric.round ?: JSONObject.NULL)
-                // Per volatile-context section size (only sections the request carried).
-                entry.put(
-                    "sectionChars",
-                    metric.sectionChars?.let { sections ->
-                        JSONObject().also { obj -> sections.forEach { (name, chars) -> obj.put(name, chars) } }
-                    } ?: JSONObject.NULL,
-                )
-                // Why the request prefix moved this round (`instructions-changed` /
-                // `tools-changed` / `history-rebased` / `history-extended`): the only way
-                // to tell a real cache miss caused by an edit from normal history growth.
-                if (!metric.prefixChange.isNullOrBlank()) entry.put("prefixChange", metric.prefixChange)
-                entry.put("characterId", metric.characterId ?: JSONObject.NULL)
-                entry.put("inputTokens", metric.inputTokens ?: JSONObject.NULL)
-                entry.put("hitTokens", metric.hitTokens ?: JSONObject.NULL)
-                entry.put("missTokens", metric.missTokens ?: JSONObject.NULL)
-                entry.put("hitRate", metric.hitRate ?: JSONObject.NULL)
-                array.put(entry)
-            }
-            add("【最近 API 用量与缓存统计】\n" + array.toString(2))
-        }
-    }
+    // Last-turn metadata plus the last 12 usage/cache rows, rendered as Chinese field
+    // labels and readable values. Reply/raw prose is intentionally not included.
+    val parts = formatDebugInfo(config, metrics)
     if (parts.isEmpty()) return
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
         Text("调试信息", fontSize = 12.sp, color = legacy.textMuted, modifier = Modifier.weight(1f))

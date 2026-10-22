@@ -505,7 +505,7 @@ class BackgroundTasks(
         val prompt = EXTRACTION_PROMPT_HEAD + countClause + EXTRACTION_PROMPT_TAIL +
             json.encodeToString(existingEvents) + "\n对话内容:\n" + json.encodeToString(payload)
 
-        onStatus("正在提取短期记忆…")
+        onStatus("正在生成短期记忆…")
         val reply = completeDetailed(EXTRACTION_SYSTEM, prompt, sessionId = sessionIdFor(character), taskType = "extraction")
         val raw = reply.text
         if (raw.isBlank()) {
@@ -765,7 +765,7 @@ class BackgroundTasks(
         }
         val prompt = ANALYSIS_PROMPT_HEAD + json.encodeToString(inputs) + ANALYSIS_PROMPT_TAIL
         val guard = captureGuard(character)
-        onStatus("正在分析长期记忆…")
+        onStatus("正在生成长期记忆…")
         val reply = completeDetailed(ANALYSIS_SYSTEM, prompt, sessionId = sessionIdFor(character), taskType = "analysis")
         val raw = reply.text
         if (!isGuardCurrent(guard)) return AnalysisOutcome(TaskStatus.Stale, character)

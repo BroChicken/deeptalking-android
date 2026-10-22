@@ -318,7 +318,7 @@ internal fun toolActivityHint(name: String): String = when (name) {
     "search" -> "正在搜索…"
     "hot_board" -> "正在看热榜…"
     "memory_write" -> "正在更新记忆…"
-    "upsert_lorebook_entry" -> "已更新世界书…"
+    "upsert_lorebook_entry" -> "正在更新世界书…"
     "send_sticker" -> "正在挑表情…"
     else -> "正在处理…"
 }

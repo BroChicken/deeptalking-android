@@ -22,6 +22,7 @@ dependencies {
     implementation(project(":core:data"))
     implementation(project(":core:security"))
     implementation(project(":engine:ondevice"))
+    implementation(libs.kotlinx.serialization.json)
     implementation(libs.androidx.activity.compose)
     implementation(platform(libs.compose.bom))
     implementation(libs.compose.ui)

@@ -806,7 +806,7 @@ class BackgroundTasksTest {
             onAuxiliaryUsage = { task, usage -> usages += task to usage },
         )
         background.analyzeShortToLongTerm(analyzableCharacter())
-        assertTrue(statuses.contains("正在分析长期记忆…"))
+        assertTrue(statuses.contains("正在生成长期记忆…"))
         assertEquals("analysis", usages.first().first)
         assertEquals(3, usages.first().second.inputTokens)
     }
