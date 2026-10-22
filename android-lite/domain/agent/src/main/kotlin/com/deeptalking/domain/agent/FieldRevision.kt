@@ -18,7 +18,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 
 /**
- * Single-field revision call (REPLY_PIPELINE_PLAN §12.1#7 / OUTBOUND_CALLS_V2 §三).
+ * Single-field revision call (see docs/AGENT_ARCHITECTURE.md, 静态字段修订 / OUTBOUND_CALLS_V2 §三).
  *
  * The old `update_character_field` tool let the main call rewrite a static field. The main
  * call is now plain text, so a dedicated auxiliary call does the rewrite: the client detects

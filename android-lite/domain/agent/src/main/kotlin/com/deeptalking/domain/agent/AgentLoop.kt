@@ -61,7 +61,7 @@ class AgentLoop(
 ) {
 
     /**
-     * Runs the turn in two phases (see REPLY_PIPELINE_PLAN §12.1#2):
+     * Runs the turn in two phases (see docs/AGENT_ARCHITECTURE.md, 对话循环):
      *
      * - `AUTO`: the model may call information tools. Tool rounds are tool-only; any prose
      *   that arrives alongside a call is discarded (the contract says "tool or prose, not

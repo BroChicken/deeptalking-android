@@ -337,7 +337,7 @@ private const val RULE_6 =
 
 /**
  * "This session's available tools" enumeration. It must list **every** registered tool
- * (`defaultTools`, docs/REPLY_PIPELINE_PLAN.md §10) — a partial list contradicts the
+ * (`defaultTools`, docs/AGENT_ARCHITECTURE.md 工具清单) — a partial list contradicts the
  * tool schemas actually sent and reads as "I don't have that capability".
  * `PromptToolListTest` guards it against drifting again.
  *
@@ -761,7 +761,7 @@ fun buildShortTermBlock(character: Character): String {
 }
 
 // ---------------------------------------------------------------------------
-// Volatile context (docs/OUTBOUND_CALLS_V2.md §一(二)4 + REPLY_PIPELINE_PLAN.md §11).
+// Volatile context (docs/OUTBOUND_CALLS_V2.md §一(二)4 + docs/AGENT_ARCHITECTURE.md volatile 11 段).
 //
 // Fixed order, empty sections omitted entirely:
 //   1 时间 · 2 当前状态 · 3 未完成事项 · 4 世界书 · 5 场景概要 · 6 记忆召回

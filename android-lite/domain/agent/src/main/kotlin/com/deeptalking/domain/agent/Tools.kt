@@ -12,7 +12,7 @@ import com.deeptalking.domain.agent.tools.WebSearchTool
 import com.deeptalking.domain.memory.MemoryService
 
 /**
- * Builds the default agent tool list (eight tools; see `docs/REPLY_PIPELINE_PLAN.md` §10).
+ * Builds the default agent tool list (eight tools; see `docs/AGENT_ARCHITECTURE.md`, 工具清单).
  *
  * Read: `search_memory` / `web_search` / `web_fetch` / `search` / `hot_board`.
  * Write: `memory_write` (memory) / `upsert_lorebook_entry` (world book).
