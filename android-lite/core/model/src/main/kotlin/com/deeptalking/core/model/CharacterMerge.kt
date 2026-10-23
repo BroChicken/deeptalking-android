@@ -52,7 +52,7 @@ fun mergeCharacterChanges(before: Character, after: Character, live: Character):
         workerIssues = pick(before.workerIssues, after.workerIssues, live.workerIssues),
         shortTerm = mergeEntryList(before.shortTerm, after.shortTerm, live.shortTerm) { it.id },
         longTerm = mergeMemories(before.longTerm, after.longTerm, live.longTerm),
-        instant = mergeEntryList(before.instant, after.instant, live.instant) { it.id },
+        instant = mergeInstant(before.instant, after.instant, live.instant),
         scenes = mergeEntryList(before.scenes, after.scenes, live.scenes) { it.id },
         stickers = pick(before.stickers, after.stickers, live.stickers),
         pendingRecall = mergeEntryList(before.pendingRecall, after.pendingRecall, live.pendingRecall) { it.id },
@@ -252,6 +252,27 @@ fun mergeTodos(before: List<Todo>, after: List<Todo>, live: List<Todo>): List<To
  * legacy window without ids is still consumed, while a concurrent writer's unlocatable entries
  * are never collapsed onto a single `""` key or silently dropped.
  */
+/**
+ * Instant-window merge. A fold deliberately shrinks the window to the low watermark;
+ * generic per-entry removal would let a stale live row drop messages that the fold kept.
+ * A write that shrinks the window to exactly [com.deeptalking.core.common.AppLimits.Memory.INSTANT_TRIM_FLOOR]
+ * entries is a fold commit: the written tail wins, and only live messages newer than its
+ * last sequence are appended.
+ */
+internal fun mergeInstant(
+    before: List<ChatMessage>,
+    after: List<ChatMessage>,
+    live: List<ChatMessage>,
+): List<ChatMessage> {
+    val isFoldCommit = after.size == com.deeptalking.core.common.AppLimits.Memory.INSTANT_TRIM_FLOOR &&
+        after.size < before.size
+    if (!isFoldCommit) return mergeEntryList(before, after, live) { it.id }
+    val seen = after.mapTo(HashSet()) { it.id }
+    val lastSequence = after.lastOrNull()?.sequence ?: 0
+    val newer = live.filter { it.id !in seen && it.sequence > lastSequence }
+    return after + newer
+}
+
 internal fun <T> mergeEntryList(
     before: List<T>,
     after: List<T>,
@@ -408,7 +429,7 @@ internal fun mergeMemberChanges(before: GroupMember, after: GroupMember, live: G
         dynamicStateMeta = mergeDynamicStateMeta(before.dynamicStateMeta, after.dynamicStateMeta, live.dynamicStateMeta),
         shortTerm = mergeEntryList(before.shortTerm, after.shortTerm, live.shortTerm) { it.id },
         longTerm = mergeMemories(before.longTerm, after.longTerm, live.longTerm),
-        instant = mergeEntryList(before.instant, after.instant, live.instant) { it.id },
+        instant = mergeInstant(before.instant, after.instant, live.instant),
         pendingRecall = mergeEntryList(before.pendingRecall, after.pendingRecall, live.pendingRecall) { it.id },
         scenes = mergeEntryList(before.scenes, after.scenes, live.scenes) { it.id },
         sceneState = pick(before.sceneState, after.sceneState, live.sceneState),

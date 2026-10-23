@@ -335,7 +335,21 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                     onOpenDrawer = { scope.launch { drawerState.open() } },
                     onSelectTheme = vm::setTheme,
                 )
-                if (status.isNotBlank()) {
+                val activeMemoryRetry = memoryRetryPrompt?.takeIf { it.characterId == activeId }
+                if (activeMemoryRetry != null) {
+                    Text(
+                        text = "${activeMemoryRetry.title}：${activeMemoryRetry.reason} · 点击重试",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.error,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.End,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { vm.retryMemoryNow() }
+                            .padding(end = 12.dp, top = 2.dp),
+                    )
+                } else if (status.isNotBlank()) {
                     Text(
                         status,
                         fontSize = 11.sp,
@@ -526,24 +540,6 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
             title = { Text("正在整理短期记忆…") },
             text = { Text("分批转成长期记忆，请稍候。") },
             confirmButton = {},
-        )
-    }
-
-    memoryRetryPrompt?.let { prompt ->
-        AlertDialog(
-            onDismissRequest = { vm.dismissMemoryRetry() },
-            title = { Text(prompt.title) },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("「${prompt.characterName}」连续 3 次没有生成成功。")
-                    if (prompt.reason.isNotBlank()) {
-                        Text("原因：${prompt.reason}", fontSize = 13.sp)
-                    }
-                    Text("重试会立刻再跑一次；忽略则不再提示，但后台仍会按退避继续尝试，不会丢数据。", fontSize = 13.sp)
-                }
-            },
-            confirmButton = { TextButton(onClick = { vm.retryMemoryNow() }) { Text("重试") } },
-            dismissButton = { TextButton(onClick = { vm.dismissMemoryRetry() }) { Text("忽略") } },
         )
     }
 

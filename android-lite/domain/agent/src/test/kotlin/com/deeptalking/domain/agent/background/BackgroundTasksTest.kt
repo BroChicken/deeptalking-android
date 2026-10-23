@@ -45,6 +45,22 @@ private class ScriptedLlm(private val responses: MutableList<String>) : LlmBacke
     override fun stream(request: LlmRequest): Flow<LlmChunk> = flowOf()
 }
 
+private class FlakyLlm(private val outcomes: MutableList<Any>) : LlmBackend {
+    override val id = "flaky"
+    val requests = mutableListOf<LlmRequest>()
+
+    override suspend fun complete(request: LlmRequest): LlmResult {
+        requests += request
+        return when (val outcome = outcomes.removeFirstOrNull()) {
+            is Throwable -> throw outcome
+            is String -> LlmResult(text = outcome)
+            else -> LlmResult(text = "")
+        }
+    }
+
+    override fun stream(request: LlmRequest): Flow<LlmChunk> = flowOf()
+}
+
 class BackgroundTasksTest {
 
     private fun tasks(responses: List<String>): Pair<BackgroundTasks, ScriptedLlm> {
@@ -1059,6 +1075,46 @@ class BackgroundTasksTest {
         assertEquals(listOf("user"), entry.sourceRoles)
         assertEquals(listOf("m2"), entry.userEvidence.map { it.sourceMessageId })
         assertTrue(entry.userEvidence.single().text.contains("看书"))
+    }
+
+    @Test
+    fun failedExtractionCommitsTwentyAndKeepsTheSameRequestForRetry() = runBlocking {
+        val instant = (0 until AppLimits.Memory.INSTANT).map { index ->
+            ChatMessage(
+                id = "m$index",
+                role = if (index % 2 == 0) Role.User else Role.Assistant,
+                content = if (index % 2 == 0) "用户消息$index" else "角色回复$index",
+                timestamp = "2026-08-01T15:00:00Z",
+            )
+        }
+        val character = Character(id = "c1", instant = instant)
+        val retries = ExtractionRetryStore()
+        val llm = FlakyLlm(
+            mutableListOf(
+                IllegalStateException("network down"),
+                """[{"content":"用户2026-08-01下午在家看书","eventTime":"2026-08-01T15:00:00Z","participants":["用户"],"location":"家"}]""",
+            ),
+        )
+        val background = BackgroundTasks(
+            llm = llm,
+            memory = MemoryServiceImpl(),
+            extractionRetries = retries,
+        )
+
+        val (firstStatus, committed) = background.extractMemoryStatus(character, instant)
+        assertEquals(BackgroundTasks.TaskStatus.Failure, firstStatus)
+        assertEquals(AppLimits.Memory.INSTANT_TRIM_FLOOR, committed.instant.size)
+        assertTrue(committed.instant.map { it.id } == instant.takeLast(AppLimits.Memory.INSTANT_TRIM_FLOOR).map { it.id })
+        val pending = retries.get("c1")
+        assertTrue(pending != null)
+
+        val (retryStatus, retried) = background.retryMemoryTask(committed, MemoryTaskKind.Extraction)
+
+        assertEquals(BackgroundTasks.TaskStatus.Success, retryStatus)
+        assertEquals(1, retried.shortTerm.size)
+        assertEquals(2, llm.requests.size)
+        assertEquals("retry must resend the retained request", llm.requests[0], llm.requests[1])
+        assertTrue(retries.get("c1") == null)
     }
 
     @Test

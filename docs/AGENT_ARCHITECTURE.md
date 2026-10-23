@@ -156,7 +156,7 @@ BackgroundTasks.scheduleTurn       后台：文风校对、快速回应校验/�
 | `final-empty` | FINAL 阶段没有正文 | 重试（≤2 次） | `正在重新生成…` |
 | `empty` | 重试后仍无正文 | 失败 | 外层提示"收到空回复，请重试。你的消息已保留。" |
 
-工具提示（`AgentLoop.toolActivityHint`）：`search_memory`→`正在回忆…`、`web_search`→`正在搜索…`、`web_fetch`→`正在读取网页…`、`search`→`正在搜索…`、`hot_board`→`正在看热榜…`、`memory_write`→`正在更新记忆…`、`upsert_lorebook_entry`→`正在更新世界书…`、`send_sticker`→`正在挑表情…`，未知工具回退 `正在处理…`。发请求前的上下文组装阶段显示 `正在拼接上下文…`。
+工具提示（`AgentLoop.toolActivityHint`）：`search_memory`→`正在回忆…`、`web_search`→`正在搜索…`、`web_fetch`→`正在读取网页…`、`search`→`正在搜索…`、`hot_board`→`正在看热榜…`、`memory_write`→`正在更新记忆…`、`upsert_lorebook_entry`→`正在更新世界书…`、`send_sticker`→`正在挑表情…`，未知工具回退 `正在处理…`。
 
 > `quickReplies` 不是收尾门槛：worker 失败或只给出不足两条时没有按钮，正文照常显示；后台换位生成在**开关开启且 worker 未成功、或成功但不足两条**时运行，结果通过 `detectQuickReplyIssues` 才补上。worker 已给出两条时不再跑，避免抢写。
 
@@ -176,8 +176,10 @@ BackgroundTasks.scheduleTurn       后台：文风校对、快速回应校验/�
 
 **上下文窗口（高/低水位 + 整窗折叠）**：`INSTANT=60` / `INSTANT_TRIM_FLOOR=20`、`SHORT_TERM=40` / `SHORT_TERM_TRIM_FLOOR=20`。两个窗口都是同一形态：
 
+- **`history` 与 `instant` 是两个独立状态**：`history` 是 Room `messages` 的完整聊天记录（UI 可上划查看），折叠永远不删除它；`instant` 是请求携带的逐字尾段，会随折叠变化。
 - **窗口内容就是状态**，且是**追加式**的：每轮只把窗口没见过的消息追加进 `instant`（`AppViewModel.growInstantWindow`），**绝不从聊天存档重建**（否则折叠裁掉的消息会被捞回来，窗口只涨不缩）。只有折叠那一轮才把窗口压回低水位；`shortTerm` 同理——只有整窗抽取会追加、只有同一轮折叠会压缩，所以窗口在两次折叠之间**逐字不变**。
-- **到高水位折叠（绝不按位置截断）**：`instant` 满 60 → **发送整个窗口**（60、61、62 条都发，绝不先砍成正好 60）→ `shortTerm` 追加条目 → **只消费刚读过的那一批**，保留最新 20 条作原文上下文；`shortTerm` 满 40 → 一次整窗分析（输入=整个 40 条窗口）→ 产出 `longTerm` → 落回最新 20 条。低水位留下的 20 条会作为下一次折叠的上下文被**再读一遍**（连贯性）；重复靠**提示词注入已有短期条目**压，不靠标记。**窗口超过 `INSTANT_MIGRATION_THRESHOLD`(120) 视为旧档遗留**，走**补课通道**（`BackgroundTasks.migrateOversizedWindow`：每批最旧的 60 条，折完即丢，**一次跑完**）；启动时检测到会**先弹确认框**（含「以后不再询问」），确认后弹**阻塞式**进度框，与正常通道严格分开。世界书条目内容超过 `Lorebook.CONTENT_CHARS`(400) 时同样由一次性重写处理（见"世界书"）。
+- **到高水位折叠（绝不按位置截断）**：`instant` 满 60 → **发送整个窗口**（60、61、62 条都发，绝不先砍成正好 60）→ **请求发出后立即把 instant 替换为本次批次的最后 20 条**（不等短期提取返回）→ 提取成功后只追加 `shortTerm`；提取失败保留这次请求，重试直接重发，不依赖已经折叠的 `instant`。`shortTerm` 满 40 → 一次整窗分析（输入=整个 40 条窗口）→ 产出 `longTerm` → 落回最新 20 条。低水位留下的 20 条会作为下一次折叠的上下文被**再读一遍**（连贯性）；重复靠**提示词注入已有短期条目**压，不靠标记。**窗口超过 `INSTANT_MIGRATION_THRESHOLD`(120) 视为旧档遗留**，走**补课通道**（`BackgroundTasks.migrateOversizedWindow`：每批最旧的 60 条，折完即丢，**一次跑完**）；启动时检测到会**先弹确认框**（含「以后不再询问」），确认后弹**阻塞式**进度框，与正常通道严格分开。世界书条目内容超过 `Lorebook.CONTENT_CHARS`(400) 时同样由一次性重写处理（见"世界书"）。
+- **窗口错误处理**：连续失败达到 3 次后，右上角显示红色可点击的「短期记忆生成失败 / 长期记忆生成失败」；短期提取的重试直接重发保留的请求，长期分析仍等成功后再消费 `shortTerm`。
 - **抽取不点名消息 id**：模型把整窗压成按"日期+时段"划分的事件摘要，**原话证据由客户端按同一时段从窗口里采**（挂成 `userEvidence`/`sourceRoles`）。因此没有"id 必须存在""必须连续覆盖"这类硬约束，单条出错不再作废整批。
 - **注入**：`instant` 整窗进历史；`shortTerm` 整窗进 **历史之前**的一条 user 块（`buildShortTermBlock`），因此它落在缓存前缀里。
 - **紧急上限**：`INSTANT_HARD_CAP=120` / `SHORT_TERM_HARD_CAP=80`，仅在折叠持续失败时生效（丢最旧的并在 `counters.analysisLastError` 写明原因，绝不静默）。
@@ -215,7 +217,7 @@ BackgroundTasks.scheduleTurn       后台：文风校对、快速回应校验/�
 
 | 任务 | 触发 | 计数器 | 说明 |
 |---|---|---|---|
-| 抽取（instant→shortTerm） | `instant` 满 `INSTANT`(60) | `extractionRetryAt` / `extractionFailures` | 整窗折叠成"日期+时段"事件摘要 |
+| 抽取（instant→shortTerm） | `instant` 满 `INSTANT`(60) | `extractionRetryAt` / `extractionFailures` | 整窗折叠成"日期+时段"事件摘要；请求发出后立即把窗口提交为最后 20 条，失败保留请求重发 |
 | 分析（shortTerm→longTerm） | `shortTerm` 低水位之上攒够 20 条 | `analysisRetryAt` / `analysisFailures` | **逐条容错**（单条校验不过只丢该条）＋**ack 宽容**（只承认批次内 id，缺的下轮再送）＋**截断抢救** `AnalysisSalvage`＋显式 `max_output_tokens` |
 | 场景概要 | 场景切换或跨度 ≥ `Scene.SPAN`(12) 条 | `sceneRetryAt` / `sceneFailures` | `summarizeScene` |
 | 世界书整理 | 跟随**抽取**：处理本次折叠刚产出的那批短期（排在分析之前） | `lorebookRetryAt` / `lorebookFailures` | `consolidateLorebook` + 容量驱动归档；失败的那批留在内存待重试 |
@@ -359,7 +361,7 @@ tools: AUTO 阶段 8 个工具 / FINAL 阶段无 tools（tool_choice 恒为 auto
 
 - **短期块放在历史之前**是有意的：它只在折叠那一轮变化，而折叠同时把历史 rebase 掉——即"它变的时候前缀本来就要断"。中间那段它逐字不变，于是和"追加式历史"一起待在缓存前缀里。
 - 前缀缓存的失配只应来自三处：`instructions-changed`（角色静态资料被改）、`tools-changed`、以及两个窗口各自的 `history-rebased`（折叠，约每 20 轮一次）。`AppViewModel.requestTrace` 把短期块作为首个伪条目纳入前缀快照，否则它的变化会被误报成 `history-extended`。
-- 历史**不逐轮滑动**：`AppViewModel.growInstantWindow` 只追加窗口没见过的消息，`ChatOrchestrator` 只取窗口末尾 `INSTANT`(60) 条作尺寸兜底。
+- 历史**不逐轮滑动**：`AppViewModel.growInstantWindow` 只追加窗口没见过的消息；`ChatOrchestrator` 直接使用 append-only 窗口，不再在请求侧 `takeLast(INSTANT)` 造成逐轮滑窗。
 - 图片保留窗口 `AppLimits.Media.IMAGE_RETENTION_MESSAGES`(60) 必须 ≥ `INSTANT`(60)：否则还在窗口内的消息会被剪掉图片，等于在稳定期中间改写前缀，还让模型"忘掉"刚看过的图。
 
 ### 提示词字符上限
@@ -385,7 +387,7 @@ tools: AUTO 阶段 8 个工具 / FINAL 阶段无 tools（tool_choice 恒为 auto
 
 - **每条请求一行**：主对话用 `chat.main`——工具轮、FINAL 轮、外层重试的每一轮都是独立一行；turn worker 用 `chat.worker`（有用量、失败、或留下任何 note 才写；`phase` 为 `worker-failed: <原因>` 或 `worker-note: <原因>`）。后台（抽取/分析/场景/世界书/字段补全/快速回应）用自己的 taskType，不计入面板的主聊天行。
 - **失败也留痕**：空回复写一条 `chat.main` + `status=failed`、`phase=empty-reply`；异常轮把错误摘要写进 `phase`；辅助调用失败同样 `status=failed`。
-- **`cacheStats` 快照**在每个完成的回合写一次（取本轮**第一条** `chat.main` 的用量），只作为兼容/诊断数据保留；它描述上一轮，不再驱动右上角状态。右上角在发请求前显示 `正在拼接上下文…`。
+- **`cacheStats` 快照**在每个完成的回合写一次（取本轮**第一条** `chat.main` 的用量），只作为兼容/诊断数据保留；它描述上一轮，不驱动右上角状态，也不显示“正在拼接上下文”。
 - **缓存面板（▾）**固定两行中文：**主聊天 / 后台处理**（`CacheMenu`）。主聊天按 `round` 回溯到本回合的第一条 `chat.main` 并把各工具轮加总（没有 `round` 的旧行不显示，绝不拿单次请求冒充整轮）；后台处理取 `chat.worker` 最新的成功行。短期/长期/世界书等后台任务不放进缓存面板，避免用单次一次性请求的 0% 干扰判断。失败请求仍留在调试明细，但**不参与缓存面板/命中率**，避免一条没有用量的失败行把上一次正常数据顶成「缓存 --」。没有用量时该行写「缓存 --」。
 - **逐请求明细**在设置页「调试信息」：中文分字段展示最近 12 条 `RequestMetric`（类型、状态、耗时、输入/输出、命中/未命中、命中率、`contextChars`、`inputChars`、`prefixChange`、`commonHistoryMessages`、逐段 `sectionChars` 及合计），用于判断"这次破缓存是我改了设定、历史自然增长，还是某一段在膨胀"。回复原文不再放进调试信息。
 
@@ -487,7 +489,7 @@ tools: AUTO 阶段 8 个工具 / FINAL 阶段无 tools（tool_choice 恒为 auto
 - **工具失败可恢复**：工具失败时回传可修正的提示（如 `memory_write` 找不到 ID 时提示先用 `search_memory` 查询）。工具返回 `ok:false` 不中断回合，模型下一轮可修正。
 - **工具轮上限**：`MAX_TOOL_ROUNDS`(5) 按"模型响应"（轮）计数，达到上限直接转 FINAL 出正文；同一条响应里的所有 `tool_calls` 都会被执行，不会把整轮耗在工具上。`MAX_TOOL_CALLS`(12) 目前无判定点（保留常量）。
 - **记忆任务重试**：`extraction` / `analysis` / `scene` / `lorebook` 四组计数器（`*Failures` / `*RetryAt`），`scheduleMemoryRetry` 指数退避（5→30 分钟封顶）。
-- **后台任务过期保护**：`captureGuard` / `isGuardCurrent`（`revision` + 末条消息 ID）保护**会覆盖用户可见状态**的任务（场景概要、静态补全、动态状态）；**折叠/分析这类只做增量的任务改为合并写回**——重读最新角色后把新条目追加到最新列表、只移除刚刚折过的那批，所以用户中途又发消息时折叠结果照样落地（不再整批判 `Stale` 丢弃）。
+- **后台任务过期保护**：`captureGuard` / `isGuardCurrent`（`revision` + 末条消息 ID）保护**会覆盖用户可见状态**的任务（场景概要、静态补全、动态状态）；**折叠/分析这类只做增量的任务改为合并写回**——折叠先在请求发出后提交 `instant` 的最后 20 条，提取结果只追加 `shortTerm`；失败保留原请求，不等待、不回灌旧窗口。
 - **摘要不被提前丢弃**：消费只发生在读它的那一趟之后——分析失败的批次原样留在窗口里、由退避门控重试；**世界书整理排在长期分析之前**、读的正是短期抽取刚产出的那批（再加内存里上次失败遗留的），逐条校验来源与字段，坏条目跳过（其余照常入库）并记录原因；这一趟失败时那批**留在内存待重试**（连续失败后弹窗问「重试 / 忽略」），不会因为分析随后消费掉短期条目而永久丢失。**窗口去重只在消费这一刻做**（`BackgroundTasks.settleShortTerm` → `MemoryPolicy.dedupeShortTerm`）：同一逻辑日+时段且相似度 ≥0.6，或全局 ≥`NEAR_DUP_SIMILARITY`(0.72) 合并；稳定期内不碰窗口，否则已发出的请求前缀会变得不可预测。
 - **写入只写自己那部分**：所有写路径（主对话收尾、后台维护、编辑器）都用 `mergeCharacterChanges`（`core:model`）把"本次真正改动的字段"合并到最新行上——普通字段按值差异判定、世界书**与长期记忆都按条目 id 三方合并**（并发新增的条目不会被抹掉，删除才真正删除）。因此长期的整份写回不再互相回滚：世界书整理只动世界书、聊天收尾不会再把你期间的世界书/记忆改动覆盖掉（连"只给某条承诺落确认戳"的那点改动也不会整表写回）。
 - **检索相关性下限**：`rankMemories` 只保留至少命中一个非停用词的候选，并用特异性下限 `MIN_MATCH_SCORE`(1.5) 过滤泛词命中；`pendingRecall` 优先占位；短指代查询经 `buildMemoryQuery` 补上下文；**用户提到具体日期时由模型用 `search_memory` 的 `date`/`timeRef` 按日期召回那天的原始对话与记忆**。

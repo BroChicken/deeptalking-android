@@ -25,19 +25,16 @@ internal fun growInstantWindow(instant: List<ChatMessage>, room: List<ChatMessag
     if (kept.isEmpty()) {
         return if (room.size > AppLimits.Memory.INSTANT) room.takeLast(AppLimits.Memory.INSTANT) else room
     }
-    // A normal fold never leaves a window below the low-water mark. If a partial
-    // write/import left only one synthetic assistant message while the chat archive
-    // is intact, rebuilding from the tail is safe and prevents a permanently
-    // context-less conversation (the merge path cannot resurrect lost entries).
-    if (kept.size < AppLimits.Memory.INSTANT_TRIM_FLOOR &&
-        room.size >= AppLimits.Memory.INSTANT_TRIM_FLOOR
-    ) {
+    // Only a truly collapsed window (one synthetic/in-flight message) is rebuilt. A
+    // legitimate fold can leave 18/19 messages, and treating that as corruption used to
+    // re-inject already folded history on every turn.
+    if (kept.size <= 1 && room.size > kept.size) {
         return room.takeLast(AppLimits.Memory.INSTANT)
     }
     val lastSeen = kept.maxOf { roomIndex.getValue(it.id) }
     val seen = kept.mapTo(HashSet()) { it.id }
     val appended = room.drop(lastSeen + 1).filter { it.id !in seen }
-    // Safety clamp: an imported/legacy window can be far larger than the watermark
-    // (the archive never drops rows). Only the recent slice is the working window.
-    return (kept + appended).takeLast(AppLimits.Memory.INSTANT)
+    // Append-only: the fold is the only trim point. Clamping here would slide the
+    // window by the number of new messages and break the request prefix every turn.
+    return kept + appended
 }

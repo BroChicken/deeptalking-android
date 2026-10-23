@@ -1801,10 +1801,6 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 var result: OrchestratorResult? = null
                 val attemptResults = mutableListOf<OrchestratorResult>()
                 var receiveLogged = false
-                // The next phase assembles system/history/volatile/tools and then sends the
-                // request. Cache stats describe the previous turn and are not a prediction
-                // for this one, so they no longer drive the activity hint.
-                statusState.value = "正在拼接上下文…"
                 val outcome = orchestrator.run(
                     character = character,
                     history = character.instant,
@@ -3247,7 +3243,8 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                     memoryPromptsRestored = true
                     list.forEach { character ->
                         if (character.counters.extractionFailures >= 3 &&
-                            !character.counters.extractionPromptAcked
+                            !character.counters.extractionPromptAcked &&
+                            core.hasPendingExtraction(character.id)
                         ) {
                             enqueueMemoryRetry(
                                 MemoryRetryUi(

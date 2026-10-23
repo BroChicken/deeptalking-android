@@ -9,7 +9,7 @@ data class MemoryRetryOutcome(
     val reason: String = "",
 )
 
-/** A third consecutive extraction/analysis failure waiting for retry or ignore. */
+/** A failed extraction/analysis request waiting for the top-right retry affordance. */
 data class MemoryRetryUi(
     val kind: MemoryTaskKind,
     val characterId: String,

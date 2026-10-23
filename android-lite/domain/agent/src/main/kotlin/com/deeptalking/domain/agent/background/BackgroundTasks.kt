@@ -68,6 +68,8 @@ import com.deeptalking.engine.ondevice.LlmRequest
 import com.deeptalking.engine.ondevice.TokenUsage
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
@@ -340,6 +342,8 @@ class BackgroundTasks(
      * keeps trying.
      */
     private val onMemoryRetryNeeded: (MemoryTaskKind, String) -> Unit = { _, _ -> },
+    /** Failed extraction requests are retained here so the retry button can resend them. */
+    private val extractionRetries: ExtractionRetryStore? = null,
 ) {
 
     /**
@@ -422,16 +426,16 @@ class BackgroundTasks(
 
     /**
      * Extracts new short-term events from the live instant window (legacy
-     * `extractInstantToShortTerm`). Returns a changed character on success and the
-     * unchanged character on failure, so callers can schedule a retry.
+     * `extractInstantToShortTerm`). Returns the committed window even when the request
+     * fails, so callers can persist the fold and retry the retained request.
      */
     suspend fun extractMemory(
         character: Character,
         messages: List<ChatMessage>,
         migration: Boolean = false,
     ): Character {
-        val (status, updated) = extractInstantToShortTermTask(character, migration)
-        return if (status == TaskStatus.Success) updated else character
+        val (_, updated) = extractInstantToShortTermTask(character, migration)
+        return updated
     }
 
     /** Extraction with an explicit status (legacy `extractInstantToShortTerm`), including `Stale`. */
@@ -439,7 +443,8 @@ class BackgroundTasks(
         character: Character,
         messages: List<ChatMessage>,
         migration: Boolean = false,
-    ): Pair<TaskStatus, Character> = extractInstantToShortTermTask(character, migration)
+        onCommitted: (Character) -> Unit = {},
+    ): Pair<TaskStatus, Character> = extractInstantToShortTermTask(character, migration, onCommitted)
 
     /**
      * Normal fold (legacy `extractInstantToShortTerm`): the window *is* the unit.
@@ -458,8 +463,9 @@ class BackgroundTasks(
     private suspend fun extractInstantToShortTermTask(
         character: Character,
         migration: Boolean = false,
+        onCommitted: (Character) -> Unit = {},
     ): Pair<TaskStatus, Character> =
-        foldWindow(character, if (migration) FoldMode.Migration else FoldMode.Normal)
+        foldWindow(character, if (migration) FoldMode.Migration else FoldMode.Normal, onCommitted)
 
     /** Which slice of the window one pass consumes. */
     private enum class FoldMode { Normal, Migration }
@@ -470,11 +476,16 @@ class BackgroundTasks(
      * the oldest [AppLimits.Memory.INSTANT] messages (a huge legacy window cannot be
      * sent at once) and drops exactly those, so the backlog is walked oldest-first.
      *
-     * The result is merged into the **live** character, not into the captured snapshot:
-     * a turn that arrives while the model works keeps its new messages and the fold
-     * still lands, instead of the whole pass being thrown away.
+     * The normal fold commits the window to the captured batch's last 20 messages before
+     * waiting for the model. The extraction reply then only appends short-term entries;
+     * a turn that arrives during the request stays in history and is appended later.
+     * A failed request is retained in [ExtractionRetryStore] and resent verbatim.
      */
-    private suspend fun foldWindow(character: Character, mode: FoldMode): Pair<TaskStatus, Character> {
+    private suspend fun foldWindow(
+        character: Character,
+        mode: FoldMode,
+        onCommitted: (Character) -> Unit = {},
+    ): Pair<TaskStatus, Character> {
         val window = character.instant.filter { !it.isLoading }
         if (window.size < AppLimits.Memory.INSTANT) return TaskStatus.Failure to character
         // Normal sends the window as it stands (never cut to a fixed 60); migration takes
@@ -504,24 +515,78 @@ class BackgroundTasks(
         val countClause = if (mode == FoldMode.Migration) EXTRACTION_COUNT_UNLIMITED else EXTRACTION_COUNT_LIMITED
         val prompt = EXTRACTION_PROMPT_HEAD + countClause + EXTRACTION_PROMPT_TAIL +
             json.encodeToString(existingEvents) + "\n对话内容:\n" + json.encodeToString(payload)
+        val request = extractionRequest(character, prompt)
+        val pending = PendingExtraction(
+            request = request,
+            sourceMessages = sourceMessages,
+            migration = mode == FoldMode.Migration,
+        )
+        extractionRetries?.put(character.id, pending)
 
         onStatus("正在生成短期记忆…")
-        val reply = completeDetailed(EXTRACTION_SYSTEM, prompt, sessionId = sessionIdFor(character), taskType = "extraction")
-        val raw = reply.text
-        if (raw.isBlank()) {
-            if (reply.error.isNotBlank()) onAuxiliaryFailure("extraction", reply.error)
-            return TaskStatus.Failure to character
+        // Normal folds commit the window immediately. Migration is the one-time overload
+        // path: it must keep the remaining backlog until it has walked every batch, so it
+        // only consumes the batch after that pass succeeds.
+        val batchIds = sourceMessages.mapTo(HashSet()) { it.id }
+        val committed = if (mode == FoldMode.Migration) {
+            character
+        } else {
+            character.copy(instant = sourceMessages.takeLast(AppLimits.Memory.INSTANT_TRIM_FLOOR))
         }
+        return coroutineScope {
+            val reply = async { completeRequest(request, "extraction") }
+            onCommitted(committed)
+            val completion = reply.await()
+            val raw = completion.text
+            if (raw.isBlank()) {
+                onMemoryRetryNeeded(MemoryTaskKind.Extraction, character.id)
+                return@coroutineScope TaskStatus.Failure to committed
+            }
+            val updated = applyExtraction(committed, sourceMessages, raw, mode)
+            if (updated != null) {
+                extractionRetries?.clear(character.id)
+                val finished = if (mode == FoldMode.Migration) {
+                    updated.copy(instant = updated.instant.filterNot { it.id in batchIds })
+                } else {
+                    updated
+                }
+                TaskStatus.Success to finished
+            } else {
+                onMemoryRetryNeeded(MemoryTaskKind.Extraction, character.id)
+                TaskStatus.Failure to committed
+            }
+        }
+    }
 
+    private fun extractionRequest(character: Character, prompt: String): LlmRequest =
+        LlmRequest(
+            model = model,
+            instructions = EXTRACTION_SYSTEM,
+            input = listOf(ChatMessage(role = Role.User, content = prompt)),
+            temperature = normalizeTemperature(config.temperature),
+            maxOutputTokens = AppLimits.Api.AUXILIARY_MAX_OUTPUT_TOKENS,
+            stream = false,
+            reasoningEffort = "none",
+            apiPlatform = apiPlatform,
+            sessionId = sessionIdFor(character),
+            auxiliary = true,
+        )
+
+    /**
+     * Applies one extraction reply to the live character. It only appends short-term
+     * memories; the instant window was already committed by [foldWindow].
+     */
+    private suspend fun applyExtraction(
+        character: Character,
+        sourceMessages: List<ChatMessage>,
+        raw: String,
+        mode: FoldMode,
+    ): Character? {
         val root = ResponseParser.parseJsonLenient(raw)
         var points = (root as? JsonArray)?.mapNotNull { it as? JsonObject }.orEmpty()
         if (mode == FoldMode.Normal) points = points.take(15)
-        if (points.isEmpty()) return TaskStatus.Failure to character
+        if (points.isEmpty()) return null
 
-        // The evidence anchor is collected client-side: an event owns the user lines
-        // that fall in the same logical day + time slot. No message ids are demanded
-        // from the model, so one bad citation can no longer discard the whole fold, and
-        // a beat the character narrated alone still gets an entry (with no user quote).
         val userMessages = sourceMessages.filter { it.role == Role.User && it.content.isNotBlank() }
         val prepared = mutableListOf<PreparedPoint>()
         for (point in points) {
@@ -542,23 +607,12 @@ class BackgroundTasks(
                 location = point.string("location").trim(),
             )
         }
-        if (prepared.isEmpty()) return TaskStatus.Failure to character
+        if (prepared.isEmpty()) return null
 
-        // Merge-write. The drafts land on the *live* character, never on the captured
-        // snapshot, so a turn that arrives during the request keeps its own new messages
-        // and the fold still advances (the old all-or-nothing stale guard discarded the
-        // whole pass whenever the user typed again during those seconds).
-        // Stale only when the conversation moved on without us: the batch is gone.
+        // Citations belong to the batch that was summarized. The live row may already
+        // have advanced; it only contributes newer short-term entries and existing
+        // source ids, never the authority for this batch.
         val live = liveCharacter(character.id) ?: character
-        val liveIds = live.instant.mapTo(HashSet()) { it.id }
-        if (sourceMessages.none { it.id in liveIds }) return TaskStatus.Stale to character
-
-        // Citations belong to the batch that was just summarized, not to whatever
-        // happens to be left in the live window when the model returns. A turn can
-        // advance the window while the request is in flight, so resolving only
-        // against `live` silently stripped every source from the new summaries.
-        // The captured batch is authoritative for this pass; live sources still
-        // resolve pre-existing entries when a summary merges into one of them.
         val capturedSources = sourceMessages.associate { message ->
             message.id to SourceRef(
                 id = message.id,
@@ -598,21 +652,43 @@ class BackgroundTasks(
                 accepted++
             }
         }
-        if (accepted == 0) return TaskStatus.Failure to character
+        if (accepted == 0) return null
+        // The normal fold's window was already committed. Do not let a stale live row
+        // (the async persist may not have landed yet) write the pre-fold window back.
+        // Any message that arrived during extraction stays in history and is appended on
+        // the next turn.
+        if (mode == FoldMode.Normal) working = working.copy(instant = character.instant)
+        return settleShortTerm(working)
+    }
 
-        // Consume exactly what this pass folded — never "keep the newest 20 by position",
-        // which on a legacy backlog would throw away messages no pass had ever read.
-        // Normal keeps the newest window slice as verbatim context; migration drops the
-        // whole batch (there is more backlog behind it). Anything that arrived during
-        // the request is untouched.
-        val consumed = sourceMessages.mapTo(HashSet()) { it.id }
-        val keep: Set<String> = if (mode == FoldMode.Normal) {
-            sourceMessages.takeLast(AppLimits.Memory.INSTANT_TRIM_FLOOR).mapTo(HashSet()) { it.id }
-        } else {
-            emptySet()
+    private suspend fun retryPendingExtraction(
+        character: Character,
+        pending: PendingExtraction,
+    ): Pair<TaskStatus, Character> {
+        onStatus("正在生成短期记忆…")
+        val completion = completeRequest(pending.request, "extraction")
+        if (completion.text.isBlank()) {
+            onMemoryRetryNeeded(MemoryTaskKind.Extraction, character.id)
+            return TaskStatus.Failure to character
         }
-        working = working.copy(instant = working.instant.filterNot { it.id in consumed && it.id !in keep })
-        return TaskStatus.Success to settleShortTerm(working)
+        val mode = if (pending.migration) FoldMode.Migration else FoldMode.Normal
+        val updated = applyExtraction(
+            character = character,
+            sourceMessages = pending.sourceMessages,
+            raw = completion.text,
+            mode = mode,
+        ) ?: run {
+            onMemoryRetryNeeded(MemoryTaskKind.Extraction, character.id)
+            return TaskStatus.Failure to character
+        }
+        extractionRetries?.clear(character.id)
+        val finished = if (mode == FoldMode.Migration) {
+            val batchIds = pending.sourceMessages.mapTo(HashSet()) { it.id }
+            updated.copy(instant = updated.instant.filterNot { it.id in batchIds })
+        } else {
+            updated
+        }
+        return TaskStatus.Success to finished
     }
 
     /**
@@ -645,7 +721,12 @@ class BackgroundTasks(
         val nowMillis = System.currentTimeMillis()
         return when (task) {
             MemoryTaskKind.Extraction -> {
-                val (status, updated) = extractMemoryStatus(character, messages)
+                val pending = extractionRetries?.get(character.id)
+                val (status, updated) = if (pending != null) {
+                    retryPendingExtraction(character, pending)
+                } else {
+                    extractMemoryStatus(character, messages)
+                }
                 val counters = when (status) {
                     TaskStatus.Success -> resetMemoryRetry(countersOf(updated), MemoryTaskKind.Extraction)
                     TaskStatus.Failure -> scheduleMemoryRetry(countersOf(updated), MemoryTaskKind.Extraction, nowMillis)
@@ -1479,13 +1560,14 @@ class BackgroundTasks(
     suspend fun migrateOversizedWindow(
         character: Character,
         onProgress: (batchesDone: Int, remaining: Int) -> Unit = { _, _ -> },
+        onCommitted: (Character) -> Unit = {},
     ): Pair<TaskStatus, Character> {
         var working = character
         var size = working.instant.count { !it.isLoading }
         if (size <= AppLimits.Memory.INSTANT_MIGRATION_THRESHOLD) return TaskStatus.Success to working
         var done = 0
         while (size > AppLimits.Memory.INSTANT) {
-            val (status, updated) = foldWindow(working, FoldMode.Migration)
+            val (status, updated) = foldWindow(working, FoldMode.Migration, onCommitted)
             if (status != TaskStatus.Success) return status to working
             val next = updated.instant.count { !it.isLoading }
             // No forward progress would spin forever; leave the rest for the next attempt.
@@ -1883,12 +1965,17 @@ class BackgroundTasks(
         // pass at the high watermark). Nothing else may append to the window in
         // between, which is what keeps the injected short-term block byte-stable while
         // the history grows (cache hit) and lets its changes ride along with the fold.
+        // A failed request already holds the exact batch to retry; do not overwrite it
+        // with a newer fold while the red retry affordance is waiting.
+        val hasPendingExtraction = extractionRetries?.get(working.id) != null
         // Oversized window (legacy/anomalous backlog): walk it in batches, oldest first,
         // until it is back inside the normal range. The whole-window fold below cannot
         // send hundreds of messages at once, so the two paths are kept strictly apart.
-        if (hasOversizedWindow(working) && canRunMemoryTask(counters, MemoryTaskKind.Extraction, nowMillis)) {
+        if (!hasPendingExtraction && hasOversizedWindow(working) &&
+            canRunMemoryTask(counters, MemoryTaskKind.Extraction, nowMillis)
+        ) {
             val hadIds = working.shortTerm.mapTo(HashSet()) { it.id }
-            val (status, migrated) = migrateOversizedWindow(working)
+            val (status, migrated) = migrateOversizedWindow(working, onCommitted = onCharacterUpdated)
             working = migrated
             if (status == TaskStatus.Success) {
                 newlyExtracted = working.shortTerm.filterNot { it.id in hadIds }
@@ -1902,11 +1989,15 @@ class BackgroundTasks(
                 }
                 TaskStatus.Stale -> counters
             }
-        } else if (working.instant.size >= AppLimits.Memory.INSTANT &&
+        } else if (!hasPendingExtraction && working.instant.size >= AppLimits.Memory.INSTANT &&
             canRunMemoryTask(counters, MemoryTaskKind.Extraction, nowMillis)
         ) {
             val hadIds = working.shortTerm.mapTo(HashSet()) { it.id }
-            val (extractStatus, extracted) = extractMemoryStatus(working, messages)
+            val (extractStatus, extracted) = extractMemoryStatus(
+                character = working,
+                messages = messages,
+                onCommitted = onCharacterUpdated,
+            )
             when (extractStatus) {
                 TaskStatus.Success -> {
                     working = extracted
@@ -1916,6 +2007,9 @@ class BackgroundTasks(
                     counters = resetMemoryRetry(counters, MemoryTaskKind.Extraction)
                 }
                 TaskStatus.Failure -> {
+                    // The window was committed before the request; keep that commit even
+                    // when extraction failed. The retained request is retried later.
+                    working = extracted
                     counters = scheduleMemoryRetry(counters, MemoryTaskKind.Extraction, nowMillis)
                     maybeAskMemoryRetry(MemoryTaskKind.Extraction, working.id, counters)
                 }
@@ -2055,6 +2149,11 @@ class BackgroundTasks(
             sessionId = sessionId ?: "deeptalking-general",
             auxiliary = true,
         )
+        return completeRequest(request, taskType)
+    }
+
+    /** Sends one already-built request; extraction retries resend the same object. */
+    private suspend fun completeRequest(request: LlmRequest, taskType: String): Completion {
         var attempt = 0
         while (true) {
             try {

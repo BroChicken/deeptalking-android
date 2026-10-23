@@ -45,6 +45,7 @@ import com.deeptalking.domain.agent.ToolRegistry
 import com.deeptalking.domain.agent.background.BackgroundTaskQueue
 import com.deeptalking.domain.agent.background.BackgroundTasks
 import com.deeptalking.domain.agent.background.LorebookRetryStore
+import com.deeptalking.domain.agent.background.ExtractionRetryStore
 import com.deeptalking.domain.agent.background.MemoryTaskKind
 import com.deeptalking.domain.agent.defaultTools
 import com.deeptalking.domain.memory.MemoryServiceImpl
@@ -274,6 +275,7 @@ class NativeCore(context: Context) {
                 recordAuxMetric(config, taskType, System.currentTimeMillis(), null, "note", note)
             },
             lorebookRetries = lorebookRetries,
+            extractionRetries = extractionRetries,
             onLorebookRetryNeeded = { characterId ->
                 onLorebookRetryNeeded?.invoke(
                     characterId,
@@ -301,6 +303,9 @@ class NativeCore(context: Context) {
      * one is built per turn). See [LorebookRetryStore].
      */
     private val lorebookRetries = LorebookRetryStore()
+
+    /** Failed short-term extraction requests, shared across per-turn background instances. */
+    private val extractionRetries = ExtractionRetryStore()
 
     /**
      * Raised once a world-book batch has failed enough times that the app should ask the
@@ -333,9 +338,11 @@ class NativeCore(context: Context) {
     ): MemoryRetryOutcome = withContext(Dispatchers.IO) {
         val character = data.characters.get(characterId)
             ?: return@withContext MemoryRetryOutcome(ok = false, reason = "角色不存在")
-        // Extraction folds `character.instant`, not the 400-row archive. Re-feeding the
-        // archive here would re-fold already-consumed history and inflate the request.
+        // A failed extraction keeps its full request in `extractionRetries`; the instant
+        // window has already been folded, so the old size check must not block the retry.
+        // Only a fresh, never-folded window with no retained request is a no-op.
         if (kind == MemoryTaskKind.Extraction &&
+            extractionRetries.get(characterId) == null &&
             character.instant.count { !it.isLoading } < AppLimits.Memory.INSTANT
         ) {
             return@withContext MemoryRetryOutcome(ok = true, noop = true, reason = "暂无可整理的新对话")
@@ -374,6 +381,9 @@ class NativeCore(context: Context) {
             }
         }
     }
+
+    /** True when a failed extraction request is still held in memory for retry. */
+    fun hasPendingExtraction(characterId: String): Boolean = extractionRetries.get(characterId) != null
 
     /** True when a world-book batch is waiting for the user's retry/drop decision. */
     fun hasPendingLorebookRetry(characterId: String): Boolean = lorebookRetries.awaitingUser(characterId)
@@ -702,10 +712,13 @@ class NativeCore(context: Context) {
         var batches = 0
         for (character in data.characters.all()) {
             if (!tasks.hasOversizedWindow(character)) continue
-            val (status, updated) = tasks.migrateOversizedWindow(character) { done, remaining ->
-                batches = maxOf(batches, done)
-                onProgress(done, remaining)
-            }
+            val (status, updated) = tasks.migrateOversizedWindow(
+                character = character,
+                onProgress = { done, remaining ->
+                    batches = maxOf(batches, done)
+                    onProgress(done, remaining)
+                },
+            )
             if (updated != character) persistMemory(character, updated)
             if (status == BackgroundTasks.TaskStatus.Failure) {
                 return@withContext MigrationResult(batches, migrationFailure("提取记忆", lastFailureNote("extraction")))
@@ -1330,6 +1343,7 @@ class NativeCore(context: Context) {
                 recordAuxMetric(config, taskType, System.currentTimeMillis(), null, "note", note)
             },
             lorebookRetries = lorebookRetries,
+            extractionRetries = extractionRetries,
             onLorebookRetryNeeded = { characterId ->
                 onLorebookRetryNeeded?.invoke(
                     characterId,

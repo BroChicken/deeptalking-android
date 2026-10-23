@@ -34,6 +34,42 @@ class CharacterMergeTest {
     }
 
     @Test
+    fun aFoldKeepsItsTwentyMessageWindowEvenWhenLiveIsStale() {
+        val before = Character(
+            id = "c1",
+            instant = (0 until 30).map {
+                ChatMessage(id = "m$it", role = Role.User, content = "消息$it", sequence = it)
+            },
+        )
+        val after = before.copy(instant = before.instant.takeLast(20))
+        val staleLive = before.copy(instant = before.instant.takeLast(18))
+
+        val merged = mergeCharacterChanges(before, after, staleLive)
+
+        assertEquals(after.instant.map { it.id }, merged.instant.map { it.id })
+    }
+
+    @Test
+    fun aFoldAppendsMessagesThatArrivedAfterItsBatch() {
+        val before = Character(
+            id = "c1",
+            instant = (0 until 30).map {
+                ChatMessage(id = "m$it", role = Role.User, content = "消息$it", sequence = it)
+            },
+        )
+        val after = before.copy(instant = before.instant.takeLast(20))
+        val liveWithNewer = before.copy(
+            instant = before.instant.takeLast(20) +
+                ChatMessage(id = "m30", role = Role.User, content = "新消息", sequence = 30),
+        )
+
+        val merged = mergeCharacterChanges(before, after, liveWithNewer)
+
+        assertEquals(21, merged.instant.size)
+        assertEquals("m30", merged.instant.last().id)
+    }
+
+    @Test
     fun workerIssuesFollowTheTurnWriter() {
         val before = Character(id = "c1", workerIssues = listOf("待办：期限不明"))
         val after = before.copy(workerIssues = listOf("情绪：证据不符"))

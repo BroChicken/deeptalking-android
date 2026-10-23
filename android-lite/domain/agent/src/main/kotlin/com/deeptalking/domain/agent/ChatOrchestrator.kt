@@ -1,6 +1,5 @@
 package com.deeptalking.domain.agent
 
-import com.deeptalking.core.common.AppLimits
 import com.deeptalking.core.common.trimTo
 import com.deeptalking.core.model.AppConfig
 import com.deeptalking.core.model.Character
@@ -176,9 +175,9 @@ class ChatOrchestrator(
         val instructions = buildSystemPrompt(PersonaInputs(character, config, proactive))
         val context = AgentContext(character = character, activeCharacterId = character.id)
 
-        val mapped = builder.mapHistory(history).let { mapped ->
-            if (mapped.size > AppLimits.Memory.INSTANT) mapped.takeLast(AppLimits.Memory.INSTANT) else mapped
-        }.toMutableList()
+        // Append-only: the fold pass is the only place that trims the window. Taking
+        // `takeLast(INSTANT)` here would slide the prefix by the new messages every turn.
+        val mapped = builder.mapHistory(history).toMutableList()
         // The history must end with the user's turn. A proactive opening has **no** user
         // message at all — appending an empty placeholder would tell the model the user
         // just said nothing, so the request keeps the real (user-less) shape instead.

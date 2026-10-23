@@ -44,4 +44,13 @@ class InstantWindowTest {
         val grown = growInstantWindow(instant, room(25))
         assertEquals((1..25).map { "m$it" }, grown.map { it.id })
     }
+
+    @Test
+    fun `a legitimate short tail is not rebuilt from history`() {
+        // A fold can legitimately leave fewer than 20 messages (for example while the
+        // newest batch is still being resolved). It is a tail, not a collapsed window.
+        val instant = (380..396).map { message("m$it", it) }
+        val grown = growInstantWindow(instant, room(400))
+        assertEquals((380..400).map { "m$it" }, grown.map { it.id })
+    }
 }
