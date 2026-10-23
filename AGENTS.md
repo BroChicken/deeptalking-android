@@ -30,6 +30,7 @@
      —— 本机 keystore 签名构建 release APK，归档 `apk/DeepTalking-lite-v<版本>.apk`，
      再用 `gh` 把**这个本地包**创建/覆盖上传到 GitHub Release（tag `v<版本>`）；
   4. 提交版本改动并 `git push`。
+  - **如果 `git push` 因网络不可达失败**：不要反复重试、不要改写历史或强推；保留本地提交，向用户报告提交 SHA 和「推送失败」，等网络恢复后再推即可。
   CI（`.github/workflows/verify-lite.yml`）只跑「编译 + 单测」当门禁，**不出包、不发布**。
 - **版本号没变就不要出包**：Release 用 `versionName` 当标签，同名 Release 已存在时 `-Publish` 会 `--clobber` 覆盖已发布的 APK（等于把同版本的包换掉）。
 - 升 X 或 Y 由用户决定，**若我认为需要升 X 或 Y，必须先询问用户**。
