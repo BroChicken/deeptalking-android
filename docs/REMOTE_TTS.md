@@ -127,7 +127,8 @@ tools\run-cosyvoice-server.bat            # 之后 auto 就会自动认它
 ### 2.4 防火墙与路由
 
 Windows 常把这些网卡判成「公用网络」，防火墙会默认拦住 8080 且不一定弹窗，加一条不依赖网络分类的
-显式规则（`-OpenFirewall` 会自动做，需管理员）：
+显式规则（`-OpenFirewall` 会自动做；规则只在**第一次**需要管理员——非提权窗口里它会弹一次 UAC，
+用一个只加规则的提权子进程完成，失败才打印「Access denied / System Error 5」和手工命令）：
 
 ```powershell
 New-NetFirewallRule -DisplayName "cosyvoice-server" -Direction Inbound -Protocol TCP `
@@ -288,8 +289,9 @@ foreach ($ip in '<手机链路地址>','<本机 Wi-Fi 地址>','127.0.0.1','192.
 **别的网络里的机器扫 8080 只会得到「连不上」，连端口是否开着都看不出来**——这就是"绑具体地址"而不是
 "绑 `0.0.0.0` 再靠防火墙"的关键区别。
 
-防火墙里只应有一条由本方案添加的规则 `Inbound / Allow / TCP 8080`（首次运行 `-OpenFirewall` 时创建；
-若发现 `Action=Block` 见第 7 节的说明）。除 8080 外的监听端口都属系统或其他软件，与本方案无关。
+防火墙里只应有一条由本方案添加的规则 `Inbound / Allow / TCP 8080`（首次运行 `-OpenFirewall` 时创建，
+非提权窗口会自动弹 UAC；若发现 `Action=Block` 或 `Enabled=False`，`-OpenFirewall` 会直接告警——用提权
+PowerShell 删掉那条再重跑一次即可）。除 8080 外的监听端口都属系统或其他软件，与本方案无关。
 
 只有显式 `-Bind any`（或直接给服务传 `--host 0.0.0.0`）才会真的对 Wi-Fi 开放——那种情况下口令是唯一
 防线，务必确认 `tools\tts-token.txt` 里是强口令。
