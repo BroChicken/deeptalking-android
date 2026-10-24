@@ -14,7 +14,7 @@ import org.junit.Test
 
 /**
  * The system prompt must describe the V2 tool set the model actually receives
- * (docs/OUTBOUND_CALLS_V2.md §一(三)) and must not mention any retired tool or the old
+ * (docs/OUTBOUND_CALLS.md §一(三)) and must not mention any retired tool or the old
  * JSON/submit_response protocol. A body-less world-book entry must be visible exactly when
  * it can be filled.
  */

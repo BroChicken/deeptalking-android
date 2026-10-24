@@ -25,7 +25,7 @@ import org.junit.Test
 import java.time.Instant
 
 /**
- * Volatile 上下文的 V2 结构测试（docs/OUTBOUND_CALLS_V2.md §一(二)4 +
+ * Volatile 上下文的 V2 结构测试（docs/OUTBOUND_CALLS.md §一(二)4 +
  * docs/AGENT_ARCHITECTURE.md volatile 11 段）：固定顺序、空段不出现、总长硬上限、召回条数与
  * 句子边界截断、pendingRecall 按实际渲染的 id 消费、同地点场景仍注入。
  */

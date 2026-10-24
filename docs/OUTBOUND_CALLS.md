@@ -1,4 +1,4 @@
-# 请求原文（新管线）
+# 请求原文
 
 > 与 `android-lite/` 当前实现对齐（主调用纯文本协议 + turn worker + 后台记忆/世界书链路）。工具描述字符串和 schema 以 `domain/agent/tools/*.kt`、`TurnWorker.kt`、`BackgroundTasks.kt` 与 `Prompts.kt` 为准；本文件保留可读的请求原文与字段说明。
 

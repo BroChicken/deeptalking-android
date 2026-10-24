@@ -306,7 +306,7 @@ internal fun buildRoleContext(character: Character, staticOnly: Boolean): String
 }
 
 // ---------------------------------------------------------------------------
-// System prompt (docs/OUTBOUND_CALLS_V2.md §一(一)).
+// System prompt (docs/OUTBOUND_CALLS.md §一(一)).
 //
 // Plain-text protocol: the reply IS the assistant text. The only extra channel is
 // one trailing `【语气】` line; everything that used to be JSON (dynamicState,
@@ -702,7 +702,7 @@ private fun currentStyleViolations(character: Character, recentAssistantReplies:
 }
 
 /**
- * 【世界书】段 (docs/OUTBOUND_CALLS_V2.md §一(二)4.4) using `selectLorebook` hits.
+ * 【世界书】段 (docs/OUTBOUND_CALLS.md §一(二)4.4) using `selectLorebook` hits.
  *
  * The count (≤6) and the 1400-char budget are enforced by `LorebookMatcher.select`, so this
  * assembly must **not** truncate again; the single-entry `CONTENT_CHARS` trim is only a
@@ -761,7 +761,7 @@ fun buildShortTermBlock(character: Character): String {
 }
 
 // ---------------------------------------------------------------------------
-// Volatile context (docs/OUTBOUND_CALLS_V2.md §一(二)4 + docs/AGENT_ARCHITECTURE.md volatile 11 段).
+// Volatile context (docs/OUTBOUND_CALLS.md §一(二)4 + docs/AGENT_ARCHITECTURE.md volatile 11 段).
 //
 // Fixed order, empty sections omitted entirely:
 //   1 时间 · 2 当前状态 · 3 未完成事项 · 4 世界书 · 5 场景概要 · 6 记忆召回

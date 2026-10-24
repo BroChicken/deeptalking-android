@@ -137,7 +137,7 @@ STATIC_PROFILE_FIELDS ─┬─► TurnWorker 不含静态字段（成员/本体
 - [ ] 是否新增 `parseJsonLenient` 调用？→ 检查返回类型守卫。
 - [ ] 是否改请求体阶段（`RequestBuilder`/`ResponsesLlmBackend`）？→ 核对 FINAL 相 tools 为空、`tool_choice=auto`（INV-5）。
 - [ ] 是否改待办（todo）准入？→ 必须保留「明确日期 + 双方同意」约束（INV-6）；改 promises 自动写入则保留"用户原话证据"约束。
-- [ ] 是否改 `submit_state` 字段？→ 同步 `TurnWorker.SCHEMA`、`TurnWorker.parse`、`ChatOrchestrator.runTurnWorker` 与 `OUTBOUND_CALLS_V2.md` 附录 B-1。
+- [ ] 是否改 `submit_state` 字段？→ 同步 `TurnWorker.SCHEMA`、`TurnWorker.parse`、`ChatOrchestrator.runTurnWorker` 与 `OUTBOUND_CALLS.md` 附录 B-1。
 - [ ] 是否改群组回复格式（`成员名：内容`）？→ 同步 `parseGroupSpeechSegments`（气泡）与 `extractSpeechSegments`（朗读），并确认历史/窗口仍按**一条**消息计数（INV-9）。
 
 ## 6. GRAPH（YAML 镜像）

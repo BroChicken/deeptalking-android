@@ -62,7 +62,7 @@ class UpsertLorebookEntryTool : AgentTool {
                 errorJson("sourceMessageIds 必须是上下文里真实存在的消息ID，且 evidence 要能对上原话或明确描述；拿不出依据时不要写世界书（本轮新编、还没出现在消息里的内容也不要写）"),
             )
         }
-        // `timeRef` is part of the documented schema (docs/OUTBOUND_CALLS_V2.md A-7) and is
+        // `timeRef` is part of the documented schema (docs/OUTBOUND_CALLS.md A-7) and is
         // parsed exactly like every other tool's relative-time hint.
         val timeRef = ToolArgs.timeRef(args, "timeRef")
         val content = if (timeRef != null) {

@@ -4,7 +4,7 @@ package com.deeptalking.domain.agent
  * Splits the plain-text reply protocol's trailing read-aloud directive off the body.
  *
  * The model writes the visible reply first, then — on its own line — `【语气】<朗读指导>`
- * (see `docs/OUTBOUND_CALLS_V2.md` §一(一)4). Only the exact `【语气】` marker is cut, so
+ * (see `docs/OUTBOUND_CALLS.md` §一(一)4). Only the exact `【语气】` marker is cut, so
  * ordinary bracketed text such as `【系统提示】` stays part of the body.
  */
 internal object ToneText {
