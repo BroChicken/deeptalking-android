@@ -529,56 +529,25 @@ class NativeCore(context: Context) {
         }
     }
 
-    /**
-     * What the memory cleanup sees right now.
-     *
-     * [shortTermPending] is the work left to do (entries above the low-water mark),
-     * while [shortTermTotal] is the raw list length — the "over the cap" prompt is
-     * based on the cap, the "how much is left" message on [shortTermPending].
-     */
-    data class MemoryCleanupTarget(
-        val characters: Int,
-        val shortTermTotal: Int,
-        val shortTermPending: Int,
-        val images: Int,
-        /** True when some character's short-term is over [AppLimits.Memory.SHORT_TERM]. */
-        val overLimit: Boolean,
-    ) {
-        /** True when there is still something to consume. */
-        val hasWork: Boolean get() = shortTermPending > 0 || images > 0
-    }
-
     /** Result of a bounded drain: how many batches landed, plus the last failure reason. */
     data class MemoryDrainResult(val passes: Int, val lastAnalysisError: String)
 
     /**
-     * Detects the two leftovers: short-term memory piled up because the analysis task
-     * could never drain it, and image attachments older than
-     * [AppLimits.Media.IMAGE_RETENTION_MESSAGES] messages.
+     * Detects the short-term backlog: a window the analysis could not drain, i.e. one
+     * above [AppLimits.Memory.SHORT_TERM]. The normal 20..40 window is not reported.
      */
     suspend fun memoryCleanupTarget(): MemoryCleanupTarget = withContext(Dispatchers.IO) {
-        var characters = 0
-        var total = 0
-        var pending = 0
-        var images = 0
-        var overLimit = false
-        data.characters.all().forEach { character ->
-            val size = character.shortTerm.size
-            if (size > AppLimits.Memory.SHORT_TERM) overLimit = true
-            // "Backlog" means *above the high watermark*: a window sitting between the low
-            // and the high watermark is normal operation (it is about to be consumed).
-            val over = (size - AppLimits.Memory.SHORT_TERM).coerceAtLeast(0)
-            val staleImages = staleImageCount(data.chat.getMessages(character.id))
-            if (over > 0 || staleImages > 0) {
-                characters++
-                images += staleImages
-            }
-            // Reported unconditionally: the prompt/summary says how much is still waiting
-            // to be consumed, whether or not the window is over the high watermark.
-            total += size
-            pending += (size - AppLimits.Memory.SHORT_TERM_TRIM_FLOOR).coerceAtLeast(0)
+        MemoryCleanupTarget.of(data.characters.all().map { it.shortTerm.size })
+    }
+
+    /**
+     * Old chat images still waiting to be shrunk, across every character. Independent of
+     * short-term memory: the "整理图片" prompt only ever consumes this count.
+     */
+    suspend fun pendingImageCleanupCount(): Int = withContext(Dispatchers.IO) {
+        data.characters.all().sumOf { character ->
+            staleImageCount(data.chat.getMessages(character.id))
         }
-        MemoryCleanupTarget(characters, total, pending, images, overLimit)
     }
 
     /**
@@ -763,12 +732,15 @@ class NativeCore(context: Context) {
 
     /**
      * Drains the short-term backlog towards [AppLimits.Memory.SHORT_TERM_LOW_WATER]:
-     * runs up to [maxBatches] whole-window passes. One pass already folds everything
-     * pending (the window *is* the unit), so a single invocation converges; extra passes
-     * only matter for a backlog larger than the window itself. Bounded so a single
-     * invocation never spends a burst of API calls, and it stops as soon as a pass makes
-     * no progress. The caller persists the "still pending" flag and continues on the next
-     * launch, so one confirmation is enough.
+     * runs up to [maxBatches] whole-window passes. Only windows above the high watermark
+     * [AppLimits.Memory.SHORT_TERM] are touched — a normal 20..40 window belongs to the
+     * ordinary per-turn analysis, so an image-only cleanup never runs a needless
+     * short→long analysis pass (which would also change the injected prefix).
+     * One pass already folds everything pending (the window *is* the unit), so a single
+     * invocation converges; extra passes only matter for a backlog larger than the window
+     * itself. Bounded so a single invocation never spends a burst of API calls, and it
+     * stops as soon as a pass makes no progress. The caller persists the "still pending"
+     * flag and continues on the next launch, so one confirmation is enough.
      */
     suspend fun drainShortTermBacklog(
         config: AppConfig,
@@ -781,7 +753,7 @@ class NativeCore(context: Context) {
         repeat(maxBatches) {
             var progressed = false
             for (character in data.characters.all()) {
-                if (character.shortTerm.size <= AppLimits.Memory.SHORT_TERM_LOW_WATER) continue
+                if (character.shortTerm.size <= AppLimits.Memory.SHORT_TERM) continue
                 val outcome = tasks.drainMemoryBacklog(character)
                 if (outcome.character.counters.analysisLastError.isNotBlank()) {
                     lastError = outcome.character.counters.analysisLastError

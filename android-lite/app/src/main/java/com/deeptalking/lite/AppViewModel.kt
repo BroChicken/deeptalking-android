@@ -227,9 +227,13 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
 
     // --------------------------------------------------------- memory cleanup
 
-    /** Non-null when the memory cleanup dialog should show. */
-    private val memoryCleanupState = MutableStateFlow<NativeCore.MemoryCleanupTarget?>(null)
-    val memoryCleanupPrompt: StateFlow<NativeCore.MemoryCleanupTarget?> = memoryCleanupState
+    /** Non-null when the short-term backlog dialog should show. */
+    private val memoryCleanupState = MutableStateFlow<MemoryCleanupTarget?>(null)
+    val memoryCleanupPrompt: StateFlow<MemoryCleanupTarget?> = memoryCleanupState
+
+    /** Non-null when the old-image dialog should show (count of stale images). */
+    private val imageCleanupState = MutableStateFlow<Int?>(null)
+    val imageCleanupPrompt: StateFlow<Int?> = imageCleanupState
 
     /** True while the short-term drain runs (progress dialog). */
     private val memoryCleanupProgressState = MutableStateFlow(false)
@@ -237,6 +241,9 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
 
     /** True once the cleanup dialog was shown in this run (one prompt at a time). */
     private var memoryCleanupPromptedThisRun = false
+
+    /** Same latch for the independent image prompt. */
+    private var imageCleanupPromptedThisRun = false
 
     /** Non-null when the oversized-window catch-up should be confirmed first. */
     private val memoryMigrationPromptState = MutableStateFlow<NativeCore.OversizedWindowTarget?>(null)
@@ -279,30 +286,54 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     )
 
     /**
-     * Asks once, when short-term memory is over its cap (the analysis task could not
-     * drain it) or when images sit outside the retention window. Silent while a
-     * confirmed cleanup is still running: one confirmation is enough, the app finishes
-     * the job on its own and only asks again if it piles up later.
+     * Asks once when short-term memory is over its high watermark (the analysis task could
+     * not drain it). A normal 20..40 window never asks. Silent while a confirmed cleanup
+     * is still running: one confirmation is enough, the app finishes the job on its own
+     * and only asks again if it piles up later.
      */
     private suspend fun checkMemoryCleanupPrompt() {
         if (memoryCleanupPromptedThisRun) return
         if (core.data.settings.getBoolean(MEMORY_CLEANUP_SKIP_KEY)) return
         if (core.data.settings.getBoolean(MEMORY_CLEANUP_PENDING_KEY)) return
         val target = runCatching { core.memoryCleanupTarget() }.getOrNull() ?: return
-        if (!target.overLimit && target.images <= 0) return
+        if (!target.overLimit) return
         memoryCleanupPromptedThisRun = true
         memoryCleanupState.value = target
     }
 
+    /**
+     * Asks once about old chat images. Completely independent of short-term memory: it
+     * never drains memory and never runs an analysis pass.
+     */
+    private suspend fun checkImageCleanupPrompt() {
+        if (imageCleanupPromptedThisRun) return
+        if (core.data.settings.getBoolean(IMAGE_CLEANUP_SKIP_KEY)) return
+        val count = runCatching { core.pendingImageCleanupCount() }.getOrNull() ?: return
+        if (count <= 0) return
+        imageCleanupPromptedThisRun = true
+        imageCleanupState.value = count
+    }
+
     fun dismissMemoryCleanup() {
         memoryCleanupState.value = null
-        askLorebookRebuildOnce()
+        continueStartupPromptsLater()
     }
 
     fun skipMemoryCleanupForever() {
         memoryCleanupState.value = null
         viewModelScope.launch { core.data.settings.putBoolean(MEMORY_CLEANUP_SKIP_KEY, true) }
-        askLorebookRebuildOnce()
+        continueStartupPromptsLater()
+    }
+
+    fun dismissImageCleanup() {
+        imageCleanupState.value = null
+        continueStartupPromptsLater()
+    }
+
+    fun skipImageCleanupForever() {
+        imageCleanupState.value = null
+        viewModelScope.launch { core.data.settings.putBoolean(IMAGE_CLEANUP_SKIP_KEY, true) }
+        continueStartupPromptsLater()
     }
 
     // ------------------------------------------------------ world-book retry
@@ -547,6 +578,13 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         if (memoryCleanupState.value == null && !memoryCleanupProgressState.value) {
             runCatching { checkMemoryCleanupPrompt() }.onFailure { DeepTalkingApp.recordError(it) }
         }
+        // One dialog at a time: the image prompt only appears once the memory prompt
+        // (and its progress dialog) is gone.
+        if (memoryCleanupState.value == null && !memoryCleanupProgressState.value &&
+            imageCleanupState.value == null
+        ) {
+            runCatching { checkImageCleanupPrompt() }.onFailure { DeepTalkingApp.recordError(it) }
+        }
         askLorebookRebuildOnce()
     }
 
@@ -565,6 +603,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         // is set *after* these gates so a deferred ask still happens later (the paths that
         // can defer it all funnel back through `continueStartupPrompts`).
         if (memoryCleanupState.value != null || memoryCleanupProgressState.value) return
+        if (imageCleanupState.value != null) return
         if (memoryMigrationPromptState.value != null || memoryMigrationState.value != null) return
         if (fieldMigrationState.value != null || lorebookMigrationState.value != null) return
         if (avatarRepairPromptState.value != null || avatarRepairProgressState.value != null) return
@@ -618,11 +657,12 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     }
 
     /**
-     * Confirms the cleanup: stale images are pruned immediately and short-term is
-     * drained in bounded passes. Nothing is truncated — the backlog is *processed* into
-     * long-term memory. If work is left over, the pending flag stays set and the app
-     * keeps consuming it quietly on later launches and idle moments until short-term
-     * settles at its low-water mark, so the dialog is never shown twice for one backlog.
+     * Confirms the short-term cleanup: the backlog is drained in bounded passes. Nothing
+     * is truncated — it is *processed* into long-term memory. If work is left over, the
+     * pending flag stays set and the app keeps consuming it quietly on later launches and
+     * idle moments until short-term settles at its low-water mark, so the dialog is never
+     * shown twice for one backlog. Old images are handled by the separate
+     * [runImageCleanup] and are never touched here.
      */
     fun runMemoryCleanup() {
         memoryCleanupState.value = null
@@ -631,7 +671,6 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             val canAnalyze = cfg != null && core.hasApiKey(cfg.apiPlatform)
             if (canAnalyze) core.data.settings.putBoolean(MEMORY_CLEANUP_PENDING_KEY, true)
             memoryCleanupProgressState.value = true
-            val removedImages = runCatching { core.pruneOldMessageImages() }.getOrDefault(0)
             val drain = if (canAnalyze) {
                 runCatching { core.drainShortTermBacklog(cfg!!) }
                     .getOrElse { NativeCore.MemoryDrainResult(0, it.message ?: "整理失败") }
@@ -643,10 +682,26 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             val stillPending = canAnalyze && remaining?.hasWork == true && drain.passes > 0
             if (canAnalyze) core.data.settings.putBoolean(MEMORY_CLEANUP_PENDING_KEY, stillPending)
             eventsState.tryEmit(
-                UiEvent(cleanupSummary(removedImages, drain, remaining, canAnalyze, stillPending)),
+                UiEvent(memoryCleanupSummary(drain, remaining, canAnalyze, stillPending)),
             )
-            // Hand over to the next startup prompt (world-book rewrite, …): the chain used
-            // to dead-end here, so confirming the cleanup was the last thing that ever ran.
+            // Hand over to the next startup prompt (image cleanup, world-book rewrite, …).
+            continueStartupPrompts()
+        }
+    }
+
+    /**
+     * Confirms the image cleanup: old images are shrunk in place. Short-term memory is
+     * deliberately not read or drained here, so this never changes the injected prefix.
+     */
+    fun runImageCleanup() {
+        imageCleanupState.value = null
+        viewModelScope.launch {
+            val shrunk = runCatching { core.pruneOldMessageImages() }.getOrDefault(0)
+            eventsState.tryEmit(
+                UiEvent(
+                    if (shrunk > 0) "清理了 $shrunk 张旧图片" else "没有需要清理的旧图片",
+                ),
+            )
             continueStartupPrompts()
         }
     }
@@ -685,22 +740,20 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         }
     }
 
-    private fun cleanupSummary(
-        removedImages: Int,
+    private fun memoryCleanupSummary(
         drain: NativeCore.MemoryDrainResult,
-        remaining: NativeCore.MemoryCleanupTarget?,
+        remaining: MemoryCleanupTarget?,
         canAnalyze: Boolean,
         stillPending: Boolean,
     ): String {
         val parts = mutableListOf<String>()
-        if (removedImages > 0) parts += "清理了 $removedImages 张旧图片"
         if (drain.passes > 0) parts += "整理了 ${drain.passes} 批短期记忆"
         if (!canAnalyze) {
             parts += "短期记忆需要 API Key 才能生成"
         } else if (drain.passes == 0 && drain.lastAnalysisError.isNotBlank()) {
             parts += "短期记忆生成失败：${drain.lastAnalysisError}"
         }
-        if (parts.isEmpty()) parts += "没有需要清理的内容"
+        if (parts.isEmpty()) parts += "没有需要整理的短期记忆"
         val tail = when {
             stillPending -> "，还有 ${remaining?.shortTermPending ?: 0} 条会自动继续整理"
             canAnalyze && remaining != null -> "，短期记忆现有 ${remaining.shortTermTotal} 条"
@@ -2518,8 +2571,11 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         const val FIELD_MIGRATION_SKIP_KEY = "deeptalking_field_migration_skip_v1"
         const val LOREBOOK_MIGRATION_SKIP_KEY = "deeptalking_lorebook_migration_skip_v1"
 
-        /** Set when the user chose "以后不再询问" on the one-time memory cleanup. */
+        /** Set when the user chose "以后不再询问" on the short-term memory cleanup. */
         const val MEMORY_CLEANUP_SKIP_KEY = "deeptalking_memory_cleanup_skip_v1"
+
+        /** Set when the user chose "以后不再询问" on the old-image cleanup (independent). */
+        const val IMAGE_CLEANUP_SKIP_KEY = "deeptalking_image_cleanup_skip_v1"
 
         /** Set when the user chose "以后不再询问" on the oversized-window catch-up. */
         const val MEMORY_WINDOW_MIGRATION_SKIP_KEY = "deeptalking_memory_window_migration_skip_v1"

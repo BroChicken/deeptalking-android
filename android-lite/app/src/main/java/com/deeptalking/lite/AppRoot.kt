@@ -115,6 +115,7 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
     val avatarRepairPrompt by vm.avatarRepairPrompt.collectAsState()
     val avatarRepairProgress by vm.avatarRepairProgress.collectAsState()
     val memoryCleanupPrompt by vm.memoryCleanupPrompt.collectAsState()
+    val imageCleanupPrompt by vm.imageCleanupPrompt.collectAsState()
     val memoryCleanupProgress by vm.memoryCleanupProgress.collectAsState()
     val memoryMigrationPrompt by vm.memoryMigrationPrompt.collectAsState()
     val memoryMigration by vm.memoryMigration.collectAsState()
@@ -487,31 +488,28 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
         }
     }
 
-    // One-time cleanup of the short-term pile-up + over-window images. Nothing is
-    // truncated: old images are pruned (text stays) and the backlog is *processed*
-    // into long-term memory in bounded batches.
+    // One-time cleanup of the short-term pile-up. Nothing is truncated: the backlog is
+    // *processed* into long-term memory in bounded batches. Old images are a completely
+    // separate prompt below and never run through this path.
     if (fieldMigrationCount == null && lorebookMigrationCount == null) {
         memoryCleanupPrompt?.let { target ->
             var skipForever by remember { mutableStateOf(false) }
             AlertDialog(
                 onDismissRequest = { vm.dismissMemoryCleanup() },
-                title = { Text("整理记忆与图片") },
+                title = { Text("整理记忆") },
                 text = {
                     Column {
-                        val lines = mutableListOf<String>()
-                        if (target.shortTermPending > 0) {
-                            lines += "短期记忆现有 ${target.shortTermTotal} 条，其中 ${target.shortTermPending} 条还没消化成" +
-                                "长期记忆（会分批处理，直到降到 " +
-                                "${com.deeptalking.core.common.AppLimits.Memory.SHORT_TERM_LOW_WATER} 条左右）。"
-                        }
-                        if (target.images > 0) {
-                            lines += "有 ${target.images} 张较旧的聊天图片可以清理（只删图片，聊天文字保留）。"
-                        }
-                        Text(lines.joinToString("\n"))
+                        Text(
+                            "短期记忆现有 ${target.shortTermTotal} 条（上限 " +
+                                "${com.deeptalking.core.common.AppLimits.Memory.SHORT_TERM} 条），" +
+                                "其中 ${target.shortTermPending} 条还没消化成长期记忆" +
+                                "（会分批处理，直到降到 " +
+                                "${com.deeptalking.core.common.AppLimits.Memory.SHORT_TERM_LOW_WATER} 条左右）。",
+                        )
                         Spacer(Modifier.height(6.dp))
                         Text(
-                            "点一次就行：图片立刻清理，短期记忆分批转成长期记忆，之后会在后台自己继续，" +
-                                "不会删除内容。",
+                            "点一次就行：短期记忆分批转成长期记忆，之后会在后台自己继续，" +
+                                "不会删除内容，也不会动聊天图片。",
                             fontSize = 13.sp,
                         )
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -532,12 +530,45 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                 },
             )
         }
+
+        imageCleanupPrompt?.let { count ->
+            var skipForever by remember { mutableStateOf(false) }
+            AlertDialog(
+                onDismissRequest = { vm.dismissImageCleanup() },
+                title = { Text("整理图片") },
+                text = {
+                    Column {
+                        Text("有 $count 张较旧的聊天图片可以清理（只压成缩略图，聊天文字保留，不会删除消息）。")
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            "只处理最近 ${com.deeptalking.core.common.AppLimits.Media.IMAGE_RETENTION_MESSAGES} " +
+                                "条消息以外的旧图片，最近的图片保持原样。整理图片不会触发记忆整理。",
+                            fontSize = 13.sp,
+                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(checked = skipForever, onCheckedChange = { skipForever = it })
+                            Text("以后不再询问", fontSize = 13.sp)
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        if (skipForever) vm.skipImageCleanupForever() else vm.runImageCleanup()
+                    }) { Text("开始整理") }
+                },
+                dismissButton = {
+                    TextButton(onClick = {
+                        if (skipForever) vm.skipImageCleanupForever() else vm.dismissImageCleanup()
+                    }) { Text("以后再说") }
+                },
+            )
+        }
     }
 
     if (memoryCleanupProgress) {
         AlertDialog(
             onDismissRequest = {},
-            title = { Text("正在整理短期记忆…") },
+            title = { Text("正在整理记忆…") },
             text = { Text("分批转成长期记忆，请稍候。") },
             confirmButton = {},
         )
@@ -641,7 +672,7 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
     // grew by appending instead of replacing). Shown only when no other prompt is up — the
     // view model already serialises these, this is the belt-and-braces check.
     lorebookRebuildPrompt?.let { count ->
-        if (memoryCleanupPrompt != null || memoryCleanupProgress ||
+        if (memoryCleanupPrompt != null || imageCleanupPrompt != null || memoryCleanupProgress ||
             memoryMigration != null || memoryMigrationPrompt != null
         ) {
             return@let
