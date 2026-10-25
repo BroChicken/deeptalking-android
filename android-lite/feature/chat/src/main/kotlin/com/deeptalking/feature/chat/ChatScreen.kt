@@ -34,6 +34,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
@@ -96,6 +98,8 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import coil.compose.AsyncImage
 import com.deeptalking.core.common.AppLimits
 import com.deeptalking.core.data.legacy.MediaRef
@@ -361,33 +365,46 @@ fun ChatScreen(
     }
 
     imagePreview?.let { path ->
-        Box(
-            modifier = Modifier.fillMaxSize().background(Color(0xD9000000)).clickable { imagePreview = null },
-            contentAlignment = Alignment.Center,
+        // 必须走 Dialog：这个覆盖层以前直接写在 ChatScreen 的 Column 里，会被排在
+        // 输入栏下面（y 超出屏幕）——状态设了但永远看不见，表现就是“点了没反应”。
+        Dialog(
+            onDismissRequest = { imagePreview = null },
+            properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
         ) {
-            // Pinch to zoom / drag to pan; tap the dark background to close.
-            var imageScale by remember(path) { androidx.compose.runtime.mutableFloatStateOf(1f) }
-            var imageOffset by remember(path) { mutableStateOf(Offset.Zero) }
-            AsyncImage(
-                model = MediaRef.model(context, path),
-                contentDescription = "图片",
-                contentScale = ContentScale.Fit,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(24.dp)
-                    .graphicsLayer(
-                        scaleX = imageScale,
-                        scaleY = imageScale,
-                        translationX = imageOffset.x,
-                        translationY = imageOffset.y,
-                    )
-                    .pointerInput(path) {
-                        detectTransformGestures { _, pan, zoom, _ ->
-                            imageScale = (imageScale * zoom).coerceIn(1f, 6f)
-                            imageOffset = if (imageScale <= 1f) Offset.Zero else imageOffset + pan
-                        }
-                    },
-            )
+            Box(
+                modifier = Modifier.fillMaxSize().background(Color(0xD9000000)).clickable { imagePreview = null },
+                contentAlignment = Alignment.Center,
+            ) {
+                // Pinch to zoom / drag to pan; tap the dark background to close.
+                var imageScale by remember(path) { androidx.compose.runtime.mutableFloatStateOf(1f) }
+                var imageOffset by remember(path) { mutableStateOf(Offset.Zero) }
+                AsyncImage(
+                    model = MediaRef.model(context, path),
+                    contentDescription = "图片",
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(24.dp)
+                        .graphicsLayer(
+                            scaleX = imageScale,
+                            scaleY = imageScale,
+                            translationX = imageOffset.x,
+                            translationY = imageOffset.y,
+                        )
+                        .pointerInput(path) {
+                            detectTransformGestures { _, pan, zoom, _ ->
+                                imageScale = (imageScale * zoom).coerceIn(1f, 6f)
+                                imageOffset = if (imageScale <= 1f) Offset.Zero else imageOffset + pan
+                            }
+                        },
+                )
+                Text(
+                    "双指缩放 · 拖动平移 · 点空白处关闭",
+                    fontSize = 11.sp,
+                    color = Color(0xB3FFFFFF),
+                    modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 40.dp),
+                )
+            }
         }
     }
 
@@ -860,6 +877,9 @@ private fun MessageImages(
     }
 }
 
+/** 表情面板里「全部」那个 tab 的 id；其余 tab 直接用 [StickerCategory] 的 id。 */
+private const val STICKER_TAB_ALL = "__all"
+
 @Composable
 private fun StickerPanel(
     stickers: List<Sticker>,
@@ -871,6 +891,7 @@ private fun StickerPanel(
     onPreview: (String) -> Unit,
 ) {
     var editing by remember { mutableStateOf<Sticker?>(null) }
+    var selected by rememberSaveable { mutableStateOf(STICKER_TAB_ALL) }
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -881,34 +902,67 @@ private fun StickerPanel(
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
             TextButton(onClick = onUpload) { Text("+ 上传表情", fontSize = 12.sp, color = MaterialTheme.legacy.text) }
             Spacer(Modifier.weight(1f))
-            Text("${stickers.size} 张 · 长按可改关键词", fontSize = 11.sp, color = MaterialTheme.legacy.textMuted)
+            Text("${stickers.size} 张 · 长按改关键词", fontSize = 11.sp, color = MaterialTheme.legacy.textMuted)
         }
         if (stickers.isEmpty()) {
             Text("还没有表情包。点「上传表情」加入，或长按对话里的图片收进来。", fontSize = 12.sp, color = MaterialTheme.legacy.textMuted, modifier = Modifier.padding(12.dp))
         } else {
-            LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = 190.dp)) {
-                StickerCategory.group(stickers).forEach { (def, group) ->
-                    item(key = "head-" + def.id) {
-                        Text(
-                            "${def.label} · ${group.size}",
-                            fontSize = 11.sp,
-                            color = MaterialTheme.legacy.textMuted,
-                            modifier = Modifier.padding(top = 4.dp, bottom = 2.dp),
-                        )
-                    }
-                    item(key = "row-" + def.id) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        ) {
-                            group.forEach { sticker ->
-                                StickerCell(
-                                    sticker = sticker,
-                                    onSend = { onSend(sticker) },
-                                    onLongPress = { editing = sticker },
-                                )
+            val groups = StickerCategory.group(stickers)
+            // 选中的大类被删空了就回落到「全部」，不显示空页。
+            val active = selected.takeIf { id -> id == STICKER_TAB_ALL || groups.any { it.first.id == id } }
+                ?: STICKER_TAB_ALL
+            Row(
+                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                StickerTab("全部 ${stickers.size}", active == STICKER_TAB_ALL) { selected = STICKER_TAB_ALL }
+                groups.forEach { (def, group) ->
+                    StickerTab("${def.label} ${group.size}", active == def.id) { selected = def.id }
+                }
+            }
+            Spacer(Modifier.height(4.dp))
+            if (active == STICKER_TAB_ALL) {
+                LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = 160.dp)) {
+                    groups.forEach { (def, group) ->
+                        item(key = "head-" + def.id) {
+                            Text(
+                                "${def.label} · ${group.size}",
+                                fontSize = 11.sp,
+                                color = MaterialTheme.legacy.textMuted,
+                                modifier = Modifier.padding(top = 4.dp, bottom = 2.dp),
+                            )
+                        }
+                        item(key = "row-" + def.id) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                group.forEach { sticker ->
+                                    StickerCell(
+                                        sticker = sticker,
+                                        onSend = { onSend(sticker) },
+                                        onLongPress = { editing = sticker },
+                                    )
+                                }
                             }
                         }
+                    }
+                }
+            } else {
+                val group = groups.first { it.first.id == active }.second
+                LazyVerticalGrid(
+                    columns = GridCells.Adaptive(72.dp),
+                    modifier = Modifier.fillMaxWidth().heightIn(max = 160.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    items(group.size) { index ->
+                        val sticker = group[index]
+                        StickerCell(
+                            sticker = sticker,
+                            onSend = { onSend(sticker) },
+                            onLongPress = { editing = sticker },
+                        )
                     }
                 }
             }
@@ -928,6 +982,27 @@ private fun StickerPanel(
             onDismiss = { editing = null },
         )
     }
+}
+
+@Composable
+private fun StickerTab(label: String, selected: Boolean, onClick: () -> Unit) {
+    val shape = RoundedCornerShape(10.dp)
+    Text(
+        label,
+        fontSize = 11.sp,
+        color = if (selected) MaterialTheme.legacy.onUserBubble else MaterialTheme.legacy.text,
+        modifier = Modifier
+            .clip(shape)
+            .then(
+                if (selected) {
+                    Modifier.background(MaterialTheme.legacy.btnPrimary)
+                } else {
+                    Modifier.border(1.dp, MaterialTheme.legacy.border, shape)
+                },
+            )
+            .clickable { onClick() }
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+    )
 }
 
 @Composable
