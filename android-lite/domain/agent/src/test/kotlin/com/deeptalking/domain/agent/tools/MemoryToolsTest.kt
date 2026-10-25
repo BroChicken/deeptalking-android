@@ -443,9 +443,9 @@ class MemoryToolsTest {
         val character = Character(
             id = "c1",
             stickers = listOf(
-                Sticker(id = "s1", tag = "开心", fileRef = "f1"),
-                Sticker(id = "s2", tag = "难过", fileRef = "f2"),
-                Sticker(id = "s3", tag = "开心", fileRef = "f3"),
+                Sticker(id = "s1", keyword = "开心", fileRef = "f1"),
+                Sticker(id = "s2", keyword = "难过", fileRef = "f2"),
+                Sticker(id = "s3", keyword = "开心", fileRef = "f3"),
             ),
         )
         val registry = ToolRegistry(listOf(SendStickerTool()))

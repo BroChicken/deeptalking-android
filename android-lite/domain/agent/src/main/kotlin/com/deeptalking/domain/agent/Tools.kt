@@ -1,6 +1,7 @@
 package com.deeptalking.domain.agent
 
 import com.deeptalking.core.network.WebContentProvider
+import com.deeptalking.domain.agent.sticker.StickerFetcher
 import com.deeptalking.domain.agent.tools.HotBoardTool
 import com.deeptalking.domain.agent.tools.MemoryWriteTool
 import com.deeptalking.domain.agent.tools.SearchMemoryTool
@@ -31,6 +32,7 @@ fun defaultTools(
     web: WebContentProvider?,
     stickersEnabled: Boolean,
     bilibiliVideo: AgentTool? = null,
+    stickerFetcher: StickerFetcher? = null,
 ): List<AgentTool> = buildList {
     add(SearchMemoryTool(memory))
     add(WebSearchTool(web))
@@ -40,5 +42,5 @@ fun defaultTools(
     if (bilibiliVideo != null) add(bilibiliVideo)
     add(MemoryWriteTool(memory))
     add(UpsertLorebookEntryTool())
-    if (stickersEnabled) add(SendStickerTool(stickersEnabled))
+    if (stickersEnabled) add(SendStickerTool(stickersEnabled, stickerFetcher))
 }

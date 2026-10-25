@@ -89,7 +89,7 @@ BackgroundTasks.scheduleTurn       后台：文风校对、快速回应校验/�
 | `bilibili_video` | B 站视频的唯一入口：给 `query` 搜视频（BV 号/标题/UP/时长/播放/简介/封面），给 `url` 或 BV 号总结这个视频（`focus` 可选）。总结逐句字幕走分块、官方 AI 总结存在时直接采用，都没有就用简介/章节/抽帧画面说个大概并标明"没字幕"；结果按 BV 号本地缓存 7 天 | `BilibiliVideoTool` → `HttpBiliVideoSource` + `WebContentProvider`（搜索） + `VideoSummaryService` + `BiliFrameExtractor`/`BiliVideoCache`（见 `docs/BILIBILI_VIDEO_SUMMARY.md`） |
 | `memory_write` | 按 ID 修正（`op=update`，须 evidence + sourceMessageIds）或删除（`op=delete`）记忆 | `MemoryWriteTool` |
 | `upsert_lorebook_entry` | 写入/更新世界书条目（世界层设定唯一入口，保护人工维护条目） | `UpsertLorebookEntryTool` |
-| `send_sticker` | 发表情包（**仅当角色有贴图时注册**，schema 内联该角色的标签枚举） | `SendStickerTool` |
+| `send_sticker` | 发表情包（**仅当角色有贴图时注册**）。库里有关键词就给 `keyword`（schema 内联枚举，按大类分组写进 description）；库里没有合适的就给 `query`，按情境联网找一张、逐字审核并起名后入库、直接发出 | `SendStickerTool` + `StickerFetcher`（`:app` 的 `HttpStickerFetcher`） |
 
 每个工具就是一段 JSON Schema 描述（name + description + parameters），模型据此决定何时调用。
 **工具描述是"何时用哪个工具"的权威依据**，system 提示词的规则 A 只留一句导引 + 工具名单。

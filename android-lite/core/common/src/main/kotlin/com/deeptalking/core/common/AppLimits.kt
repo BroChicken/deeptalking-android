@@ -209,6 +209,18 @@ object AppLimits {
     object Sticker {
         const val MAX_DIMENSION = 384
         const val TARGET_BYTES = 120 * 1024
+
+        /** 关键词上限（按字算）；旧数据里 6 字的标签天然合法。 */
+        const val KEYWORD_MAX = 7
+
+        /** 单角色表情库上限：库满了不再联网补图，也不给模型多塞 enum。 */
+        const val MAX_PER_CHARACTER = 60
+
+        /** 一次主题检索最多下载几张候选（第一张不合格才看第二张）。 */
+        const val FETCH_CANDIDATES = 3
+
+        /** 单张下载体积上限，超了直接放弃（压缩前）。 */
+        const val MAX_FETCH_BYTES = 3 * 1024 * 1024
     }
 
     object Media {

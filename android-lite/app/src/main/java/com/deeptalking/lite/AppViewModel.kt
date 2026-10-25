@@ -4,6 +4,7 @@ import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.deeptalking.core.common.AppLimits
+import com.deeptalking.core.model.StickerCategory
 import com.deeptalking.core.model.AppConfig
 import com.deeptalking.core.model.CacheStats
 import com.deeptalking.core.model.Character
@@ -1482,28 +1483,68 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 eventsState.tryEmit(UiEvent("图片处理失败，请换一张试试"))
                 return@launch
             }
+            stowAndLabel(id, path, source = "user")
+        }
+    }
+
+    /**
+     * 长按对话里的图片 → 收进当前角色的表情库。
+     * 同一张图（内容 hash 相同）已经存在就提示一下，不重复入库。
+     */
+    fun collectSticker(path: String) {
+        val id = activeIdState.value ?: return
+        viewModelScope.launch {
             val character = core.data.characters.get(id) ?: return@launch
-            // Skip duplicates (same compressed payload → same file key).
-            if (character.stickers.any { it.fileRef == path }) return@launch
-            val sticker = com.deeptalking.core.model.Sticker(
-                id = UUID.randomUUID().toString(),
-                tag = "未分类",
-                fileRef = path,
-                createdAt = Instant.now().toString(),
-            )
-            patchCharacter(id) { live -> live.copy(stickers = live.stickers + sticker) }
-            // Legacy `tagStickerInBackground`: vision-classify, fill only while untagged.
-            viewModelScope.launch {
-                val cfg = runCatching { core.currentConfig() }.getOrNull() ?: return@launch
-                if (!core.hasApiKey(cfg.apiPlatform)) return@launch
-                val tag = runCatching { core.tagSticker(cfg, path) }.getOrNull() ?: return@launch
-                patchCharacter(id) { live ->
-                    live.copy(
-                        stickers = live.stickers.map {
-                            if (it.fileRef == path && it.tag == "未分类") it.copy(tag = tag) else it
-                        },
-                    )
-                }
+            if (character.stickers.size >= AppLimits.Sticker.MAX_PER_CHARACTER) {
+                eventsState.tryEmit(UiEvent("表情库满了（${AppLimits.Sticker.MAX_PER_CHARACTER} 张），先删几张"))
+                return@launch
+            }
+            val stored = media.saveStickerFromFile(path) ?: run {
+                eventsState.tryEmit(UiEvent("这张图存不下来"))
+                return@launch
+            }
+            if (character.stickers.any { it.fileRef == stored }) {
+                eventsState.tryEmit(UiEvent("这张图已经在表情库里了"))
+                return@launch
+            }
+            stowAndLabel(id, stored, source = "user")
+        }
+    }
+
+    /**
+     * 入库 → 后台让视觉模型看图写关键词、归大类。
+     * 没配 Key 或模型不支持看图时关键词留空（面板显示「未命名」，用户可手改）。
+     */
+    private suspend fun stowAndLabel(id: String, path: String, source: String) {
+        val character = core.data.characters.get(id) ?: return
+        if (character.stickers.any { it.fileRef == path }) return
+        if (character.stickers.size >= AppLimits.Sticker.MAX_PER_CHARACTER) {
+            eventsState.tryEmit(UiEvent("表情库满了（${AppLimits.Sticker.MAX_PER_CHARACTER} 张），先删几张"))
+            return
+        }
+        val sticker = com.deeptalking.core.model.Sticker(
+            id = UUID.randomUUID().toString(),
+            keyword = "",
+            category = "",
+            fileRef = path,
+            source = source,
+            createdAt = Instant.now().toString(),
+        )
+        patchCharacter(id) { live -> live.copy(stickers = live.stickers + sticker) }
+        viewModelScope.launch {
+            val cfg = runCatching { core.currentConfig() }.getOrNull() ?: return@launch
+            if (!core.hasApiKey(cfg.apiPlatform)) return@launch
+            val label = runCatching { core.labelSticker(cfg, path) }.getOrNull() ?: return@launch
+            patchCharacter(id) { live ->
+                live.copy(
+                    stickers = live.stickers.map {
+                        if (it.id == sticker.id) {
+                            it.copy(keyword = label.keyword, category = label.category, source = source)
+                        } else {
+                            it
+                        }
+                    },
+                )
             }
         }
     }
@@ -1514,9 +1555,25 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         }
     }
 
-    fun setStickerTag(character: Character, stickerId: String, tag: String) {
+    fun setStickerKeyword(character: Character, stickerId: String, keyword: String) {
+        val cleaned = sanitizeKeyword(keyword)
         patchCharacter(character.id) { live ->
-            live.copy(stickers = live.stickers.map { if (it.id == stickerId) it.copy(tag = tag) else it })
+            live.copy(
+                stickers = live.stickers.map {
+                    if (it.id == stickerId) it.copy(keyword = cleaned, updatedAt = Instant.now().toString()) else it
+                },
+            )
+        }
+    }
+
+    fun setStickerCategory(character: Character, stickerId: String, category: String) {
+        val valid = category.takeIf(StickerCategory::isValid) ?: return
+        patchCharacter(character.id) { live ->
+            live.copy(
+                stickers = live.stickers.map {
+                    if (it.id == stickerId) it.copy(category = valid, updatedAt = Instant.now().toString()) else it
+                },
+            )
         }
     }
 

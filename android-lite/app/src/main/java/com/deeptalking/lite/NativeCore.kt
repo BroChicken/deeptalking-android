@@ -18,12 +18,16 @@ import com.deeptalking.core.model.MessageAttachment
 import com.deeptalking.core.model.RequestMetric
 import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.StaticProfile
+import com.deeptalking.core.model.StickerCategory
 import com.deeptalking.core.model.mergeCharacterChanges
 import com.deeptalking.core.model.TTS_BACKEND_REMOTE
+import com.deeptalking.core.network.BaiduImageSearch
 import com.deeptalking.core.network.BiliVideoSource
 import com.deeptalking.core.network.HttpBiliVideoSource
 import com.deeptalking.core.network.HttpWebContentProvider
+import com.deeptalking.core.network.StickerImageSearch
 import com.deeptalking.core.network.DohDns
+import com.deeptalking.domain.agent.sticker.StickerFetcher
 import com.deeptalking.core.network.ResponsesLlmBackend
 import com.deeptalking.core.network.defaultClient
 import com.deeptalking.core.network.opencodeSessionHeader
@@ -122,6 +126,29 @@ class NativeCore(context: Context) {
     private val biliFrameExtractor: BiliFrameExtractor =
         BiliFrameExtractor(defaultClient(dohDns), biliVideoCacheDir)
 
+    /** 表情图入库：上传、从对话里收、联网抓到的图都走这里压到 384px/120KB。 */
+    private val stickerMedia: MediaStore = MediaStore(appContext)
+
+    /** 表情主题检索（百度图片，免登录）；换站点只改这一层。 */
+    private val stickerSearch: StickerImageSearch = BaiduImageSearch(defaultClient(dohDns))
+
+    /**
+     * 主题检索 → 直接发：找图、压缩、**同一次视觉调用**判「能不能用 + 关键词 + 大类」，
+     * 然后写进当前角色的表情库。视觉调用复用 `auxiliary` 通道，所以每次抓图都会在
+     * `requestMetrics` 里留一条记录（失败也带原因）。
+     */
+    val stickerFetcher: StickerFetcher = HttpStickerFetcher(
+        search = stickerSearch,
+        client = defaultClient(dohDns),
+        media = stickerMedia,
+        characters = data.characters,
+        label = label@{ imageRef ->
+            val config = runCatching { currentConfig() }.getOrNull() ?: return@label null
+            if (!hasApiKey(config.apiPlatform)) return@label null
+            runCatching { labelSticker(config, imageRef) }.getOrNull()
+        },
+    )
+
     /**
      * 字幕/画面总结用的辅助补全：走 [trackedComplete]，因此每次总结都会在 `requestMetrics` 里留
      * 一条指标记录 `video_summary`（任务名保留旧值，便于和历史指标对比；输入/输出/hit 都能看），失败也带原因。
@@ -185,6 +212,7 @@ class NativeCore(context: Context) {
                 frames = biliFrameExtractor,
                 images = MediaRefInlineImages(appContext),
             ),
+            stickerFetcher = stickerFetcher,
         ),
     )
 
@@ -1311,12 +1339,17 @@ class NativeCore(context: Context) {
         return null
     }
 
-    /** Legacy `tagStickerImage`: vision-classify a sticker into one vocabulary tag. */
-    suspend fun tagSticker(config: AppConfig, imageRef: String): String? {
+    /**
+     * 看一眼图，判断它能不能当表情包，能的话同时给出**关键词（≤7 字）+ 大类**。
+     * 返回 null = 模型觉得不适合（裸露/血腥/政治敏感/纯文字长截图/重水印/拼图），调用方据此换下一张。
+     *
+     * 一次调用干两件事（审核 + 起名），既省一次请求，也保证能被发出去的表情一定是看过的。
+     */
+    suspend fun labelSticker(config: AppConfig, imageRef: String): StickerLabel? {
         if (MediaRef.toDataUri(appContext, imageRef) == null) return null
         val message = ChatMessage(
             role = Role.User,
-            content = "给这张图打一个短词标签。",
+            content = "看看这张表情。",
             attachments = listOf(com.deeptalking.core.model.MessageAttachment(com.deeptalking.core.model.MessageAttachment.Kind.Image, imageRef)),
         )
         val result = trackedComplete(
@@ -1324,11 +1357,10 @@ class NativeCore(context: Context) {
             "auxiliary",
             LlmRequest(
                 model = config.modelName,
-                instructions = "你是表情包分类助手。看这张表情包或图片，从下列标签中选一个最贴切的：" + STICKER_TAGS.joinToString("、") +
-                    "。若都不贴切，就给出一个 1 到 6 字的中文短词。只输出这一个词，不要标点、解释或其它文字。",
+                instructions = STICKER_LABEL_INSTRUCTIONS,
                 input = listOf(message),
                 temperature = 0.2,
-                maxOutputTokens = 8,
+                maxOutputTokens = 64,
                 reasoningEffort = "none",
                 apiPlatform = config.apiPlatform,
                 sessionId = "deeptalking-general",
@@ -1336,10 +1368,12 @@ class NativeCore(context: Context) {
                 imageResolver = { ref -> MediaRef.toDataUri(appContext, ref) },
             ),
         )
-        val tag = result.text.trim()
-            .replace(Regex("[\\s\r\n\"'“”‘’。，,、！!？?：:；;（）()\\[\\]]"), "")
-            .take(6)
-        return tag.takeIf { it.isNotEmpty() }
+        val json = extractJsonObject(result.text) ?: return null
+        if (json.str("kind") != "sticker") return null
+        val keyword = sanitizeKeyword(json.str("keyword"))
+        if (keyword.isEmpty()) return null
+        val category = json.str("category").takeIf(StickerCategory::isValid) ?: StickerCategory.OTHER
+        return StickerLabel(keyword = keyword, category = category, accepted = true)
     }
 
     /** Parses the model's group/member JSON into [GroupMember]s (tolerating prose/fences). */
@@ -1499,11 +1533,15 @@ class NativeCore(context: Context) {
         (this[key] as? JsonPrimitive)?.contentOrNull.orEmpty().trim()
 
     private companion object {
-        /** Legacy `STICKER_TAGS` (`src/js/core/config.js:107`). */
-        val STICKER_TAGS = listOf(
-            "开心", "大笑", "难过", "委屈", "生气", "无语", "惊讶", "疑惑", "害羞",
-            "得意", "爱意", "亲亲", "抱抱", "加油", "点赞", "拒绝", "睡觉", "干杯",
-        )
+        /** 表情入库/审核提示词：一次调用同时判「能不能用」和「叫什么、归哪类」。 */
+        val STICKER_LABEL_INSTRUCTIONS = """
+            你是表情包助理。看这张图，判断它能不能当聊天表情包；能的话给它起一个关键词。
+            只输出 JSON，不要任何解释、旁白或代码块标记：
+            {"kind":"sticker","keyword":"7 字以内的中文短句","category":"happy"}
+            category 只能选一个 id：happy 开心 / speechless 无语 / angry 生气 / sad 难过 / shy 害羞 / affection 亲密 / smug 得意 / surprise 惊讶 / cheer 鼓励 / tired 疲惫 / animal 动物 / other 其他。
+            关键词要求：不超过 7 个字；一眼能想起这张图，写具体的情绪或梗（例如「吓死我了」「搬砖去了」「无语凝噎」），不要写「开心」「难过」这种泛词；不要标点、引号、空格。
+            如果这张图不适合当表情包（真人裸露、血腥、政治敏感、纯文字长截图、严重水印、多图拼贴），只输出 {"kind":"reject"}。
+        """.trimIndent()
 
         val QUICK_GEN_INSTRUCTIONS = """
             你是角色设计助手。严格按用户在消息里给出的 JSON 结构返回，只输出 JSON，不要任何解释、旁白或代码块标记。

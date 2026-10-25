@@ -297,7 +297,7 @@ tool: { content: <工具结果 JSON>, toolCallId }
 
 ### （三）tools
 
-> 以下为工具语义摘要；实际 `ToolDefinition.description` 由 `domain/agent/tools/*.kt` 生成（`send_sticker` 的标签列表还是运行时动态拼接），精确 schema 见附录 A。
+> 以下为工具语义摘要；实际 `ToolDefinition.description` 由 `domain/agent/tools/*.kt` 生成（`send_sticker` 的关键词列表与分组还是运行时动态拼接），精确 schema 见附录 A。
 
 #### `search_memory`
 
@@ -383,10 +383,16 @@ B 站视频：按关键词搜视频，或总结一个视频讲了什么。① �
 
 #### `send_sticker`
 
-- parameters：附录 A-8。基础 schema 里 `tag` 是普通 string；实际发给模型的 `definitionFor` 会用当前角色的贴图标签生成 `enum`（没有贴图时工具不启用），因此模型看到的是受约束的标签枚举。
+- parameters：附录 A-8。基础 schema 里 `keyword` 是普通 string；实际发给模型的 `definitionFor`
+  会用当前角色的关键词生成 `enum`，并把它们**按大类分组**写进 description（没有贴图时工具不启用）。
+- 两个入口共用一个工具：`keyword` 发已有表情（同关键词多张随机挑一张）；`query` 现找一张
+  （百度检索 → 下载 → 压缩 → 视觉审核 + 起名 → 入库 → 直接发）。抓取失败回退成「报可用关键词」。
 
 ```text
-给用户发一个表情包。tag 必须是该角色可用标签里的某一个：<该角色可用的贴图标签>。贴图作为你的下一条消息单独发出，不需要再用文字描述。
+给用户发一个表情包（贴图）。想表达情绪时用 keyword 从已有表情里挑一个；库里没有合适的，就给 query 描述此刻的情境，系统会联网找一张、加进你的表情库并直接发出。贴图会作为你的下一条消息单独发出，不需要再用文字描述它。别频繁用（普通闲聊几轮一张就够），严肃或正经的话题别用。
+已有表情（按大类）：
+开心：笑死我了、嘿嘿
+无语：无语凝噎
 ```
 
 ## 二、turn worker
@@ -874,20 +880,44 @@ lorebook 每条 content 精炼、一条只讲一件事，目标 300 字以内（
 <描述；空描述时实际发送「一个神秘角色」>
 ```
 
-## 十八、表情包打标签（tagSticker）
+## 十八、表情包入库（labelSticker）与主题检索（百度图片）
 
 ### system
 
 ```text
-你是表情包分类助手。看这张表情包或图片，从下列标签中选一个最贴切的：开心、大笑、难过、委屈、生气、无语、惊讶、疑惑、害羞、得意、爱意、亲亲、抱抱、加油、点赞、拒绝、睡觉、干杯。若都不贴切，就给出一个 1 到 6 字的中文短词。只输出这一个词，不要标点、解释或其它文字。
+你是表情包助理。看这张图，判断它能不能当聊天表情包；能的话给它起一个关键词。
+只输出 JSON，不要任何解释、旁白或代码块标记：
+{"kind":"sticker","keyword":"7 字以内的中文短句","category":"happy"}
+category 只能选一个 id：happy 开心 / speechless 无语 / angry 生气 / sad 难过 / shy 害羞 / affection 亲密 / smug 得意 / surprise 惊讶 / cheer 鼓励 / tired 疲惫 / animal 动物 / other 其他。
+关键词要求：不超过 7 个字；一眼能想起这张图，写具体的情绪或梗（例如「吓死我了」「搬砖去了」「无语凝噎」），不要写「开心」「难过」这种泛词；不要标点、引号、空格。
+如果这张图不适合当表情包（真人裸露、血腥、政治敏感、纯文字长截图、严重水印、多图拼贴），只输出 {"kind":"reject"}。
 ```
 
 ### user
 
 ```text
-给这张图打一个短词标签。
+看看这张表情。
 <图片>
 ```
+
+一次调用同时完成「审核 + 起名 + 归大类」：旧版只打一个固定标签（`tagSticker`），现在返回
+`kind/keyword/category`，`kind != sticker` 即视为不可用（换下一张候选）。关键词在落库前还会被
+`sanitizeKeyword` 收口（去空白标点、封顶 7 字），外部网页标题永远不直接进关键词。
+
+### 出站：百度图片（已登录态无关）
+
+```text
+GET https://image.baidu.com/search/acjson?tn=resultjson_com&pn=0&rn=<6..30>&word=<query 表情包>
+User-Agent: <桌面 Chrome UA>
+```
+
+- **关键词必须拼上「表情包」**：实测只搜实体名（如「蓝色大肥鱼」）会按字面返回海洋馆新闻图。
+- 响应不是严格 JSON（尾逗号、键序不稳），由 `parseBaiduImageJson` 用正则逐项抠
+  `middleURL`（500px 级缩略图）与同一项里的 `fromURL`（来源页，用于溯源/删除）。
+- 素材站/图库/电商（`699pic` / `nipic` / `ibaotu` / `tujuren` / `vcg` …）在水印拦截名单
+  `STICKER_HOST_BLOCKLIST` 里，命中直接丢弃；下载后还会压到 384px/120KB 再让视觉模型审一遍。
+- 免登录、无 key；单次最多下载 `AppLimits.Sticker.FETCH_CANDIDATES` 张候选。
+
 
 ## 十九、群成员字段补全（NativeCore）
 
@@ -1152,16 +1182,21 @@ speakingStyle 写“声音底色”：1~2 句，只写语速、用词层次、�
 {
     "type": "object",
     "properties": {
-        "tag": {
+        "keyword": {
             "type": "string",
-            "description": "表情包标签（运行时用该角色的可用标签生成 enum）",
-            "enum": ["<该角色可用标签>"]
+            "description": "已有表情的关键词；优先用它，发送时会在同关键词的多张里随机挑一张。",
+            "enum": ["<该角色已有的关键词>"]
+        },
+        "query": {
+            "type": "string",
+            "description": "库里没有合适的表情时，写一句具体情境去联网找一张（会入库并直接发出），例如「被无语到」「想贴贴」。"
         }
     },
-    "required": ["tag"],
     "additionalProperties": false
 }
 ```
+
+`keyword` 与 `query` 都不给会直接报错；`keyword` 命中就不再联网。
 
 ### A-9 `bilibili_video`
 

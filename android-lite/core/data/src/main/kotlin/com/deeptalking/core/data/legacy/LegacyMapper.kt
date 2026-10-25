@@ -27,6 +27,7 @@ import com.deeptalking.core.model.SpeechSegment
 import com.deeptalking.core.model.StaticFillMeta
 import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.core.model.Sticker
+import com.deeptalking.core.model.StickerCategory
 import com.deeptalking.core.model.TTS_BACKEND_ONDEVICE
 import com.deeptalking.core.model.TTS_BACKEND_REMOTE
 import com.deeptalking.core.model.Todo
@@ -107,8 +108,11 @@ internal fun normalizeTimestamp(value: String?): String? =
 /** Legacy `TIME_PARSE_VERSION` (src/js/memory/time.js). */
 const val TIME_PARSE_VERSION: Int = 1
 
-/** Legacy `STICKER_LIMITS.maxTagChars` (src/js/core/config.js). */
-const val MAX_STICKER_TAG_CHARS: Int = 6
+/**
+ * 表情关键词上限。旧前端是 6（`STICKER_LIMITS.maxTagChars`），现在是 7：
+ * 语义从「固定标签」变成「模型写的短句」后 6 个字太紧，旧 6 字数据仍然合法。
+ */
+const val MAX_STICKER_TAG_CHARS: Int = 7
 
 private const val DAY_START_HOUR: Int = 2
 private const val MAX_PARTICIPANTS: Int = 8
@@ -385,17 +389,20 @@ private fun mapInstant(dto: LegacyInstantMessage, imageSink: StickerSink?): Chat
         },
 )
 
-/** Normalizes a sticker tag the way `normalizeStickers` does (strip whitespace, cap 6). */
+/** Normalizes a sticker keyword (strip whitespace, cap [MAX_STICKER_TAG_CHARS]). */
 internal fun normalizeStickerTag(raw: String?): String =
     (raw ?: "").replace(Regex("[\\s\\r\\n]+"), "").take(MAX_STICKER_TAG_CHARS).ifEmpty { "未分类" }
 
 /** Maps a legacy sticker. Returns null when there is no image payload at all. */
 fun mapSticker(dto: LegacySticker, stickerSink: StickerSink?): Sticker? {
+    val keyword = normalizeStickerTag(dto.tag)
+    val category = StickerCategory.infer(keyword)
     val dataUri = dto.dataUrl
     if (dataUri != null && dataUri.startsWith("data:image/", ignoreCase = true)) {
         return Sticker(
             id = dto.id ?: "",
-            tag = normalizeStickerTag(dto.tag),
+            keyword = keyword,
+            category = category,
             // Without a sink the raw data URI is kept so no data is lost.
             fileRef = stickerSink?.refFor(dataUri) ?: dataUri,
             createdAt = dto.createdAt,
@@ -405,7 +412,8 @@ fun mapSticker(dto: LegacySticker, stickerSink: StickerSink?): Sticker? {
     val existingRef = dto.fileRef?.takeIf { it.isNotBlank() } ?: return null
     return Sticker(
         id = dto.id ?: "",
-        tag = normalizeStickerTag(dto.tag),
+        keyword = keyword,
+        category = category,
         fileRef = existingRef,
         createdAt = dto.createdAt,
         updatedAt = dto.updatedAt ?: dto.createdAt,

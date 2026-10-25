@@ -206,7 +206,7 @@ class LegacyMapperTest {
 
         assertEquals(1, character.stickers.size)
         assertEquals("/tmp/stickers/1.jpg", character.stickers.first().fileRef)
-        assertEquals("开心", character.stickers.first().tag)
+        assertEquals("开心", character.stickers.first().keyword)
         assertEquals(listOf("data:image/png;base64,AAAA"), sink.calls)
     }
 
@@ -486,8 +486,9 @@ class LegacyMapperTest {
         """.trimIndent()
         val character = mapCharacter(parse(json).characters!!.getValue("c1"), null)
         assertEquals(2, character.stickers.size)
-        assertEquals("开心开心", character.stickers[0].tag)
-        assertEquals("一二三四五六", character.stickers[1].tag)
+        assertEquals("开心开心", character.stickers[0].keyword)
+        assertEquals("一二三四五六七", character.stickers[1].keyword)
+        assertEquals("other", character.stickers[1].category)
     }
 
     @Test

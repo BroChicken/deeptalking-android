@@ -34,8 +34,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
@@ -68,6 +66,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -109,6 +108,7 @@ import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.SpeechSegment
 import com.deeptalking.core.model.displaySpeechSegments
 import com.deeptalking.core.model.Sticker
+import com.deeptalking.core.model.StickerCategory
 import com.deeptalking.core.model.TtsPhase
 import java.util.Locale
 
@@ -133,8 +133,10 @@ fun ChatScreen(
     onUserActivity: () -> Unit,
     onAddSticker: (Uri) -> Unit = {},
     onDeleteSticker: (String) -> Unit = {},
-    onSetStickerTag: (String, String) -> Unit = { _, _ -> },
+    onSetStickerKeyword: (String, String) -> Unit = { _, _ -> },
+    onSetStickerCategory: (String, String) -> Unit = { _, _ -> },
     onSendSticker: (Sticker, String) -> Unit = { _, _ -> },
+    onCollectSticker: (String) -> Unit = {},
     onReadAloud: (ChatMessage) -> Unit = {},
     ttsActiveMessageId: String? = null,
     ttsPhase: TtsPhase = TtsPhase.Idle,
@@ -145,6 +147,7 @@ fun ChatScreen(
     var editTarget by remember { mutableStateOf<ChatMessage?>(null) }
     var confirmRegenerate by remember { mutableStateOf<ChatMessage?>(null) }
     var stickerPanelOpen by rememberSaveable { mutableStateOf(false) }
+    var collectTarget by remember { mutableStateOf<String?>(null) }
     val listState = rememberLazyListState()
     val context = LocalContext.current
 
@@ -237,6 +240,7 @@ fun ChatScreen(
                                     onEditResend = { editTarget = message },
                                     onRegenerate = { confirmRegenerate = message },
                                     onImageClick = { imagePreview = it },
+                                    onImageLongPress = { collectTarget = it },
                                     onReadAloud = { onReadAloud(message) },
                                     ttsActiveMessageId = ttsActiveMessageId,
                                     ttsPhase = ttsPhase,
@@ -292,7 +296,9 @@ fun ChatScreen(
                         onUpload = { stickerPicker.launch("image/*") },
                         onSend = { sticker -> onSendSticker(sticker, input.text); input = TextFieldValue(""); stickerPanelOpen = false },
                         onDelete = onDeleteSticker,
-                        onSetTag = onSetStickerTag,
+                        onSetKeyword = onSetStickerKeyword,
+                        onSetCategory = onSetStickerCategory,
+                        onPreview = { imagePreview = it },
                     )
                 }
                 Row(
@@ -385,6 +391,18 @@ fun ChatScreen(
         }
     }
 
+    collectTarget?.let { path ->
+        AlertDialog(
+            onDismissRequest = { collectTarget = null },
+            title = { Text("把这张图收进表情包？") },
+            text = { Text("会存进当前角色的表情库，并让模型看图给它起一个关键词。") },
+            confirmButton = {
+                TextButton(onClick = { onCollectSticker(path); collectTarget = null }) { Text("收进表情库") }
+            },
+            dismissButton = { TextButton(onClick = { collectTarget = null }) { Text("取消") } },
+        )
+    }
+
     editTarget?.let { target ->
         var draft by remember(target.id) { mutableStateOf(target.content) }
         AlertDialog(
@@ -468,6 +486,7 @@ private fun MessageRow(
     onEditResend: () -> Unit,
     onRegenerate: () -> Unit,
     onImageClick: (String) -> Unit,
+    onImageLongPress: (String) -> Unit,
     onReadAloud: () -> Unit,
     ttsActiveMessageId: String?,
     ttsPhase: TtsPhase,
@@ -492,6 +511,7 @@ private fun MessageRow(
             onEditResend = onEditResend,
             onRegenerate = onRegenerate,
             onImageClick = onImageClick,
+            onImageLongPress = onImageLongPress,
             onReadAloud = onReadAloud,
             ttsActiveMessageId = ttsActiveMessageId,
             ttsPhase = ttsPhase,
@@ -529,7 +549,7 @@ private fun MessageRow(
                         if (message.content.isNotBlank()) {
                             RichText(source = message.content, isUser = isUser, onImageClick = onImageClick)
                         }
-                        MessageImages(message, onImageClick)
+                        MessageImages(message, onImageClick, onImageLongPress)
                         message.staticChanges.takeIf { !isUser && it.isNotEmpty() }?.let {
                             Text("⚡ ${it.joinToString(" · ")}已修改", fontSize = 11.sp, color = colors.warning, modifier = Modifier.padding(top = 4.dp))
                         }
@@ -566,6 +586,7 @@ private fun SegmentedMessageRow(
     onEditResend: () -> Unit,
     onRegenerate: () -> Unit,
     onImageClick: (String) -> Unit,
+    onImageLongPress: (String) -> Unit,
     onReadAloud: () -> Unit,
     ttsActiveMessageId: String?,
     ttsPhase: TtsPhase,
@@ -600,7 +621,7 @@ private fun SegmentedMessageRow(
                         Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
                             RichText(source = segment.text, isUser = false, onImageClick = onImageClick)
                             if (isLast) {
-                                MessageImages(message, onImageClick)
+                                MessageImages(message, onImageClick, onImageLongPress)
                                 message.staticChanges.takeIf { it.isNotEmpty() }?.let {
                                     Text("⚡ ${it.joinToString(" · ")}已修改", fontSize = 11.sp, color = colors.warning, modifier = Modifier.padding(top = 4.dp))
                                 }
@@ -809,7 +830,11 @@ private fun TypingIndicator(color: Color) {
 }
 
 @Composable
-private fun MessageImages(message: ChatMessage, onImageClick: (String) -> Unit) {
+private fun MessageImages(
+    message: ChatMessage,
+    onImageClick: (String) -> Unit,
+    onImageLongPress: (String) -> Unit = {},
+) {
     val media = message.attachments.filter { it.kind == MessageAttachment.Kind.Image || it.kind == MessageAttachment.Kind.Sticker }
     if (media.isEmpty()) return
     val context = LocalContext.current
@@ -824,7 +849,12 @@ private fun MessageImages(message: ChatMessage, onImageClick: (String) -> Unit) 
                     // included) at 220px.
                     .size(220.dp)
                     .clip(RoundedCornerShape(10.dp))
-                    .clickable { onImageClick(attachment.uri) },
+                    .pointerInput(attachment.uri) {
+                        detectTapGestures(
+                            onTap = { onImageClick(attachment.uri) },
+                            onLongPress = { onImageLongPress(attachment.uri) },
+                        )
+                    },
             )
         }
     }
@@ -836,77 +866,177 @@ private fun StickerPanel(
     onUpload: () -> Unit,
     onSend: (Sticker) -> Unit,
     onDelete: (String) -> Unit,
-    onSetTag: (String, String) -> Unit,
+    onSetKeyword: (String, String) -> Unit,
+    onSetCategory: (String, String) -> Unit,
+    onPreview: (String) -> Unit,
 ) {
-    var tagEdit by remember { mutableStateOf<Sticker?>(null) }
-    val context = LocalContext.current
+    var editing by remember { mutableStateOf<Sticker?>(null) }
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .heightIn(max = 240.dp)
+            .heightIn(max = 260.dp)
             .background(MaterialTheme.legacy.input)
             .padding(10.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
             TextButton(onClick = onUpload) { Text("+ 上传表情", fontSize = 12.sp, color = MaterialTheme.legacy.text) }
             Spacer(Modifier.weight(1f))
-            Text("${stickers.size} 张", fontSize = 11.sp, color = MaterialTheme.legacy.textMuted)
+            Text("${stickers.size} 张 · 长按可改关键词", fontSize = 11.sp, color = MaterialTheme.legacy.textMuted)
         }
         if (stickers.isEmpty()) {
-            Text("还没有表情包。点上方「上传表情」加入。", fontSize = 12.sp, color = MaterialTheme.legacy.textMuted, modifier = Modifier.padding(12.dp))
+            Text("还没有表情包。点「上传表情」加入，或长按对话里的图片收进来。", fontSize = 12.sp, color = MaterialTheme.legacy.textMuted, modifier = Modifier.padding(12.dp))
         } else {
-            LazyVerticalGrid(
-                columns = GridCells.Adaptive(72.dp),
-                modifier = Modifier.fillMaxWidth().heightIn(max = 180.dp),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                items(stickers.size) { index ->
-                    val sticker = stickers[index]
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Box {
-                            AsyncImage(
-                                model = MediaRef.model(context, sticker.fileRef),
-                                contentDescription = sticker.tag,
-                                contentScale = ContentScale.Crop,
-                                modifier = Modifier.size(72.dp).clip(RoundedCornerShape(8.dp)).clickable { onSend(sticker) },
-                            )
-                            IconButton(onClick = { onDelete(sticker.id) }, modifier = Modifier.align(Alignment.TopEnd).size(18.dp)) {
-                                Icon(Icons.Outlined.Close, contentDescription = "删除表情", modifier = Modifier.size(12.dp))
+            LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = 190.dp)) {
+                StickerCategory.group(stickers).forEach { (def, group) ->
+                    item(key = "head-" + def.id) {
+                        Text(
+                            "${def.label} · ${group.size}",
+                            fontSize = 11.sp,
+                            color = MaterialTheme.legacy.textMuted,
+                            modifier = Modifier.padding(top = 4.dp, bottom = 2.dp),
+                        )
+                    }
+                    item(key = "row-" + def.id) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            group.forEach { sticker ->
+                                StickerCell(
+                                    sticker = sticker,
+                                    onSend = { onSend(sticker) },
+                                    onLongPress = { editing = sticker },
+                                )
                             }
                         }
-                        Text(
-                            sticker.tag.ifEmpty { "未分类" },
-                            fontSize = 10.sp,
-                            color = MaterialTheme.legacy.textMuted,
-                            maxLines = 1,
-                            modifier = Modifier.clickable { tagEdit = sticker },
-                        )
                     }
                 }
             }
         }
     }
 
-    tagEdit?.let { sticker ->
-        var tag by remember(sticker.id) { mutableStateOf(sticker.tag) }
-        AlertDialog(
-            onDismissRequest = { tagEdit = null },
-            title = { Text("编辑标签") },
-            text = {
-                OutlinedTextField(
-                    value = tag,
-                    // Legacy caps sticker tags at 6 chars with no whitespace.
-                    onValueChange = { raw -> tag = raw.replace(Regex("\\s+"), "").take(6) },
-                    singleLine = true,
-                )
+    editing?.let { sticker ->
+        StickerEditDialog(
+            sticker = sticker,
+            onPreview = { onPreview(sticker.fileRef) },
+            onSave = { keyword, category ->
+                onSetKeyword(sticker.id, keyword)
+                onSetCategory(sticker.id, category)
+                editing = null
             },
-            confirmButton = {
-                TextButton(onClick = { onSetTag(sticker.id, tag); tagEdit = null }) { Text("保存") }
-            },
-            dismissButton = { TextButton(onClick = { tagEdit = null }) { Text("取消") } },
+            onDelete = { onDelete(sticker.id); editing = null },
+            onDismiss = { editing = null },
         )
     }
+}
+
+@Composable
+private fun StickerCell(
+    sticker: Sticker,
+    onSend: () -> Unit,
+    onLongPress: () -> Unit,
+) {
+    val context = LocalContext.current
+    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.width(72.dp)) {
+        Box {
+            AsyncImage(
+                model = MediaRef.model(context, sticker.fileRef),
+                contentDescription = sticker.keyword,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .size(72.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .pointerInput(sticker.id) {
+                        detectTapGestures(onTap = { onSend() }, onLongPress = { onLongPress() })
+                    },
+            )
+            if (sticker.source == "web") {
+                Text(
+                    "网",
+                    fontSize = 8.sp,
+                    color = MaterialTheme.legacy.onUserBubble,
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(2.dp)
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(MaterialTheme.legacy.btnPrimary)
+                        .padding(horizontal = 2.dp),
+                )
+            }
+        }
+        Text(
+            sticker.keyword.ifEmpty { "未命名" },
+            fontSize = 10.sp,
+            color = MaterialTheme.legacy.textMuted,
+            maxLines = 1,
+            modifier = Modifier.padding(top = 2.dp),
+        )
+    }
+}
+
+@Composable
+private fun StickerEditDialog(
+    sticker: Sticker,
+    onPreview: () -> Unit,
+    onSave: (String, String) -> Unit,
+    onDelete: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    var keyword by remember(sticker.id) { mutableStateOf(sticker.keyword) }
+    var category by remember(sticker.id) { mutableStateOf(StickerCategory.of(sticker)) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("表情") },
+        text = {
+            Column {
+                AsyncImage(
+                    model = MediaRef.model(context, sticker.fileRef),
+                    contentDescription = sticker.keyword,
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 160.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable { onPreview() },
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = keyword,
+                    onValueChange = { raw -> keyword = raw.replace(Regex("\\s+"), "").take(AppLimits.Sticker.KEYWORD_MAX) },
+                    singleLine = true,
+                    label = { Text("关键词（≤${AppLimits.Sticker.KEYWORD_MAX} 字）") },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    StickerCategory.ALL.forEach { def ->
+                        val selected = def.id == category
+                        Text(
+                            def.label,
+                            fontSize = 12.sp,
+                            color = if (selected) MaterialTheme.legacy.onUserBubble else MaterialTheme.legacy.text,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(if (selected) MaterialTheme.legacy.btnPrimary else MaterialTheme.legacy.input)
+                                .clickable { category = def.id }
+                                .padding(horizontal = 10.dp, vertical = 5.dp),
+                        )
+                    }
+                }
+                TextButton(onClick = onDelete) {
+                    Text("删除这张表情", color = MaterialTheme.legacy.textMuted, fontSize = 12.sp)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onSave(keyword, category) }) { Text("保存") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
 }
 
 private fun formatTime(timestamp: String?): String {

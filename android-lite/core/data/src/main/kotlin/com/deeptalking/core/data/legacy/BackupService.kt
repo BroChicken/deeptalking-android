@@ -580,7 +580,11 @@ class BackupService(
 
     private fun stickerToJson(sticker: Sticker): JsonObject = buildJsonObject {
         put("id", sticker.id)
-        put("tag", sticker.tag)
+        // JSON 键仍是 `tag`：旧版本导出的备份/旧 WebView 数据靠它对齐。
+        put("tag", sticker.keyword)
+        put("category", sticker.category)
+        if (sticker.source.isNotEmpty()) put("source", sticker.source)
+        if (sticker.origin.isNotEmpty()) put("origin", sticker.origin)
         // Inline the payload so a restored backup (other device / after clear-data)
         // can re-materialize the image; keep fileRef as a fallback.
         mediaSource?.toDataUri(sticker.fileRef)?.let { put("dataUrl", it) }

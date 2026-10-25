@@ -19,6 +19,9 @@ import kotlinx.coroutines.withContext
  * to [AppLimits.Media]; stickers to [AppLimits.Sticker]. Returns the absolute
  * file path, which is what [com.deeptalking.core.model.MessageAttachment.uri]
  * holds for [com.deeptalking.core.model.MessageAttachment.Kind.Image]/Sticker.
+ *
+ * [saveStickerBytes] / [saveStickerFromFile] are the two non-picker entries:
+ * 联网抓到的图按字节进，对话里的图按已有路径进（“长按收进表情包”）。
  */
 class MediaStore(private val context: Context) {
 
@@ -40,6 +43,43 @@ class MediaStore(private val context: Context) {
             maxBytes = AppLimits.Sticker.TARGET_BYTES,
             qualities = QUALITIES,
         )
+    }
+
+    /** 联网抓到的图：解码 → 压到表情规格 → 存盘。 */
+    suspend fun saveStickerBytes(bytes: ByteArray): String? = withContext(Dispatchers.IO) {
+        storeSticker(decodeBytes(bytes))
+    }
+
+    /** 对话里已有的图片（filesDir 下的绝对路径）：复制成一张表情。 */
+    suspend fun saveStickerFromFile(path: String): String? = withContext(Dispatchers.IO) {
+        val bytes = runCatching { File(path).readBytes() }.getOrNull() ?: return@withContext null
+        storeSticker(decodeBytes(bytes))
+    }
+
+    private fun decodeBytes(bytes: ByteArray): Bitmap? =
+        runCatching { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }.getOrNull()
+
+    /** Sticker variant of [compressToFile] that starts from an already decoded bitmap. */
+    private fun storeSticker(original: Bitmap?): String? {
+        if (original == null) return null
+        val scaled = scaleDown(original, AppLimits.Sticker.MAX_DIMENSION)
+        val flattened = flattenOnWhite(scaled)
+        var bytes = encodeJpeg(flattened, QUALITIES.first())
+        for (quality in QUALITIES.drop(1)) {
+            if (bytes.size <= AppLimits.Sticker.TARGET_BYTES) break
+            bytes = encodeJpeg(flattened, quality)
+        }
+        flattened.recycle()
+        if (scaled !== original) {
+            scaled.recycle()
+            original.recycle()
+        }
+        val directory = File(context.filesDir, "stickers").apply { mkdirs() }
+        val file = File(directory, sha256Hex(bytes) + ".jpg")
+        return runCatching {
+            file.writeBytes(bytes)
+            "stickers/${file.name}"
+        }.getOrNull()
     }
 
     private fun compressToFile(
@@ -104,8 +144,8 @@ class MediaStore(private val context: Context) {
         return buildString(digest.size * 2) { for (b in digest) append("%02x".format(b)) }
     }
 
-    private companion object {
+    companion object {
         /** Legacy quality ramp: 0.82, then −0.12 while > 0.4 (`images.js:39-44`). */
-        val QUALITIES = intArrayOf(82, 70, 58, 46, 34)
+        private val QUALITIES = intArrayOf(82, 70, 58, 46, 34)
     }
 }
