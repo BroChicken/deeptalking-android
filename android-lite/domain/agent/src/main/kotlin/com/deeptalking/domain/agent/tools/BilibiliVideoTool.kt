@@ -4,6 +4,7 @@ import com.deeptalking.core.network.BiliLinks
 import com.deeptalking.core.network.BiliVideoSource
 import com.deeptalking.core.network.BiliVideoText
 import com.deeptalking.core.network.BiliVideoTextResult
+import com.deeptalking.core.network.WebContentProvider
 import com.deeptalking.core.network.formatBiliClock
 import com.deeptalking.domain.agent.AgentContext
 import com.deeptalking.domain.agent.AgentTool
@@ -23,9 +24,15 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 
 /**
- * 总结一个 B 站视频（第 9 个工具）。
+ * B 站视频的唯一入口（第 9 个工具）：**搜**和**看**在同一个工具里。
  *
- * 三条输入路径，**没有一条会以"失败"收场**（除非视频本身取不到）：
+ * 为什么合并且把 B 站从 `search` 里摘出去：用户说“找个讲 X 的视频，说说讲了啥”是一件事的
+ * 两步，拆成两个工具只会让模型自己做路由（经常先搜了却忘了总结）。其他平台（网易云/虎扑）
+ * 没有“读完再总结”这一步，继续留在 `search`。
+ *
+ * 参数按"给了什么"分派：给 `url`/BV 号 → 总结；只给 `query` → 搜视频；两个都给时按 url 走。
+ *
+ * 总结有三条输入路径，**没有一条会以"失败"收场**（除非视频本身取不到）：
  * 1. 逐句字幕（要登录态）→ 分块总结，产出带 `mm:ss` 的要点；
  * 2. B 站官方 AI 总结（要登录态）→ 直接采用，零 LLM 调用；
  * 3. 只有元信息 + 章节 + 画面截图（免登录）→ 说"没字幕，只能看个大概"，禁止编造。
@@ -33,8 +40,10 @@ import kotlinx.serialization.json.put
  * 有缓存（默认 7 天）时同一条视频第二次问直接返回上次的结果，不再抓字幕、不再调模型。
  * 字幕原文和截图只留在本机缓存里，不进聊天历史、不进备份。
  */
-class VideoSummaryTool(
+class BilibiliVideoTool(
     private val source: BiliVideoSource?,
+    /** 搜索走平台搜索（`WebContentProvider.searchSocial`），与总结共用同一个网络层。 */
+    private val search: WebContentProvider? = null,
     private val summary: VideoSummaryService? = null,
     private val cache: VideoSummaryCache? = null,
     private val frames: VideoFrameProvider? = null,
@@ -43,32 +52,51 @@ class VideoSummaryTool(
 ) : AgentTool {
 
     override val definition = ToolDefinition(
-        name = "video_summary",
-        description = "总结一个 B 站视频讲了什么（用户发来 B 站链接，或你先用 search 搜到视频再挑一个）。" +
-            "返回标题、UP主、时长、是否有字幕，以及带时间戳的要点；传 focus 可只关注某个问题。" +
-            "有字幕时依据字幕，没有字幕时会标明“没字幕、只能看个大概”（依据简介/章节/画面），" +
-            "那种情况下不得把内容当成逐句事实，也不要凭标题编造。",
-        parametersJson = """{"type":"object","properties":{"url":{"type":"string","description":"B 站视频链接或 BV 号（必须来自上下文里真实存在的视频，禁止编造）"},"focus":{"type":"string","description":"用户特别想了解的点，如“结论是什么”“讲了哪几本书”（可选）"}},"required":["url"],"additionalProperties":false}""",
+        name = "bilibili_video",
+        description = "B 站视频：按关键词搜视频，或总结一个视频讲了什么。① 给 query → 搜视频，返回 BV 号、标题、" +
+            "UP主、时长、播放量、简介与封面，可据此挑一个；② 给 url（B 站链接或 BV 号）→ 总结它，返回是否有字幕、" +
+            "带时间戳的要点，传 focus 可只关注某个问题。两个都给时按 url 总结。总结只依据字幕/站方 AI 总结/画面截图；" +
+            "没字幕时会标明“只能看个大概”，此时不得当成逐句事实，也不要凭标题编造。",
+        parametersJson = """{"type":"object","properties":{"query":{"type":"string","description":"检索关键词（搜视频时用，从用户意图提取）"},"url":{"type":"string","description":"B 站视频链接或 BV 号（总结时用；必须来自上下文里真实存在的视频，禁止编造）"},"focus":{"type":"string","description":"总结时用户特别想了解的点，如“结论是什么”（可选）"},"limit":{"type":"integer","minimum":1,"maximum":20,"description":"搜索条数，默认 6（总结时忽略）"}},"additionalProperties":false}""",
     )
 
     override suspend fun execute(call: ToolCall, context: AgentContext): AgentToolResult {
-        val provider = source ?: return AgentToolResult(errorJson("视频总结不可用（联网功能未启用）"))
         val args = ToolArgs.parse(call.arguments)
-        val raw = ToolArgs.string(args, "url").trim()
-        val bvid = BiliLinks.bvidOf(raw)
-            ?: return AgentToolResult(errorJson("需要一个 B 站视频链接或 BV 号（当前参数里没有可识别的 BV 号）"))
+        val rawUrl = ToolArgs.string(args, "url").trim()
+        val query = ToolArgs.string(args, "query").trim()
         val focus = ToolArgs.string(args, "focus").trim().ifEmpty { null }
+        if (rawUrl.isNotEmpty()) return AgentToolResult(summarize(rawUrl, focus))
+        if (query.isNotEmpty()) {
+            val limit = (ToolArgs.int(args, "limit") ?: DEFAULT_LIMIT).coerceIn(1, MAX_LIMIT)
+            return AgentToolResult(searchVideos(query, limit))
+        }
+        return AgentToolResult(errorJson("需要 query（搜视频）或 url（总结视频）至少给一个"))
+    }
+
+    // ------------------------------------------------------------------ 搜视频
+
+    private suspend fun searchVideos(query: String, limit: Int): String {
+        val provider = search ?: return errorJson("联网功能不可用")
+        return provider.searchSocial("bilibili", query, limit)
+    }
+
+    // ------------------------------------------------------------------ 总结
+
+    private suspend fun summarize(rawUrl: String, focus: String?): String {
+        val provider = source ?: return errorJson("B 站视频总结不可用（联网功能未启用）")
+        val bvid = BiliLinks.bvidOf(rawUrl)
+            ?: return errorJson("需要一个 B 站视频链接或 BV 号（当前参数里没有可识别的 BV 号）")
 
         // 只缓存"泛总结"：带 focus 的问题每次都得重新问，否则会拿旧答案敷衍新问题。
         if (focus == null) {
             cache?.read(bvid)?.let { cached ->
-                return AgentToolResult(withCached(cached))
+                return withCached(cached)
             }
         }
 
         return when (val result = provider.load(bvid)) {
-            is BiliVideoTextResult.Failure -> AgentToolResult(errorJson(failureReason(result)))
-            is BiliVideoTextResult.Ok -> AgentToolResult(render(provider, result.text, focus))
+            is BiliVideoTextResult.Failure -> errorJson(failureReason(result))
+            is BiliVideoTextResult.Ok -> render(provider, result.text, focus)
         }
     }
 
@@ -193,5 +221,8 @@ class VideoSummaryTool(
 
         /** 回给主模型的截图张数上限：低清图约 85 token/张，两张就够说明"画面在做什么"。 */
         const val MAX_RESULT_FRAMES = 2
+
+        const val DEFAULT_LIMIT = 6
+        const val MAX_LIMIT = 20
     }
 }

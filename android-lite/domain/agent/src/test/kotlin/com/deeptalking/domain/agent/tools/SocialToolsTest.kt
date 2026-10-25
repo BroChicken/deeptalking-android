@@ -86,12 +86,12 @@ class SocialToolsTest {
     @Test
     fun `search forwards the platform query and limit`() = runBlocking {
         val web = FakeWeb()
-        SearchTool(web).execute(call("""{"platform":"bilibili","query":"火影忍者","limit":5}"""), context)
+        SearchTool(web).execute(call("""{"platform":"hupu","query":"原神","limit":5}"""), context)
         SearchTool(web).execute(call("""{"platform":"netease","query":"海阔天空"}"""), context)
         SearchTool(web).execute(call("""{"platform":"hupu","query":"原神","limit":99}"""), context)
         assertEquals(
             listOf(
-                "searchSocial:bilibili:火影忍者:5",
+                "searchSocial:hupu:原神:5",
                 "searchSocial:netease:海阔天空:6",
                 "searchSocial:hupu:原神:20",
             ),
@@ -108,15 +108,17 @@ class SocialToolsTest {
         )
         assertTrue(
             SearchTool(web).execute(call("""{"platform":"weibo","query":"热搜"}"""), context)
-                .contentJson.contains("platform 只能是 bilibili / netease / hupu"),
+                .contentJson.contains("platform 只能是 netease / hupu"),
         )
         assertTrue(web.calls.isEmpty())
     }
 
     @Test
-    fun `search schema exposes exactly the three platforms`() {
+    fun `search schema exposes exactly the two remaining platforms`() {
         val params = SearchTool(null).definition.parametersJson
-        listOf("bilibili", "netease", "hupu").forEach { assertTrue(it, params.contains("\"$it\"")) }
+        listOf("netease", "hupu").forEach { assertTrue(it, params.contains("\"$it\"")) }
+        // B 站视频已被 bilibili_video 接管，不能再出现在 search 的枚举里。
+        assertFalse(params.contains("\"bilibili\""))
         assertTrue(params.contains("\"required\":[\"platform\",\"query\"]"))
     }
 

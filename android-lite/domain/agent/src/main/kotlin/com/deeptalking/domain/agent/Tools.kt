@@ -14,11 +14,11 @@ import com.deeptalking.domain.memory.MemoryService
 /**
  * Builds the default agent tool list (nine tools; see `docs/AGENT_ARCHITECTURE.md`, 工具清单).
  *
- * Read: `search_memory` / `web_search` / `web_fetch` / `search` / `hot_board` / `video_summary`.
+ * Read: `search_memory` / `web_search` / `web_fetch` / `search` / `hot_board` / `bilibili_video`.
  * Write: `memory_write` (memory) / `upsert_lorebook_entry` (world book).
  * Expression: `send_sticker` (only when the character owns stickers).
  *
- * `video_summary` is injected by the app (it needs the B 站文本源 + 总结用的辅助调用通道), so it
+ * `bilibili_video` is injected by the app (it needs the B 站文本源 + 总结用的辅助调用通道), so it
  * stays optional here: tests and builds without网络 wiring keep the eight-tool set unchanged.
  *
  * `submit_response` is gone with the structured protocol: the main call is plain text,
@@ -30,14 +30,14 @@ fun defaultTools(
     memory: MemoryService,
     web: WebContentProvider?,
     stickersEnabled: Boolean,
-    videoSummary: AgentTool? = null,
+    bilibiliVideo: AgentTool? = null,
 ): List<AgentTool> = buildList {
     add(SearchMemoryTool(memory))
     add(WebSearchTool(web))
     add(WebFetchTool(web))
     add(SearchTool(web))
     add(HotBoardTool(web))
-    if (videoSummary != null) add(videoSummary)
+    if (bilibiliVideo != null) add(bilibiliVideo)
     add(MemoryWriteTool(memory))
     add(UpsertLorebookEntryTool())
     if (stickersEnabled) add(SendStickerTool(stickersEnabled))

@@ -33,7 +33,7 @@ class PromptToolListTest {
             "web_fetch",
             "search",
             "hot_board",
-            "video_summary",
+            "bilibili_video",
             "memory_write",
             "upsert_lorebook_entry",
             "send_sticker",
@@ -70,7 +70,8 @@ class PromptToolListTest {
     @Test
     fun platformToolsTakeAnExplicitPlatform() {
         val prompt = systemPrompt()
-        assertTrue(prompt.contains("platform=bilibili"))
+        assertTrue(prompt.contains("platform=netease"))
+        assertTrue("B 站视频走独立工具", prompt.contains("bilibili_video"))
         assertTrue(prompt.contains("platform=baidu"))
         assertTrue(prompt.contains("upsert_lorebook_entry"))
     }

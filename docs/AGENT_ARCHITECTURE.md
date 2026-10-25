@@ -77,16 +77,16 @@ BackgroundTasks.scheduleTurn       后台：文风校对、快速回应校验/�
 
 ### 2. 工具清单（agent 的能力）
 
-`Tools.defaultTools(memory, web, stickersEnabled, videoSummary)`——**9 个工具**（顺序即注册顺序；`video_summary` 由 `:app` 注入，未接线时保持 8 个）：
+`Tools.defaultTools(memory, web, stickersEnabled, bilibiliVideo)`——**9 个工具**（顺序即注册顺序；`bilibili_video` 由 `:app` 注入，未接线时保持 8 个）：
 
 | 工具 | 作用 | 实现 |
 |---|---|---|
 | `search_memory` | 检索长期记忆（关键词 / 按日期 `date`/`timeRef`/`slot` / 给 `category` 即盘点分类，`limit` 可调）；群组可指定成员私人记忆 | `SearchMemoryTool` |
 | `web_search` | 通用联网搜索（必应 RSS，`limit` 1–20） | `WebSearchTool` |
 | `web_fetch` | 读取链接（网页正文 / 图片 / 站内专门解析）；虎扑帖子、网易云歌曲、B站视频链接各有专门解析。**只读链接、不做关键词搜索** | `WebFetchTool` → `HttpWebContentProvider` |
-| `search` | 按关键词搜一个社区平台：`platform` ∈ `bilibili` / `netease` / `hupu` | `SearchTool` |
+| `search` | 按关键词搜一个社区平台：`platform` ∈ `netease` / `hupu`（B 站视频改走 `bilibili_video`） | `SearchTool` |
 | `hot_board` | 指定平台热榜：`platform` ∈ `baidu` / `toutiao` / `douyin` / `zhihu` | `HotBoardTool` |
-| `video_summary` | 总结一个 B 站视频讲了什么（`url` 传链接或 BV 号，`focus` 可选）：逐句字幕走分块总结，官方 AI 总结存在时直接采用，都没有就用简介/章节/抽帧画面说个大概并标明"没字幕"；结果按 BV 号本地缓存 7 天 | `VideoSummaryTool` → `HttpBiliVideoSource` + `VideoSummaryService` + `BiliFrameExtractor`/`BiliVideoCache`（见 `docs/BILIBILI_VIDEO_SUMMARY.md`） |
+| `bilibili_video` | B 站视频的唯一入口：给 `query` 搜视频（BV 号/标题/UP/时长/播放/简介/封面），给 `url` 或 BV 号总结这个视频（`focus` 可选）。总结逐句字幕走分块、官方 AI 总结存在时直接采用，都没有就用简介/章节/抽帧画面说个大概并标明"没字幕"；结果按 BV 号本地缓存 7 天 | `BilibiliVideoTool` → `HttpBiliVideoSource` + `WebContentProvider`（搜索） + `VideoSummaryService` + `BiliFrameExtractor`/`BiliVideoCache`（见 `docs/BILIBILI_VIDEO_SUMMARY.md`） |
 | `memory_write` | 按 ID 修正（`op=update`，须 evidence + sourceMessageIds）或删除（`op=delete`）记忆 | `MemoryWriteTool` |
 | `upsert_lorebook_entry` | 写入/更新世界书条目（世界层设定唯一入口，保护人工维护条目） | `UpsertLorebookEntryTool` |
 | `send_sticker` | 发表情包（**仅当角色有贴图时注册**，schema 内联该角色的标签枚举） | `SendStickerTool` |
@@ -157,7 +157,7 @@ BackgroundTasks.scheduleTurn       后台：文风校对、快速回应校验/�
 | `final-empty` | FINAL 阶段没有正文 | 重试（≤2 次） | `正在重新生成…` |
 | `empty` | 重试后仍无正文 | 失败 | 外层提示"收到空回复，请重试。你的消息已保留。" |
 
-工具提示（`AgentLoop.toolActivityHint`）：`search_memory`→`正在回忆…`、`web_search`→`正在搜索…`、`web_fetch`→`正在读取网页…`、`search`→`正在搜索…`、`hot_board`→`正在看热榜…`、`video_summary`→`正在看视频…`、`memory_write`→`正在更新记忆…`、`upsert_lorebook_entry`→`正在更新世界书…`、`send_sticker`→`正在挑表情…`，未知工具回退 `正在处理…`。
+工具提示（`AgentLoop.toolActivityHint`）：`search_memory`→`正在回忆…`、`web_search`→`正在搜索…`、`web_fetch`→`正在读取网页…`、`search`→`正在搜索…`、`hot_board`→`正在看热榜…`、`bilibili_video`→`正在看视频…`、`memory_write`→`正在更新记忆…`、`upsert_lorebook_entry`→`正在更新世界书…`、`send_sticker`→`正在挑表情…`，未知工具回退 `正在处理…`。
 
 > `quickReplies` 不是收尾门槛：worker 失败或只给出不足两条时没有按钮，正文照常显示；后台换位生成在**开关开启且 worker 未成功、或成功但不足两条**时运行，结果通过 `detectQuickReplyIssues` 才补上。worker 已给出两条时不再跑，避免抢写。
 
@@ -409,7 +409,7 @@ tools: AUTO 阶段 8 个工具 / FINAL 阶段无 tools（tool_choice 恒为 auto
 | `5` | 需要工具时**只调工具、不写正文**；工具结果回来后再写正文；正文不提工具名或检索过程 |
 | `6` | 文风以"性格特征"、可选"声音底色"和"对用户的称呼"为准；不向默认助手腔靠拢；不复用最近几轮的整句/句式/比喻/意象/收尾 |
 | `7` | 通用真人感（与角色无关，所有角色共享）：句长要乱（多数 3~15 字、长句 ≤40 字）、允许不完整句/省略主语/停住改口/语气词；情绪不直说、不必每轮表态；可以不接话/只回半句；近三轮用过的词句不再复用；禁总结升华排比与结构词；禁 AI 腔固定句 |
-| `A` | 本会话可用工具清单（9 个，逐一点名）+ 何时用哪个工具的导引；日期用 `search_memory` 的 `date`/`timeRef`；说"第一次/从来没/总是"前先检索；讲 B 站视频内容用 `video_summary`（依据字幕/站方总结/画面；`has_subtitle=false` 时说清"没字幕"） |
+| `A` | 本会话可用工具清单（9 个，逐一点名）+ 何时用哪个工具的导引；日期用 `search_memory` 的 `date`/`timeRef`；说"第一次/从来没/总是"前先检索；B 站视频用 `bilibili_video`（给 query 搜、给 url 总结；依据字幕/站方总结/画面，`has_subtitle=false` 时说清"没字幕"） |
 | `10` | 群组：只能由已列出的成员发言，每人独立一行"成员名：内容"；成员之间语气必须显著不同 |
 | `11` | 群组：成员私人记忆互不相通，只有全体都知道的事才写共享记忆；不得张冠李戴 |
 | — | 【角色设定（固定，不随对话变化）】= `buildSystemPrompt` 的静态角色块（群组含群组前提与成员清单） |

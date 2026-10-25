@@ -51,7 +51,7 @@ import com.deeptalking.domain.agent.background.LorebookRetryStore
 import com.deeptalking.domain.agent.background.ExtractionRetryStore
 import com.deeptalking.domain.agent.background.MemoryTaskKind
 import com.deeptalking.domain.agent.defaultTools
-import com.deeptalking.domain.agent.tools.VideoSummaryTool
+import com.deeptalking.domain.agent.tools.BilibiliVideoTool
 import com.deeptalking.domain.agent.video.VideoDigest
 import com.deeptalking.domain.agent.video.VideoSummarizer
 import com.deeptalking.domain.agent.video.VideoSummaryService
@@ -124,7 +124,7 @@ class NativeCore(context: Context) {
 
     /**
      * 字幕/画面总结用的辅助补全：走 [trackedComplete]，因此每次总结都会在 `requestMetrics` 里留
-     * 一条 `video_summary`（输入/输出/hit 都能看），失败也带原因。
+     * 一条指标记录 `video_summary`（任务名保留旧值，便于和历史指标对比；输入/输出/hit 都能看），失败也带原因。
      *
      * 带图请求被拒（模型不支持视觉时会 400）就退回纯文字重试一次，而不是让整次总结失败。
      */
@@ -177,8 +177,9 @@ class NativeCore(context: Context) {
             memory,
             web,
             stickersEnabled = true,
-            videoSummary = VideoSummaryTool(
+            bilibiliVideo = BilibiliVideoTool(
                 source = biliVideoSource,
+                search = web,
                 summary = VideoSummaryService(videoSummarizer),
                 cache = biliVideoCache,
                 frames = biliFrameExtractor,

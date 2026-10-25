@@ -365,10 +365,10 @@ private const val RULE_7 =
  */
 internal const val RULE_A_PREFIX =
     "A. 本会话可用工具（何时用、怎么用见各工具描述）：search_memory / web_search / web_fetch / search / " +
-        "hot_board / video_summary / memory_write / upsert_lorebook_entry / send_sticker。" +
-        "回忆过往、盘点记忆用 search_memory（给 category 即盘点分类）；平台搜索用 search（platform=bilibili 视频/UP主、" +
-        "netease 歌曲/歌手、hupu 帖子/讨论）；热榜用 hot_board（platform=baidu / toutiao / douyin / zhihu）；" +
-        "要讲某个 B 站视频讲了什么用 video_summary（先 search 拿链接，或用户直接给链接/BV 号）——" +
+        "hot_board / bilibili_video / memory_write / upsert_lorebook_entry / send_sticker。" +
+        "回忆过往、盘点记忆用 search_memory（给 category 即盘点分类）；平台搜索用 search（platform=netease 歌曲/歌手、" +
+        "hupu 帖子/讨论）；热榜用 hot_board（platform=baidu / toutiao / douyin / zhihu）；" +
+        "B 站视频统一用 bilibili_video：给 query 搜视频、给 url 或 BV 号总结这个视频——" +
         "它依据字幕、站方 AI 总结和画面截图；返回里 has_subtitle=false 表示没字幕，那种总结只是看个大概，" +
         "转述时要说清“没字幕”，不要当成逐字内容，也绝不凭标题、封面或常识编视频内容；" +
         "记忆过期、重复或被用户纠正时用 memory_write 带原话与消息 ID 按 id 修正或删除；世界层设定用 upsert_lorebook_entry。" +
