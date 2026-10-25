@@ -8,8 +8,8 @@ import com.deeptalking.core.network.formatBiliClock
 import com.deeptalking.domain.agent.AgentContext
 import com.deeptalking.domain.agent.AgentTool
 import com.deeptalking.domain.agent.AgentToolResult
+import com.deeptalking.domain.agent.video.InlineImages
 import com.deeptalking.domain.agent.video.VideoFrameProvider
-import com.deeptalking.domain.agent.video.VideoSummarizer
 import com.deeptalking.domain.agent.video.VideoSummaryCache
 import com.deeptalking.domain.agent.video.VideoSummaryService
 import com.deeptalking.engine.ondevice.ToolCall
@@ -17,6 +17,7 @@ import com.deeptalking.engine.ondevice.ToolDefinition
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
@@ -37,6 +38,8 @@ class VideoSummaryTool(
     private val summary: VideoSummaryService? = null,
     private val cache: VideoSummaryCache? = null,
     private val frames: VideoFrameProvider? = null,
+    /** 无字幕时把 1~2 张截图直接回给主模型（能识图的模型可以自己看画面）。 */
+    private val images: InlineImages? = null,
 ) : AgentTool {
 
     override val definition = ToolDefinition(
@@ -86,11 +89,46 @@ class VideoSummaryTool(
         val payload = payload(
             text = text,
             source = if (text.hasSubtitle) "subtitle" else "metadata",
-            digest = digest,
+            digest = digest.text,
             frameCount = imageRefs.size,
         )
         if (focus == null) runCatching { cache?.write(text.bvid, payload) }
-        return payload
+        return attachFrames(payload, text, imageRefs, digest.imagesAccepted)
+    }
+
+    /**
+     * 无字幕时把 1~2 张截图作为 `input_image` 一并回给主模型：这时候画面本身就是证据，
+     * 让能识图的模型自己看一遍，比只给它一段"看画面像是…"的二手描述更靠谱。
+     *
+     * 三条闸门缺一不可：**没字幕**（有字幕时文字信息足够，图片纯占上下文）、**模型确实能看图**
+     * （[imagesAccepted]，纯文本模型收到 `input_image` 会让下一轮直接 400）、**缓存里只存纯文字**
+     * （命中缓存时不带 base64，避免历史里堆积几十 KB 的图片数据）。
+     */
+    private fun attachFrames(
+        payload: String,
+        text: BiliVideoText,
+        imageRefs: List<String>,
+        imagesAccepted: Boolean,
+    ): String {
+        if (text.hasSubtitle || imageRefs.isEmpty() || !imagesAccepted) return payload
+        val inliner = images ?: return payload
+        val uris = imageRefs.take(MAX_RESULT_FRAMES).mapNotNull { ref ->
+            runCatching { inliner.dataUri(ref) }.getOrNull()?.takeIf { it.startsWith("data:") }
+        }
+        if (uris.isEmpty()) return payload
+        return buildJsonArray {
+            add(buildJsonObject {
+                put("type", "input_text")
+                put("text", payload)
+            })
+            uris.forEach { uri ->
+                add(buildJsonObject {
+                    put("type", "input_image")
+                    put("image_url", uri)
+                    put("detail", "low")
+                })
+            }
+        }.toString()
     }
 
     private fun failureReason(result: BiliVideoTextResult.Failure): String = buildString {
@@ -152,5 +190,8 @@ class VideoSummaryTool(
 
     private companion object {
         val JSON = Json { ignoreUnknownKeys = true; isLenient = true }
+
+        /** 回给主模型的截图张数上限：低清图约 85 token/张，两张就够说明"画面在做什么"。 */
+        const val MAX_RESULT_FRAMES = 2
     }
 }

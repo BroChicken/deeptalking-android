@@ -8,6 +8,8 @@ import com.deeptalking.core.network.BiliVideoText
 import com.deeptalking.core.network.BiliVideoTextResult
 import com.deeptalking.domain.agent.AgentContext
 import com.deeptalking.domain.agent.defaultTools
+import com.deeptalking.domain.agent.video.InlineImages
+import com.deeptalking.domain.agent.video.VideoDigest
 import com.deeptalking.domain.agent.video.VideoFrameProvider
 import com.deeptalking.domain.agent.video.VideoSummarizer
 import com.deeptalking.domain.agent.video.VideoSummaryCache
@@ -40,13 +42,16 @@ class VideoSummaryToolTest {
         override suspend fun storyboard(bvid: String, cid: Long): BiliStoryboard? = storyboard
     }
 
-    private class RecordingSummarizer(private val reply: String? = "一句话：讲猫\n要点：\n- 00:10 猫很可爱") :
-        VideoSummarizer {
+    private class RecordingSummarizer(
+        private val reply: String? = "一句话：讲猫\n要点：\n- 00:10 猫很可爱",
+        /** false 模拟"模型不支持看图"：工具据此不再把截图塞进结果。 */
+        private val acceptImages: Boolean = true,
+    ) : VideoSummarizer {
         var calls = 0
 
-        override suspend fun complete(system: String, user: String, imageRefs: List<String>): String? {
+        override suspend fun complete(system: String, user: String, imageRefs: List<String>): VideoDigest? {
             calls++
-            return reply
+            return reply?.let { VideoDigest(it, imagesAccepted = acceptImages || imageRefs.isEmpty()) }
         }
     }
 
@@ -175,6 +180,56 @@ class VideoSummaryToolTest {
     }
 
     @Test
+    fun aVideoWithoutSubtitlesSendsItsFramesToTheMainModel() = runBlocking {
+        val tool = VideoSummaryTool(
+            source = FakeSource(BiliVideoTextResult.Ok(metadataText())),
+            summary = VideoSummaryService(RecordingSummarizer(reply = "一句话：没字幕，看画面像是日常记录")),
+            frames = VideoFrameProvider { _, _ -> listOf("/cache/f0.jpg", "/cache/f1.jpg", "/cache/f2.jpg") },
+            images = InlineImages { ref -> "data:image/jpeg;base64,${ref.hashCode()}" },
+        )
+
+        val result = tool.execute(call("""{"url":"BV1ZKn267EY3"}"""), context)
+
+        assertTrue("无字幕时工具结果应是 input_text + input_image 数组", result.contentJson.startsWith("["))
+        assertTrue(result.contentJson.contains("\"type\":\"input_text\""))
+        // 只带两张：低清图约 85 token/张，再多就是浪费上下文。
+        assertEquals(2, Regex("\"type\":\"input_image\"").findAll(result.contentJson).count())
+        assertTrue(result.contentJson.contains("\"detail\":\"low\""))
+        assertTrue(result.contentJson.contains("没字幕"))
+    }
+
+    @Test
+    fun aSubtitleSummaryStaysPlainTextEvenWhenFramesExist() = runBlocking {
+        val tool = VideoSummaryTool(
+            source = FakeSource(BiliVideoTextResult.Ok(subtitleText())),
+            summary = VideoSummaryService(RecordingSummarizer()),
+            frames = VideoFrameProvider { _, _ -> listOf("/cache/f0.jpg") },
+            images = InlineImages { "data:image/jpeg;base64,AAA" },
+        )
+
+        val result = tool.execute(call("""{"url":"BV1ZKn267EY3"}"""), context)
+
+        assertTrue("有字幕时不该往结果里塞图片", result.contentJson.startsWith("{"))
+    }
+
+    @Test
+    fun aCachedShallowSummaryComesBackWithoutImages() = runBlocking {
+        val cache = FakeCache(stored = """{"ok":true,"bvid":"BV1ZKn267EY3","has_subtitle":false,"cached":false}""")
+        val tool = VideoSummaryTool(
+            source = FakeSource(BiliVideoTextResult.Ok(metadataText())),
+            summary = VideoSummaryService(RecordingSummarizer()),
+            cache = cache,
+            frames = VideoFrameProvider { _, _ -> listOf("/cache/f0.jpg") },
+            images = InlineImages { "data:image/jpeg;base64,AAA" },
+        )
+
+        val result = tool.execute(call("""{"url":"BV1ZKn267EY3"}"""), context)
+
+        assertTrue(result.contentJson.startsWith("{"))
+        assertTrue(result.contentJson.contains("\"cached\":true"))
+    }
+
+    @Test
     fun aCachedSummaryShortCircuitsTheWholePipeline() = runBlocking {
         val source = FakeSource(BiliVideoTextResult.Ok(subtitleText()))
         val cache = FakeCache(stored = """{"ok":true,"bvid":"BV1ZKn267EY3","cached":false,"summary":"旧结果"}""")
@@ -260,6 +315,22 @@ class VideoSummaryToolTest {
     fun unavailableSourceIsReported() = runBlocking {
         val result = VideoSummaryTool(null).execute(call("""{"url":"BV1ZKn267EY3"}"""), context)
         assertTrue(result.contentJson.contains("视频总结不可用"))
+    }
+
+    @Test
+    fun aTextOnlyModelNeverGetsFramesInTheResult() = runBlocking {
+        val tool = VideoSummaryTool(
+            source = FakeSource(BiliVideoTextResult.Ok(metadataText())),
+            summary = VideoSummaryService(RecordingSummarizer(acceptImages = false)),
+            frames = VideoFrameProvider { _, _ -> listOf("/cache/f0.jpg") },
+            images = InlineImages { "data:image/jpeg;base64,AAA" },
+        )
+
+        val result = tool.execute(call("""{"url":"BV1ZKn267EY3"}"""), context)
+
+        // 纯文本模型收到 input_image 会让下一轮 400，所以这里必须是纯 JSON。
+        assertTrue(result.contentJson.startsWith("{"))
+        assertTrue(result.contentJson.contains("\"frames\":1"))
     }
 
     @Test

@@ -52,6 +52,7 @@ import com.deeptalking.domain.agent.background.ExtractionRetryStore
 import com.deeptalking.domain.agent.background.MemoryTaskKind
 import com.deeptalking.domain.agent.defaultTools
 import com.deeptalking.domain.agent.tools.VideoSummaryTool
+import com.deeptalking.domain.agent.video.VideoDigest
 import com.deeptalking.domain.agent.video.VideoSummarizer
 import com.deeptalking.domain.agent.video.VideoSummaryService
 import com.deeptalking.domain.memory.MemoryServiceImpl
@@ -134,7 +135,15 @@ class NativeCore(context: Context) {
                 .text.trim().ifEmpty { null }
         }.getOrNull()
         val withImages = attempt(imageRefs)
-        if (withImages != null || imageRefs.isEmpty()) withImages else attempt(emptyList())
+        if (imageRefs.isEmpty()) {
+            withImages?.let { VideoDigest(it, imagesAccepted = true) }
+        } else if (withImages != null) {
+            VideoDigest(withImages, imagesAccepted = true)
+        } else {
+            // 带图被拒（纯文本模型会 400）：退回纯文字，并回执"图没被接受"——工具据此不再把
+            // 截图塞进工具结果，否则主模型下一轮会直接挂掉。
+            attempt(emptyList())?.let { VideoDigest(it, imagesAccepted = false) }
+        }
     }
 
     /** 一次总结请求：图片通过 [MessageAttachment] 走 `input_image`，由 [MediaRef] 转成 data URI。 */
@@ -173,6 +182,7 @@ class NativeCore(context: Context) {
                 summary = VideoSummaryService(videoSummarizer),
                 cache = biliVideoCache,
                 frames = biliFrameExtractor,
+                images = MediaRefInlineImages(appContext),
             ),
         ),
     )

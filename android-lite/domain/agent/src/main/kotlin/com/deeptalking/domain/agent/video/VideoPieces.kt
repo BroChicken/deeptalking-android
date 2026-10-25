@@ -28,3 +28,13 @@ fun interface VideoFrameProvider {
     /** [storyboard] 为 null 表示没有可用截图墙；返回空表表示"这次没有画面可用"。 */
     suspend fun frames(text: BiliVideoText, storyboard: BiliStoryboard?): List<String>
 }
+
+/**
+ * 把本地图片引用变成能塞进工具结果的东西（`data:` URI）。
+ *
+ * 需要它是因为"无字幕"时**画面本身就是证据**：这时候只给主模型一段二手文字描述太亏，
+ * 直接把 1~2 张截图作为 `input_image` 回给能识图的模型，让它自己看、自己说。
+ */
+fun interface InlineImages {
+    fun dataUri(ref: String): String?
+}

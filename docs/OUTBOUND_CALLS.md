@@ -345,7 +345,9 @@ tool: { content: <工具结果 JSON>, toolCallId }
 {"ok":true,"platform":"bilibili","bvid":"BV1xx411c7mD","title":"…","author":"…","duration":"12:34","duration_sec":754,"source":"subtitle","has_subtitle":true,"frames":6,"cached":false,"summary":"一句话：…\n要点：\n- 01:15 …","note":"时间戳可跳转：https://www.bilibili.com/video/<bvid>?t=<秒>；…"}
 ```
 
-`source` 取值：`subtitle`（逐句字幕经 `VideoSummaryService` 分块总结）、`official`（直接采用 B 站官方 AI 总结，零 LLM 调用）、`metadata`（没有字幕，只能靠简介/章节/画面看个大概）。`has_subtitle=false` 时必须在回复里说清"没字幕"。`frames` 是这次喂给视觉模型的截图数量（`0` 表示没抽到或模型不支持看图）。`cached=true` 表示命中 7 天本地缓存，没有重新抓取。失败时返回 `{"ok":false,"reason":…}`。
+`source` 取值：`subtitle`（逐句字幕经 `VideoSummaryService` 分块总结）、`official`（直接采用 B 站官方 AI 总结，零 LLM 调用）、`metadata`（没有字幕，只能靠简介/章节/画面看个大概）。`has_subtitle=false` 时必须在回复里说清"没字幕"。`frames` 是这次抽到的截图数量（`0` 表示没抽到或模型不支持看图）。`cached=true` 表示命中 7 天本地缓存，没有重新抓取。失败时返回 `{"ok":false,"reason":…}`。
+
+**无字幕时结果不是纯文本**：抽到截图且 `has_subtitle=false` 时，工具结果是内容数组——第一项 `input_text`（上面的 JSON），后面最多 2 项 `input_image`（`detail:"low"`，即视频画面本身）。能识图的模型可以直接看画面，再结合简介/章节说"看个大概"。有字幕时只给纯文本（图片对文字信息没有增量）；命中缓存时也一定是纯文本（缓存只存文字，不存 base64）。
 
 #### `hot_board`
 

@@ -5,14 +5,23 @@ import com.deeptalking.core.network.BiliVideoText
 import com.deeptalking.core.network.formatBiliClock
 
 /**
- * 一次非流式补全：`system` + `user` 进、纯文本出，`imageRefs` 是可以给视觉模型看的本地图片引用。
+ * 一次非流式补全：`system` + `user` 进，`imageRefs` 是可以给视觉模型看的本地图片引用。
  *
  * 只留这一个方法是有意的——总结服务不该知道模型名、平台、重试策略（那些属于 `:app` 的辅助
  * 调用通道）。图片也一样：调用方给引用，怎么变成 `data:` URI 由实现决定。
  */
 fun interface VideoSummarizer {
-    suspend fun complete(system: String, user: String, imageRefs: List<String>): String?
+    suspend fun complete(system: String, user: String, imageRefs: List<String>): VideoDigest?
 }
+
+/**
+ * 一次总结的结果。
+ *
+ * [imagesAccepted] 是"这次带图请求是否被模型接受了"的回执：false 表示模型不支持看图（实现已经
+ * 退回纯文字重试过）。工具据此决定要不要把截图塞进工具结果——**只有确认模型能看图才塞**，
+ * 否则纯文本模型会在下一轮直接 400。没有带图请求时它没有意义，恒为 true。
+ */
+data class VideoDigest(val text: String, val imagesAccepted: Boolean = true)
 
 /** 一段被切开的字幕（[index] 从 1 开始，只用于提示词里的"第几段/共几段"）。 */
 data class TranscriptChunk(val index: Int, val lines: List<BiliSubtitleLine>)
@@ -30,14 +39,14 @@ data class TranscriptChunk(val index: Int, val lines: List<BiliSubtitleLine>)
 class VideoSummaryService(private val summarizer: VideoSummarizer) {
 
     /**
-     * 返回可直接放进工具结果的摘要文本；失败返回 null（由调用方如实报错，不许编造）。
+     * 返回可直接放进工具结果的摘要；失败返回 null（由调用方如实报错，不许编造）。
      * [imageRefs] 是抽到的画面截图，有字幕时用来确认场景，没字幕时是唯一的信息来源。
      */
     suspend fun digest(
         text: BiliVideoText,
         focus: String? = null,
         imageRefs: List<String> = emptyList(),
-    ): String? {
+    ): VideoDigest? {
         if (!text.hasSubtitle) return digestShallow(text, focus, imageRefs)
         val chunks = chunkTranscript(text.lines)
         if (chunks.isEmpty()) return null
@@ -45,33 +54,37 @@ class VideoSummaryService(private val summarizer: VideoSummarizer) {
         if (chunks.size == 1) {
             val user = header + transcriptBlock(chunks[0].lines) + framesBlock(imageRefs)
             return summarizer.complete(WRITER_SYSTEM + framesRule(imageRefs.size), user, imageRefs)
-                ?.trim()?.takeIf { it.isNotEmpty() }
+                ?.normalized()
         }
         val partials = chunks.mapNotNull { chunk ->
             val user = headerOf(text, null) +
                 "（第 " + chunk.index + "/" + chunks.size + " 段）\n" +
                 transcriptBlock(chunk.lines)
-            summarizer.complete(MAP_SYSTEM, user, emptyList())?.trim()?.takeIf { it.isNotEmpty() }
+            summarizer.complete(MAP_SYSTEM, user, emptyList())?.normalized()
         }
         if (partials.isEmpty()) return null
         val reduceUser = buildString {
             append(headerOf(text, focus))
             append("【分段要点】\n")
             partials.forEachIndexed { position, partial ->
-                append("第 ").append(position + 1).append(" 段：\n").append(partial).append('\n')
+                append("第 ").append(position + 1).append(" 段：\n").append(partial.text).append('\n')
             }
             append(framesBlock(imageRefs))
         }
         return summarizer.complete(REDUCE_SYSTEM + framesRule(imageRefs.size), reduceUser, imageRefs)
-            ?.trim()?.takeIf { it.isNotEmpty() }
+            ?.normalized()
+            ?: VideoDigest(partials.joinToString("\n") { it.text }, imagesAccepted = imageRefs.isEmpty())
     }
+
+    private fun VideoDigest.normalized(): VideoDigest? =
+        text.trim().takeIf { it.isNotEmpty() }?.let { VideoDigest(it, imagesAccepted) }
 
     /** 没字幕：只给元信息 + 章节 + 画面，要求明确声明"没字幕、只能看个大概"。 */
     private suspend fun digestShallow(
         text: BiliVideoText,
         focus: String?,
         imageRefs: List<String>,
-    ): String? {
+    ): VideoDigest? {
         val user = buildString {
             append(headerOf(text, focus))
             if (text.chapters.isNotEmpty()) {
@@ -87,7 +100,7 @@ class VideoSummaryService(private val summarizer: VideoSummarizer) {
             system = SHALLOW_SYSTEM + framesRule(imageRefs.size),
             user = user,
             imageRefs = imageRefs,
-        )?.trim()?.takeIf { it.isNotEmpty() }
+        )?.normalized()
     }
 
     private fun headerOf(text: BiliVideoText, focus: String?): String = buildString {

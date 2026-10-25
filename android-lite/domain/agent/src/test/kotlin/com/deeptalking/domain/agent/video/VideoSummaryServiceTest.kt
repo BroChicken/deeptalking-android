@@ -18,12 +18,14 @@ class VideoSummaryServiceTest {
 
     private class RecordingSummarizer(
         private val reply: (Int) -> String? = { "一句话：讲猫\n要点：\n- 00:10 猫很可爱" },
+        /** false 模拟"模型不支持看图"：实现会退回纯文字，并回执 imagesAccepted=false。 */
+        private val acceptImages: Boolean = true,
     ) : VideoSummarizer {
         val calls = mutableListOf<Call>()
 
-        override suspend fun complete(system: String, user: String, imageRefs: List<String>): String? {
+        override suspend fun complete(system: String, user: String, imageRefs: List<String>): VideoDigest? {
             calls += Call(system, user, imageRefs)
-            return reply(calls.size)
+            return reply(calls.size)?.let { VideoDigest(it, imagesAccepted = acceptImages || imageRefs.isEmpty()) }
         }
     }
 
@@ -62,7 +64,7 @@ class VideoSummaryServiceTest {
         assertTrue(call.user.contains("UP主：某个UP"))
         assertTrue(call.user.contains("[00:10] 猫很可爱"))
         assertTrue(call.system.contains("只依据字幕"))
-        assertEquals("一句话：讲猫\n要点：\n- 00:10 猫很可爱", digest)
+        assertEquals("一句话：讲猫\n要点：\n- 00:10 猫很可爱", digest?.text)
     }
 
     @Test
@@ -161,7 +163,19 @@ class VideoSummaryServiceTest {
         assertTrue(call.user.contains("【章节标签】"))
         assertTrue(call.user.contains("- 01:35 第一部分"))
         assertEquals(3, call.images.size)
-        assertEquals("一句话：讲猫\n要点：\n- 00:10 猫很可爱", digest)
+        assertEquals("一句话：讲猫\n要点：\n- 00:10 猫很可爱", digest?.text)
+    }
+
+    @Test
+    fun rejectionOfImagesIsReportedBackToTheCaller() = runBlocking {
+        val summarizer = RecordingSummarizer(acceptImages = false)
+        val digest = VideoSummaryService(summarizer).digest(
+            videoText(lines = emptyList(), source = BiliVideoText.Source.Metadata),
+            imageRefs = listOf("/tmp/f0.jpg"),
+        )
+        // 文本照常拿到，但回执标明"图没被接受"，工具据此不会把截图塞给主模型。
+        assertEquals("一句话：讲猫\n要点：\n- 00:10 猫很可爱", digest?.text)
+        assertEquals(false, digest?.imagesAccepted)
     }
 
     @Test
