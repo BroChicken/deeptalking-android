@@ -61,8 +61,8 @@ class VideoSummaryServiceTest {
 
     @Test
     fun longTranscriptIsMappedInChunksThenReduced() = runBlocking {
-        // 每行约 108 字，60 行 ≈ 6500 字，刚好切成两段。
-        val lines = (0 until 60).map { line(it * 5, "第${it}句".padEnd(100, '字')) }
+        // 每行约 108 字，130 行 ≈ 14k 字，刚好超过一次补全的阈值，切成两段。
+        val lines = (0 until 130).map { line(it * 5, "第${it}句".padEnd(100, '字')) }
         val summarizer = RecordingSummarizer()
         VideoSummaryService(summarizer).digest(videoText(lines))
 
@@ -73,6 +73,16 @@ class VideoSummaryServiceTest {
         val reduce = summarizer.calls.last().second
         assertTrue(reduce.contains("【分段要点】"))
         assertTrue(reduce.contains("第 1 段："))
+    }
+
+    @Test
+    fun aRealisticHalfHourVideoFitsInOneCall() = runBlocking {
+        // 实测样本：28 分钟视频 637 句 / 7730 字，加上时间戳前缀约 12.8k 字符。
+        val lines = (0 until 637).map { line(it * 2, "一句话十二个字左右的内容") }
+        val summarizer = RecordingSummarizer()
+        VideoSummaryService(summarizer).digest(videoText(lines, durationSec = 1707))
+
+        assertEquals(1, summarizer.calls.size)
     }
 
     @Test

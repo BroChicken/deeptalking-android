@@ -69,10 +69,16 @@ class VideoSummaryService(private val summarizer: VideoSummarizer) {
     }
 
     companion object {
-        /** 单次补全能吃下的字幕字数上限（中文按 1 字≈1 token 估，留足输出余量）。 */
-        const val CHUNK_CHARS = 6000
+        /**
+         * 单次补全能吃下的字幕字数上限。
+         *
+         * 实测：28 分钟的中文视频（AI 字幕 637 句 / 7730 字）加上逐行 `[mm:ss]` 前缀后约
+         * 12.8k 字符，一次补全完全吃得下（约 9k~13k 输入 token）——所以阈值取 14000，让
+         * 半小时以内的视频都只调一次模型，而不是分两段再合并（少 2 次往返、少一半延迟）。
+         */
+        const val CHUNK_CHARS = 14000
 
-        /** 最多几段：再多就不值得为一次"总结一下这个视频"等这么久。 */
+        /** 最多几段（配合 [CHUNK_CHARS] 约覆盖 2 万~4 万字的超长视频）：再多就不值得等了。 */
         const val MAX_CHUNKS = 4
 
         /**
