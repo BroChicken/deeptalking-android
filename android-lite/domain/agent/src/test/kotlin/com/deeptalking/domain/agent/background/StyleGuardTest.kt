@@ -417,4 +417,51 @@ class StyleGuardTest {
             ),
         )
     }
+
+    @Test
+    fun repeatedPhrasesFindsTheSharedPhrase() {
+        val replies = listOf(
+            "我不知道你在说什么。",
+            "我真的不知道啊。",
+            "不知道就算了。",
+        )
+        // 三条都含“不知道”；“我不知道”只出现在第一条，不算重复。
+        assertEquals(listOf("不知道"), repeatedPhrasesIn(replies))
+    }
+
+    @Test
+    fun repeatedPhrasesPrefersTheLongerSpan() {
+        val replies = listOf("我知道你在想什么", "我知道你很难过", "我知道你不说话")
+        // “我知道你”与“我知道”都重复，只点名更长的那一个。
+        assertEquals(listOf("我知道你"), repeatedPhrasesIn(replies))
+    }
+
+    @Test
+    fun repeatedPhrasesIgnoresWhatOnlyAppearsOnce() {
+        val replies = listOf("今天风好大。", "我去买点吃的。", "你先睡吧。")
+        assertTrue(repeatedPhrasesIn(replies).isEmpty())
+    }
+
+    @Test
+    fun repeatedPhrasesSkipsNamesAndAddresses() {
+        val replies = listOf("小雨你怎么了，小雨。", "小雨别怕。", "小雨在呢。")
+        assertTrue(repeatedPhrasesIn(replies, exclude = listOf("小雨")).isEmpty())
+    }
+
+    @Test
+    fun repeatedPhrasesKeepsAtMostTheLimit() {
+        val replies = listOf(
+            "我不知道你在说什么，我真的不知道。",
+            "我不知道啊，可能是这样。",
+            "不知道就算了，我也不知道。",
+        )
+        assertTrue(repeatedPhrasesIn(replies, limit = 1).size <= 1)
+        assertTrue(repeatedPhrasesIn(replies).size <= STYLE_GUARD.repeatPhraseLimit)
+    }
+
+    @Test
+    fun repeatedPhrasesNeedsAtLeastTwoReplies() {
+        assertTrue(repeatedPhrasesIn(listOf("我不知道你在说什么。")).isEmpty())
+        assertTrue(repeatedPhrasesIn(emptyList()).isEmpty())
+    }
 }

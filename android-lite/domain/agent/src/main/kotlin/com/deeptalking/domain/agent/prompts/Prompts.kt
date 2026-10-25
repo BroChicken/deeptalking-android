@@ -21,8 +21,8 @@ import com.deeptalking.core.model.extractSpeechSegments
 import com.deeptalking.domain.agent.background.STYLE_GUARD
 import com.deeptalking.domain.agent.background.detectStyleViolations
 import com.deeptalking.domain.agent.background.extractReplyEnding
-import com.deeptalking.domain.agent.background.extractSpeakingSamples
 import com.deeptalking.domain.agent.background.getLastStyleViolations
+import com.deeptalking.domain.agent.background.repeatedPhrasesIn
 import com.deeptalking.domain.memory.MemoryService
 import com.deeptalking.domain.memory.formatAbsoluteDate
 import com.deeptalking.domain.memory.logicalDay
@@ -51,7 +51,8 @@ internal val STATIC_PROFILE_FIELDS: List<Pair<String, String>> = listOf(
     "personality" to "性格特征",
     "fears" to "恐惧/弱点",
     "background" to "个人背景",
-    "speakingStyle" to "说话风格",
+    // 不是“说话风格说明书”，只是这个角色的声音底色（语速/用词层次/句尾/称呼），可以为空。
+    "speakingStyle" to "声音底色",
     "language" to "语言/方言",
     "userAddress" to "对用户的称呼",
 )
@@ -333,7 +334,25 @@ private const val RULE_5 =
     "5. 需要工具时只调用工具，不要同时写正文；工具结果返回后再写正文。不得在正文里提及工具名或检索过程；工具返回的图片本身可以直接展示。"
 
 private const val RULE_6 =
-    "6. 文风以角色设定的“说话风格”和“对用户的称呼”为准；不向默认助手腔靠拢；不复用最近几轮的整句、句式、比喻、意象与收尾。"
+    "6. 文风以角色设定的“性格特征”、可选的“声音底色”和“对用户的称呼”为准；不向默认助手腔靠拢；" +
+        "不复用最近几轮的整句、句式、比喻、意象与收尾。"
+
+/**
+ * RULE_7: 所有角色共用的「像真人说话」规则。
+ *
+ * 与角色无关的东西放这里（句长起伏、口语的不完美、不总结不升华、禁 AI 腔），
+ * 角色专属的只剩静态字段里那句可选的「声音底色」。这样底层提示词写一次、所有角色共享，
+ * 而字段不再需要塞示例台词或口癖清单（示例越具体越容易被逐字照抄，正是“每轮固定词语”的来源）。
+ */
+private const val RULE_7 =
+    "7. 像真人说话，不像写文章：\n" +
+        "   - 句子长短不齐：多数 3~15 字，偶尔一句长的也不超过 40 字；允许不完整句、省略主语。\n" +
+        "   - 允许口语的不完美：停住、改口、重复一个词、语气词（嗯/啊/那个）。\n" +
+        "   - 情绪不直说：用动作、停顿和语气带出来，不必每轮表态。\n" +
+        "   - 不追求把话说完整：可以只回半句、可以小幅岔开、可以不接话。\n" +
+        "   - 近三轮用过的词、句式、开头、收尾不再复用；同一个口头禅或句尾助词不要连着两轮出现。\n" +
+        "   - 不用总结、升华、排比、四字成语堆砌；不用“首先/其次/总之/另外”这类结构词；不用每段都以问句收尾。\n" +
+        "   - 不说这些固定句：希望这些对你有帮助 / 好的我明白了 / 请问还需要什么 / 如果有需要可以……"
 
 /**
  * "This session's available tools" enumeration. It must list **every** registered tool
@@ -371,8 +390,8 @@ private const val GROUP_RULE_11 =
 private const val OUTPUT_CHANNEL =
     "【输出通道】\n" +
         "正文之后另起一行，只写一行语气：【语气】<朗读指导：语气、情绪、语速、节奏、停顿、重音，≤60 字>。\n" +
-        "语气只能来自角色设定的“说话风格”与“对用户的称呼”，不得向默认 AI 助手腔靠拢，也不得把它中和成通用书面语；" +
-        "至少自然带出其中 2 处签名标记（口头禅、句尾助词、称呼、标点习惯）。"
+        "语气只能来自角色的性格、“声音底色”与“对用户的称呼”，不得向默认 AI 助手腔靠拢，也不得把它中和成通用书面语；" +
+        "签名标记（口癖、句尾助词、称呼）是底色，不是每轮都要凑数的任务，同一个标记不要连着两轮重复。"
 
 /** Builds the full system prompt (static prefix) for a turn. */
 fun buildSystemPrompt(inputs: PersonaInputs): String {
@@ -380,7 +399,7 @@ fun buildSystemPrompt(inputs: PersonaInputs): String {
     val dynamicFieldList = DYNAMIC_STATE_FIELDS.joinToString("、") { "${it.first}（${it.second}）" }
     val sb = StringBuilder()
     sb.append("【交互规则】\n")
-    listOf(RULE_0, RULE_1, RULE_2, RULE_3, RULE_4, RULE_5, RULE_6).forEach { sb.append(it).append('\n') }
+    listOf(RULE_0, RULE_1, RULE_2, RULE_3, RULE_4, RULE_5, RULE_6, RULE_7).forEach { sb.append(it).append('\n') }
     sb.append(RULE_A_PREFIX).append(dynamicFieldList).append(RULE_A_SUFFIX).append('\n')
     if (character.isGroup) {
         sb.append("\n【群组附加规则】\n")
@@ -793,6 +812,15 @@ internal const val VOLATILE_TARGET_CHARS = 5500
 /** Whole 【本轮写法】 cap. */
 internal const val WRITING_BLOCK_CHARS = 500
 
+/**
+ * 尾部口吻行只带这么长的一句声音底色（原来 60）。它每轮逐字相同，越长越容易被当成
+ * “本轮台词模板”；只留最标志性的那点特征，详细的底色在 system 的【角色设定】里。
+ */
+internal const val VOICE_SUMMARY_CHARS = 40
+
+/** `8 本轮写法` 的「本轮别用」最多点名几个近轮重复片段。 */
+internal const val REPEATED_PHRASE_LIMIT = 3
+
 private const val RECALL_FOOTER =
     "可能过时或只有部分相关；只在自然相关时提及，不硬提旧事，也不当成对方刚说过的话。方括号是这条记忆讲的是谁："
 
@@ -818,19 +846,24 @@ private const val HOT_TOPIC_DIRECTIVE =
         "主动开场就围绕它起头，回应就在合适时自然引到它。只挑一条，不罗列榜单、不复读热度数字，也不提\"热搜/热榜/系统/工具\"。" +
         "对方在说严肃、紧急或伤心的事时正常回应，不必强行提话题。工具没取到内容（ok:false）就按平常方式回应，不编造话题。"
 
-/** Parsed voice spec of one persona: style summary (≤60), up to 2 samples and the address. */
+/**
+ * `8 本轮写法` 的口吻行：**只发声音底色摘要（≤40 字）与称呼**，不再发示例台词。
+ *
+ * 示例台词已经在 system 的【角色设定】里逐字出现过（`buildRoleContext` 会渲染整个
+ * `speakingStyle`），尾部再发一遍是同一段文本发两次；而逐字示例恰恰是最容易被照抄的
+ * 部分——模型会把它当成本轮台词的模板，于是每轮都是同样几句。嗓音的“像不像这个人”
+ * 交给 system 的完整底色，尾部只留一个短提醒（离生成点最近的那一点）。
+ */
 private fun voiceSpec(profile: StaticProfile): String {
     val style = profile.speakingStyle
     val idx = style.indexOf("示例")
     val summary = trimText(
         (if (idx >= 0) style.substring(0, idx) else style).trim().trimEnd('；', ';', '，', ','),
-        60,
+        VOICE_SUMMARY_CHARS,
     )
-    val samples = extractSpeakingSamples(style).take(2)
     val address = normalizeUserAddress(profile.userAddress)
     val parts = mutableListOf<String>()
     if (summary.isNotEmpty()) parts += summary
-    if (samples.isNotEmpty()) parts += "示例: " + samples.joinToString(" / ")
     if (address.isNotEmpty()) parts += "称呼: $address"
     if (parts.isEmpty()) return ""
     return "口吻: " + parts.joinToString("；")
@@ -1012,7 +1045,7 @@ private fun styleReviewDue(character: Character): Boolean {
     return turns > 0 && turns % STYLE_GUARD.reviewEveryTurns == 0
 }
 
-/** `8 本轮写法`: voice + skeleton + cold/switch + last-turn violations + ending dedupe. */
+/** `8 本轮写法`: voice + skeleton + cold/switch + last-turn violations + ending/repeat dedupe. */
 private fun buildWritingSection(
     character: Character,
     query: String,
@@ -1039,10 +1072,24 @@ private fun buildWritingSection(
     if (violations.isNotEmpty()) {
         lines += "上一轮: " + violations.joinToString("、") { SHORT_VIOLATION_LABELS[it] ?: it } + "，本轮不得再出现"
     } else if (styleReviewDue(character)) {
-        lines += "上一轮: 语气以说话风格为准，不复用近期比喻与收尾，不替对方说话"
+        lines += "上一轮: 语气以性格与声音底色为准，不复用近期比喻与收尾，不替对方说话"
     }
     val endings = recentEndings(character, recentAssistantReplies, 1)
     if (endings.isNotEmpty()) lines += "收尾不要重复: ${endings[0]}"
+    // 反模板闭环：把近三轮真正被复用的词句点名，比抽象地要求“别重复”有效。
+    // 名字与称呼一律排除，否则会把“称呼”本身当成口头禅禁掉。
+    val recentTexts = if (recentAssistantReplies.isNotEmpty()) {
+        recentAssistantReplies
+    } else {
+        character.instant.filter { it.role == Role.Assistant && !it.isLoading && it.content.isNotBlank() }
+            .map { it.content }
+    }
+    val repeats = repeatedPhrasesIn(
+        replies = recentTexts,
+        limit = REPEATED_PHRASE_LIMIT,
+        exclude = listOfNotNull(character.name, normalizeUserAddress(character.staticProfile.userAddress)),
+    )
+    if (repeats.isNotEmpty()) lines += "本轮别用: ${repeats.joinToString("、")}（近三轮已经用过的词句）"
     if (lines.isEmpty()) return ""
     val sb = StringBuilder("【本轮写法】")
     var used = "【本轮写法】".length

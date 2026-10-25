@@ -1164,7 +1164,7 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                 append("\"additionalMembers\":[{\"name\":\"\",\"avatar\":\"emoji\",\"gender\":\"\",\"age\":\"\",\"race\":\"\",\"appearance\":\"\",\"personality\":\"\",\"fears\":\"\",\"background\":\"\",\"speakingStyle\":\"\",\"language\":\"\",\"userAddress\":\"\",\"roleInGroup\":\"\",\"dynamicState\":{\"currentSituation\":\"\",\"currentLocation\":\"\",\"currentMood\":\"\",\"currentOccupation\":\"\",\"currentGoal\":\"\",\"currentTone\":\"\"}}]}。")
                 append("lorebook 只需补上近期对话中出现、值得日后复用的世界层设定（没有就返回空数组）；additionalMembers只能包含新增成员，至少一名，且姓名必须互不重复；每名成员必须尽可能填满所有字段，不能只返回名称和性格；成员之间的说话方式必须显著不同（看台词就能分辨是谁）。")
                 append(CharacterParity.CHARACTER_QUALITY_RULE)
-                append(CharacterParity.SPEAKING_STYLE_SAMPLES_RULE)
+                append(CharacterParity.VOICE_BASE_RULE)
                 append("\n原角色（禁止重复输出）:\n").append(originalCharJson)
                 if (transcript.isNotBlank()) append("\n近期对话:\n").append(transcript)
             }

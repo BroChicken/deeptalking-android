@@ -79,8 +79,12 @@ class PromptToolListTest {
         val prompt = systemPrompt()
         assertTrue(prompt.contains("【输出通道】"))
         assertTrue(prompt.contains("【语气】"))
-        assertTrue(prompt.contains("至少自然带出其中 2 处签名标记"))
+        // 签名标记是底色，不是每轮配额：这一条锁住“别再要求凑 2 处”，否则模型会为凑数反复用同一批词。
+        assertTrue(prompt.contains("签名标记（口癖、句尾助词、称呼）是底色"))
         assertTrue(prompt.contains("不得向默认 AI 助手腔靠拢"))
+        // 与角色无关的“像真人说话”规则必须留在静态 system 里（RULE_7）。
+        assertTrue(prompt.contains("像真人说话，不像写文章"))
+        assertTrue(prompt.contains("不用每段都以问句收尾"))
     }
 
     @Test

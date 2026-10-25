@@ -79,7 +79,7 @@ private val STATIC_FIELDS = listOf(
     "personality" to "性格特征",
     "fears" to "恐惧/弱点",
     "background" to "个人背景",
-    "speakingStyle" to "说话风格",
+    "speakingStyle" to "声音底色",
     "language" to "语言/方言",
     "userAddress" to "对用户的称呼",
 )

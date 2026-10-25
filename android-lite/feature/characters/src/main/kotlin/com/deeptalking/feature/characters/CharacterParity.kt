@@ -40,10 +40,17 @@ object CharacterParity {
             "②personality 写具体的行为倾向（遇到事情会怎么做、在意什么），不要堆砌形容词；" +
             "③background 只写 3-5 条会影响当下互动的要点，不要写编年史。"
 
-    const val SPEAKING_STYLE_SAMPLES_RULE =
-        "speakingStyle 必须写成“整体调性描述；示例：<台词1> / <台词2> / <台词3>”：三条示例台词必须是该角色真的会说的口语短句，" +
-            "要体现口头禅、句尾助词、标点习惯与对用户的称呼，三条之间差异明显（能看出是同一个人、但场景不同）；" +
-            "**禁止换行，三条之间只能用 \" / \" 分隔**，整个字段不超过 200 字。"
+    /**
+     * 声音底色规则：只写 1~2 句“怎么说话”，**不再要求示例台词**。
+     *
+     * 逐字示例是最容易被模型当成本轮台词模板的东西（越具体越容易照抄），所以生成侧
+     * 也禁止产出示例；句长起伏、口语的不完美、禁 AI 腔这些与角色无关的东西统一由
+     * system 的 RULE_7 管，字段只负责“这个人的声音底色是什么”。
+     */
+    const val VOICE_BASE_RULE =
+        "speakingStyle 写“声音底色”：1~2 句，只写语速、用词层次、句尾助词习惯和对用户的称呼" +
+            "（例如“说话慢，用词普通，句尾常带‘吧’”）；**不要写示例台词、不要罗列口头禅清单**" +
+            "（示例会被逐字照抄，反而变成每轮固定语句）；整段不超过 60 字。"
 
     /**
      * 世界书条目内容规则：**目标 300 字**、硬上限 [AppLimits.Lorebook.CONTENT_CHARS]，
@@ -72,17 +79,17 @@ object CharacterParity {
 
     /** Full one-sentence generation prompt (legacy `quickGenerateCharacter`). */
     fun buildQuickGeneratePrompt(desc: String, isGroup: Boolean): String =
-        if (isGroup) GROUP_PROMPT_PREFIX + CHARACTER_QUALITY_RULE + SPEAKING_STYLE_SAMPLES_RULE + LOREBOOK_CONTENT_RULE + "\n描述: " + desc
-        else CHARACTER_PROMPT_PREFIX + CHARACTER_QUALITY_RULE + SPEAKING_STYLE_SAMPLES_RULE + LOREBOOK_CONTENT_RULE + "\n描述: " + desc
+        if (isGroup) GROUP_PROMPT_PREFIX + CHARACTER_QUALITY_RULE + VOICE_BASE_RULE + LOREBOOK_CONTENT_RULE + "\n描述: " + desc
+        else CHARACTER_PROMPT_PREFIX + CHARACTER_QUALITY_RULE + VOICE_BASE_RULE + LOREBOOK_CONTENT_RULE + "\n描述: " + desc
 
     private val GROUP_PROMPT_PREFIX = buildString {
         append("根据以下描述生成一个角色群组。只返回JSON：")
         append("{\"entityType\":\"group\",\"groupInfo\":{\"name\":\"群组名\",\"avatar\":\"emoji\",\"description\":\"群组前提（这群人是谁、为什么在一起，1-2 句；不要写世界观/时代/地点/组织等世界层设定）\",\"scene\":\"场景\",\"interactionRules\":\"成员互动规则\"},")
         append("\"lorebook\":[{\"name\":\"条目名（地点/组织/专有名词/规则等）\",\"keywords\":[\"触发词\"],\"content\":\"命中后注入的世界层设定\",\"alwaysActive\":false}],")
-        append("\"members\":[{\"name\":\"成员名\",\"avatar\":\"emoji\",\"gender\":\"性别\",\"age\":\"年龄\",\"race\":\"种族\",\"appearance\":\"外貌\",\"personality\":\"性格\",\"fears\":\"恐惧或弱点\",\"background\":\"背景\",\"speakingStyle\":\"说话风格\",\"language\":\"语言\",\"userAddress\":\"该成员对用户的称呼（一个短称呼词）\",\"roleInGroup\":\"群内定位\",\"dynamicState\":{\"currentSituation\":\"当前处境\",\"currentLocation\":\"当前位置\",\"currentMood\":\"当前情绪\",\"currentOccupation\":\"当前职业/身份\",\"currentGoal\":\"当前目标\",\"currentTone\":\"当前语气（供朗读的播报指令，可短可长，通常约60字内）\"}}]}。")
+        append("\"members\":[{\"name\":\"成员名\",\"avatar\":\"emoji\",\"gender\":\"性别\",\"age\":\"年龄\",\"race\":\"种族\",\"appearance\":\"外貌\",\"personality\":\"性格\",\"fears\":\"恐惧或弱点\",\"background\":\"背景\",\"speakingStyle\":\"声音底色\",\"language\":\"语言\",\"userAddress\":\"该成员对用户的称呼（一个短称呼词）\",\"roleInGroup\":\"群内定位\",\"dynamicState\":{\"currentSituation\":\"当前处境\",\"currentLocation\":\"当前位置\",\"currentMood\":\"当前情绪\",\"currentOccupation\":\"当前职业/身份\",\"currentGoal\":\"当前目标\",\"currentTone\":\"当前语气（供朗读的播报指令，可短可长，通常约60字内）\"}}]}。")
         append("群组的 description/scene 是全体成员共用的前提，必须填写；**世界层设定（时代/世界观、地点、组织、专有名词、历史、规则）一律写进 lorebook（2-4 条），绝不能塞进 description 或成员的 background**；")
         append("lorebook 条目要能被日后复用，keywords 写剧情里可能出现的称呼（常驻内容把 alwaysActive 设为 true），content 只写该条目本身的信息。")
-        append("至少生成两名成员；每名成员的所有字段都必须填写，不能返回空字符串；成员之间的说话方式必须显著不同（看台词就能分辨是谁）。")
+        append("至少生成两名成员；每名成员的所有字段都必须填写，不能返回空字符串；成员之间的声音底色必须显著不同（听语气就能分辨是谁），但不要写口癖清单或示例台词。")
     }
 
     private val CHARACTER_PROMPT_PREFIX = buildString {

@@ -33,7 +33,7 @@ object FieldCleaning {
 
     private val STATIC_FIELD_LABELS = listOf(
         "性别", "年龄", "种族", "外貌特征", "性格特征", "恐惧/弱点",
-        "个人背景", "说话风格", "语言/方言", "对用户的称呼",
+        "个人背景", "声音底色", "语言/方言", "对用户的称呼",
     )
 
     private val DYNAMIC_FIELD_LABELS = listOf(
@@ -42,7 +42,8 @@ object FieldCleaning {
 
     private val FIELD_KEYS: Set<String> = (STATIC_FIELD_KEYS + DYNAMIC_FIELD_KEYS).toSet()
 
-    private val FIELD_LABELS: List<String> = STATIC_FIELD_LABELS + DYNAMIC_FIELD_LABELS
+    /** 旧存档里的字段名「说话风格」也当同一个字段处理（只用于剥掉 `字段名：` 前缀）。 */
+    private val FIELD_LABELS: List<String> = STATIC_FIELD_LABELS + DYNAMIC_FIELD_LABELS + listOf("说话风格")
 
     /** `key → 界面标签`，用于把规范化原因回给用户（`roleInGroup` 只在成员卡上出现）。 */
     private val FIELD_LABEL_MAP: Map<String, String> =

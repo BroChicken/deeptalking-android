@@ -1613,11 +1613,11 @@ class BackgroundTasks(
                 val value = trimText(com.deeptalking.domain.agent.prompts.staticProfileValue(character.staticProfile, key), 300)
                 if (value.isEmpty()) null else "\"" + key + "\":\"" + value.replace("\"", "\\\"") + "\""
             }
-        val samplesRule = if ("speakingStyle" in missing) SPEAKING_STYLE_SAMPLES_RULE else ""
+        val voiceRule = if ("speakingStyle" in missing) VOICE_BASE_RULE else ""
         val addressRule = if ("userAddress" in missing) "“对用户的称呼”(userAddress) 只填一个简短称呼词（如“明明”“老公”），不带任何解释。" else ""
         val prompt = "请只补全下列【当前为空】的字段：" + labels + "。\n" +
             "要求：只补空字段，绝不修改或覆盖已有设定（已有设定是绝对权威，不得改写、润色或替换）；只根据已知信息合理补写，没有把握的字段直接省略；不要编造与已有设定冲突的内容。" +
-            samplesRule + addressRule + "\n已有设定:\n{" + existing.joinToString(",") + "}\n只返回JSON对象，键为字段英文名，值为补写内容。"
+            voiceRule + addressRule + "\n已有设定:\n{" + existing.joinToString(",") + "}\n只返回JSON对象，键为字段英文名，值为补写内容。"
         val raw = complete(FILL_SYSTEM, prompt, sessionId = sessionIdFor(character))
         val data = if (raw.isBlank()) null else ResponseParser.parseJsonLenient(raw) as? JsonObject
         var profile = character.staticProfile
@@ -1705,8 +1705,8 @@ class BackgroundTasks(
             "群内其他成员：" + others.ifEmpty { "（无）" } + "\n" +
             "请只补全该成员下列【当前为空】的字段：" + labels + "。\n" +
             "要求：只补空字段，绝不修改或覆盖已有设定（已有设定是绝对权威，不得改写、润色或替换）；只根据已知信息合理补写，没有把握的字段直接省略；不要编造与已有设定冲突的内容。" +
-            (if ("speakingStyle" in missing) SPEAKING_STYLE_SAMPLES_RULE else "") +
-            (if ("speakingStyle" in missing) "该成员的说话方式必须与群内其他成员显著不同（看台词就能分辨是谁）。" else "") +
+            (if ("speakingStyle" in missing) VOICE_BASE_RULE else "") +
+            (if ("speakingStyle" in missing) "该成员的声音底色必须与群内其他成员显著不同（听语气就能分辨是谁），但不要写口癖清单。" else "") +
             (if ("userAddress" in missing) "“对用户的称呼”(userAddress) 只填一个简短称呼词（如“明明”“老公”），不带任何解释。" else "") +
             "\n已有设定:\n{" + existing.joinToString(",") + "}\n只返回JSON对象，键为字段英文名，值为补写内容。"
         val raw = complete(FILL_SYSTEM, prompt, sessionId = sessionIdFor(group))
@@ -2337,10 +2337,16 @@ class BackgroundTasks(
                 "只返回 JSON：{\"entries\":[{\"name\":\"条目名\",\"keywords\":[\"触发词\"],\"content\":\"设定内容\",\"alwaysActive\":false}]}"
 
         const val FILL_SYSTEM = "你是角色卡补全助手。只返回JSON。"
-        const val SPEAKING_STYLE_SAMPLES_RULE =
-            "speakingStyle 必须写成“整体调性描述；示例：<台词1> / <台词2> / <台词3>”：三条示例台词必须是该角色真的会说的口语短句，" +
-                "要体现口头禅、句尾助词、标点习惯与对用户的称呼，三条之间差异明显（能看出是同一个人、但场景不同）；" +
-                "**禁止换行，三条之间只能用 \" / \" 分隔**，整个字段不超过 200 字。"
+        /**
+         * 声音底色规则：只写 1~2 句“怎么说话”，**不产出示例台词**。
+         *
+         * 示例台词会被逐字照抄成每轮固定语句；句长起伏、口语不完美、禁 AI 腔这些与角色
+         * 无关的东西统一在 system 的 RULE_7 里，字段只留底色。
+         */
+        const val VOICE_BASE_RULE =
+            "speakingStyle 写“声音底色”：1~2 句，只写语速、用词层次、句尾助词习惯和对用户的称呼" +
+                "（例如“说话慢，用词普通，句尾常带‘吧’”）；**不要写示例台词、不要罗列口头禅清单**" +
+                "（示例会被逐字照抄，反而变成每轮固定语句）；整段不超过 60 字。"
 
         const val EXTRACTION_SYSTEM = "你是一个信息提取助手。只返回JSON数组，不要其他文字。"
         const val ANALYSIS_SYSTEM = "你是一个记忆分析助手。只返回JSON，不要其他文字。"

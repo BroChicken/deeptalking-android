@@ -15,6 +15,19 @@ object STYLE_GUARD {
     const val critiqueMaxChars = 1600
     const val critiqueMinRatio = 0.5
     const val critiqueMaxRatio = 2.0
+
+    /** 近轮重复检测：看最近几条回复。 */
+    const val repeatLookbackReplies = 3
+
+    /** 至少要在几条回复里都出现，才算“模板化重复”。 */
+    const val repeatMinReplies = 2
+
+    /** 重复片段的长度范围（连续汉字个数）。2 字太容易误伤，7 字以上几乎不会重复。 */
+    const val repeatSpanMin = 3
+    const val repeatSpanMax = 6
+
+    /** 一次最多点名几个重复片段。 */
+    const val repeatPhraseLimit = 3
 }
 
 object QUICK_REPLY_GUARD {
@@ -49,7 +62,7 @@ val STYLE_VIOLATION_LABELS: Map<String, String> = mapOf(
     "speaksForUser" to "替用户写了台词或行动——用户的话只能由用户自己说",
     "cliche" to "出现陈词滥调（如\"心湖泛起涟漪\"\"勾起嘴角\"\"空气中弥漫着\"）",
     "reusedImagery" to "复用了近期用过的比喻、意象或收尾方式",
-    "toneDrift" to "没有体现设定的说话风格（口癖/句尾/称呼），或句长过于整齐缺少起伏",
+    "toneDrift" to "句长过于整齐、缺少长短起伏（读起来像模板，不像人随口说的）",
     "recitedLore" to "复述了世界书或设定条目本身，应当只在需要时自然引用",
 )
 
@@ -104,6 +117,11 @@ private fun speakingStyleSummary(style: String): String {
  * the signature markers (口癖/句尾/称呼/标点) the reply must surface and forbids
  * the model's default assistant voice, so different characters stop sounding
  * alike. A blank speaking style contributes nothing (自动补全字段 later fills it).
+ *
+ * **未接线**：生产路径不再调用它——尾部现在只发 `Prompts.voiceSpec()` 的声音底色摘要
+ * （不发示例台词），"像真人说话"的通用规则在 `RULE_7`。保留这里是因为它包含"只借语气、
+ * 不要照抄字面"的措辞，可作为以后重写契约的参考；如果决定彻底不用，连同
+ * `buildGroupVoiceContract` / `buildStyleReview` / `buildStyleCorrectionReminder` 一起删。
  */
 fun buildStyleAnchor(character: Character?): String {
     val profile = character?.staticProfile ?: return ""
@@ -114,7 +132,7 @@ fun buildStyleAnchor(character: Character?): String {
     val address = normalizeUserAddress(profile.userAddress)
     val lines = mutableListOf<String>()
     lines += "【本轮声音契约（离生成最近，优先级高于一切风格偏好）】"
-    if (summary.isNotEmpty()) lines += "说话风格：$summary"
+    if (summary.isNotEmpty()) lines += "声音底色：$summary"
     if (samples.isNotEmpty()) {
         lines += "照此口吻说话（只借用语气与用词，不要照抄内容，也不要照搬其中的引号或标点）：" +
             samples.joinToString(" / ")
@@ -142,7 +160,7 @@ fun buildGroupVoiceContract(character: Character?): String {
         val address = normalizeUserAddress(member.staticProfile.userAddress)
         val lines = mutableListOf<String>()
         lines += "【成员声音·${member.name.trim()}】"
-        if (summary.isNotEmpty()) lines += "说话风格：$summary"
+        if (summary.isNotEmpty()) lines += "声音底色：$summary"
         if (samples.isNotEmpty()) {
             lines += "照此口吻说话（只借用语气与用词，不要照抄内容，也不要照搬其中的引号或标点）：" +
                 samples.joinToString(" / ")
@@ -181,6 +199,56 @@ fun sharesDistinctivePhrase(text: String?, priors: List<String>): Boolean {
         i++
     }
     return false
+}
+
+/**
+ * 最近几条回复里反复出现的短片段（3~6 个连续汉字），用来生成【本轮写法】的「本轮别用」。
+ *
+ * 这是**反模板**的确定性闭环：底层规则要求“近三轮用过的词句不再复用”，这里把真正被
+ * 复用的那几段挑出来点名，比抽象地说“别重复”有效。只取连续汉字片段——2 字太容易误伤
+ * （“我们”“不知”），7 字以上几乎不会真的重复；[exclude] 里的角色名与称呼一律跳过，
+ * 免得把名字当成口头禅。
+ *
+ * 返回顺序：长片段优先（信息量更大），同长度按出现在几条回复里降序。
+ */
+fun repeatedPhrasesIn(
+    replies: List<String>,
+    limit: Int = STYLE_GUARD.repeatPhraseLimit,
+    lookback: Int = STYLE_GUARD.repeatLookbackReplies,
+    exclude: List<String> = emptyList(),
+): List<String> {
+    if (limit <= 0) return emptyList()
+    val texts = replies.filter { it.isNotBlank() }.takeLast(lookback).map { it.replace(Regex("\\s+"), "") }
+    if (texts.size < STYLE_GUARD.repeatMinReplies) return emptyList()
+    val excluded = exclude.filter { it.isNotBlank() }
+    val counts = mutableMapOf<String, Int>()
+    for (span in STYLE_GUARD.repeatSpanMax downTo STYLE_GUARD.repeatSpanMin) {
+        val seenIn = mutableMapOf<String, MutableSet<Int>>()
+        texts.forEachIndexed { index, text ->
+            if (text.length < span) return@forEachIndexed
+            for (i in 0..text.length - span) {
+                val gram = text.substring(i, i + span)
+                if (!gram.all { it in '\u4e00'..'\u9fff' }) continue
+                if (excluded.any { it.contains(gram) }) continue
+                seenIn.getOrPut(gram) { mutableSetOf() }.add(index)
+            }
+        }
+        seenIn.forEach { (gram, indices) ->
+            if (indices.size >= STYLE_GUARD.repeatMinReplies) counts[gram] = indices.size
+        }
+    }
+    if (counts.isEmpty()) return emptyList()
+    val ordered = counts.entries
+        .sortedWith(compareByDescending<Map.Entry<String, Int>> { it.key.length }.thenByDescending { it.value })
+        .map { it.key }
+    val picked = mutableListOf<String>()
+    for (candidate in ordered) {
+        if (picked.size >= limit) break
+        // 已被更长片段覆盖的短片段不再单独点名（命中“我不知道”后不再报“不知道”）。
+        if (picked.any { it.contains(candidate) }) continue
+        picked += candidate
+    }
+    return picked
 }
 
 internal fun extractReplyEnding(text: String?): String {
@@ -270,7 +338,7 @@ fun buildStyleReview(character: Character?): String {
     val labels = collectRecentStyleViolations(character, STYLE_GUARD.lookbackReplies)
     val lines = mutableListOf<String>()
     lines += "【语气回顾（每 ${STYLE_GUARD.reviewEveryTurns} 轮一次，内部提醒）】"
-    lines += "语气永远以角色设定的说话风格为准，优先级高于你的默认文风与最近的写法。"
+    lines += "语气永远以角色设定的性格与声音底色为准，优先级高于你的默认文风与最近的写法。"
     if (labels.isNotEmpty()) {
         lines += "最近几轮出现的问题：" + labels.mapNotNull { STYLE_VIOLATION_LABELS[it] }.joinToString("；") + "。"
     }

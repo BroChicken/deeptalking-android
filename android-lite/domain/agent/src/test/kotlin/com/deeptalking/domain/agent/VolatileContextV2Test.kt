@@ -385,11 +385,13 @@ class VolatileContextV2Test {
     }
 
     @Test
-    fun `本轮写法的口吻含风格摘要示例与称呼`() = runBlocking {
+    fun `本轮写法的口吻只留底色摘要与称呼，不发示例`() = runBlocking {
         val text = buildVolatileContext(character = fullCharacter(), query = "在吗", memory = memory, now = now)
         assertTrue(text.contains("【本轮写法】"))
         assertTrue(text.contains("口吻: 慵懒黏人，句尾常带“啦”"))
-        assertTrue(text.contains("示例: 好困哦 / 你回来啦"))
+        // 示例台词已经在 system 的【角色设定】里；尾部再发一遍会被逐字照抄成每轮固定语句。
+        assertFalse("尾部不应再发逐字示例", text.contains("示例: 好困哦"))
+        assertFalse(text.contains("示例:"))
         assertTrue(text.contains("称呼: 明明"))
         assertTrue(text.contains("骨架: "))
         assertFalse(text.contains("【语气回顾】"))

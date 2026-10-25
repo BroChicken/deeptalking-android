@@ -1069,7 +1069,7 @@ class NativeCore(context: Context) {
             appendLine("性格：${profile.personality}")
             appendLine("恐惧/弱点：${profile.fears}")
             appendLine("背景：${profile.background}")
-            appendLine("说话风格：${profile.speakingStyle}")
+            appendLine("声音底色：${profile.speakingStyle}")
             appendLine("语言：${profile.language}")
             appendLine("对用户的称呼：${profile.userAddress}")
             if (member != null) appendLine("群内定位：${member.roleInGroup}")
@@ -1109,7 +1109,7 @@ class NativeCore(context: Context) {
         "personality" -> "性格特征"
         "fears" -> "恐惧/弱点"
         "background" -> "个人背景"
-        "speakingStyle" -> "说话风格"
+        "speakingStyle" -> "声音底色"
         "language" -> "语言/方言"
         "userAddress" -> "对用户的称呼"
         else -> null
@@ -1258,7 +1258,7 @@ class NativeCore(context: Context) {
             append("群组其他成员:\n").append(otherMembers).append('\n')
             append("待补全成员:\n").append(memberJson).append('\n')
             append("用户补充:\n").append(hint)
-            append('\n').append(com.deeptalking.feature.characters.CharacterParity.SPEAKING_STYLE_SAMPLES_RULE)
+            append('\n').append(com.deeptalking.feature.characters.CharacterParity.VOICE_BASE_RULE)
         }
         val result = trackedComplete(
             config,
@@ -1372,8 +1372,9 @@ class NativeCore(context: Context) {
             返回字段：name, avatar, gender, age, race, appearance, personality, fears,
             background, speakingStyle, language, userAddress, roleInGroup,
             dynamicState(对象: currentSituation, currentLocation, currentMood, currentOccupation, currentGoal, currentTone)。
-            只给出有把握的字段，没有把握就省略。成员的说话方式必须与群内其他成员显著不同。
-            每个字段都要精炼：短字段几十字内（性别/年龄/种族/语言/称呼），外貌/性格/恐惧弱点/说话风格一两句、不超过 120 字，背景故事不超过 250 字；
+            只给出有把握的字段，没有把握就省略。成员的声音底色必须与群内其他成员显著不同。
+            每个字段都要精炼：短字段几十字内（性别/年龄/种族/语言/称呼），外貌/性格/恐惧弱点一两句、不超过 120 字，
+            声音底色只写语速、用词层次、句尾习惯与称呼，不超过 60 字且**不要写示例台词**，背景故事不超过 250 字；
             一律写成明确的简短陈述句，禁止“不是…而是…”这类对比句，禁止括号注释、理由与解释性文字。
         """.trimIndent()
     }
