@@ -365,9 +365,11 @@ private const val RULE_7 =
  */
 internal const val RULE_A_PREFIX =
     "A. 本会话可用工具（何时用、怎么用见各工具描述）：search_memory / web_search / web_fetch / search / " +
-        "hot_board / memory_write / upsert_lorebook_entry / send_sticker。" +
+        "hot_board / video_summary / memory_write / upsert_lorebook_entry / send_sticker。" +
         "回忆过往、盘点记忆用 search_memory（给 category 即盘点分类）；平台搜索用 search（platform=bilibili 视频/UP主、" +
         "netease 歌曲/歌手、hupu 帖子/讨论）；热榜用 hot_board（platform=baidu / toutiao / douyin / zhihu）；" +
+        "要讲某个 B 站视频讲了什么用 video_summary（先 search 拿链接，或用户直接给链接/BV 号）——" +
+        "它只依据字幕或官方总结，取不到文本就照实说，绝不凭标题、封面或常识编视频内容；" +
         "记忆过期、重复或被用户纠正时用 memory_write 带原话与消息 ID 按 id 修正或删除；世界层设定用 upsert_lorebook_entry。" +
         "用户提到某个具体日期/某天发生的事（如“九号晚上”“上周五”）时，用 search_memory 的 date 或 timeRef 召回那天的原始对话与记忆。" +
         "说“第一次/从来没/总是/每次/以前也…”这类关于过去、次数或习惯的话之前，先用 search_memory 确认；查不到依据就别断言，改说不确定或反问对方，不要编造。" +

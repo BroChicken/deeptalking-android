@@ -19,7 +19,7 @@ class SearchTool(private val web: WebContentProvider?) : AgentTool {
 
     override val definition = ToolDefinition(
         name = "search",
-        description = "按关键词搜索指定平台的公开内容（免登录）。platform 取值：bilibili=视频/UP主，netease=歌曲/歌手，hupu=帖子/讨论。返回标题与链接；失败或无结果时不得编造结果。",
+        description = "按关键词搜索指定平台的公开内容（免登录）。platform 取值：bilibili=视频/UP主，netease=歌曲/歌手，hupu=帖子/讨论。返回标题与链接；B站结果另带时长（duration/duration_sec）与播放量，可据此挑一个再用 video_summary 看内容。失败或无结果时不得编造结果。",
         parametersJson = """{"type":"object","properties":{"platform":{"type":"string","enum":["bilibili","netease","hupu"],"description":"bilibili=视频/UP主，netease=歌曲/歌手，hupu=帖子/讨论"},"query":{"type":"string","description":"检索关键词（从用户意图提取）"},"limit":{"type":"integer","minimum":1,"maximum":20,"description":"返回条数，默认 6"}},"required":["platform","query"],"additionalProperties":false}""",
     )
 

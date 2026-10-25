@@ -2375,6 +2375,35 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     private val testResultState = MutableStateFlow<String?>(null)
     val testResult: StateFlow<String?> = testResultState
 
+    // --------------------------------------------------------------- B 站登录
+
+    private val biliCookieSavedState = MutableStateFlow(core.hasBiliCookie())
+
+    /** 只暴露"有没有存"，Cookie 本身永远不回到 UI/日志。 */
+    val biliCookieSaved: StateFlow<Boolean> = biliCookieSavedState
+
+    private val biliStatusState = MutableStateFlow<String?>(null)
+    val biliStatus: StateFlow<String?> = biliStatusState
+
+    /** 保存/清除 B 站 Cookie（传空串即清除），成功后顺手把状态文字更新掉。 */
+    fun saveBiliCookie(raw: String?) {
+        core.saveBiliCookie(raw)
+        biliCookieSavedState.value = core.hasBiliCookie()
+        biliStatusState.value = if (core.hasBiliCookie()) {
+            "已保存（只存在本机）；点“测试登录”确认是否有效"
+        } else {
+            "已清除"
+        }
+    }
+
+    fun testBiliLogin() {
+        viewModelScope.launch {
+            biliStatusState.value = "测试中…"
+            biliStatusState.value = runCatching { core.probeBiliLogin() }
+                .getOrElse { "测试失败：" + (it.message ?: it.toString()) }
+        }
+    }
+
     fun testApiConnection(config: AppConfig, typedKey: String? = null) {
         viewModelScope.launch {
             testResultState.value = "测试中…"

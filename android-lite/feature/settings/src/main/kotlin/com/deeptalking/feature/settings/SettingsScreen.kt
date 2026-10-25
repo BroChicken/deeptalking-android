@@ -102,6 +102,11 @@ fun SettingsScreen(
     hasApiKey: Boolean,
     loadApiKey: (String) -> String? = { null },
     testResult: String?,
+    /** B 站登录态：只暴露"是否已保存"，Cookie 值永远不回填到界面。 */
+    biliCookieSaved: Boolean = false,
+    biliStatus: String? = null,
+    onSaveBiliCookie: (String?) -> Unit = {},
+    onTestBiliLogin: () -> Unit = {},
     onSave: (AppConfig, apiKey: String?) -> Unit,
     onTestConnection: (AppConfig, String?) -> Unit,
     ttsEnabled: Boolean = false,
@@ -158,6 +163,8 @@ fun SettingsScreen(
     var platformMenuOpen by rememberSaveable { mutableStateOf(false) }
     var thinkingMenuOpen by rememberSaveable { mutableStateOf(false) }
     var dohMenuOpen by rememberSaveable { mutableStateOf(false) }
+    // 只在本页编辑，保存后立刻清空：Cookie 不回显、不记住。
+    var biliCookie by remember { mutableStateOf("") }
     // Once the user edits, local state wins: the config flow's delayed echo of our own
     // per-change saves must never roll the field back mid-typing.
     var userEdited by remember { mutableStateOf(false) }
@@ -317,6 +324,39 @@ fun SettingsScreen(
             onSyncVoices = onSyncTtsVoices,
             onRenameRemoteVoice = onRenameTtsRemoteVoice,
         )
+
+        SectionLabel("B 站视频总结（可选）")
+        Text(
+            "B 站的字幕和官方 AI 总结都不对未登录请求开放，所以要让角色讲清一个视频讲了什么，" +
+                "需要填一次登录态：在浏览器登录 B 站后复制包含 SESSDATA 的 Cookie 粘到下面。" +
+                "它只存在本机的加密存储里，不进数据库、不进备份导出，也不显示在日志或本页面。",
+            fontSize = 11.sp,
+            color = legacy.textMuted,
+        )
+        FieldLabel(if (biliCookieSaved) "B 站 Cookie（已保存）" else "B 站 Cookie（未保存）")
+        LegacyField(
+            value = biliCookie,
+            onValueChange = { biliCookie = it },
+            placeholder = if (biliCookieSaved) "已保存；要换就粘贴新的" else "SESSDATA=... 或整段 Cookie",
+            visualTransformation = PasswordVisualTransformation(),
+            keyboardType = KeyboardType.Password,
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            LegacyButton("保存", modifier = Modifier.weight(1f), onClick = {
+                if (biliCookie.isNotBlank()) {
+                    onSaveBiliCookie(biliCookie)
+                    biliCookie = ""
+                }
+            })
+            LegacyButton("测试登录", modifier = Modifier.weight(1f), onClick = onTestBiliLogin)
+            LegacyButton("清除", modifier = Modifier.weight(1f), onClick = {
+                onSaveBiliCookie(null)
+                biliCookie = ""
+            })
+        }
+        if (!biliStatus.isNullOrBlank()) {
+            Text(biliStatus, fontSize = 12.sp, color = legacy.textMuted)
+        }
 
         DebugInfoPanel(config, metrics, context)
     }

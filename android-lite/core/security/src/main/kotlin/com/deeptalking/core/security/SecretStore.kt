@@ -51,6 +51,20 @@ class SecretStore(context: Context) {
     }
 
     /**
+     * B 站登录 Cookie（`SESSDATA=…`），只用来取视频字幕与官方 AI 总结。
+     *
+     * **刻意不进 [snapshot]**：SESSDATA 等价于账号（可读用户资料、发弹幕），一旦跟备份
+     * 一起导出就会离开这台设备。它同样不进数据库和日志——设置页只显示"已保存/未保存"。
+     */
+    fun getBiliCookie(): String? = prefs.getString(KEY_BILI_COOKIE, null)
+
+    fun setBiliCookie(value: String?) {
+        prefs.edit().apply {
+            if (value == null) remove(KEY_BILI_COOKIE) else putString(KEY_BILI_COOKIE, value)
+        }.apply()
+    }
+
+    /**
      * Snapshot of every managed secret for an encrypted backup. Only the global/per-platform
      * API key slots and the remote-TTS token are included; unrelated preferences never are.
      */
@@ -94,5 +108,23 @@ class SecretStore(context: Context) {
         const val FILE_NAME = "deeptalking_secrets"
         const val KEY_API_KEY = "api_key"
         const val KEY_TTS_TOKEN = "tts_token"
+
+        /** Never part of [snapshot]: a session cookie is account-level, not app config. */
+        const val KEY_BILI_COOKIE = "bili_cookie"
     }
+}
+
+/**
+ * 把用户粘贴的内容归一成可以直接放进 `Cookie:` 头的一串：
+ * 整段 Cookie（含 `SESSDATA=`）原样保留；只粘了 SESSDATA 的值时补上前缀；去掉换行/引号。
+ */
+fun normalizeBiliCookie(raw: String?): String? {
+    val text = raw
+        ?.trim()
+        ?.trim('"', '\'')
+        ?.replace(Regex("\\s+"), "")
+        ?.takeIf { it.isNotEmpty() }
+        ?: return null
+    if (text.contains("SESSDATA=", ignoreCase = true)) return text
+    return "SESSDATA=" + text
 }

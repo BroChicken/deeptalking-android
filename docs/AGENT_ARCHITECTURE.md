@@ -72,12 +72,12 @@ BackgroundTasks.scheduleTurn       后台：文风校对、快速回应校验/�
 - `ResponsesLlmBackend.buildBody()`（`:core:network`）+ `ResponsesDto`：请求体字段 `model`、`input`（首条 system 提升为 `instructions`）、`stream`、`temperature`、`max_output_tokens=8192`、`tools`、`tool_choice`、`reasoning.effort`。
 - 端点：`responsesEndpoint()`（把 base URL 归一化为 `/responses`；DeepSeek 去尾 `/v1`，OpenCode Go 保留）。
 - 请求头：`Content-Type`、`User-Agent`、`Authorization: Bearer`（缺 Key 抛清晰错误）、流式加 `Accept: text/event-stream`、`opencode` 平台加 `x-opencode-session`（`deeptalking-<charId>` / `deeptalking-general`）。
-- `tools`：主调用只带**信息/写入类工具**（下表 8 个）；`tool_choice` 恒为 `auto`。终稿那一轮（`RequestPhase.FINAL`）`tools` 为空、`reasoning.effort='none'`，正文以纯文本返回。
+- `tools`：主调用只带**信息/写入类工具**（下表 9 个）；`tool_choice` 恒为 `auto`。终稿那一轮（`RequestPhase.FINAL`）`tools` 为空、`reasoning.effort='none'`，正文以纯文本返回。
 - 传输超时：chat 180s（call + read），SSE 空闲 60s；**辅助/后台调用 90s**（`LlmRequest.auxiliary`，见"健壮性"）。
 
 ### 2. 工具清单（agent 的能力）
 
-`Tools.defaultTools(memory, web, stickersEnabled)`——**8 个工具**（顺序即注册顺序）：
+`Tools.defaultTools(memory, web, stickersEnabled, videoSummary)`——**9 个工具**（顺序即注册顺序；`video_summary` 由 `:app` 注入，未接线时保持 8 个）：
 
 | 工具 | 作用 | 实现 |
 |---|---|---|
@@ -86,6 +86,7 @@ BackgroundTasks.scheduleTurn       后台：文风校对、快速回应校验/�
 | `web_fetch` | 读取链接（网页正文 / 图片 / 站内专门解析）；虎扑帖子、网易云歌曲、B站视频链接各有专门解析。**只读链接、不做关键词搜索** | `WebFetchTool` → `HttpWebContentProvider` |
 | `search` | 按关键词搜一个社区平台：`platform` ∈ `bilibili` / `netease` / `hupu` | `SearchTool` |
 | `hot_board` | 指定平台热榜：`platform` ∈ `baidu` / `toutiao` / `douyin` / `zhihu` | `HotBoardTool` |
+| `video_summary` | 总结一个 B 站视频讲了什么（`url` 传链接或 BV 号，`focus` 可选）：逐句字幕走分块总结，官方 AI 总结存在时直接采用；取不到文本时如实报"需要登录" | `VideoSummaryTool` → `HttpBiliVideoSource` + `VideoSummaryService`（见 `docs/BILIBILI_VIDEO_SUMMARY.md`） |
 | `memory_write` | 按 ID 修正（`op=update`，须 evidence + sourceMessageIds）或删除（`op=delete`）记忆 | `MemoryWriteTool` |
 | `upsert_lorebook_entry` | 写入/更新世界书条目（世界层设定唯一入口，保护人工维护条目） | `UpsertLorebookEntryTool` |
 | `send_sticker` | 发表情包（**仅当角色有贴图时注册**，schema 内联该角色的标签枚举） | `SendStickerTool` |
@@ -156,7 +157,7 @@ BackgroundTasks.scheduleTurn       后台：文风校对、快速回应校验/�
 | `final-empty` | FINAL 阶段没有正文 | 重试（≤2 次） | `正在重新生成…` |
 | `empty` | 重试后仍无正文 | 失败 | 外层提示"收到空回复，请重试。你的消息已保留。" |
 
-工具提示（`AgentLoop.toolActivityHint`）：`search_memory`→`正在回忆…`、`web_search`→`正在搜索…`、`web_fetch`→`正在读取网页…`、`search`→`正在搜索…`、`hot_board`→`正在看热榜…`、`memory_write`→`正在更新记忆…`、`upsert_lorebook_entry`→`正在更新世界书…`、`send_sticker`→`正在挑表情…`，未知工具回退 `正在处理…`。
+工具提示（`AgentLoop.toolActivityHint`）：`search_memory`→`正在回忆…`、`web_search`→`正在搜索…`、`web_fetch`→`正在读取网页…`、`search`→`正在搜索…`、`hot_board`→`正在看热榜…`、`video_summary`→`正在看视频…`、`memory_write`→`正在更新记忆…`、`upsert_lorebook_entry`→`正在更新世界书…`、`send_sticker`→`正在挑表情…`，未知工具回退 `正在处理…`。
 
 > `quickReplies` 不是收尾门槛：worker 失败或只给出不足两条时没有按钮，正文照常显示；后台换位生成在**开关开启且 worker 未成功、或成功但不足两条**时运行，结果通过 `detectQuickReplyIssues` 才补上。worker 已给出两条时不再跑，避免抢写。
 
@@ -408,7 +409,7 @@ tools: AUTO 阶段 8 个工具 / FINAL 阶段无 tools（tool_choice 恒为 auto
 | `5` | 需要工具时**只调工具、不写正文**；工具结果回来后再写正文；正文不提工具名或检索过程 |
 | `6` | 文风以"性格特征"、可选"声音底色"和"对用户的称呼"为准；不向默认助手腔靠拢；不复用最近几轮的整句/句式/比喻/意象/收尾 |
 | `7` | 通用真人感（与角色无关，所有角色共享）：句长要乱（多数 3~15 字、长句 ≤40 字）、允许不完整句/省略主语/停住改口/语气词；情绪不直说、不必每轮表态；可以不接话/只回半句；近三轮用过的词句不再复用；禁总结升华排比与结构词；禁 AI 腔固定句 |
-| `A` | 本会话可用工具清单（8 个，逐一点名）+ 何时用哪个工具的导引；日期用 `search_memory` 的 `date`/`timeRef`；说"第一次/从来没/总是"前先检索 |
+| `A` | 本会话可用工具清单（9 个，逐一点名）+ 何时用哪个工具的导引；日期用 `search_memory` 的 `date`/`timeRef`；说"第一次/从来没/总是"前先检索；讲 B 站视频内容用 `video_summary`（只依据字幕/官方总结，取不到就照实说） |
 | `10` | 群组：只能由已列出的成员发言，每人独立一行"成员名：内容"；成员之间语气必须显著不同 |
 | `11` | 群组：成员私人记忆互不相通，只有全体都知道的事才写共享记忆；不得张冠李戴 |
 | — | 【角色设定（固定，不随对话变化）】= `buildSystemPrompt` 的静态角色块（群组含群组前提与成员清单） |

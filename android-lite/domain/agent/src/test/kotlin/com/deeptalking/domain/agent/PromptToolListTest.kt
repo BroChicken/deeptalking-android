@@ -25,7 +25,7 @@ class PromptToolListTest {
     private fun systemPrompt(): String = buildSystemPrompt(PersonaInputs(character = character))
 
     @Test
-    fun systemPromptListsTheEightV2Tools() {
+    fun systemPromptListsTheNineV2Tools() {
         val prompt = systemPrompt()
         listOf(
             "search_memory",
@@ -33,6 +33,7 @@ class PromptToolListTest {
             "web_fetch",
             "search",
             "hot_board",
+            "video_summary",
             "memory_write",
             "upsert_lorebook_entry",
             "send_sticker",

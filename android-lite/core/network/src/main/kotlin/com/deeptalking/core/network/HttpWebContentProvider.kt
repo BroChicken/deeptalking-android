@@ -239,6 +239,10 @@ class HttpWebContentProvider(
                     val play = item["play"]
                     put("play", if (play == null || play is JsonNull) JsonPrimitive(0) else play)
                     put("duration", item["duration"].toText())
+                    // 搜索接口只给 "M:SS"/"H:MM:SS" 字符串，模型算不了时长；补一个秒数方便它挑视频。
+                    parseBiliDurationClock(item["duration"].toText())?.let { put("duration_sec", it) }
+                    val desc = stripHtmlTags(item["description"].toText())
+                    if (desc.isNotEmpty()) put("desc", trimText(desc, 120))
                     put("url", "https://www.bilibili.com/video/$bvid")
                     put("cover", normalizeBiliPic(item["pic"].toText()))
                 }

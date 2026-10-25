@@ -20,12 +20,15 @@ import com.deeptalking.core.model.Role
 import com.deeptalking.core.model.StaticProfile
 import com.deeptalking.core.model.mergeCharacterChanges
 import com.deeptalking.core.model.TTS_BACKEND_REMOTE
+import com.deeptalking.core.network.BiliVideoSource
+import com.deeptalking.core.network.HttpBiliVideoSource
 import com.deeptalking.core.network.HttpWebContentProvider
 import com.deeptalking.core.network.DohDns
 import com.deeptalking.core.network.ResponsesLlmBackend
 import com.deeptalking.core.network.defaultClient
 import com.deeptalking.core.network.opencodeSessionHeader
 import com.deeptalking.core.security.SecretStore
+import com.deeptalking.core.security.normalizeBiliCookie
 import com.deeptalking.engine.ondevice.InferenceRegistry
 import com.deeptalking.engine.ondevice.LlmRequest
 import com.deeptalking.engine.ondevice.LlmResult
@@ -48,6 +51,9 @@ import com.deeptalking.domain.agent.background.LorebookRetryStore
 import com.deeptalking.domain.agent.background.ExtractionRetryStore
 import com.deeptalking.domain.agent.background.MemoryTaskKind
 import com.deeptalking.domain.agent.defaultTools
+import com.deeptalking.domain.agent.tools.VideoSummaryTool
+import com.deeptalking.domain.agent.video.VideoSummarizer
+import com.deeptalking.domain.agent.video.VideoSummaryService
 import com.deeptalking.domain.memory.MemoryServiceImpl
 import com.deeptalking.domain.memory.MEMORY_REPAIR_VERSION
 import com.deeptalking.domain.memory.needsLorebookRewrite
@@ -96,7 +102,45 @@ class NativeCore(context: Context) {
 
     val memory: MemoryServiceImpl = MemoryServiceImpl()
     val web: HttpWebContentProvider = HttpWebContentProvider(defaultClient(dohDns))
-    val tools: ToolRegistry = ToolRegistry(defaultTools(memory, web, stickersEnabled = true))
+
+    /**
+     * B 站视频文本源（逐句字幕优先、官方 AI 总结兜底）。Cookie 每次调用现取，所以用户在设置页
+     * 改完下一次工具调用就生效，不用重启。未配置时工具会如实报"需要登录"，而不是编内容。
+     */
+    val biliVideoSource: BiliVideoSource = HttpBiliVideoSource(defaultClient(dohDns)) { secrets.getBiliCookie() }
+
+    /**
+     * 字幕分块总结用的辅助补全：走 [trackedComplete]，因此每次总结都会在 `requestMetrics` 里留
+     * 一条 `video_summary`（输入/输出/hit 都能看），失败也带原因。
+     */
+    private val videoSummarizer: VideoSummarizer = VideoSummarizer { system, user ->
+        val config = currentConfig()
+        trackedComplete(
+            config,
+            "video_summary",
+            LlmRequest(
+                model = config.modelName,
+                instructions = system,
+                input = listOf(ChatMessage(role = Role.User, content = user)),
+                temperature = 0.3,
+                maxOutputTokens = AppLimits.Api.AUXILIARY_MAX_OUTPUT_TOKENS,
+                stream = false,
+                reasoningEffort = "none",
+                apiPlatform = config.apiPlatform,
+                sessionId = "deeptalking-general",
+                auxiliary = true,
+            ),
+        ).text.trim().ifEmpty { null }
+    }
+
+    val tools: ToolRegistry = ToolRegistry(
+        defaultTools(
+            memory,
+            web,
+            stickersEnabled = true,
+            videoSummary = VideoSummaryTool(biliVideoSource, VideoSummaryService(videoSummarizer)),
+        ),
+    )
 
     /**
      * App-process-lifetime scope + serial background queue: legacy background
@@ -252,6 +296,61 @@ class NativeCore(context: Context) {
     /** Resolves the active platform's key, falling back to the legacy global key. */
     private fun apiKeyFor(platform: String): String? =
         secrets.getApiKey(platform) ?: secrets.getApiKey()
+
+    // ------------------------------------------------------------- B 站登录态
+
+    fun hasBiliCookie(): Boolean = !secrets.getBiliCookie().isNullOrBlank()
+
+    /** 保存（传 null 即清除）B 站 Cookie；归一化后只进 [SecretStore]，不进数据库/备份/日志。 */
+    fun saveBiliCookie(raw: String?) {
+        secrets.setBiliCookie(normalizeBiliCookie(raw))
+    }
+
+    /**
+     * 设置页的"测试登录"：只回报状态与昵称，绝不回显 Cookie。
+     *
+     * 用 `nav` 而不是去抓某个视频，才能区分"Cookie 过期了"和"这个视频恰好没字幕"——
+     * 后者在设置页里看会像是登录失败。
+     */
+    suspend fun probeBiliLogin(): String = withContext(Dispatchers.IO) {
+        val cookie = secrets.getBiliCookie()?.trim().orEmpty()
+        if (cookie.isEmpty()) {
+            return@withContext "未保存 Cookie：B站字幕与官方 AI 总结都取不到"
+        }
+        try {
+            val request = Request.Builder()
+                .url("https://api.bilibili.com/x/web-interface/nav")
+                .get()
+                .header("User-Agent", userAgent)
+                .header("Referer", "https://www.bilibili.com/")
+                .header("Cookie", cookie)
+                .build()
+            val body = defaultClient(dohDns).newBuilder()
+                .callTimeout(15, TimeUnit.SECONDS)
+                .build()
+                .newCall(request)
+                .execute()
+                .use { response ->
+                    if (!response.isSuccessful) return@withContext "测试失败：HTTP " + response.code
+                    response.body?.string().orEmpty()
+                }
+            val root = runCatching { Json.parseToJsonElement(body) as? JsonObject }.getOrNull()
+                ?: return@withContext "测试失败：返回不是 JSON"
+            val code = (root["code"] as? JsonPrimitive)?.content?.toIntOrNull() ?: -1
+            val data = root["data"] as? JsonObject
+            val loggedIn = (data?.get("isLogin") as? JsonPrimitive)?.content == "true"
+            when {
+                code == -101 -> "Cookie 无效或已过期（-101 账号未登录），请重新复制一次"
+                loggedIn -> {
+                    val name = (data?.get("uname") as? JsonPrimitive)?.content.orEmpty()
+                    "已登录" + (if (name.isNotEmpty()) "：$name" else "") + " · 视频总结可用"
+                }
+                else -> "未登录（code " + code + "）：Cookie 可能不完整"
+            }
+        } catch (e: Exception) {
+            "测试失败：" + (e.message ?: e.toString())
+        }
+    }
 
     private fun backgroundTasks(config: AppConfig): BackgroundTasks =
         BackgroundTasks(

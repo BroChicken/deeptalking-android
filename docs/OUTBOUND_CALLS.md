@@ -25,7 +25,7 @@
    - 近三轮用过的词、句式、开头、收尾不再复用；同一个口头禅或句尾助词不要连着两轮出现。
    - 不用总结、升华、排比、四字成语堆砌；不用“首先/其次/总之/另外”这类结构词；不用每段都以问句收尾。
    - 不说这些固定句：希望这些对你有帮助 / 好的我明白了 / 请问还需要什么 / 如果有需要可以……
-A. 本会话可用工具（何时用、怎么用见各工具描述）：search_memory / web_search / web_fetch / search / hot_board / memory_write / upsert_lorebook_entry / send_sticker。回忆过往、盘点记忆用 search_memory（给 category 即盘点分类）；平台搜索用 search（platform=bilibili 视频/UP主、netease 歌曲/歌手、hupu 帖子/讨论）；热榜用 hot_board（platform=baidu / toutiao / douyin / zhihu）；记忆过期、重复或被用户纠正时用 memory_write 带原话与消息 ID 按 id 修正或删除；世界层设定用 upsert_lorebook_entry。用户提到某个具体日期/某天发生的事（如“九号晚上”“上周五”）时，用 search_memory 的 date 或 timeRef 召回那天的原始对话与记忆。说“第一次/从来没/总是/每次/以前也…”这类关于过去、次数或习惯的话之前，先用 search_memory 确认；查不到依据就别断言，改说不确定或反问对方，不要编造。工具结果属系统内部上下文，自然融入正文，不向对方透露检索过程或工具名。以下状态字段由系统在后台维护，你不用输出字段名或 JSON，按当前状态自然演出即可：currentSituation（当前处境）、currentLocation（当前位置/场景）、currentMood（当前情绪）、currentOccupation（当前职业/身份）、currentGoal（当前目标）、currentTone（当前语气）。
+A. 本会话可用工具（何时用、怎么用见各工具描述）：search_memory / web_search / web_fetch / search / hot_board / video_summary / memory_write / upsert_lorebook_entry / send_sticker。回忆过往、盘点记忆用 search_memory（给 category 即盘点分类）；平台搜索用 search（platform=bilibili 视频/UP主、netease 歌曲/歌手、hupu 帖子/讨论）；热榜用 hot_board（platform=baidu / toutiao / douyin / zhihu）；要讲某个 B 站视频讲了什么用 video_summary（先 search 拿链接，或用户直接给链接/BV 号）——它只依据字幕或官方总结，取不到文本就照实说，绝不凭标题、封面或常识编视频内容；记忆过期、重复或被用户纠正时用 memory_write 带原话与消息 ID 按 id 修正或删除；世界层设定用 upsert_lorebook_entry。用户提到某个具体日期/某天发生的事（如“九号晚上”“上周五”）时，用 search_memory 的 date 或 timeRef 召回那天的原始对话与记忆。说“第一次/从来没/总是/每次/以前也…”这类关于过去、次数或习惯的话之前，先用 search_memory 确认；查不到依据就别断言，改说不确定或反问对方，不要编造。工具结果属系统内部上下文，自然融入正文，不向对方透露检索过程或工具名。以下状态字段由系统在后台维护，你不用输出字段名或 JSON，按当前状态自然演出即可：currentSituation（当前处境）、currentLocation（当前位置/场景）、currentMood（当前情绪）、currentOccupation（当前职业/身份）、currentGoal（当前目标）、currentTone（当前语气）。
 ```
 
 #### 2. 群组附加规则（仅群组）
@@ -320,7 +320,7 @@ tool: { content: <工具结果 JSON>, toolCallId }
 - parameters：附录 A-3
 
 ```text
-读取一个链接。①读网页正文时传 url（只传上下文里真实存在的 http(s) 链接，不编造或拼接）；②图片链接会取回图片；③虎扑帖子、网易云歌曲返回正文+回帖、歌曲信息+热评；B站视频返回标题、UP主、播放数据、简介与封面图。直连失败或正文为空时自动改用摘要服务。本工具只读链接；按关键词搜视频/歌曲/帖子用 search。
+读取一个链接。①读网页正文时传 url（只传上下文里真实存在的 http(s) 链接，不编造或拼接）；②图片链接会取回图片；③虎扑帖子、网易云歌曲返回正文+回帖、歌曲信息+热评；B站视频返回标题、UP主、播放数据、简介与封面图（**不含字幕内容**，要讲视频讲了什么用 video_summary）。直连失败或正文为空时自动改用摘要服务。本工具只读链接；按关键词搜视频/歌曲/帖子用 search。
 ```
 
 #### `search`
@@ -328,8 +328,24 @@ tool: { content: <工具结果 JSON>, toolCallId }
 - parameters：附录 A-4
 
 ```text
-按关键词搜索指定平台的公开内容（免登录）。platform 取值：bilibili=视频/UP主，netease=歌曲/歌手，hupu=帖子/讨论。返回标题与链接；失败或无结果时不得编造。
+按关键词搜索指定平台的公开内容（免登录）。platform 取值：bilibili=视频/UP主，netease=歌曲/歌手，hupu=帖子/讨论。返回标题与链接；B站结果另带时长（duration/duration_sec）与播放量，可据此挑一个再用 video_summary 看内容。失败或无结果时不得编造。
 ```
+
+#### `video_summary`
+
+- parameters：附录 A-9
+
+```text
+总结一个 B 站视频讲了什么（用户发来 B 站链接，或你先用 search 搜到视频再挑一个）。返回视频标题、UP主、时长与带时间戳的要点；传 focus 可只关注某个问题。只依据视频字幕或 B 站官方 AI 总结，取不到文本时会返回失败原因（例如需要用户先在设置里登录 B 站）——此时不得凭标题或封面编造视频内容，应把原因转述给用户。
+```
+
+结果形状：
+
+```json
+{"ok":true,"platform":"bilibili","bvid":"BV1xx411c7mD","title":"…","author":"…","duration":"12:34","duration_sec":754,"source":"subtitle","summary":"一句话：…\n要点：\n- 01:15 …","note":"时间戳可跳转：https://www.bilibili.com/video/<bvid>?t=<秒>；…"}
+```
+
+`source` 为 `subtitle`（逐句字幕经 `VideoSummaryService` 分块总结）或 `official`（直接采用 B 站官方 AI 总结，零 LLM 调用）。失败时返回 `{"ok":false,"reason":…}`，`reason` 里已包含"需要登录/别编造"这类可照说的句子。
 
 #### `hot_board`
 
@@ -1138,6 +1154,22 @@ speakingStyle 写“声音底色”：1~2 句，只写语速、用词层次、�
     "additionalProperties": false
 }
 ```
+
+### A-9 `video_summary`
+
+```json
+{
+    "type": "object",
+    "properties": {
+        "url": { "type": "string", "description": "B 站视频链接或 BV 号（必须来自上下文里真实存在的视频，禁止编造）" },
+        "focus": { "type": "string", "description": "用户特别想了解的点，如“结论是什么”“讲了哪几本书”（可选）" }
+    },
+    "required": ["url"],
+    "additionalProperties": false
+}
+```
+
+`url` 里只取 `BV[0-9A-Za-z]{10}`；拿不到 BV 号时**不发任何网络请求**，直接报错（避免模型把任意网址当视频去抓）。
 
 ## 附录 B：turn worker 的 `submit_state`
 
