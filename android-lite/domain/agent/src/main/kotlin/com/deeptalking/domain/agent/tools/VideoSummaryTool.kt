@@ -8,34 +8,43 @@ import com.deeptalking.core.network.formatBiliClock
 import com.deeptalking.domain.agent.AgentContext
 import com.deeptalking.domain.agent.AgentTool
 import com.deeptalking.domain.agent.AgentToolResult
+import com.deeptalking.domain.agent.video.VideoFrameProvider
+import com.deeptalking.domain.agent.video.VideoSummarizer
+import com.deeptalking.domain.agent.video.VideoSummaryCache
 import com.deeptalking.domain.agent.video.VideoSummaryService
 import com.deeptalking.engine.ondevice.ToolCall
 import com.deeptalking.engine.ondevice.ToolDefinition
-import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 
 /**
  * 总结一个 B 站视频（第 9 个工具）。
  *
- * 文本来源只有两条，都够不到时**必须如实报错**：`search` 能搜到视频，但"这个视频讲了什么"
- * 只能来自字幕或 B 站官方 AI 总结（两者都要登录态，见 `HttpBiliVideoSource`）。
- * 所以本工具的价值有一半是**挡住幻觉**——它把"没有字幕"翻译成模型能照着说的一句话，
- * 而不是让模型凭标题编内容。
+ * 三条输入路径，**没有一条会以"失败"收场**（除非视频本身取不到）：
+ * 1. 逐句字幕（要登录态）→ 分块总结，产出带 `mm:ss` 的要点；
+ * 2. B 站官方 AI 总结（要登录态）→ 直接采用，零 LLM 调用；
+ * 3. 只有元信息 + 章节 + 画面截图（免登录）→ 说"没字幕，只能看个大概"，禁止编造。
  *
- * 字幕文本不落库、不进历史：这里只把 [VideoSummaryService] 压出来的几百字摘要交给模型。
+ * 有缓存（默认 7 天）时同一条视频第二次问直接返回上次的结果，不再抓字幕、不再调模型。
+ * 字幕原文和截图只留在本机缓存里，不进聊天历史、不进备份。
  */
 class VideoSummaryTool(
     private val source: BiliVideoSource?,
     private val summary: VideoSummaryService? = null,
+    private val cache: VideoSummaryCache? = null,
+    private val frames: VideoFrameProvider? = null,
 ) : AgentTool {
 
     override val definition = ToolDefinition(
         name = "video_summary",
         description = "总结一个 B 站视频讲了什么（用户发来 B 站链接，或你先用 search 搜到视频再挑一个）。" +
-            "返回视频标题、UP主、时长与带时间戳的要点；传 focus 可只关注某个问题。" +
-            "只依据视频字幕或 B 站官方 AI 总结，取不到文本时会返回失败原因（例如需要用户先在设置里登录 B 站）——" +
-            "此时不得凭标题或封面编造视频内容，应把原因转述给用户。",
+            "返回标题、UP主、时长、是否有字幕，以及带时间戳的要点；传 focus 可只关注某个问题。" +
+            "有字幕时依据字幕，没有字幕时会标明“没字幕、只能看个大概”（依据简介/章节/画面），" +
+            "那种情况下不得把内容当成逐句事实，也不要凭标题编造。",
         parametersJson = """{"type":"object","properties":{"url":{"type":"string","description":"B 站视频链接或 BV 号（必须来自上下文里真实存在的视频，禁止编造）"},"focus":{"type":"string","description":"用户特别想了解的点，如“结论是什么”“讲了哪几本书”（可选）"}},"required":["url"],"additionalProperties":false}""",
     )
 
@@ -46,10 +55,42 @@ class VideoSummaryTool(
         val bvid = BiliLinks.bvidOf(raw)
             ?: return AgentToolResult(errorJson("需要一个 B 站视频链接或 BV 号（当前参数里没有可识别的 BV 号）"))
         val focus = ToolArgs.string(args, "focus").trim().ifEmpty { null }
+
+        // 只缓存"泛总结"：带 focus 的问题每次都得重新问，否则会拿旧答案敷衍新问题。
+        if (focus == null) {
+            cache?.read(bvid)?.let { cached ->
+                return AgentToolResult(withCached(cached))
+            }
+        }
+
         return when (val result = provider.load(bvid)) {
             is BiliVideoTextResult.Failure -> AgentToolResult(errorJson(failureReason(result)))
-            is BiliVideoTextResult.Ok -> AgentToolResult(render(result.text, focus))
+            is BiliVideoTextResult.Ok -> AgentToolResult(render(provider, result.text, focus))
         }
+    }
+
+    private suspend fun render(
+        provider: BiliVideoSource,
+        text: BiliVideoText,
+        focus: String?,
+    ): String {
+        val storyboard = runCatching { provider.storyboard(text.bvid, text.cid) }.getOrNull()
+        val imageRefs = frames?.frames(text, storyboard).orEmpty()
+
+        if (text.source == BiliVideoText.Source.OfficialSummary) {
+            return payload(text, source = "official", digest = officialText(text), frameCount = imageRefs.size)
+        }
+        val service = summary ?: return errorJson("总结服务不可用")
+        val digest = service.digest(text, focus, imageRefs)
+            ?: return errorJson("取到了视频信息但总结失败，可稍后再试")
+        val payload = payload(
+            text = text,
+            source = if (text.hasSubtitle) "subtitle" else "metadata",
+            digest = digest,
+            frameCount = imageRefs.size,
+        )
+        if (focus == null) runCatching { cache?.write(text.bvid, payload) }
+        return payload
     }
 
     private fun failureReason(result: BiliVideoTextResult.Failure): String = buildString {
@@ -59,16 +100,6 @@ class VideoSummaryTool(
         } else {
             append("。不要编造视频内容，把这句话如实转述给用户")
         }
-    }
-
-    /** 官方总结省一次 LLM 调用；只有拿到逐句字幕时才走自建总结（能回答 focus）。 */
-    private suspend fun render(text: BiliVideoText, focus: String?): String {
-        if (text.source == BiliVideoText.Source.OfficialSummary) {
-            return payload(text, "official", officialText(text))
-        }
-        val service = summary ?: return errorJson("总结服务不可用")
-        val digest = service.digest(text, focus) ?: return errorJson("取到了字幕但总结失败，可稍后再试")
-        return payload(text, "subtitle", digest)
     }
 
     private fun officialText(text: BiliVideoText): String = buildString {
@@ -82,7 +113,12 @@ class VideoSummaryTool(
         }
     }.trim()
 
-    private fun payload(text: BiliVideoText, source: String, digest: String): String {
+    private fun payload(
+        text: BiliVideoText,
+        source: String,
+        digest: String,
+        frameCount: Int,
+    ): String {
         val seconds = text.durationSec
         return buildJsonObject {
             put("ok", true)
@@ -93,9 +129,28 @@ class VideoSummaryTool(
             put("duration", formatBiliClock(seconds))
             put("duration_sec", seconds)
             put("source", source)
+            put("has_subtitle", text.hasSubtitle)
+            put("frames", frameCount)
+            put("cached", false)
             put("summary", digest)
-            put("note", "时间戳可跳转：https://www.bilibili.com/video/" + text.bvid + "?t=<秒>；" +
-                "只依据" + (if (source == "official") "B站官方 AI 总结" else "视频字幕") + "整理，字幕里没有的别补充")
+            put("note", noteFor(source, text.bvid))
         }.toString()
+    }
+
+    private fun noteFor(source: String, bvid: String): String = when (source) {
+        "official" -> "这是 B 站官方 AI 总结，不是逐句字幕；时间戳可跳转：https://www.bilibili.com/video/$bvid?t=<秒>"
+        "metadata" -> "这个视频没有可用字幕，以上只是根据简介、章节和画面截图看的大概，不是逐句内容；" +
+            "转述时要说清“没字幕”，不要当成看过全部内容"
+        else -> "时间戳可跳转：https://www.bilibili.com/video/$bvid?t=<秒>；只依据视频字幕整理，字幕里没有的别补充"
+    }
+
+    /** 命中缓存时把 `cached` 翻成 true，保留原来的其它字段。 */
+    private fun withCached(payload: String): String = runCatching {
+        val obj = JSON.parseToJsonElement(payload).jsonObject
+        JsonObject(obj + ("cached" to JsonPrimitive(true))).toString()
+    }.getOrDefault(payload)
+
+    private companion object {
+        val JSON = Json { ignoreUnknownKeys = true; isLenient = true }
     }
 }

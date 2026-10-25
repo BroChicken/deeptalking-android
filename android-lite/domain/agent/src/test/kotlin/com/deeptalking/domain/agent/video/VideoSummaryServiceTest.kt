@@ -9,18 +9,20 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * 分块与合并的纯逻辑：短字幕一次写完、长字幕先分段再合并、切块只在行边界断开、
- * 超过段数上限就截断。总结内容本身由模型负责，这里只锁"调了几次、喂了什么"。
+ * 分块与两种路径的纯逻辑：有字幕走 wrIter/map-reduce，没字幕走 shallow（并明确声明没字幕）、
+ * 切块只在行边界断开、超过段数上限就截断。总结内容本身由模型负责，这里只锁"调了几次、喂了什么"。
  */
 class VideoSummaryServiceTest {
+
+    private data class Call(val system: String, val user: String, val images: List<String>)
 
     private class RecordingSummarizer(
         private val reply: (Int) -> String? = { "一句话：讲猫\n要点：\n- 00:10 猫很可爱" },
     ) : VideoSummarizer {
-        val calls = mutableListOf<Pair<String, String>>()
+        val calls = mutableListOf<Call>()
 
-        override suspend fun complete(system: String, user: String): String? {
-            calls += system to user
+        override suspend fun complete(system: String, user: String, imageRefs: List<String>): String? {
+            calls += Call(system, user, imageRefs)
             return reply(calls.size)
         }
     }
@@ -33,6 +35,8 @@ class VideoSummaryServiceTest {
         author: String = "某个UP",
         durationSec: Int = 600,
         desc: String = "记录一只猫的日常",
+        source: BiliVideoText.Source = BiliVideoText.Source.Subtitle,
+        chapters: List<BiliSubtitleLine> = emptyList(),
     ) = BiliVideoText(
         bvid = "BV1ZKn267EY3",
         title = title,
@@ -41,9 +45,10 @@ class VideoSummaryServiceTest {
         cid = 43032511529L,
         upMid = 1L,
         desc = desc,
-        source = BiliVideoText.Source.Subtitle,
-        lang = "ai-zh",
+        source = source,
+        lang = if (source == BiliVideoText.Source.Subtitle) "ai-zh" else "",
         lines = lines,
+        chapters = chapters,
     )
 
     @Test
@@ -52,10 +57,11 @@ class VideoSummaryServiceTest {
         val digest = VideoSummaryService(summarizer).digest(videoText(listOf(line(10, "猫很可爱"))))
 
         assertEquals(1, summarizer.calls.size)
-        val user = summarizer.calls.single().second
-        assertTrue(user.contains("【视频】猫的一天"))
-        assertTrue(user.contains("UP主：某个UP"))
-        assertTrue(user.contains("[00:10] 猫很可爱"))
+        val call = summarizer.calls.single()
+        assertTrue(call.user.contains("【视频】猫的一天"))
+        assertTrue(call.user.contains("UP主：某个UP"))
+        assertTrue(call.user.contains("[00:10] 猫很可爱"))
+        assertTrue(call.system.contains("只依据字幕"))
         assertEquals("一句话：讲猫\n要点：\n- 00:10 猫很可爱", digest)
     }
 
@@ -68,9 +74,9 @@ class VideoSummaryServiceTest {
 
         assertEquals(3, summarizer.calls.size)
         val mapCalls = summarizer.calls.dropLast(1)
-        assertTrue(mapCalls[0].second.contains("第 1/2 段"))
-        assertTrue(mapCalls[1].second.contains("第 2/2 段"))
-        val reduce = summarizer.calls.last().second
+        assertTrue(mapCalls[0].user.contains("第 1/2 段"))
+        assertTrue(mapCalls[1].user.contains("第 2/2 段"))
+        val reduce = summarizer.calls.last().user
         assertTrue(reduce.contains("【分段要点】"))
         assertTrue(reduce.contains("第 1 段："))
     }
@@ -104,16 +110,67 @@ class VideoSummaryServiceTest {
     }
 
     @Test
-    fun emptyTranscriptNeverCallsTheModel() = runBlocking {
+    fun aTextWithoutLinesFallsBackToTheShallowPrompt() = runBlocking {
         val summarizer = RecordingSummarizer()
-        assertNull(VideoSummaryService(summarizer).digest(videoText(emptyList())))
-        assertTrue(summarizer.calls.isEmpty())
+        // 字幕源但一行都没有 = 实际没取到字幕，走 shallow，而不是"返回 null 让工具报错"。
+        VideoSummaryService(summarizer).digest(
+            videoText(emptyList(), source = BiliVideoText.Source.Subtitle),
+        )
+        assertEquals(1, summarizer.calls.size)
+        assertTrue(summarizer.calls.single().system.contains("没有字幕"))
     }
 
     @Test
     fun focusIsForwardedToTheModel() = runBlocking {
         val summarizer = RecordingSummarizer()
         VideoSummaryService(summarizer).digest(videoText(listOf(line(5, "提到一本旧书"))), focus = "讲了哪本书")
-        assertTrue(summarizer.calls.single().second.contains("【用户特别想知道】讲了哪本书"))
+        assertTrue(summarizer.calls.single().user.contains("【用户特别想知道】讲了哪本书"))
+    }
+
+    @Test
+    fun framesAreAttachedAndTheSystemPromptWarnsAgainstGuessingFromThem() = runBlocking {
+        val summarizer = RecordingSummarizer()
+        VideoSummaryService(summarizer).digest(
+            videoText(listOf(line(10, "猫很可爱"))),
+            imageRefs = listOf("/tmp/f0.jpg", "/tmp/f1.jpg"),
+        )
+
+        val call = summarizer.calls.single()
+        assertEquals(2, call.images.size)
+        assertTrue(call.user.contains("另附 2 张视频截图"))
+        assertTrue(call.system.contains("不要凭画面推测台词"))
+    }
+
+    // ------------------------------------------------------------- 没字幕的路径
+
+    @Test
+    fun aVideoWithoutSubtitlesIsSummarisedFromMetadataPlusFrames() = runBlocking {
+        val summarizer = RecordingSummarizer()
+        val digest = VideoSummaryService(summarizer).digest(
+            text = videoText(
+                lines = emptyList(),
+                source = BiliVideoText.Source.Metadata,
+                chapters = listOf(BiliSubtitleLine(0, "开场"), BiliSubtitleLine(95, "第一部分")),
+            ),
+            imageRefs = listOf("/tmp/f0.jpg", "/tmp/f1.jpg", "/tmp/f2.jpg"),
+        )
+
+        val call = summarizer.calls.single()
+        assertTrue(call.system.contains("没有字幕"))
+        assertTrue(call.system.contains("严禁编造"))
+        assertTrue(call.user.contains("【章节标签】"))
+        assertTrue(call.user.contains("- 01:35 第一部分"))
+        assertEquals(3, call.images.size)
+        assertEquals("一句话：讲猫\n要点：\n- 00:10 猫很可爱", digest)
+    }
+
+    @Test
+    fun aMetadataOnlyVideoWithNoFramesStillGetsAPrompt() = runBlocking {
+        val summarizer = RecordingSummarizer()
+        VideoSummaryService(summarizer).digest(
+            videoText(lines = emptyList(), source = BiliVideoText.Source.Metadata),
+        )
+        assertTrue(summarizer.calls.single().images.isEmpty())
+        assertTrue(summarizer.calls.single().user.contains("取不到字幕"))
     }
 }

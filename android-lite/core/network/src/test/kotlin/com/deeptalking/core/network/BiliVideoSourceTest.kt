@@ -153,4 +153,69 @@ class BiliVideoSourceTest {
         assertEquals("BV1ZKn267EY3", BiliLinks.bvidOf(" https://b23.tv/BV1ZKn267EY3 "))
         assertNull(BiliLinks.bvidOf("https://www.bilibili.com/video/av12345"))
     }
+
+    @Test
+    fun storyboardIsParsedIntoGridAndTimestamps() {
+        val storyboard = parseBiliStoryboard(STORYBOARD_JSON)
+        requireNotNull(storyboard)
+        assertEquals(10, storyboard.gridWidth)
+        assertEquals(10, storyboard.gridHeight)
+        assertEquals(480, storyboard.frameWidth)
+        assertEquals(270, storyboard.frameHeight)
+        assertEquals(2, storyboard.images.size)
+        assertEquals("https://bimp.hdslb.com/a.jpg", storyboard.images[0])
+        assertEquals(200, storyboard.timestamps.size)
+        assertEquals(200, storyboard.frameCount)
+        assertEquals(FrameLocation(0, 0, 0), storyboard.locationOf(0))
+        assertEquals(FrameLocation(0, 9, 9), storyboard.locationOf(99))
+        assertEquals(FrameLocation(1, 0, 0), storyboard.locationOf(100))
+        assertNull(storyboard.locationOf(200))
+        assertNull(storyboard.locationOf(-1))
+    }
+
+    @Test
+    fun brokenStoryboardDegradesToNull() {
+        assertNull(parseBiliStoryboard("""{"code":0}"""))
+        assertNull(parseBiliStoryboard("""{"code":0,"data":{"img_x_len":0,"image":[],"index":[]}}"""))
+        assertNull(parseBiliStoryboard("<html>403</html>"))
+    }
+
+    @Test
+    fun framePickingSpreadsAcrossTheWholeVideo() {
+        val storyboard = requireNotNull(parseBiliStoryboard(STORYBOARD_JSON))
+        // 200 帧、取 4 帧：首尾都要，中间等距。
+        assertEquals(listOf(0, 66, 132, 199), pickStoryboardFrames(storyboard, 4))
+        assertEquals(6, pickStoryboardFrames(storyboard, 6).size)
+        assertEquals(listOf(100), pickStoryboardFrames(storyboard, 1))
+        assertEquals((0 until 200).toList(), pickStoryboardFrames(storyboard, 500))
+    }
+
+    @Test
+    fun viewPointsBecomeChapters() {
+        val root = """
+            {"code":0,"data":{"view_points":[
+              {"type":1,"from":0,"to":43,"content":"开场"},
+              {"type":1,"from":108,"to":271,"content":"第一部分：为什么"}
+            ]}}
+        """.trimIndent()
+        val chapters = parseBiliViewPoints(root)
+        assertEquals(listOf("开场", "第一部分：为什么"), chapters.map { it.text })
+        assertEquals(listOf(0, 108), chapters.map { it.fromSec })
+        assertTrue(parseBiliViewPoints("""{"code":0,"data":{}}""").isEmpty())
+    }
+
+    private companion object {
+        /**
+         * 真实响应的形状：2 张 10×10 拼图、每帧 480×270、`index` 是每帧的秒数（可能重复）。
+         * 这里把 timestamps 压到 200 项，便于断言越界。
+         */
+        val STORYBOARD_JSON = """
+            {"code":0,"data":{
+              "pvdata":"",
+              "img_x_len":10,"img_y_len":10,"img_x_size":480,"img_y_size":270,
+              "image":["//bimp.hdslb.com/a.jpg","//bimp.hdslb.com/b.jpg"],
+              "index":[${(0 until 200).joinToString(",") { "${it * 5}" }}]
+            }}
+        """.trimIndent()
+    }
 }

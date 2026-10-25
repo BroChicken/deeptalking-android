@@ -24,9 +24,41 @@ data class BiliSubtitleTrack(val lan: String, val url: String)
 data class BiliConclusion(val summary: String, val outline: List<BiliSubtitleLine>)
 
 /**
- * 一个 B 站视频里所有能喂给模型的文本。要么拿到**字幕**（逐句，带时间轴），要么只拿到
- * **官方 AI 总结**（摘要 + 大纲）——两者都取不到时由 [BiliVideoTextResult.Failure] 说明原因。
+ * B 站的「截图墙」（`x/player/videoshot`）：整段视频被切成 [gridWidth]×[gridHeight] 帧一张的
+ * 拼图，每 [frameWidth]×[frameHeight] 像素一帧，[timestamps] 是每一帧对应的秒数。
+ *
+ * **这个接口不需要登录**，是本 App 唯一的"抽帧"来源：下载拼图后在本地裁出几帧，就能让视觉
+ * 模型看一眼画面（比下载视频流再解码便宜两个数量级）。
  */
+data class BiliStoryboard(
+    val gridWidth: Int,
+    val gridHeight: Int,
+    val frameWidth: Int,
+    val frameHeight: Int,
+    val images: List<String>,
+    val timestamps: List<Int>,
+) {
+    val framesPerImage: Int get() = (gridWidth * gridHeight).coerceAtLeast(1)
+
+    val frameCount: Int get() = minOf(timestamps.size, images.size * framesPerImage)
+
+    /** 第 [frame] 帧在拼图里的位置；越界返回 null。 */
+    fun locationOf(frame: Int): FrameLocation? {
+        if (frame < 0 || frame >= frameCount) return null
+        val imageIndex = frame / framesPerImage
+        val cell = frame % framesPerImage
+        if (imageIndex >= images.size) return null
+        return FrameLocation(
+            imageIndex = imageIndex,
+            column = cell % gridWidth,
+            row = cell / gridWidth,
+        )
+    }
+}
+
+data class FrameLocation(val imageIndex: Int, val column: Int, val row: Int)
+
+/** 一个 B 站视频里所有能喂给模型的文本。 */
 data class BiliVideoText(
     val bvid: String,
     val title: String,
@@ -37,13 +69,19 @@ data class BiliVideoText(
     val desc: String,
     val source: Source,
     val lang: String,
-    val lines: List<BiliSubtitleLine>,
+    /** 逐句字幕；[Source.Metadata] 时为空。 */
+    val lines: List<BiliSubtitleLine> = emptyList(),
+    /** B 站官方 AI 总结正文（[Source.OfficialSummary] 时有值）。 */
     val officialSummary: String = "",
     val officialOutline: List<BiliSubtitleLine> = emptyList(),
+    /** `view_points` 的章节标签（不需要登录就能拿到），无字幕时它是唯一的"结构"信息。 */
+    val chapters: List<BiliSubtitleLine> = emptyList(),
 ) {
-    enum class Source { Subtitle, OfficialSummary }
+    enum class Source { Subtitle, OfficialSummary, Metadata }
 
-    /** 逐句字幕的总字数（官方总结路径下为 0）。 */
+    /** 只有逐句字幕才算"看得见文字内容"；官方总结是二手摘要，Metadata 什么都没有。 */
+    val hasSubtitle: Boolean get() = source == Source.Subtitle && lines.isNotEmpty()
+
     val transcriptChars: Int get() = lines.sumOf { it.text.length }
 }
 
@@ -51,23 +89,27 @@ sealed interface BiliVideoTextResult {
     data class Ok(val text: BiliVideoText) : BiliVideoTextResult
 
     /**
-     * [needsLogin] 为 true 表示"配上 Cookie 大概率就能取到"——工具据此让模型说清楚该做什么，
-     * 而不是含糊地回一句"没有字幕"。
+     * 只有**连视频元信息都取不到**时才走到这里：没字幕不是失败，见 [BiliVideoText.Source.Metadata]。
+     * [needsLogin] 为 true 表示"配上 Cookie 可能拿到字幕"。
      */
     data class Failure(val reason: String, val needsLogin: Boolean = false) : BiliVideoTextResult
 }
 
-/** 取一个 B 站视频的可总结文本（字幕优先，官方总结兜底）。 */
+/** 取一个 B 站视频的可总结材料（字幕 / 官方总结 / 只有元信息 + 章节）。 */
 interface BiliVideoSource {
     suspend fun load(bvid: String): BiliVideoTextResult
+
+    /** 截图墙（抽帧用）；接口不可用或没有截图时返回 null。默认不支持，便于测试替身。 */
+    suspend fun storyboard(bvid: String, cid: Long): BiliStoryboard? = null
 }
 
 /**
  * [BiliVideoSource] 的 HTTP 实现。
  *
- * B 站的 AI 字幕与官方总结都**要求登录态**（匿名请求 `x/player/wbi/v2` 的 `subtitles` 恒为空，
- * `view/conclusion/get` 直接 -403），所以 [cookie] 返回用户自己填的 `SESSDATA=...`；
- * 未配置时本类仍会尝试，失败结果里 [BiliVideoTextResult.Failure.needsLogin] 为 true。
+ * B 站的 AI 字幕与官方总结都**要求登录态**（匿名请求 `x/player/wbi/v2` 的 `subtitles` 恒为空、
+ * `view/conclusion/get` 直接 -403），所以 [cookie] 返回用户自己填的 `SESSDATA=...`。
+ * 但 **`x/player/videoshot`（截图墙）和 `view`（元信息）、`view_points`（章节）都不需要登录**，
+ * 所以"没有 Cookie"只会让总结从"逐句"降级为"看画面 + 简介/章节"，而不是直接失败。
  *
  * 风控与时效注意：`wbi_img` 每天轮换（本类按天缓存），字幕 CDN 地址的 `auth_key` 只有
  * 分钟级有效期（必须现取现用、不可落库），高频请求会触发 -412/-799。
@@ -113,46 +155,54 @@ class HttpBiliVideoSource(
                 upMid = owner?.get("mid").longOrZero() ?: 0L,
                 desc = data["desc"].textOrEmpty(),
             )
-            val loggedIn = !cookie().isNullOrBlank()
 
             // 1) 字幕优先：逐句文本能回答"某个细节在第几分钟"，官方总结做不到。
-            val tracks = playerTracks(meta.bvid, cid)
-            val track = pickBiliSubtitleTrack(tracks)
+            val player = playerPayload(meta.bvid, cid)
+            val chapters = parseBiliViewPoints(player.orEmpty())
+            val track = pickBiliSubtitleTrack(parseBiliSubtitleTracks(player.orEmpty()))
             if (track != null) {
                 val lines = fetchSubtitleLines(track.url)
                 if (lines.isNotEmpty()) {
                     return@withContext BiliVideoTextResult.Ok(
-                        meta.toText(BiliVideoText.Source.Subtitle, track.lan, lines),
+                        meta.toText(BiliVideoText.Source.Subtitle, track.lan, lines, chapters = chapters),
                     )
                 }
             }
 
-            // 2) 官方 AI 总结兜底：零 LLM 成本，带 outline 时间戳。
+            // 2) 官方 AI 总结：零 LLM 成本，带 outline 时间戳。
             val conclusion = officialConclusion(meta.bvid, cid, meta.upMid)
-            if (conclusion != null && (conclusion.summary.isNotEmpty() || conclusion.outline.isNotEmpty())) {
+            if (conclusion != null) {
                 return@withContext BiliVideoTextResult.Ok(
                     meta.toText(
                         source = BiliVideoText.Source.OfficialSummary,
                         lang = "zh",
                         lines = conclusion.outline,
                         summary = conclusion.summary,
+                        chapters = chapters,
                     ),
                 )
             }
 
-            BiliVideoTextResult.Failure(
-                reason = if (loggedIn) {
-                    "这个视频既没有字幕也没有官方总结，取不到可以总结的文本"
-                } else {
-                    "B站的字幕与官方总结都需要登录态才能取到；请在设置里填一次 B 站 Cookie（SESSDATA）"
-                },
-                needsLogin = !loggedIn,
+            // 3) 什么都没有（大概率是没登录）：仍然带着元信息 + 章节回去，让上层"看画面说个大概"，
+            //    而不是把整次调用判成失败。
+            BiliVideoTextResult.Ok(
+                meta.toText(BiliVideoText.Source.Metadata, lang = "", chapters = chapters),
             )
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
             BiliVideoTextResult.Failure("B站视频文本获取失败：" + (e.message ?: e.toString()))
         }
+    }
+
+    override suspend fun storyboard(bvid: String, cid: Long): BiliStoryboard? = withContext(Dispatchers.IO) {
+        if (cid <= 0L) return@withContext null
+        val root = getJsonObject(
+            url = "https://api.bilibili.com/x/player/videoshot?bvid=$bvid&cid=$cid&index=1",
+            referer = "https://www.bilibili.com/video/$bvid",
+        ) ?: return@withContext null
+        if (root["code"].intOrZero() != 0) return@withContext null
+        parseBiliStoryboard(root.toString())
     }
 
     private data class Meta(
@@ -168,8 +218,9 @@ class HttpBiliVideoSource(
     private fun Meta.toText(
         source: BiliVideoText.Source,
         lang: String,
-        lines: List<BiliSubtitleLine>,
+        lines: List<BiliSubtitleLine> = emptyList(),
         summary: String = "",
+        chapters: List<BiliSubtitleLine> = emptyList(),
     ) = BiliVideoText(
         bvid = bvid,
         title = title,
@@ -183,12 +234,16 @@ class HttpBiliVideoSource(
         lines = lines,
         officialSummary = summary,
         officialOutline = if (source == BiliVideoText.Source.OfficialSummary) lines else emptyList(),
+        chapters = chapters,
     )
 
-    /** `x/player/wbi/v2` 的字幕轨列表；无登录或无字幕时为空。 */
-    private fun playerTracks(bvid: String, cid: Long): List<BiliSubtitleTrack> {
-        if (cid <= 0L) return emptyList()
-        val keys = wbiKeys() ?: return emptyList()
+    /**
+     * `x/player/wbi/v2` 的原始响应；没有 cid 或签名 key 取不到时返回 null。
+     * 字幕轨、`need_login_subtitle`、`view_points` 章节都在这里面。
+     */
+    private fun playerPayload(bvid: String, cid: Long): String? {
+        if (cid <= 0L) return null
+        val keys = wbiKeys() ?: return null
         val query = BiliWbi.signedQuery(
             params = mapOf("bvid" to bvid, "cid" to cid.toString()),
             imgKey = keys.imgKey,
@@ -198,9 +253,9 @@ class HttpBiliVideoSource(
         val root = getJsonObject(
             url = "https://api.bilibili.com/x/player/wbi/v2?$query",
             referer = "https://www.bilibili.com/video/$bvid",
-        ) ?: return emptyList()
-        if (root["code"].intOrZero() != 0) return emptyList()
-        return parseBiliSubtitleTracks(root.toString())
+        ) ?: return null
+        if (root["code"].intOrZero() != 0) return null
+        return root.toString()
     }
 
     /** 官方 AI 总结（`x/web-interface/view/conclusion/get`，需登录 + WBI）。 */
@@ -243,7 +298,7 @@ class HttpBiliVideoSource(
         referer: String = "https://www.bilibili.com/",
     ): JsonObject? {
         val body = getRaw(url, referer) ?: return null
-        return json.parseToJsonElement(body) as? JsonObject
+        return runCatching { json.parseToJsonElement(body) as? JsonObject }.getOrNull()
     }
 
     private fun getRaw(url: String, referer: String): String? {
@@ -308,6 +363,21 @@ internal fun parseBiliSubtitleTracks(rootJson: String): List<BiliSubtitleTrack> 
 }
 
 /**
+ * 解析 `x/player/wbi/v2` 的 `view_points` 章节标签（不需要登录）。
+ * 只有少数视频有，内容通常是 4~18 字的短标签，但足以说明"视频分几段、每段讲什么方向"。
+ */
+internal fun parseBiliViewPoints(rootJson: String): List<BiliSubtitleLine> {
+    val root = runCatching { JSON_FOR_PARSING.parseToJsonElement(rootJson) as? JsonObject }.getOrNull() ?: return emptyList()
+    val items = (root["data"] as? JsonObject)?.get("view_points") as? JsonArray ?: return emptyList()
+    return items.mapNotNull { element ->
+        val obj = element as? JsonObject ?: return@mapNotNull null
+        val content = obj["content"].textOrEmpty().trim()
+        if (content.isEmpty()) return@mapNotNull null
+        BiliSubtitleLine(fromSec = obj["from"].intOrZero(), text = content)
+    }
+}
+
+/**
  * AI 中文字幕优先（`ai-zh`），其次任意中文轨，最后退回第一条。
  * AI 字幕通常比 UP 上传的 CC 更完整，且语言与本应用对得上。
  */
@@ -317,6 +387,48 @@ internal fun pickBiliSubtitleTrack(tracks: List<BiliSubtitleTrack>): BiliSubtitl
     tracks.firstOrNull { it.lan.startsWith("ai", ignoreCase = true) }?.let { return it }
     tracks.firstOrNull { it.lan.startsWith("zh", ignoreCase = true) }?.let { return it }
     return tracks.first()
+}
+
+/** 解析 `x/player/videoshot` 的截图墙。 */
+internal fun parseBiliStoryboard(rootJson: String): BiliStoryboard? {
+    val root = runCatching { JSON_FOR_PARSING.parseToJsonElement(rootJson) as? JsonObject }.getOrNull() ?: return null
+    val data = root["data"] as? JsonObject ?: return null
+    val gridWidth = data["img_x_len"].intOrZero()
+    val gridHeight = data["img_y_len"].intOrZero()
+    val frameWidth = data["img_x_size"].intOrZero()
+    val frameHeight = data["img_y_size"].intOrZero()
+    val images = (data["image"] as? JsonArray)?.mapNotNull { element ->
+        val url = element.textOrEmpty().trim()
+        if (url.isEmpty()) null else if (url.startsWith("//")) "https:$url" else url
+    }.orEmpty()
+    val timestamps = (data["index"] as? JsonArray)?.map { it.intOrZero() }.orEmpty()
+    if (gridWidth <= 0 || gridHeight <= 0 || frameWidth <= 0 || frameHeight <= 0) return null
+    if (images.isEmpty() || timestamps.isEmpty()) return null
+    return BiliStoryboard(
+        gridWidth = gridWidth,
+        gridHeight = gridHeight,
+        frameWidth = frameWidth,
+        frameHeight = frameHeight,
+        images = images,
+        timestamps = timestamps,
+    )
+}
+
+/**
+ * 从截图墙里均匀挑 [count] 帧（按帧号升序、去重）。挑帧而不是整墙喂给模型：一帧 480×270 的
+ * JPEG 已经够看清"画面里在干嘛"，4~6 帧就能覆盖开场/中段/结尾的视觉变化。
+ */
+fun pickStoryboardFrames(storyboard: BiliStoryboard, count: Int): List<Int> {
+    val total = storyboard.frameCount
+    val wanted = count.coerceAtLeast(1)
+    if (total <= 0) return emptyList()
+    if (total <= wanted) return (0 until total).toList()
+    if (wanted == 1) return listOf(total / 2)
+    val picked = LinkedHashSet<Int>()
+    for (step in 0 until wanted) {
+        picked += (step.toLong() * (total - 1) / (wanted - 1)).toInt()
+    }
+    return picked.sorted()
 }
 
 /**
@@ -388,7 +500,7 @@ private val JSON_FOR_PARSING = Json {
 
 private fun JsonElement?.textOrEmpty(): String {
     val primitive = this as? JsonPrimitive ?: return ""
-    return if (primitive.isString) primitive.content else primitive.content
+    return primitive.content
 }
 
 private fun JsonElement?.intOrZero(): Int =

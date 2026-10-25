@@ -86,7 +86,7 @@ BackgroundTasks.scheduleTurn       后台：文风校对、快速回应校验/�
 | `web_fetch` | 读取链接（网页正文 / 图片 / 站内专门解析）；虎扑帖子、网易云歌曲、B站视频链接各有专门解析。**只读链接、不做关键词搜索** | `WebFetchTool` → `HttpWebContentProvider` |
 | `search` | 按关键词搜一个社区平台：`platform` ∈ `bilibili` / `netease` / `hupu` | `SearchTool` |
 | `hot_board` | 指定平台热榜：`platform` ∈ `baidu` / `toutiao` / `douyin` / `zhihu` | `HotBoardTool` |
-| `video_summary` | 总结一个 B 站视频讲了什么（`url` 传链接或 BV 号，`focus` 可选）：逐句字幕走分块总结，官方 AI 总结存在时直接采用；取不到文本时如实报"需要登录" | `VideoSummaryTool` → `HttpBiliVideoSource` + `VideoSummaryService`（见 `docs/BILIBILI_VIDEO_SUMMARY.md`） |
+| `video_summary` | 总结一个 B 站视频讲了什么（`url` 传链接或 BV 号，`focus` 可选）：逐句字幕走分块总结，官方 AI 总结存在时直接采用，都没有就用简介/章节/抽帧画面说个大概并标明"没字幕"；结果按 BV 号本地缓存 7 天 | `VideoSummaryTool` → `HttpBiliVideoSource` + `VideoSummaryService` + `BiliFrameExtractor`/`BiliVideoCache`（见 `docs/BILIBILI_VIDEO_SUMMARY.md`） |
 | `memory_write` | 按 ID 修正（`op=update`，须 evidence + sourceMessageIds）或删除（`op=delete`）记忆 | `MemoryWriteTool` |
 | `upsert_lorebook_entry` | 写入/更新世界书条目（世界层设定唯一入口，保护人工维护条目） | `UpsertLorebookEntryTool` |
 | `send_sticker` | 发表情包（**仅当角色有贴图时注册**，schema 内联该角色的标签枚举） | `SendStickerTool` |
@@ -409,7 +409,7 @@ tools: AUTO 阶段 8 个工具 / FINAL 阶段无 tools（tool_choice 恒为 auto
 | `5` | 需要工具时**只调工具、不写正文**；工具结果回来后再写正文；正文不提工具名或检索过程 |
 | `6` | 文风以"性格特征"、可选"声音底色"和"对用户的称呼"为准；不向默认助手腔靠拢；不复用最近几轮的整句/句式/比喻/意象/收尾 |
 | `7` | 通用真人感（与角色无关，所有角色共享）：句长要乱（多数 3~15 字、长句 ≤40 字）、允许不完整句/省略主语/停住改口/语气词；情绪不直说、不必每轮表态；可以不接话/只回半句；近三轮用过的词句不再复用；禁总结升华排比与结构词；禁 AI 腔固定句 |
-| `A` | 本会话可用工具清单（9 个，逐一点名）+ 何时用哪个工具的导引；日期用 `search_memory` 的 `date`/`timeRef`；说"第一次/从来没/总是"前先检索；讲 B 站视频内容用 `video_summary`（只依据字幕/官方总结，取不到就照实说） |
+| `A` | 本会话可用工具清单（9 个，逐一点名）+ 何时用哪个工具的导引；日期用 `search_memory` 的 `date`/`timeRef`；说"第一次/从来没/总是"前先检索；讲 B 站视频内容用 `video_summary`（依据字幕/站方总结/画面；`has_subtitle=false` 时说清"没字幕"） |
 | `10` | 群组：只能由已列出的成员发言，每人独立一行"成员名：内容"；成员之间语气必须显著不同 |
 | `11` | 群组：成员私人记忆互不相通，只有全体都知道的事才写共享记忆；不得张冠李戴 |
 | — | 【角色设定（固定，不随对话变化）】= `buildSystemPrompt` 的静态角色块（群组含群组前提与成员清单） |

@@ -104,41 +104,76 @@ class NativeCore(context: Context) {
     val web: HttpWebContentProvider = HttpWebContentProvider(defaultClient(dohDns))
 
     /**
-     * B 站视频文本源（逐句字幕优先、官方 AI 总结兜底）。Cookie 每次调用现取，所以用户在设置页
-     * 改完下一次工具调用就生效，不用重启。未配置时工具会如实报"需要登录"，而不是编内容。
+     * B 站视频文本源（逐句字幕优先、官方 AI 总结次之、都没有就只给元信息+章节）。
+     * Cookie 每次调用现取，所以用户在设置页改完下一次工具调用就生效，不用重启。
      */
     val biliVideoSource: BiliVideoSource = HttpBiliVideoSource(defaultClient(dohDns)) { secrets.getBiliCookie() }
 
     /**
-     * 字幕分块总结用的辅助补全：走 [trackedComplete]，因此每次总结都会在 `requestMetrics` 里留
-     * 一条 `video_summary`（输入/输出/hit 都能看），失败也带原因。
+     * 视频数据缓存目录（7 天）：总结结果 JSON + 抽帧截图都放这里，过期由 [BiliVideoCache] 顺手清掉。
+     * 走 `cacheDir` 是故意的：它是缓存，系统空间紧张时清掉不影响正确性。
      */
-    private val videoSummarizer: VideoSummarizer = VideoSummarizer { system, user ->
+    val biliVideoCacheDir: File = File(appContext.cacheDir, "bili_video")
+
+    val biliVideoCache: BiliVideoCache = BiliVideoCache(biliVideoCacheDir)
+
+    /** 抽帧：从截图墙裁 6 帧（免登录），失败返回空表让总结退化纯文字。 */
+    private val biliFrameExtractor: BiliFrameExtractor =
+        BiliFrameExtractor(defaultClient(dohDns), biliVideoCacheDir)
+
+    /**
+     * 字幕/画面总结用的辅助补全：走 [trackedComplete]，因此每次总结都会在 `requestMetrics` 里留
+     * 一条 `video_summary`（输入/输出/hit 都能看），失败也带原因。
+     *
+     * 带图请求被拒（模型不支持视觉时会 400）就退回纯文字重试一次，而不是让整次总结失败。
+     */
+    private val videoSummarizer: VideoSummarizer = VideoSummarizer { system, user, imageRefs ->
         val config = currentConfig()
-        trackedComplete(
-            config,
-            "video_summary",
-            LlmRequest(
-                model = config.modelName,
-                instructions = system,
-                input = listOf(ChatMessage(role = Role.User, content = user)),
-                temperature = 0.3,
-                maxOutputTokens = AppLimits.Api.AUXILIARY_MAX_OUTPUT_TOKENS,
-                stream = false,
-                reasoningEffort = "none",
-                apiPlatform = config.apiPlatform,
-                sessionId = "deeptalking-general",
-                auxiliary = true,
-            ),
-        ).text.trim().ifEmpty { null }
+        suspend fun attempt(images: List<String>): String? = runCatching {
+            trackedComplete(config, "video_summary", videoSummaryRequest(config, system, user, images))
+                .text.trim().ifEmpty { null }
+        }.getOrNull()
+        val withImages = attempt(imageRefs)
+        if (withImages != null || imageRefs.isEmpty()) withImages else attempt(emptyList())
     }
+
+    /** 一次总结请求：图片通过 [MessageAttachment] 走 `input_image`，由 [MediaRef] 转成 data URI。 */
+    private fun videoSummaryRequest(
+        config: AppConfig,
+        system: String,
+        user: String,
+        images: List<String>,
+    ): LlmRequest = LlmRequest(
+        model = config.modelName,
+        instructions = system,
+        input = listOf(
+            ChatMessage(
+                role = Role.User,
+                content = user,
+                attachments = images.map { MessageAttachment(MessageAttachment.Kind.Image, it) },
+            ),
+        ),
+        temperature = 0.3,
+        maxOutputTokens = AppLimits.Api.AUXILIARY_MAX_OUTPUT_TOKENS,
+        stream = false,
+        reasoningEffort = "none",
+        apiPlatform = config.apiPlatform,
+        sessionId = "deeptalking-general",
+        auxiliary = true,
+        imageResolver = { ref -> MediaRef.toDataUri(appContext, ref) },
+    )
 
     val tools: ToolRegistry = ToolRegistry(
         defaultTools(
             memory,
             web,
             stickersEnabled = true,
-            videoSummary = VideoSummaryTool(biliVideoSource, VideoSummaryService(videoSummarizer)),
+            videoSummary = VideoSummaryTool(
+                source = biliVideoSource,
+                summary = VideoSummaryService(videoSummarizer),
+                cache = biliVideoCache,
+                frames = biliFrameExtractor,
+            ),
         ),
     )
 

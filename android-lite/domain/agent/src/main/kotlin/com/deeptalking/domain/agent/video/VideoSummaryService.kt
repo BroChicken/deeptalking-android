@@ -5,40 +5,53 @@ import com.deeptalking.core.network.BiliVideoText
 import com.deeptalking.core.network.formatBiliClock
 
 /**
- * 一次非流式补全：`system` + `user` 进、纯文本出。
+ * 一次非流式补全：`system` + `user` 进、纯文本出，`imageRefs` 是可以给视觉模型看的本地图片引用。
  *
- * 只留这一个方法是有意的——总结服务不该知道模型名、平台、重试策略（那些属于 `:app` 的
- * 辅助调用通道），测试里给个记录参数的实现就能验证分块与合并逻辑。
+ * 只留这一个方法是有意的——总结服务不该知道模型名、平台、重试策略（那些属于 `:app` 的辅助
+ * 调用通道）。图片也一样：调用方给引用，怎么变成 `data:` URI 由实现决定。
  */
 fun interface VideoSummarizer {
-    suspend fun complete(system: String, user: String): String?
+    suspend fun complete(system: String, user: String, imageRefs: List<String>): String?
 }
 
 /** 一段被切开的字幕（[index] 从 1 开始，只用于提示词里的"第几段/共几段"）。 */
 data class TranscriptChunk(val index: Int, val lines: List<BiliSubtitleLine>)
 
 /**
- * 长视频的 map-reduce 总结：字幕 ≤ [CHUNK_CHARS] 时一次写完；更长时先分段提要点、再合并。
+ * 视频总结的两种路径：
+ *
+ * - **有逐句字幕** → 分块 map-reduce（短则一次），产出「一句话 + 带 `mm:ss` 的要点」；
+ * - **没字幕** → 只用标题/简介/章节标签/画面截图说“大概是什么”，并明确声明没字幕，
+ *   绝不假装看过内容。
  *
  * 为什么不让主模型直接读字幕：字幕是**追加式历史**里的一坨文本，会跟着后面每一轮重新计费。
  * 这里把它压成"一句话 + 几条带时间戳的要点"（几百字），再交给角色用自己的口气转述。
  */
 class VideoSummaryService(private val summarizer: VideoSummarizer) {
 
-    /** 返回可直接放进工具结果的摘要文本；失败返回 null（由调用方如实报错，不许编造）。 */
-    suspend fun digest(text: BiliVideoText, focus: String? = null): String? {
+    /**
+     * 返回可直接放进工具结果的摘要文本；失败返回 null（由调用方如实报错，不许编造）。
+     * [imageRefs] 是抽到的画面截图，有字幕时用来确认场景，没字幕时是唯一的信息来源。
+     */
+    suspend fun digest(
+        text: BiliVideoText,
+        focus: String? = null,
+        imageRefs: List<String> = emptyList(),
+    ): String? {
+        if (!text.hasSubtitle) return digestShallow(text, focus, imageRefs)
         val chunks = chunkTranscript(text.lines)
         if (chunks.isEmpty()) return null
         val header = headerOf(text, focus)
         if (chunks.size == 1) {
-            val user = header + transcriptBlock(chunks[0].lines)
-            return summarizer.complete(WRITER_SYSTEM, user)?.trim()?.takeIf { it.isNotEmpty() }
+            val user = header + transcriptBlock(chunks[0].lines) + framesBlock(imageRefs)
+            return summarizer.complete(WRITER_SYSTEM + framesRule(imageRefs.size), user, imageRefs)
+                ?.trim()?.takeIf { it.isNotEmpty() }
         }
         val partials = chunks.mapNotNull { chunk ->
             val user = headerOf(text, null) +
                 "（第 " + chunk.index + "/" + chunks.size + " 段）\n" +
                 transcriptBlock(chunk.lines)
-            summarizer.complete(MAP_SYSTEM, user)?.trim()?.takeIf { it.isNotEmpty() }
+            summarizer.complete(MAP_SYSTEM, user, emptyList())?.trim()?.takeIf { it.isNotEmpty() }
         }
         if (partials.isEmpty()) return null
         val reduceUser = buildString {
@@ -47,8 +60,34 @@ class VideoSummaryService(private val summarizer: VideoSummarizer) {
             partials.forEachIndexed { position, partial ->
                 append("第 ").append(position + 1).append(" 段：\n").append(partial).append('\n')
             }
+            append(framesBlock(imageRefs))
         }
-        return summarizer.complete(REDUCE_SYSTEM, reduceUser)?.trim()?.takeIf { it.isNotEmpty() }
+        return summarizer.complete(REDUCE_SYSTEM + framesRule(imageRefs.size), reduceUser, imageRefs)
+            ?.trim()?.takeIf { it.isNotEmpty() }
+    }
+
+    /** 没字幕：只给元信息 + 章节 + 画面，要求明确声明"没字幕、只能看个大概"。 */
+    private suspend fun digestShallow(
+        text: BiliVideoText,
+        focus: String?,
+        imageRefs: List<String>,
+    ): String? {
+        val user = buildString {
+            append(headerOf(text, focus))
+            if (text.chapters.isNotEmpty()) {
+                append("【章节标签】\n")
+                text.chapters.forEach { chapter ->
+                    append("- ").append(formatBiliClock(chapter.fromSec)).append(' ').append(chapter.text).append('\n')
+                }
+            }
+            append("【说明】这个视频取不到字幕（也没有站方 AI 总结），只能靠简介、章节和画面截图判断。\n")
+            append(framesBlock(imageRefs))
+        }
+        return summarizer.complete(
+            system = SHALLOW_SYSTEM + framesRule(imageRefs.size),
+            user = user,
+            imageRefs = imageRefs,
+        )?.trim()?.takeIf { it.isNotEmpty() }
     }
 
     private fun headerOf(text: BiliVideoText, focus: String?): String = buildString {
@@ -67,6 +106,14 @@ class VideoSummaryService(private val summarizer: VideoSummarizer) {
             append('[').append(formatBiliClock(line.fromSec)).append("] ").append(line.text).append('\n')
         }
     }
+
+    private fun framesBlock(imageRefs: List<String>): String =
+        if (imageRefs.isEmpty()) "" else "【画面】另附 ${imageRefs.size} 张视频截图，按时间顺序排列。\n"
+
+    private fun framesRule(count: Int): String =
+        if (count == 0) "" else
+            "\n有附带画面截图时：只用它确认“画面在拍什么/是什么形式”（真人、动画、录屏、板书…），" +
+                "不要凭画面推测台词、数据或结论。"
 
     companion object {
         /**
@@ -137,5 +184,15 @@ class VideoSummaryService(private val summarizer: VideoSummarizer) {
                 "要点：\n" +
                 "- mm:ss <不超过 40 字>\n" +
                 "最终 4 到 8 条，按时间顺序，去掉重复和琐碎细节。"
+
+        private const val SHALLOW_SYSTEM =
+            "这个视频**没有字幕**，你只能看到：标题、简介、章节标签和几张画面截图。\n" +
+                "你要做的是“看个大概”，不是总结内容：说清楚这是什么类型的内容、分了哪几段、画面是什么形式。\n" +
+                "严禁编造具体观点、结论、数据、人名或台词；不要假装看过。\n" +
+                "输出格式（不要多余的开头结尾）：\n" +
+                "一句话：<不超过 50 字，必须是“没字幕，看画面像是…”这种带保留的说法>\n" +
+                "要点：\n" +
+                "- <不超过 40 字，只能是简介/章节/画面能直接支撑的东西>\n" +
+                "要点 2 到 4 条。"
     }
 }
