@@ -924,20 +924,31 @@ category 只能选一个 id：happy 开心 / speechless 无语 / angry 生气 / 
 `labelSticker` 返回 null，调用方用**检索词**当关键词、大类记 `other`，图片照样入库，用户在面板里可改。
 关键词在落库前仍会被 `sanitizeKeyword` 收口（去空白标点、封顶 7 字），外部网页标题永远不直接进关键词。
 
-### 出站：百度图片（已登录态无关）
+### 出站：百度图片（免登录，但**必须带 `BAIDUID` cookie**）
 
 ```text
-GET https://image.baidu.com/search/acjson?tn=resultjson_com&pn=0&rn=<6..30>&word=<query 表情包>
+GET https://image.baidu.com/                                    ← 预热：只为一个 Set-Cookie: BAIDUID
+GET https://image.baidu.com/search/acjson?tn=resultjson_com&pn=<page*rn>&rn=<6..30>&word=<query 表情包>
 User-Agent: <桌面 Chrome UA>
+Cookie: BAIDUID=…（BaiduCookieJar 内存保存，进程内有效，不落盘）
 ```
 
+- **不带 cookie 一定被拦**：同一个 IP、同样只带 UA，不带 `BAIDUID` 时 `acjson` 稳定返回
+  `{"antiFlag":1,"message":"Forbid spider access"}`（HTTP 200）。`BaiduImageSearch` 因此自带
+  `BaiduCookieJar`，进程内做一次预热 GET；**被拦时会强制重新预热并重试一次**，仍被拦才报 `blocked`。
+  请求头**只带 UA**：再带 `Accept: text/html…` 这类浏览器头反而更容易命中反爬。
+- **翻页**：`pn = page*rn`。写死 `pn=0` 会让同一主题从第二次起全部撞"库里已有"；
+  `:app` 的 `HttpStickerFetcher` 最多翻 `FETCH_PAGES` 页、每页 `FETCH_CANDIDATES_PER_PAGE` 张候选。
 - **关键词必须拼上「表情包」**：实测只搜实体名（如「蓝色大肥鱼」）会按字面返回海洋馆新闻图。
-- 响应不是严格 JSON（尾逗号、键序不稳），由 `parseBaiduImageJson` 用正则逐项抠
-  `middleURL`（500px 级缩略图）与同一项里的 `fromURL`（来源页，用于溯源/删除）。
-- 素材站/图库/电商（`699pic` / `nipic` / `ibaotu` / `tujuren` / `vcg` …）在水印拦截名单
-  `STICKER_HOST_BLOCKLIST` 里，命中直接丢弃；下载后压到 384px/120KB，再让视觉模型起名归类。
-- 免登录、无 key；单次最多下载 `AppLimits.Sticker.FETCH_CANDIDATES` 张候选，第一张能存下来就停。
-- 每一步失败都会变成一句可转述的话（搜索为空 / 候选都下载失败 / 库里已有 / 入库失败），
+- 响应不是严格 JSON（尾逗号、键序不稳），`parseBaiduImageJson` 按 `middleURL` 逐项切块：
+  `middleURL` 是 500px 级缩略图；来源页**不能取 `fromURL`**——它是 `ippr_z2C$…` 混淆串，
+  当前接口里 `fromJumpUrl` 多数也是同值混淆串，真 URL 在 `replaceUrl[].FromURL`，
+  没有就退到 `fromURLHost`（含点才算域名），都没有则留空。
+- 素材站/图库/电商（`699pic` / `nipic` / `ibaotu` / `tujuren` / `vcg` …）在 `STICKER_HOST_BLOCKLIST` 里：
+  **图片全在 `img*.baidu.com` 上，只能按来源页域名过滤**，命中直接丢弃；下载后压到 384px/120KB，
+  再让视觉模型起名归类。
+- 一次检索最多入库 `AppLimits.Sticker.FETCH_MAX_COUNT`（3）张，其中第一张随这条回复发出。
+- 每一步失败都会变成一句可转述的话（被反爬拦 / 搜索为空 / 候选都下载失败 / 库里已有 / 入库失败），
   由 `StickerFetchResult.Failed` 回给模型；成功时带上入库后的总张数。
 
 

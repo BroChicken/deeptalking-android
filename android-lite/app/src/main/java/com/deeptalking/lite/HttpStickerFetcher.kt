@@ -38,6 +38,9 @@ data class StickerLabel(
  *   不再只试 3 张；
  * - **失败可解释**：搜索被反爬、HTTP 码、超体积、解码失败各自成句，带上 `step`
  *   返回给调用方（search / download / save），模型能照实转述。
+ *
+ * 检索源侧的 `BAIDUID` cookie 预热在 `:core:network` 的 `BaiduImageSearch` 里做——
+ * 不带 cookie 时百度在**翻页之前**就整页拦掉，这边翻页再卖力也用不上。
  */
 class HttpStickerFetcher(
     private val search: StickerImageSearch,
@@ -180,7 +183,9 @@ class HttpStickerFetcher(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) " +
                 "Chrome/131.0.0.0 Safari/537.36"
 
-        /** 部分图床对无 Referer 的请求会 403；指向检索页即可，不涉及登录态。 */
+        /**
+         * 百度自家 CDN（img*.baidu.com）实测不要求 Referer；带上只是为了换检索源/换图床时的兜底。
+         */
         const val REFERER = "https://image.baidu.com/"
     }
 }
