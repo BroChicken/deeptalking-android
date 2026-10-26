@@ -29,7 +29,7 @@ class SearchToolStickerTest {
         SearchTool(web = null, stickerFetcher = fetcher, stickersEnabled = enabled)
 
     @Test
-    fun `sticker search stores a sticker and hands the keyword back without sending it`() = runTest {
+    fun `sticker search stores several and sends the first one in this reply`() = runTest {
         var askedQuery = ""
         var askedCount = 0
         val fetcher = StickerFetcher { _, query, count ->
@@ -49,12 +49,24 @@ class SearchToolStickerTest {
         assertEquals(2, askedCount)
         assertTrue(result.contentJson.contains("\"ok\":true"))
         assertTrue(result.contentJson.contains("\"platform\":\"sticker\""))
+        assertTrue(result.contentJson.contains("\"sent\":true"))
         assertTrue(result.contentJson.contains("\"keyword\":\"无语\""))
         assertTrue(result.contentJson.contains("\"total\":9"))
-        assertTrue("要告诉模型下一步是 send_sticker", result.contentJson.contains("send_sticker"))
-        assertNull("搜索不是发送：不能带表情引用", result.stickerFileRef)
-        assertNull("搜索也不是贴图：不能带图片引用", result.imageFileRef)
-        assertEquals("表情库 +2：无语、裂开（共 9 张）", result.stickerNotice)
+        assertEquals("第一张直接作为这条回复的表情发出", "s1", result.stickerFileRef)
+        assertNull("表情不是回复内附图", result.imageFileRef)
+        assertEquals("表情库 +2：无语、裂开（共 9 张）· 已发出「无语」", result.stickerNotice)
+    }
+
+    @Test
+    fun `the default search fetches three so the library grows for later use`() = runTest {
+        var askedCount = -1
+        val fetcher = StickerFetcher { _, _, count ->
+            askedCount = count
+            StickerFetchResult.Stored(listOf(FetchedSticker("x", "other", "s1")), total = 1)
+        }
+        val result = tool(fetcher).execute(call("""{"platform":"sticker","query":"猫"}"""), context())
+        assertEquals(AppLimits.Sticker.FETCH_DEFAULT_COUNT, askedCount)
+        assertEquals("只有一张也要发出去", "s1", result.stickerFileRef)
     }
 
     @Test

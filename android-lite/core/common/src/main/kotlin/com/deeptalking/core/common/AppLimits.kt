@@ -232,6 +232,12 @@ object AppLimits {
         /** 一次检索最多入库几张（工具的 `count` 参数上限）。 */
         const val FETCH_MAX_COUNT = 3
 
+        /**
+         * 一次检索默认入库几张：三张，第一张直接作为这条回复的表情发出，其余留在库里供之后用。
+         * 表情库本来就是拿来慢慢用的，一次只捞一张的话同主题很快就只剩"库里已有"。
+         */
+        const val FETCH_DEFAULT_COUNT = 3
+
         /** 单张下载体积上限，超了直接放弃（压缩前）。 */
         const val MAX_FETCH_BYTES = 3 * 1024 * 1024
     }

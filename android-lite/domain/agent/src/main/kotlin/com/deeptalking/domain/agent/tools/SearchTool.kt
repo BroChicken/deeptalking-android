@@ -14,12 +14,14 @@ import com.deeptalking.engine.ondevice.ToolDefinition
  * 关键词搜索：一个工具 + 显式 `platform` 枚举，参数在 schema 里可见，不再按平台拆成多个工具名。
  *
  * - `netease` / `hupu`：搜歌/搜帖子，结果带链接（可再 `web_fetch` 看正文）。
- * - `sticker`：**找表情包**。按一句情境去网上找图，压好、起好关键词、**放进角色的表情库**，
- *   但不发出去——发由 `send_sticker` 负责（找和发是两件事，见下）。
+ * - `sticker`：**找表情包**。按一句情境去网上找图，压好、起好关键词、放进角色的表情库；
+ *   **一次找 3 张，第一张直接作为这条回复的表情发出**，其余留在库里供之后用。
+ *   之后想从库里挑别的发，用 `send_sticker(keyword=…)`。
  *
  * 为什么找图放在这里而不是 `send_sticker`：库里没有合适关键词时，模型以前要在同一个工具里
  * 从 `keyword`（枚举约束）切到 `query`，很容易瞎填一个词或干脆去 `web_search` 找图。
- * 拆开后每个工具只有一个职责，"下一步该调什么"是明确的。
+ * 拆开后每个工具只有一个职责，"下一步该调什么"是明确的；而"搜到就先用上"的体验又不能丢，
+ * 所以搜索自己负责把第一张发出去（否则要多跑一轮，模型还常常忘记发）。
  *
  * B 站视频不在这个工具里：搜视频 + 总结都在 `bilibili_video`。
  */
@@ -33,10 +35,10 @@ class SearchTool(
         name = "search",
         description = "按关键词搜索指定平台的公开内容（免登录）。platform 取值：" +
             "netease=歌曲/歌手，hupu=帖子/讨论，sticker=找表情包。" +
-            "netease/hupu 返回标题与链接；sticker 会把找到的图压好放进角色的表情库（不发出去），" +
-            "返回可用的 keyword，要发再调 send_sticker(keyword=…)。" +
+            "netease/hupu 返回标题与链接；sticker 一次找 3 张，第一张直接作为这条回复的表情发出，" +
+            "其余留在表情库里（之后可以用 send_sticker 再发）。" +
             "**B 站视频用 bilibili_video（它能搜视频、也能总结视频）**。失败或无结果时不得编造结果。",
-        parametersJson = """{"type":"object","properties":{"platform":{"type":"string","enum":["netease","hupu","sticker"],"description":"netease=歌曲/歌手，hupu=帖子/讨论，sticker=找表情包"},"query":{"type":"string","description":"检索关键词（从用户意图提取）；sticker 时写一句具体情境或情绪，例如「被无语到」"},"limit":{"type":"integer","minimum":1,"maximum":20,"description":"返回条数，默认 6（netease/hupu）"},"count":{"type":"integer","minimum":1,"maximum":3,"description":"sticker 一次入库几张，默认 1"}},"required":["platform","query"],"additionalProperties":false}""",
+        parametersJson = """{"type":"object","properties":{"platform":{"type":"string","enum":["netease","hupu","sticker"],"description":"netease=歌曲/歌手，hupu=帖子/讨论，sticker=找表情包"},"query":{"type":"string","description":"检索关键词（从用户意图提取）；sticker 时写一句具体情境或情绪，例如「被无语到」"},"limit":{"type":"integer","minimum":1,"maximum":20,"description":"返回条数，默认 6（netease/hupu）"},"count":{"type":"integer","minimum":1,"maximum":3,"description":"sticker 一次入库几张，默认 3（第一张直接发出，其余入库备用）"}},"required":["platform","query"],"additionalProperties":false}""",
     )
 
     override suspend fun execute(call: ToolCall, context: AgentContext): AgentToolResult {
@@ -55,9 +57,13 @@ class SearchTool(
     }
 
     /**
-     * 找表情：入库后把 keyword 交回模型，由它决定是否以及何时 `send_sticker`。
+     * 找表情：一次入库若干张（默认 3），**第一张直接作为这条回复的表情发出**，其余留在库里。
      *
-     * 这里**不设** `stickerFileRef` / `imageFileRef`——搜索不是发送，也不是"贴图到回复里"。
+     * 为什么搜索也发第一张：用户要的是"搜到就先用上"，而不是搜完再让模型补一次发送
+     * （多一轮、还容易变成"我找到了"却不发）。`send_sticker` 仍然负责之后从库里挑别的发。
+     *
+     * 只有 [AgentToolResult.stickerFileRef] 会被贴成气泡；这里**不设** `imageFileRef`
+     * （那是回复内的附图，不是表情）。
      */
     private suspend fun searchSticker(
         context: AgentContext,
@@ -75,25 +81,43 @@ class SearchTool(
                 stickerNotice = "没找到表情：群组没有表情库",
             )
         }
-        val count = (ToolArgs.int(args, "count") ?: 1).coerceIn(1, AppLimits.Sticker.FETCH_MAX_COUNT)
+        val count = (ToolArgs.int(args, "count") ?: AppLimits.Sticker.FETCH_DEFAULT_COUNT)
+            .coerceIn(1, AppLimits.Sticker.FETCH_MAX_COUNT)
         return when (val outcome = runCatching { fetcher.fetch(context.character, query, count) }.getOrNull()) {
             is StickerFetchResult.Stored -> {
                 val added = outcome.stickers
+                val first = added.first()
                 val keywords = added.map { it.keyword }.filter { it.isNotEmpty() }
+                val rest = added.size - 1
                 val json = buildString {
-                    append("""{"ok":true,"platform":"sticker","added":[""")
+                    append("""{"ok":true,"platform":"sticker","sent":true,"keyword":""")
+                    append(quote(first.keyword))
+                    append(""","category":""").append(quote(first.category))
+                    append(""","added":[""")
                     added.forEachIndexed { index, sticker ->
                         if (index > 0) append(',')
                         append("""{"keyword":${quote(sticker.keyword)},"category":${quote(sticker.category)}}""")
                     }
                     append("],\"total\":").append(outcome.total)
                     append(",\"hint\":")
-                    append(quote("已入库（还没发）。要发就调 send_sticker(keyword=\"${keywords.firstOrNull().orEmpty()}\")。"))
+                    append(
+                        quote(
+                            "第一张「${first.keyword}」已作为这条回复的表情发出。" +
+                                if (rest > 0) {
+                                    "另外 $rest 张已入库，之后想再发库里已有的表情就调 send_sticker(keyword=…)。"
+                                } else {
+                                    ""
+                                },
+                        ),
+                    )
                     append('}')
                 }
                 AgentToolResult(
                     contentJson = json,
-                    stickerNotice = "表情库 +${added.size}：${keywords.joinToString("、")}（共 ${outcome.total} 张）",
+                    // 第一张直接贴出去：用户要的是"搜到就用上"，不是再补一次发送。
+                    stickerFileRef = first.fileRef,
+                    stickerNotice = "表情库 +${added.size}：${keywords.joinToString("、")}" +
+                        "（共 ${outcome.total} 张）· 已发出「${first.keyword}」",
                 )
             }
 
