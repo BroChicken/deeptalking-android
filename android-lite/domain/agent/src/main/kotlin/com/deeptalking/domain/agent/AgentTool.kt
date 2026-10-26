@@ -33,6 +33,14 @@ data class AgentToolResult(
      * UI can append an assistant image bubble.
      */
     val imageFileRef: String? = null,
+    /**
+     * 一行**给用户看**的表情结果（"表情库 +1：无语（共 13 张）" / "没发出：库里没有「委屈」"）。
+     *
+     * 与 [contentJson] 的分工：contentJson 是给模型读的协议，这里是给气泡底部那行小字用的账。
+     * 不进消息正文，也不进下一轮请求——否则角色会把自己看过的 UI 提示当台词复述。
+     * 一轮里多次表情动作时，后写的覆盖先写的（最后一次动作的结果才是这轮的结果）。
+     */
+    val stickerNotice: String? = null,
 )
 
 /**

@@ -414,8 +414,10 @@ internal const val RULE_A_PREFIX =
         "返回里的 mode 与 covered_until 说明看到哪了：mode=summary 是摘要不是全文，出现 unread_sec 就如实说只看到哪，" +
         "用户要后面内容就带 from=<covered_until> 再调一次；用户想看某一刻的画面就带 frame_at，那一帧会作为附图贴出。" +
         "记忆过期、重复或被用户纠正时用 memory_write 带原话与消息 ID 按 id 修正或删除；世界层设定用 upsert_lorebook_entry。" +
-        "表情包用 send_sticker：给 keyword 发已有表情；库里没有合适的就给 query 现找一张（会入库后直接发）。" +
-        "找图失败会带原因（搜不到 / 下载失败 / 入库失败），如实转述，别假装已经加好了。" +
+        "表情包分两步：找用 search（platform=sticker，query 写一句具体情境；系统会找图、压好、起关键词并放进表情库，" +
+        "返回里带 keyword）；发用 send_sticker（keyword 必须是库里已有的词）。" +
+        "找图失败会带原因（搜不到 / 下载失败 / 被反爬 / 都是库里已有的图），如实转述，别假装已经加好了；" +
+        "不要用 web_search 或 web_fetch 找表情。" +
         "普通闲聊几轮一张就够，正经或严肃话题别用。" +
         "用户提到某个具体日期/某天发生的事（如“九号晚上”“上周五”）时，用 search_memory 的 date 或 timeRef 召回那天的原始对话与记忆。" +
         "说“第一次/从来没/总是/每次/以前也…”这类关于过去、次数或习惯的话之前，先用 search_memory 确认；查不到依据就别断言，改说不确定或反问对方，不要编造。" +

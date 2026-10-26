@@ -5,8 +5,6 @@ import com.deeptalking.core.model.StickerCategory
 import com.deeptalking.domain.agent.AgentContext
 import com.deeptalking.domain.agent.AgentTool
 import com.deeptalking.domain.agent.AgentToolResult
-import com.deeptalking.domain.agent.sticker.StickerFetchResult
-import com.deeptalking.domain.agent.sticker.StickerFetcher
 import com.deeptalking.engine.ondevice.ToolCall
 import com.deeptalking.engine.ondevice.ToolDefinition
 import kotlinx.serialization.json.add
@@ -15,18 +13,18 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 
 /**
- * 发表情包。
+ * 发表情包（**只发，不找**）。
  *
- * 两个入口共用一个工具：
- * - 给 `keyword`：从**已有**表情里挑，命中就随机发一张（同一关键词多张不会总发同一张）。
- * - 给 `query`：库里没有合适的，按情境联网找一张，压缩入库后直接发（这里只拿
- *   [StickerFetcher] 返回的 fileRef，抓取与审核都在 app 层）。
+ * 找图在 `search(platform=sticker)`：搜到、压好、起好关键词并入表情库，再把 keyword 交回来；
+ * 这个工具只按 keyword 从**已有**表情里挑一张发出（同关键词多张时随机，不会总发同一张）。
  *
- * schema 里内联该角色的关键词枚举（按大类分组写进 description），执行时仍防御性校验。
+ * 为什么拆开：以前 `keyword`（枚举约束）+ `query` 挤在一个工具里，模型在"库里没有合适的词"
+ * 时要自己意识到该换成另一个参数；实测它会瞎填一个不存在的 keyword，或跑去 `web_search`
+ * 找图，然后对用户说"加不进去"。拆开后每个工具只有一个职责，未命中时返回的错误直接写明
+ * 下一步该调什么。
  */
 class SendStickerTool(
     private val stickersEnabled: Boolean = true,
-    private val fetcher: StickerFetcher? = null,
 ) : AgentTool {
 
     override val definition = ToolDefinition(
@@ -58,10 +56,7 @@ class SendStickerTool(
         )
     }
 
-    /**
-     * 有表情能力就启用，**不看库里有没有**：空库的角色也得能靠 `query` 现找第一张，
-     * 否则新建角色永远没有表情。群组仍然不启用（群组不维护表情库，也没有共享池）。
-     */
+    /** 单角色才启用；群组不维护表情库，也没有共享池。 */
     override fun isEnabled(context: AgentContext): Boolean =
         stickersEnabled && !context.character.isGroup
 
@@ -72,32 +67,33 @@ class SendStickerTool(
         val stickers = context.character.stickers
 
         if (keyword.isNotEmpty()) {
-            val chosen = pick(stickers, keyword)
-            if (chosen != null) return sent(chosen, fetched = false)
+            pick(stickers, keyword)?.let { return sent(it) }
         }
 
-        // 库里没有 → 只有给了 query 才联网找一张；失败原因原样回给模型，能直接转述。
-        val fetch = fetcher
-        if (query.isNotEmpty() && fetch != null) {
-            when (val outcome = runCatching { fetch.fetch(context.character, query) }.getOrNull()) {
-                is StickerFetchResult.Stored -> {
-                    val sticker = outcome.sticker
-                    return AgentToolResult(
-                        contentJson = """{"ok":true,"keyword":${quote(sticker.keyword)},"source":"web","sent":true,"total":${sticker.total}}""",
-                        stickerFileRef = sticker.fileRef,
-                    )
-                }
-                is StickerFetchResult.Failed -> return AgentToolResult(errorJson(outcome.reason))
-                null -> Unit
-            }
+        // 找图已经搬到 search(platform=sticker)：老习惯传 query 的调用在这里被明确指路，
+        // 而不是静默失败让模型自行发挥。
+        if (query.isNotEmpty()) {
+            return AgentToolResult(
+                contentJson = errorJson(
+                    "找表情已移到 search(platform=sticker, query=$query)：先搜进库里，再用返回的 keyword 调 send_sticker。",
+                ),
+                stickerNotice = "没发出：找表情要用 search(platform=sticker)",
+            )
         }
 
         if (stickers.isEmpty()) {
-            return AgentToolResult(errorJson("你的表情库还是空的，先用 query 现找一张"))
+            return AgentToolResult(
+                contentJson = errorJson("你的表情库还是空的：先 search(platform=sticker, query=…) 找一张"),
+                stickerNotice = "没发出：表情库是空的",
+            )
         }
-        val allKeywords = stickers.map { it.keyword }.filter { it.isNotEmpty() }.distinct()
+        val hint = if (keyword.isEmpty()) "缺少 keyword" else "库里没有「$keyword」"
         return AgentToolResult(
-            errorJson("没有这张表情；可用关键词：" + allKeywords.joinToString("、")),
+            contentJson = errorJson(
+                "$hint；先 search(platform=sticker, query=${keyword.ifEmpty { "…" }}) 找进来再发。" +
+                    "现有关键词：" + stickers.map { it.keyword }.filter { it.isNotEmpty() }.distinct().joinToString("、"),
+            ),
+            stickerNotice = "没发出：" + (if (keyword.isEmpty()) "要指定库里已有的关键词" else "库里没有「$keyword」"),
         )
     }
 
@@ -113,8 +109,8 @@ class SendStickerTool(
         return loose.randomOrNull()
     }
 
-    private fun sent(sticker: Sticker, fetched: Boolean): AgentToolResult = AgentToolResult(
-        contentJson = """{"ok":true,"keyword":${quote(sticker.keyword)},"source":"${if (fetched) "web" else "library"}","sent":true}""",
+    private fun sent(sticker: Sticker): AgentToolResult = AgentToolResult(
+        contentJson = """{"ok":true,"keyword":${quote(sticker.keyword)},"source":"library","sent":true}""",
         stickerFileRef = sticker.fileRef,
     )
 
@@ -124,14 +120,18 @@ class SendStickerTool(
             put("properties", buildJsonObject {
                 put("keyword", buildJsonObject {
                     put("type", "string")
-                    put("description", "已有表情的关键词；优先用它，发送时会在同关键词的多张里随机挑一张。")
+                    put(
+                        "description",
+                        "要发的表情关键词（库里已有的才能发）；同关键词多张时随机挑一张。" +
+                            "库里没有合适的就先调 search(platform=sticker, query=情境) 找一张。",
+                    )
                     if (keywords.isNotEmpty()) {
                         put("enum", buildJsonArray { keywords.forEach { add(it) } })
                     }
                 })
                 put("query", buildJsonObject {
                     put("type", "string")
-                    put("description", "库里没有合适的表情时，写一句具体情境去联网找一张（会入库并直接发出），例如「被无语到」「想贴贴」。")
+                    put("description", "已废弃：找图请用 search(platform=sticker, query=…)。这里传了会被拒绝并指路。")
                 })
             })
             put("additionalProperties", false)
@@ -141,8 +141,8 @@ class SendStickerTool(
 
     private companion object {
         const val BASE_DESCRIPTION =
-            "给用户发一个表情包（贴图）。想表达情绪时用 keyword 从已有表情里挑一个；" +
-                "库里没有合适的，就给 query 描述此刻的情境，系统会联网找一张、加进你的表情库并直接发出。" +
+            "给用户发一个表情包（贴图）。keyword 填库里已有的关键词；" +
+                "库里没有合适的，先调 search(platform=sticker, query=情境) 把它找进库里，再用返回的 keyword 发。" +
                 "贴图会作为你的下一条消息单独发出，不需要再用文字描述它。" +
                 "别频繁用（普通闲聊几轮一张就够），严肃或正经的话题别用。"
     }

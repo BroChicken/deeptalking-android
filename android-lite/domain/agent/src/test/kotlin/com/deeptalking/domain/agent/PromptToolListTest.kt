@@ -71,6 +71,7 @@ class PromptToolListTest {
     fun platformToolsTakeAnExplicitPlatform() {
         val prompt = systemPrompt()
         assertTrue(prompt.contains("platform=netease"))
+        assertTrue("找表情走 search 的 platform=sticker", prompt.contains("platform=sticker"))
         assertTrue("B 站视频走独立工具", prompt.contains("bilibili_video"))
         assertTrue(prompt.contains("platform=baidu"))
         assertTrue(prompt.contains("upsert_lorebook_entry"))

@@ -17,8 +17,10 @@ import com.deeptalking.domain.memory.MemoryService
  *
  * Read: `search_memory` / `web_search` / `web_fetch` / `search` / `hot_board` / `bilibili_video`.
  * Write: `memory_write` (memory) / `upsert_lorebook_entry` (world book).
- * Expression: `send_sticker` (on for single characters only; a group has no sticker library,
- * and an empty library still needs the tool so `query` can fetch the first sticker).
+ * Expression: `send_sticker` (on for single characters only; a group has no sticker library).
+ *
+ * 找表情走 `search(platform=sticker)`（入库，不发），`send_sticker` 只负责把库里的一张发出去：
+ * 两个工具各司其职，模型不需要在同一个工具的 `keyword` / `query` 之间自己切换。
  *
  * `bilibili_video` is injected by the app (it needs the B 站文本源 + 总结用的辅助调用通道), so it
  * stays optional here: tests and builds without网络 wiring keep the eight-tool set unchanged.
@@ -38,10 +40,10 @@ fun defaultTools(
     add(SearchMemoryTool(memory))
     add(WebSearchTool(web))
     add(WebFetchTool(web))
-    add(SearchTool(web))
+    add(SearchTool(web, stickerFetcher, stickersEnabled))
     add(HotBoardTool(web))
     if (bilibiliVideo != null) add(bilibiliVideo)
     add(MemoryWriteTool(memory))
     add(UpsertLorebookEntryTool())
-    if (stickersEnabled) add(SendStickerTool(stickersEnabled, stickerFetcher))
+    if (stickersEnabled) add(SendStickerTool(stickersEnabled))
 }

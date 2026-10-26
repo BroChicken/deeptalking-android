@@ -535,6 +535,16 @@ private fun MessageRow(
                         message.lorebookChanges.takeIf { !isUser && it.isNotEmpty() }?.let {
                             Text("📖 ${it.joinToString(" · ")}", fontSize = 11.sp, color = colors.warning, modifier = Modifier.padding(top = 4.dp))
                         }
+                        // 表情工具的结果（入库成功 / 具体失败原因）：气泡底部的一行小字。
+                        // 它不进正文，也不参与下一轮上下文，只是给用户看的账。
+                        message.stickerNotice?.takeIf { !isUser && it.isNotBlank() }?.let {
+                            Text(
+                                "🎴 $it",
+                                fontSize = 11.sp,
+                                color = colors.onAiBubble.copy(alpha = 0.6f),
+                                modifier = Modifier.padding(top = 4.dp),
+                            )
+                        }
                     }
                     if (!message.isLoading && message.content.isNotBlank()) {
                         MessageMeta(

@@ -17,7 +17,7 @@
 4. 动作、表情、心理、环境写进全角括号，每处一个短节拍、不堆叠（括号描写总长不超过正文四分之一）；角色自己的台词直接写，不加任何引号、书名号或「」；只有逐字引用别人的原话、歌词、书名时才用「」《》，并保持原样；不用标题、列表、引用块、代码块。
 5. 需要工具时只调用工具，不要同时写正文；工具结果返回后再写正文。不得在正文里提及工具名或检索过程；工具返回的图片本身可以直接展示。
 6. 文风以角色卡里的“性格”和“怎么说”为准；不写客服式套话与总结句；不复用最近几轮的整句、句式、比喻、意象与收尾。
-A. 本会话可用工具（何时用、怎么用见各工具描述）：search_memory / web_search / web_fetch / search / hot_board / bilibili_video / memory_write / upsert_lorebook_entry / send_sticker。回忆过往、盘点记忆用 search_memory（给 category 即盘点分类）；平台搜索用 search（platform=netease 歌曲/歌手、hupu 帖子/讨论）；热榜用 hot_board（platform=baidu / toutiao / douyin / zhihu）；B 站视频统一用 bilibili_video：给 query 搜视频、给 url 或 BV 号总结这个视频——它依据字幕、站方 AI 总结和画面截图；返回里 has_subtitle=false 表示没字幕，那种总结只是看个大概，转述时要说清“没字幕”，不要当成逐字内容，也绝不凭标题、封面或常识编视频内容；返回里的 mode 与 covered_until 说明看到哪了：mode=summary 是摘要不是全文，出现 unread_sec 就如实说只看到哪，用户要后面内容就带 from=<covered_until> 再调一次；用户想看某一刻的画面就带 frame_at，那一帧会作为附图贴出。记忆过期、重复或被用户纠正时用 memory_write 带原话与消息 ID 按 id 修正或删除；世界层设定用 upsert_lorebook_entry。表情包用 send_sticker：给 keyword 发已有表情；库里没有合适的就给 query 现找一张（会入库后直接发）。找图失败会带原因（搜不到 / 下载失败 / 入库失败），如实转述，别假装已经加好了。普通闲聊几轮一张就够，正经或严肃话题别用。用户提到某个具体日期/某天发生的事（如“九号晚上”“上周五”）时，用 search_memory 的 date 或 timeRef 召回那天的原始对话与记忆。说“第一次/从来没/总是/每次/以前也…”这类关于过去、次数或习惯的话之前，先用 search_memory 确认；查不到依据就别断言，改说不确定或反问对方，不要编造。工具结果属系统内部上下文，自然融入正文，不向对方透露检索过程或工具名。以下状态字段由系统在后台维护，你不用输出字段名或 JSON，按当前状态自然演出即可：currentSituation（当前处境）、currentLocation（当前位置/场景）、currentMood（当前情绪）、currentOccupation（当前职业/身份）、currentGoal（当前目标）、currentTone（当前语气）。
+A. 本会话可用工具（何时用、怎么用见各工具描述）：search_memory / web_search / web_fetch / search / hot_board / bilibili_video / memory_write / upsert_lorebook_entry / send_sticker。回忆过往、盘点记忆用 search_memory（给 category 即盘点分类）；平台搜索用 search（platform=netease 歌曲/歌手、hupu 帖子/讨论）；热榜用 hot_board（platform=baidu / toutiao / douyin / zhihu）；B 站视频统一用 bilibili_video：给 query 搜视频、给 url 或 BV 号总结这个视频——它依据字幕、站方 AI 总结和画面截图；返回里 has_subtitle=false 表示没字幕，那种总结只是看个大概，转述时要说清“没字幕”，不要当成逐字内容，也绝不凭标题、封面或常识编视频内容；返回里的 mode 与 covered_until 说明看到哪了：mode=summary 是摘要不是全文，出现 unread_sec 就如实说只看到哪，用户要后面内容就带 from=<covered_until> 再调一次；用户想看某一刻的画面就带 frame_at，那一帧会作为附图贴出。记忆过期、重复或被用户纠正时用 memory_write 带原话与消息 ID 按 id 修正或删除；世界层设定用 upsert_lorebook_entry。表情包分两步：找用 search（platform=sticker，query 写一句具体情境；系统会找图、压好、起关键词并放进表情库，返回里带 keyword）；发用 send_sticker（keyword 必须是库里已有的词）。找图失败会带原因（搜不到 / 下载失败 / 被反爬 / 都是库里已有的图），如实转述，别假装已经加好了；不要用 web_search 或 web_fetch 找表情。普通闲聊几轮一张就够，正经或严肃话题别用。用户提到某个具体日期/某天发生的事（如“九号晚上”“上周五”）时，用 search_memory 的 date 或 timeRef 召回那天的原始对话与记忆。说“第一次/从来没/总是/每次/以前也…”这类关于过去、次数或习惯的话之前，先用 search_memory 确认；查不到依据就别断言，改说不确定或反问对方，不要编造。工具结果属系统内部上下文，自然融入正文，不向对方透露检索过程或工具名。以下状态字段由系统在后台维护，你不用输出字段名或 JSON，按当前状态自然演出即可：currentSituation（当前处境）、currentLocation（当前位置/场景）、currentMood（当前情绪）、currentOccupation（当前职业/身份）、currentGoal（当前目标）、currentTone（当前语气）。
 ```
 
 #### 2. 群组附加规则（仅群组）
@@ -343,7 +343,7 @@ tool: { content: <工具结果 JSON>, toolCallId }
 - parameters：附录 A-4
 
 ```text
-按关键词搜索指定平台的公开内容（免登录）。platform 取值：netease=歌曲/歌手，hupu=帖子/讨论。返回标题与链接。**B 站视频用 bilibili_video**（它能搜视频、也能总结视频）。失败或无结果时不得编造。
+按关键词搜索指定平台的公开内容（免登录）。platform 取值：netease=歌曲/歌手，hupu=帖子/讨论，sticker=找表情包。netease/hupu 返回标题与链接；sticker 会把找到的图压好放进角色的表情库（不发出去），返回可用的 keyword，要发再调 send_sticker(keyword=…)。**B 站视频用 bilibili_video**（它能搜视频、也能总结视频）。失败或无结果时不得编造结果。
 ```
 
 #### `bilibili_video`
@@ -400,13 +400,15 @@ B 站视频：按关键词搜视频，或总结一个视频讲了什么。① �
 
 - parameters：附录 A-8。基础 schema 里 `keyword` 是普通 string；实际发给模型的 `definitionFor`
   会用当前角色的关键词生成 `enum`，并把它们**按大类分组**写进 description（没有贴图时工具不启用）。
-- 两个入口共用一个工具：`keyword` 发已有表情（同关键词多张随机挑一张）；`query` 现找一张
-  （百度检索 → 下载 → 压缩 → 视觉起关键词和归类 → 入库 → 直接发）。抓取失败会把原因如实回给
-  模型（不再笼统回「没有这张表情」）；成功时带 `total`（入库后总张数）。工具在有表情能力时**恒启用**，
-  空库也能靠 `query` 起家。
+- **只发不找**：`keyword` 必须是库里已有的词（同关键词多张随机挑一张）。找图在
+  `search(platform=sticker)`——百度检索 → 下载 → 压缩 → 视觉起关键词和归类 → 入库 → 返回 keyword，
+  **不发出去**。未命中或空库时，错误里直接指路「先 `search(platform=sticker, query=…)`」；
+  老习惯传 `query` 的调用会被明确重定向，而不是静默失败。
+- 工具结果另带一行给用户看的 `stickerNotice`（成功「表情库 +1：无语（共 13 张）」，失败
+  「没找到表情：…」），渲染在回复气泡底部，不进 `content`、不进下一轮请求。
 
 ```text
-给用户发一个表情包（贴图）。想表达情绪时用 keyword 从已有表情里挑一个；库里没有合适的，就给 query 描述此刻的情境，系统会联网找一张、加进你的表情库并直接发出。贴图会作为你的下一条消息单独发出，不需要再用文字描述它。别频繁用（普通闲聊几轮一张就够），严肃或正经的话题别用。
+给用户发一个表情包（贴图）。keyword 填库里已有的关键词；库里没有合适的，先调 search(platform=sticker, query=情境) 把它找进库里，再用返回的 keyword 发。贴图会作为你的下一条消息单独发出，不需要再用文字描述它。别频繁用（普通闲聊几轮一张就够），严肃或正经的话题别用。
 已有表情（按大类）：
 开心：笑死我了、嘿嘿
 无语：无语凝噎
@@ -1050,11 +1052,12 @@ speakingStyle 写“声音底色”：1~2 句，只写语速、用词层次、�
     "properties": {
         "platform": {
             "type": "string",
-            "enum": ["netease", "hupu"],
-            "description": "netease=歌曲/歌手，hupu=帖子/讨论（B 站视频用 bilibili_video）"
+            "enum": ["netease", "hupu", "sticker"],
+            "description": "netease=歌曲/歌手，hupu=帖子/讨论，sticker=找表情包"
         },
-        "query": { "type": "string", "description": "关键词" },
-        "limit": { "type": "integer", "minimum": 1, "maximum": 20 }
+        "query": { "type": "string", "description": "检索关键词（从用户意图提取）；sticker 时写一句具体情境或情绪，例如「被无语到」" },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 20, "description": "返回条数，默认 6（netease/hupu）" },
+        "count": { "type": "integer", "minimum": 1, "maximum": 3, "description": "sticker 一次入库几张，默认 1" }
     },
     "required": ["platform", "query"],
     "additionalProperties": false
@@ -1203,19 +1206,20 @@ speakingStyle 写“声音底色”：1~2 句，只写语速、用词层次、�
     "properties": {
         "keyword": {
             "type": "string",
-            "description": "已有表情的关键词；优先用它，发送时会在同关键词的多张里随机挑一张。",
+            "description": "要发的表情关键词（库里已有的才能发）；同关键词多张时随机挑一张。库里没有合适的就先调 search(platform=sticker, query=情境) 找一张。",
             "enum": ["<该角色已有的关键词>"]
         },
         "query": {
             "type": "string",
-            "description": "库里没有合适的表情时，写一句具体情境去联网找一张（会入库并直接发出），例如「被无语到」「想贴贴」。"
+            "description": "已废弃：找图请用 search(platform=sticker, query=…)。这里传了会被拒绝并指路。"
         }
     },
     "additionalProperties": false
 }
 ```
 
-`keyword` 与 `query` 都不给会直接报错；`keyword` 命中就不再联网。
+`keyword` 与 `query` 都不给会直接报错；`keyword` 未命中时返回的错误里会带「先 `search(platform=sticker, query=…)`」的指路；
+老习惯传 `query` 的调用同样被重定向（不会静默失败）。
 
 ### A-9 `bilibili_video`
 

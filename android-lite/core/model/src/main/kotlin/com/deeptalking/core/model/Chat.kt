@@ -58,6 +58,12 @@ data class ChatMessage(
      * characters and for older messages (see [parseGroupSpeechSegments]).
      */
     val segments: List<SpeechSegment> = emptyList(),
+    /**
+     * 一行**给用户看**的表情结果（"表情库 +1：无语（共 13 张）" / "没发出：库里没有「委屈」"），
+     * 渲染在气泡底部的小字里。它不进 [content]，所以历史回放与下一轮请求都看不到——
+     * 否则角色会把自己看过的 UI 提示当成台词复述，前缀缓存也会每轮变动。
+     */
+    val stickerNotice: String? = null,
 )
 
 @Serializable

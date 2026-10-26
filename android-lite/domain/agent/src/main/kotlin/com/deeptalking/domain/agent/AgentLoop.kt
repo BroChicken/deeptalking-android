@@ -33,6 +33,8 @@ data class LoopOutcome(
     val stickerFileRef: String? = null,
     /** File ref of a picture the character wants to show inside this reply, if any. */
     val imageFileRef: String? = null,
+    /** 一行给用户看的表情结果（成功后写进气泡底部，不进模型上下文）。 */
+    val stickerNotice: String? = null,
     /** Token usage of the last model request, when the backend reported it. */
     val usage: com.deeptalking.engine.ondevice.TokenUsage? = null,
     /**
@@ -95,6 +97,7 @@ class AgentLoop(
         var latestCharacter: Character? = null
         var latestSticker: String? = null
         var latestImage: String? = null
+        var latestStickerNotice: String? = null
         var lastUsage: com.deeptalking.engine.ondevice.TokenUsage? = null
         val roundUsages = mutableListOf<com.deeptalking.engine.ondevice.TokenUsage>()
         var lastReasoning: List<String> = emptyList()
@@ -135,6 +138,8 @@ class AgentLoop(
                     val toolResult = registry.execute(call, context)
                     toolResult.stickerFileRef?.let { latestSticker = it }
                     toolResult.imageFileRef?.let { latestImage = it }
+                    // 后写的覆盖先写的：一轮里"先搜再发"时，发的结果才是这轮的结果。
+                    toolResult.stickerNotice?.let { latestStickerNotice = it }
                     toolResult.updatedCharacter?.let { updated ->
                         latestCharacter = updated
                         workingCharacter = updated
@@ -171,7 +176,18 @@ class AgentLoop(
 
             val usable = responseText.ifBlank { salvaged.orEmpty() }
             if (usable.isNotBlank()) {
-                return LoopOutcome(usable, null, rounds, executedCalls, latestCharacter, latestSticker, latestImage, lastUsage, roundUsages)
+                return LoopOutcome(
+                    text = usable,
+                    submitCall = null,
+                    rounds = rounds,
+                    executedCalls = executedCalls,
+                    updatedCharacter = latestCharacter,
+                    stickerFileRef = latestSticker,
+                    imageFileRef = latestImage,
+                    stickerNotice = latestStickerNotice,
+                    usage = lastUsage,
+                    roundUsages = roundUsages,
+                )
             }
             if (phase == RequestPhase.AUTO) {
                 onToolActivity("正在整理回复…")
@@ -185,7 +201,18 @@ class AgentLoop(
                 onToolActivity("正在重新生成…")
                 continue
             }
-            return LoopOutcome("", null, rounds, executedCalls, latestCharacter, latestSticker, latestImage, lastUsage, roundUsages)
+            return LoopOutcome(
+                text = "",
+                submitCall = null,
+                rounds = rounds,
+                executedCalls = executedCalls,
+                updatedCharacter = latestCharacter,
+                stickerFileRef = latestSticker,
+                imageFileRef = latestImage,
+                stickerNotice = latestStickerNotice,
+                usage = lastUsage,
+                roundUsages = roundUsages,
+            )
         }
     }
 

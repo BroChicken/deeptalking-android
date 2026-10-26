@@ -108,18 +108,20 @@ class SocialToolsTest {
         )
         assertTrue(
             SearchTool(web).execute(call("""{"platform":"weibo","query":"热搜"}"""), context)
-                .contentJson.contains("platform 只能是 netease / hupu"),
+                .contentJson.contains("platform 只能是 netease / hupu / sticker"),
         )
         assertTrue(web.calls.isEmpty())
     }
 
     @Test
-    fun `search schema exposes exactly the two remaining platforms`() {
+    fun `search schema exposes netease, hupu and the sticker platform`() {
         val params = SearchTool(null).definition.parametersJson
-        listOf("netease", "hupu").forEach { assertTrue(it, params.contains("\"$it\"")) }
+        listOf("netease", "hupu", "sticker").forEach { assertTrue(it, params.contains("\"$it\"")) }
         // B 站视频已被 bilibili_video 接管，不能再出现在 search 的枚举里。
         assertFalse(params.contains("\"bilibili\""))
         assertTrue(params.contains("\"required\":[\"platform\",\"query\"]"))
+        // 找表情一次最多入库 3 张。
+        assertTrue(params.contains("\"count\""))
     }
 
     // --------------------------------------------------------------- web_fetch

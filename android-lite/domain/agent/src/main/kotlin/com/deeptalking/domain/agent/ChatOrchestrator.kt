@@ -73,6 +73,8 @@ data class OrchestratorResult(
     val stickerFileRef: String? = null,
     /** File ref of a picture the character wants to show inside this reply, if any. */
     val imageFileRef: String? = null,
+    /** 一行给用户看的表情结果（写进气泡底部，不进模型上下文）。 */
+    val stickerNotice: String? = null,
     /** Raw (pre-processing) model reply, for the settings debug panel. */
     val rawReply: String = "",
     /**
@@ -361,6 +363,7 @@ class ChatOrchestrator(
             lorebookChanges = diffLorebookChanges(character, finalCharacter),
             stickerFileRef = outcome.stickerFileRef,
             imageFileRef = outcome.imageFileRef,
+            stickerNotice = outcome.stickerNotice,
             rawReply = outcome.text,
             // Turn totals across **every** request the turn made (tool rounds + the
             // forced submit round). The first request is the one that carries a

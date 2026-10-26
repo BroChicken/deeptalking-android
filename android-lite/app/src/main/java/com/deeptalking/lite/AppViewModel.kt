@@ -1962,6 +1962,8 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                         // collapses back to one bubble with raw speaker prefixes.
                         segments = finalResult.segments,
                         lorebookChanges = finalResult.lorebookChanges,
+                        // 气泡底部那行表情结果；只给用户看，不进 content / 下一轮请求。
+                        stickerNotice = finalResult.stickerNotice,
                     ),
                 )
                 finalResult.stickerFileRef?.let { ref ->

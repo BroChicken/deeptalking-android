@@ -84,12 +84,12 @@ BackgroundTasks.scheduleTurn       后台：文风校对、快速回应校验/�
 | `search_memory` | 检索长期记忆（关键词 / 按日期 `date`/`timeRef`/`slot` / 给 `category` 即盘点分类，`limit` 可调）；群组可指定成员私人记忆 | `SearchMemoryTool` |
 | `web_search` | 通用联网搜索（必应 RSS，`limit` 1–20） | `WebSearchTool` |
 | `web_fetch` | 读取链接（网页正文 / 图片 / 站内专门解析）；虎扑帖子、网易云歌曲、B站视频链接各有专门解析。**只读链接、不做关键词搜索** | `WebFetchTool` → `HttpWebContentProvider` |
-| `search` | 按关键词搜一个社区平台：`platform` ∈ `netease` / `hupu`（B 站视频改走 `bilibili_video`） | `SearchTool` |
+| `search` | 按关键词搜索：`platform` ∈ `netease` / `hupu`（社区内容，返回标题与链接）/ `sticker`（**找表情包**：按情境联网找图 → 压缩 → 视觉只起关键词+归类 → 入表情库，**不发出去**，返回 keyword 供 `send_sticker` 使用；`count` 1–3）。B 站视频改走 `bilibili_video` | `SearchTool` → `WebContentProvider` + `StickerFetcher`（`:app` 的 `HttpStickerFetcher`） |
 | `hot_board` | 指定平台热榜：`platform` ∈ `baidu` / `toutiao` / `douyin` / `zhihu` | `HotBoardTool` |
 | `bilibili_video` | B 站视频的唯一入口：给 `query` 搜视频（BV 号/标题/UP/时长/播放/简介/封面），给 `url` 或 BV 号总结这个视频（`focus` 可选）。总结逐句字幕走分块、官方 AI 总结存在时直接采用，都没有就用简介/章节/抽帧画面说个大概并标明"没字幕"；结果带 `mode`（summary 摘要 / shallow 没字幕）、`covered_until`、`unread_sec`、`can_continue`，没看完就提示模型带 `from` 续读；`frame_at` 可把某一刻的帧作为附图贴进回复；7 天缓存（带 `focus`/`from`/`refresh` 时不读缓存） | `BilibiliVideoTool` → `HttpBiliVideoSource` + `WebContentProvider`（搜索） + `VideoSummaryService` + `BiliFrameExtractor`/`BiliVideoCache`（见 `docs/BILIBILI_VIDEO_SUMMARY.md`） |
 | `memory_write` | 按 ID 修正（`op=update`，须 evidence + sourceMessageIds）或删除（`op=delete`）记忆 | `MemoryWriteTool` |
 | `upsert_lorebook_entry` | 写入/更新世界书条目（世界层设定唯一入口，保护人工维护条目） | `UpsertLorebookEntryTool` |
-| `send_sticker` | 发表情包（有表情能力时**恒启用**，空库也能靠 `query` 起家）。库里有关键词就给 `keyword`（schema 内联枚举，按大类分组写进 description）；库里没有合适的就给 `query`，按情境联网找一张、视觉只起关键词+归类后入库（**模型不承担审核**）、直接发出；失败原因如实回给模型，成功带入库后总张数。**不设张数上限** | `SendStickerTool` + `StickerFetcher`（`:app` 的 `HttpStickerFetcher`） |
+| `send_sticker` | 发表情包（**只发不找**；有表情能力时恒启用）。`keyword` 必须是库里已有的词（schema 内联枚举，按大类分组写进 description），同关键词多张随机发一张；未命中/空库时错误里直接指路「先 `search(platform=sticker, query=…)`」，老习惯传 `query` 也会被明确重定向而不静默失败。**不设张数上限** | `SendStickerTool` |
 
 每个工具就是一段 JSON Schema 描述（name + description + parameters），模型据此决定何时调用。
 **工具描述是"何时用哪个工具"的权威依据**，system 提示词的规则 A 只留一句导引 + 工具名单。
@@ -403,13 +403,12 @@ tools: AUTO 阶段 8 个工具 / FINAL 阶段无 tools（tool_choice 恒为 auto
 |---|---|
 | `0` | 只输出角色这一轮的回复正文；不要 JSON、字段名、工具说明、前后缀或代码块围栏 |
 | `1` | 保持角色身份，先用手上已给的记忆；"系统提供的本轮上下文"不是用户的话 |
-| `2` | 像日常说话：可只一句/几个字/一个动作；整段 ≤250 字；自然分段；不总结、不升华、不硬抛开放问题 |
+| `2` | 像日常说话：可只一句/几个字/一个动作；整段 ≤250 字；自然分段；不总结、不升华、不硬抛开放问题。**语域是当代日常口语**——不用伪古风/评书腔的词、不刻意儿化、不文白混搭；角色卡写明口音/方言/年代感的按卡来 |
 | `3` | 只写角色自身的言行，不替用户说话或行动；用户括号里的动作/心理只作语境 |
 | `4` | 动作/表情/心理/环境用全角括号、单拍短、总量 ≤ ¼；台词直接写不加引号；引用用「」《》；不用标题/列表/代码块 |
 | `5` | 需要工具时**只调工具、不写正文**；工具结果回来后再写正文；正文不提工具名或检索过程 |
-| `6` | 文风以"性格特征"、可选"声音底色"和"对用户的称呼"为准；不向默认助手腔靠拢；不复用最近几轮的整句/句式/比喻/意象/收尾 |
-| `7` | 通用真人感（与角色无关，所有角色共享）：句长要乱（多数 3~15 字、长句 ≤40 字）、允许不完整句/省略主语/停住改口/语气词；情绪不直说、不必每轮表态；可以不接话/只回半句；近三轮用过的词句不再复用；禁总结升华排比与结构词；禁 AI 腔固定句 |
-| `A` | 本会话可用工具清单（9 个，逐一点名）+ 何时用哪个工具的导引；日期用 `search_memory` 的 `date`/`timeRef`；说"第一次/从来没/总是"前先检索；B 站视频用 `bilibili_video`（给 query 搜、给 url 总结；依据字幕/站方总结/画面，`has_subtitle=false` 时说清"没字幕"；`mode=summary` 是摘要不是全文，有 `unread_sec` 就如实说看到哪、带 `from` 续读，想看画面就带 `frame_at`）；表情包用 `send_sticker`（`keyword` 发已有、`query` 现找一张，失败原因如实转述） |
+| `6` | 文风以角色卡里的"性格"和"怎么说"为准；不写客服式套话与总结句；不复用最近几轮的整句/句式/比喻/意象/收尾 |
+| `A` | 本会话可用工具清单（9 个，逐一点名）+ 何时用哪个工具的导引；日期用 `search_memory` 的 `date`/`timeRef`；说"第一次/从来没/总是"前先检索；B 站视频用 `bilibili_video`（给 query 搜、给 url 总结；依据字幕/站方总结/画面，`has_subtitle=false` 时说清"没字幕"；`mode=summary` 是摘要不是全文，有 `unread_sec` 就如实说看到哪、带 `from` 续读，想看画面就带 `frame_at`）；表情包分两步：找用 `search(platform=sticker)`（入表情库、返回 keyword），发用 `send_sticker(keyword)`；失败原因如实转述，不要用 `web_search`/`web_fetch` 找表情 |
 | `10` | 群组：只能由已列出的成员发言，每人独立一行"成员名：内容"；成员之间语气必须显著不同 |
 | `11` | 群组：成员私人记忆互不相通，只有全体都知道的事才写共享记忆；不得张冠李戴 |
 | — | 【角色卡】= `buildSystemPrompt` 的静态角色块（`buildRoleContext` 渲染的分章 markdown；群组含群组前提、规矩与成员小节） |
