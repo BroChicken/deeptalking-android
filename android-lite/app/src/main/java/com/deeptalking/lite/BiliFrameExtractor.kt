@@ -6,6 +6,7 @@ import android.graphics.BitmapRegionDecoder
 import android.graphics.Rect
 import com.deeptalking.core.network.BiliStoryboard
 import com.deeptalking.core.network.BiliVideoText
+import com.deeptalking.core.network.nearestStoryboardFrame
 import com.deeptalking.core.network.pickStoryboardFrames
 import com.deeptalking.domain.agent.video.VideoFrameProvider
 import kotlinx.coroutines.Dispatchers
@@ -59,6 +60,25 @@ class BiliFrameExtractor(
                     }
                 }
             saved
+        }
+
+    override suspend fun frameAt(text: BiliVideoText, storyboard: BiliStoryboard?, seconds: Int): String? =
+        withContext(Dispatchers.IO) {
+            if (storyboard == null || storyboard.frameCount == 0) return@withContext null
+            val frame = nearestStoryboardFrame(storyboard, seconds) ?: return@withContext null
+            val imageIndex = storyboard.locationOf(frame)?.imageIndex ?: return@withContext null
+            val spriteUrl = storyboard.images.getOrNull(imageIndex) ?: return@withContext null
+            runCatching { root.mkdirs() }
+            val sprite = download(spriteUrl, referer = VIDEO_REFERER + text.bvid) ?: return@withContext null
+            val decoder = runCatching {
+                BitmapRegionDecoder.newInstance(sprite, 0, sprite.size, false)
+            }.getOrNull() ?: return@withContext null
+            val file = try {
+                cropFrame(decoder, storyboard, frame, text.bvid)
+            } finally {
+                runCatching { decoder.recycle() }
+            }
+            file?.absolutePath
         }
 
     private fun cropFrame(

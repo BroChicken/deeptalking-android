@@ -44,15 +44,32 @@ class BilibiliVideoToolTest {
     }
 
     private class RecordingSummarizer(
-        private val reply: String? = "一句话：讲猫\n要点：\n- 00:10 猫很可爱",
+        private val reply: String? = "一句话：讲猫\n整体脉络：先讲猫。\n关键节点：\n- 00:10 猫很可爱",
         /** false 模拟"模型不支持看图"：工具据此不再把截图塞进结果。 */
         private val acceptImages: Boolean = true,
     ) : VideoSummarizer {
         var calls = 0
+        val users = mutableListOf<String>()
 
         override suspend fun complete(system: String, user: String, imageRefs: List<String>): VideoDigest? {
             calls++
+            users += user
             return reply?.let { VideoDigest(it, imagesAccepted = acceptImages || imageRefs.isEmpty()) }
+        }
+    }
+
+    /** 可记录 `frame_at` 的抽帧替身（匿名 lambda 只能实现 `frames`）。 */
+    private class FakeFrames(
+        private val refs: List<String> = emptyList(),
+        private val frame: String? = null,
+    ) : VideoFrameProvider {
+        var frameAsked: Int? = null
+
+        override suspend fun frames(text: BiliVideoText, storyboard: BiliStoryboard?): List<String> = refs
+
+        override suspend fun frameAt(text: BiliVideoText, storyboard: BiliStoryboard?, seconds: Int): String? {
+            frameAsked = seconds
+            return frame
         }
     }
 
@@ -278,7 +295,8 @@ class BilibiliVideoToolTest {
 
         assertTrue("无字幕时工具结果应是 input_text + input_image 数组", result.contentJson.startsWith("["))
         assertTrue(result.contentJson.contains("\"type\":\"input_text\""))
-        assertEquals(2, Regex("\"type\":\"input_image\"").findAll(result.contentJson).count())
+        // 3 张候选帧均匀挑（上限 4），不是"只挑开头两张"。
+        assertEquals(3, Regex("\"type\":\"input_image\"").findAll(result.contentJson).count())
         assertTrue(result.contentJson.contains("\"detail\":\"low\""))
         assertTrue(result.contentJson.contains("没字幕"))
     }
@@ -416,6 +434,141 @@ class BilibiliVideoToolTest {
     fun unavailableSourceIsReported() = runBlocking {
         val result = BilibiliVideoTool(null).execute(call("""{"url":"BV1ZKn267EY3"}"""), context)
         assertTrue(result.contentJson.contains("视频总结不可用"))
+    }
+
+    // -------------------------------------------------- 看到哪了 / 继续看 / 贴帧
+
+    @Test
+    fun aShortVideoThatWasReadToTheEndDoesNotAskToContinue() = runBlocking {
+        val lines = listOf(BiliSubtitleLine(10, "开场"), BiliSubtitleLine(700, "结尾"))
+        val tool = BilibiliVideoTool(
+            FakeSource(BiliVideoTextResult.Ok(subtitleText(lines))),
+            summary = VideoSummaryService(RecordingSummarizer()),
+        )
+
+        // 时长 754 秒、最后一行在 700 秒 → 只剩 54 秒没读，不值得再提"继续"。
+        val result = tool.execute(call("""{"url":"BV1ZKn267EY3"}"""), context)
+
+        assertTrue(result.contentJson.contains("\"mode\":\"summary\""))
+        assertTrue(result.contentJson.contains("\"can_continue\":false"))
+        assertFalse(result.contentJson.contains("带 from="))
+    }
+
+    @Test
+    fun anUnfinishedVideoTellsTheModelToContinueWithFrom() = runBlocking {
+        val lines = listOf(BiliSubtitleLine(0, "开场"), BiliSubtitleLine(600, "讲到一半"))
+        val text = subtitleText(lines).copy(durationSec = 1800)
+        val tool = BilibiliVideoTool(
+            FakeSource(BiliVideoTextResult.Ok(text)),
+            summary = VideoSummaryService(RecordingSummarizer()),
+        )
+
+        val result = tool.execute(call("""{"url":"BV1ZKn267EY3"}"""), context)
+
+        assertTrue(result.contentJson.contains("\"can_continue\":true"))
+        assertTrue(result.contentJson.contains("\"covered_until\":\"10:00\""))
+        assertTrue(result.contentJson.contains("\"unread_sec\":1200"))
+        assertTrue(result.contentJson.contains("带 from=10:00"))
+    }
+
+    @Test
+    fun fromSendsOnlyTheLaterLinesToTheSummarizer() = runBlocking {
+        val lines = listOf(
+            BiliSubtitleLine(10, "开场白"),
+            BiliSubtitleLine(300, "中段内容"),
+            BiliSubtitleLine(700, "最后一段"),
+        )
+        val summarizer = RecordingSummarizer()
+        val tool = BilibiliVideoTool(
+            FakeSource(BiliVideoTextResult.Ok(subtitleText(lines))),
+            summary = VideoSummaryService(summarizer),
+        )
+
+        val result = tool.execute(call("""{"url":"BV1ZKn267EY3","from":"10:05"}"""), context)
+
+        assertEquals(1, summarizer.calls)
+        assertFalse("600 秒之前的内容不该再喂一遍", summarizer.users.single().contains("开场白"))
+        assertFalse(summarizer.users.single().contains("中段内容"))
+        assertTrue(summarizer.users.single().contains("最后一段"))
+        assertTrue(result.contentJson.contains("\"from\":\"10:05\""))
+    }
+
+    @Test
+    fun continuingFromAMinuteBypassesTheCacheAndDoesNotOverwriteIt() = runBlocking {
+        val cache = FakeCache(stored = """{"ok":true,"cached":false,"summary":"旧结果"}""")
+        val source = FakeSource(BiliVideoTextResult.Ok(subtitleText()))
+        val tool = BilibiliVideoTool(
+            source,
+            summary = VideoSummaryService(RecordingSummarizer()),
+            cache = cache,
+        )
+
+        val result = tool.execute(call("""{"url":"BV1ZKn267EY3","from":"5:00"}"""), context)
+
+        assertFalse(result.contentJson.contains("旧结果"))
+        assertEquals(listOf("BV1ZKn267EY3"), source.requested)
+        assertEquals("续读的结果不覆盖从头看的泛总结缓存", 0, cache.writes)
+    }
+
+    @Test
+    fun refreshForcesAFreshLookEvenWhenCached() = runBlocking {
+        val cache = FakeCache(stored = """{"ok":true,"cached":false,"summary":"旧结果"}""")
+        val source = FakeSource(BiliVideoTextResult.Ok(subtitleText()))
+        val tool = BilibiliVideoTool(
+            source,
+            summary = VideoSummaryService(RecordingSummarizer()),
+            cache = cache,
+        )
+
+        val result = tool.execute(call("""{"url":"BV1ZKn267EY3","refresh":true}"""), context)
+
+        assertFalse(result.contentJson.contains("旧结果"))
+        assertEquals(listOf("BV1ZKn267EY3"), source.requested)
+    }
+
+    @Test
+    fun frameAtPutsOneFrameOfTheVideoIntoTheReply() = runBlocking {
+        val frames = FakeFrames(refs = listOf("/cache/f0.jpg"), frame = "/cache/f7.jpg")
+        val tool = BilibiliVideoTool(
+            FakeSource(BiliVideoTextResult.Ok(subtitleText())),
+            summary = VideoSummaryService(RecordingSummarizer()),
+            frames = frames,
+        )
+
+        val result = tool.execute(call("""{"url":"BV1ZKn267EY3","frame_at":"3:20"}"""), context)
+
+        assertEquals(200, frames.frameAsked)
+        assertEquals("/cache/f7.jpg", result.imageFileRef)
+        assertTrue(result.contentJson.contains("\"frame_at\":\"03:20\""))
+        assertTrue(result.contentJson.contains("\"frame_attached\":true"))
+        assertTrue(result.contentJson.contains("作为附图贴出"))
+    }
+
+    @Test
+    fun aFrameRequestWithoutAScreenshotWallIsReportedPlainly() = runBlocking {
+        val tool = BilibiliVideoTool(
+            FakeSource(BiliVideoTextResult.Ok(subtitleText())),
+            summary = VideoSummaryService(RecordingSummarizer()),
+            frames = FakeFrames(refs = emptyList(), frame = null),
+        )
+
+        val result = tool.execute(call("""{"url":"BV1ZKn267EY3","frame_at":"1:00"}"""), context)
+
+        assertEquals(null, result.imageFileRef)
+        assertTrue(result.contentJson.contains("\"frame_attached\":false"))
+        assertTrue(result.contentJson.contains("截图墙"))
+    }
+
+    @Test
+    fun aBrokenTimeArgumentIsRejectedBeforeAnyRequest() = runBlocking {
+        val source = FakeSource(BiliVideoTextResult.Ok(subtitleText()))
+        val tool = BilibiliVideoTool(source, summary = VideoSummaryService(RecordingSummarizer()))
+
+        val result = tool.execute(call("""{"url":"BV1ZKn267EY3","frame_at":"不久之前"}"""), context)
+
+        assertTrue(result.contentJson.contains("\"ok\":false"))
+        assertTrue(result.contentJson.contains("frame_at"))
+        assertTrue(source.requested.isEmpty())
     }
 
     // -------------------------------------------------------------- registration

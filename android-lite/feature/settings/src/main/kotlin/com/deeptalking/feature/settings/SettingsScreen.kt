@@ -326,13 +326,6 @@ fun SettingsScreen(
         )
 
         SectionLabel("B 站视频总结（可选）")
-        Text(
-            "B 站的字幕和官方 AI 总结都不对未登录请求开放，所以要让角色讲清一个视频讲了什么，" +
-                "需要填一次登录态：在浏览器登录 B 站后复制包含 SESSDATA 的 Cookie 粘到下面。" +
-                "它只存在本机的加密存储里，不进数据库、不进备份导出，也不显示在日志或本页面。",
-            fontSize = 11.sp,
-            color = legacy.textMuted,
-        )
         FieldLabel(if (biliCookieSaved) "B 站 Cookie（已保存）" else "B 站 Cookie（未保存）")
         LegacyField(
             value = biliCookie,

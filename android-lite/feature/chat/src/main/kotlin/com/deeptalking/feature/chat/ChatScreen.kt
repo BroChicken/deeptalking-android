@@ -367,45 +367,7 @@ fun ChatScreen(
     imagePreview?.let { path ->
         // 必须走 Dialog：这个覆盖层以前直接写在 ChatScreen 的 Column 里，会被排在
         // 输入栏下面（y 超出屏幕）——状态设了但永远看不见，表现就是“点了没反应”。
-        Dialog(
-            onDismissRequest = { imagePreview = null },
-            properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
-        ) {
-            Box(
-                modifier = Modifier.fillMaxSize().background(Color(0xD9000000)).clickable { imagePreview = null },
-                contentAlignment = Alignment.Center,
-            ) {
-                // Pinch to zoom / drag to pan; tap the dark background to close.
-                var imageScale by remember(path) { androidx.compose.runtime.mutableFloatStateOf(1f) }
-                var imageOffset by remember(path) { mutableStateOf(Offset.Zero) }
-                AsyncImage(
-                    model = MediaRef.model(context, path),
-                    contentDescription = "图片",
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(24.dp)
-                        .graphicsLayer(
-                            scaleX = imageScale,
-                            scaleY = imageScale,
-                            translationX = imageOffset.x,
-                            translationY = imageOffset.y,
-                        )
-                        .pointerInput(path) {
-                            detectTransformGestures { _, pan, zoom, _ ->
-                                imageScale = (imageScale * zoom).coerceIn(1f, 6f)
-                                imageOffset = if (imageScale <= 1f) Offset.Zero else imageOffset + pan
-                            }
-                        },
-                )
-                Text(
-                    "双指缩放 · 拖动平移 · 点空白处关闭",
-                    fontSize = 11.sp,
-                    color = Color(0xB3FFFFFF),
-                    modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 40.dp),
-                )
-            }
-        }
+        ImageLightbox(path = path, onClose = { imagePreview = null })
     }
 
     collectTarget?.let { path ->
@@ -842,6 +804,128 @@ private fun TypingIndicator(color: Color) {
                 label = "dot$index",
             )
             Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(color.copy(alpha = alpha)))
+        }
+    }
+}
+
+/**
+ * 全屏看图，手势和系统相册一致：双指缩放（钉住手指）、单指拖动、双击 1x↔2.5x、
+ * 点任意处或右上角 × 关闭。缩放/平移的数学都在 [MediaZoom]，这里只负责接线。
+ *
+ * 为什么整块视口都挂手势：以前手势挂在图片节点上，图被裁掉/放大的部分收不到事件，
+ * 表现就是"捏了没反应"或"拖不动"。现在指针事件始终落在满屏容器上，坐标就是视口坐标。
+ */
+@Composable
+private fun ImageLightbox(path: String, onClose: () -> Unit) {
+    val context = LocalContext.current
+    Dialog(
+        onDismissRequest = onClose,
+        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
+    ) {
+        BoxWithConstraints(modifier = Modifier.fillMaxSize().background(Color(0xF2000000))) {
+            val viewportWidth = constraints.maxWidth.toFloat()
+            val viewportHeight = constraints.maxHeight.toFloat()
+            val center = ZoomPoint(viewportWidth / 2f, viewportHeight / 2f)
+            var scale by remember(path) { mutableStateOf(1f) }
+            var offset by remember(path) { mutableStateOf(ZoomPoint(0f, 0f)) }
+            // Fit 之后的显示尺寸；图片还没解码出来时是 0，此时只允许看，不允许拖。
+            var fitted by remember(path, viewportWidth, viewportHeight) { mutableStateOf(ZoomSize(0f, 0f)) }
+
+            fun settle(newScale: Float, newOffset: ZoomPoint) {
+                scale = MediaZoom.clampScale(newScale)
+                offset = if (fitted.width <= 0f || fitted.height <= 0f) {
+                    ZoomPoint(0f, 0f)
+                } else {
+                    MediaZoom.clampOffset(
+                        offset = newOffset,
+                        contentWidth = fitted.width * scale,
+                        contentHeight = fitted.height * scale,
+                        viewportWidth = viewportWidth,
+                        viewportHeight = viewportHeight,
+                    )
+                }
+            }
+
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .pointerInput(path) {
+                        detectTapGestures(
+                            onTap = { onClose() },
+                            onDoubleTap = { tap ->
+                                // 已经放大了就还原，否则以点击处为锚点放大——和系统相册一致。
+                                val target = if (scale > MediaZoom.MIN_SCALE + 0.01f) {
+                                    MediaZoom.MIN_SCALE
+                                } else {
+                                    MediaZoom.DOUBLE_TAP_SCALE
+                                }
+                                settle(
+                                    target,
+                                    MediaZoom.zoomAround(
+                                        offset = offset,
+                                        centroid = ZoomPoint(tap.x, tap.y),
+                                        viewportCenter = center,
+                                        oldScale = scale,
+                                        newScale = target,
+                                    ),
+                                )
+                            },
+                        )
+                    }
+                    .pointerInput(path) {
+                        detectTransformGestures { centroid, pan, zoom, _ ->
+                            val target = MediaZoom.clampScale(scale * zoom)
+                            settle(
+                                target,
+                                MediaZoom.zoomAround(
+                                    offset = offset,
+                                    centroid = ZoomPoint(centroid.x, centroid.y),
+                                    viewportCenter = center,
+                                    oldScale = scale,
+                                    newScale = target,
+                                    pan = ZoomPoint(pan.x, pan.y),
+                                ),
+                            )
+                        }
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                AsyncImage(
+                    model = MediaRef.model(context, path),
+                    contentDescription = "图片",
+                    contentScale = ContentScale.Fit,
+                    onSuccess = { state ->
+                        // drawable 的内在尺寸就够了：只拿它算宽高比，做 Fit 的边界用。
+                        val drawable = state.result.drawable
+                        fitted = MediaZoom.fit(
+                            imageWidth = drawable.intrinsicWidth,
+                            imageHeight = drawable.intrinsicHeight,
+                            viewportWidth = viewportWidth,
+                            viewportHeight = viewportHeight,
+                        )
+                    },
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer(
+                            scaleX = scale,
+                            scaleY = scale,
+                            translationX = offset.x,
+                            translationY = offset.y,
+                        ),
+                )
+            }
+            IconButton(
+                onClick = onClose,
+                modifier = Modifier.align(Alignment.TopEnd).padding(top = 12.dp, end = 8.dp),
+            ) {
+                Icon(Icons.Outlined.Close, contentDescription = "关闭", tint = Color(0xE6FFFFFF))
+            }
+            Text(
+                "双指缩放 · 拖动平移 · 双击放大 · 点一下关闭",
+                fontSize = 11.sp,
+                color = Color(0xB3FFFFFF),
+                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 40.dp),
+            )
         }
     }
 }

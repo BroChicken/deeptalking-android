@@ -336,7 +336,7 @@ tool: { content: <工具结果 JSON>, toolCallId }
 - parameters：附录 A-9
 
 ```text
-B 站视频：按关键词搜视频，或总结一个视频讲了什么。① 给 query → 搜视频，返回 BV 号、标题、UP主、时长、播放量、简介与封面，可据此挑一个；② 给 url（B 站链接或 BV 号）→ 总结它，返回是否有字幕、带时间戳的要点，传 focus 可只关注某个问题。两个都给时按 url 总结。总结只依据字幕/站方 AI 总结/画面截图；没字幕时会标明“只能看个大概”，此时不得当成逐句事实，也不要凭标题编造。
+B 站视频：按关键词搜视频，或总结一个视频讲了什么。① 给 query → 搜视频，返回 BV 号、标题、UP主、时长、播放量、简介与封面，可据此挑一个；② 给 url（B 站链接或 BV 号）→ 总结它，返回一句话、整体脉络和带时间戳的关键节点，并写明看到哪了（mode=summary 是摘要、shallow 是没字幕只能看个大概）；③ 用户说“继续 / 后面呢”时带 from=<上次的 covered_until> 再调一次，别重复总结同一段；④ 用户想看某一刻的画面就带 frame_at（如 3:20），那一帧会作为附图贴进你的回复。总结只依据字幕/站方 AI 总结/画面截图；没字幕时不得当成逐句事实，也不要凭标题编造。两个都给时按 url 总结。
 ```
 
 搜视频（`query`）：
@@ -348,12 +348,12 @@ B 站视频：按关键词搜视频，或总结一个视频讲了什么。① �
 
 总结（`url`）：
 ```json
-{"ok":true,"platform":"bilibili","bvid":"BV1xx411c7mD","title":"…","author":"…","duration":"12:34","duration_sec":754,"source":"subtitle","has_subtitle":true,"frames":6,"cached":false,"summary":"一句话：…\n要点：\n- 01:15 …","note":"时间戳可跳转：https://www.bilibili.com/video/<bvid>?t=<秒>；…"}
+{"ok":true,"platform":"bilibili","bvid":"BV1xx411c7mD","title":"…","author":"…","duration":"12:34","duration_sec":754,"source":"subtitle","mode":"summary","has_subtitle":true,"frames":6,"cached":false,"covered_until":"12:30","unread_sec":4,"can_continue":false,"summary":"一句话：…\n整体脉络：先…然后…最后…\n关键节点：\n- 01:15 …","note":"…这是摘要，不是全文…"}
 ```
 
-`source` 取值：`subtitle`（逐句字幕经 `VideoSummaryService` 分块总结）、`official`（直接采用 B 站官方 AI 总结，零 LLM 调用）、`metadata`（没有字幕，只能靠简介/章节/画面看个大概）。`has_subtitle=false` 时必须在回复里说清"没字幕"。`frames` 是这次抽到的截图数量（`0` 表示没抽到或模型不支持看图）。`cached=true` 表示命中 7 天本地缓存，没有重新抓取。失败时返回 `{"ok":false,"reason":…}`。
+`source` 取值：`subtitle`（逐句字幕经 `VideoSummaryService` 分块总结）、`official`（直接采用 B 站官方 AI 总结，零 LLM 调用）、`metadata`（没有字幕，只能靠简介/章节/画面看个大概）。`has_subtitle=false` 时必须在回复里说清"没字幕"。`mode=summary` 表示这是摘要不是全文；`covered_until`（读到哪）/`unread_sec`（还剩多少秒没读）/`can_continue` 一起告诉模型有没有看完——`can_continue=true` 时 `note` 会要求模型如实说看到哪，用户要继续就带 `from=<covered_until>`。`frames` 是这次抽到的截图数量（`0` 表示没抽到或模型不支持看图）。带 `frame_at` 时还有 `frame_at`/`frame_attached`：`frame_attached=true` 表示那一帧已经作为附图贴出。`cached=true` 表示命中 7 天本地缓存，没有重新抓取。失败时返回 `{"ok":false,"reason":…}`。
 
-**无字幕时结果不是纯文本**：抽到截图且 `has_subtitle=false` 时，工具结果是内容数组——第一项 `input_text`（上面的 JSON），后面最多 2 项 `input_image`（`detail:"low"`，即视频画面本身）。能识图的模型可以直接看画面，再结合简介/章节说"看个大概"。有字幕时只给纯文本（图片对文字信息没有增量）；命中缓存时也一定是纯文本（缓存只存文字，不存 base64）。
+**无字幕时结果不是纯文本**：抽到截图且 `has_subtitle=false` 时，工具结果是内容数组——第一项 `input_text`（上面的 JSON），后面最多 4 项 `input_image`（`detail:"low"`，即视频画面本身，**按时间均匀挑**，覆盖开头/中段/结尾）。能识图的模型可以直接看画面，再结合简介/章节说"看个大概"。有字幕时只给纯文本（图片对文字信息没有增量）；命中缓存时也一定是纯文本（缓存只存文字，不存 base64）。
 
 #### `hot_board`
 
@@ -386,7 +386,9 @@ B 站视频：按关键词搜视频，或总结一个视频讲了什么。① �
 - parameters：附录 A-8。基础 schema 里 `keyword` 是普通 string；实际发给模型的 `definitionFor`
   会用当前角色的关键词生成 `enum`，并把它们**按大类分组**写进 description（没有贴图时工具不启用）。
 - 两个入口共用一个工具：`keyword` 发已有表情（同关键词多张随机挑一张）；`query` 现找一张
-  （百度检索 → 下载 → 压缩 → 视觉审核 + 起名 → 入库 → 直接发）。抓取失败回退成「报可用关键词」。
+  （百度检索 → 下载 → 压缩 → 视觉起关键词和归类 → 入库 → 直接发）。抓取失败会把原因如实回给
+  模型（不再笼统回「没有这张表情」）；成功时带 `total`（入库后总张数）。工具在有表情能力时**恒启用**，
+  空库也能靠 `query` 起家。
 
 ```text
 给用户发一个表情包（贴图）。想表达情绪时用 keyword 从已有表情里挑一个；库里没有合适的，就给 query 描述此刻的情境，系统会联网找一张、加进你的表情库并直接发出。贴图会作为你的下一条消息单独发出，不需要再用文字描述它。别频繁用（普通闲聊几轮一张就够），严肃或正经的话题别用。
@@ -885,24 +887,24 @@ lorebook 每条 content 精炼、一条只讲一件事，目标 300 字以内（
 ### system
 
 ```text
-你是表情包助理。看这张图，判断它能不能当聊天表情包；能的话给它起一个关键词。
+你是表情包助理。看这张图，给它起一个关键词，并归一个大类。
 只输出 JSON，不要任何解释、旁白或代码块标记：
-{"kind":"sticker","keyword":"7 字以内的中文短句","category":"happy"}
+{"keyword":"7 字以内的中文短句","category":"happy"}
 category 只能选一个 id：happy 开心 / speechless 无语 / angry 生气 / sad 难过 / shy 害羞 / affection 亲密 / smug 得意 / surprise 惊讶 / cheer 鼓励 / tired 疲惫 / animal 动物 / other 其他。
 关键词要求：不超过 7 个字；一眼能想起这张图，写具体的情绪或梗（例如「吓死我了」「搬砖去了」「无语凝噎」），不要写「开心」「难过」这种泛词；不要标点、引号、空格。
-如果这张图不适合当表情包（真人裸露、血腥、政治敏感、纯文字长截图、严重水印、多图拼贴），只输出 {"kind":"reject"}。
 ```
 
 ### user
 
 ```text
-看看这张表情。
+给这张表情起个关键词，并归一个大类。
 <图片>
 ```
 
-一次调用同时完成「审核 + 起名 + 归大类」：旧版只打一个固定标签（`tagSticker`），现在返回
-`kind/keyword/category`，`kind != sticker` 即视为不可用（换下一张候选）。关键词在落库前还会被
-`sanitizeKeyword` 收口（去空白标点、封顶 7 字），外部网页标题永远不直接进关键词。
+**模型只负责起名和归类，不承担审核**：图片来源由检索源与素材站黑名单把关，所以提示词里没有
+「能不能当表情」这一问，也没有 `kind` 字段。返回没法解析（超时、模型不支持看图、不是 JSON）时
+`labelSticker` 返回 null，调用方用**检索词**当关键词、大类记 `other`，图片照样入库，用户在面板里可改。
+关键词在落库前仍会被 `sanitizeKeyword` 收口（去空白标点、封顶 7 字），外部网页标题永远不直接进关键词。
 
 ### 出站：百度图片（已登录态无关）
 
@@ -915,8 +917,10 @@ User-Agent: <桌面 Chrome UA>
 - 响应不是严格 JSON（尾逗号、键序不稳），由 `parseBaiduImageJson` 用正则逐项抠
   `middleURL`（500px 级缩略图）与同一项里的 `fromURL`（来源页，用于溯源/删除）。
 - 素材站/图库/电商（`699pic` / `nipic` / `ibaotu` / `tujuren` / `vcg` …）在水印拦截名单
-  `STICKER_HOST_BLOCKLIST` 里，命中直接丢弃；下载后还会压到 384px/120KB 再让视觉模型审一遍。
-- 免登录、无 key；单次最多下载 `AppLimits.Sticker.FETCH_CANDIDATES` 张候选。
+  `STICKER_HOST_BLOCKLIST` 里，命中直接丢弃；下载后压到 384px/120KB，再让视觉模型起名归类。
+- 免登录、无 key；单次最多下载 `AppLimits.Sticker.FETCH_CANDIDATES` 张候选，第一张能存下来就停。
+- 每一步失败都会变成一句可转述的话（搜索为空 / 候选都下载失败 / 库里已有 / 入库失败），
+  由 `StickerFetchResult.Failed` 回给模型；成功时带上入库后的总张数。
 
 
 ## 十九、群成员字段补全（NativeCore）
@@ -1207,13 +1211,16 @@ speakingStyle 写“声音底色”：1~2 句，只写语速、用词层次、�
         "query": { "type": "string", "description": "检索关键词（搜视频时用，从用户意图提取）" },
         "url": { "type": "string", "description": "B 站视频链接或 BV 号（总结时用；必须来自上下文里真实存在的视频，禁止编造）" },
         "focus": { "type": "string", "description": "总结时用户特别想了解的点，如“结论是什么”（可选）" },
+        "from": { "type": "string", "description": "从第几分钟开始看（如 12:30 或 750 秒）；用于视频太长只看了一段之后继续看后段（可选）" },
+        "frame_at": { "type": "string", "description": "把视频某一刻的画面贴进回复（如 3:20）；只取一张，会作为附图发出（可选）" },
+        "refresh": { "type": "boolean", "description": "true = 忽略本地缓存重新看一遍（可选）" },
         "limit": { "type": "integer", "minimum": 1, "maximum": 20, "description": "搜索条数，默认 6（总结时忽略）" }
     },
     "additionalProperties": false
 }
 ```
 
-没有 `required`：按“给了什么”分派——给 `url` 优先总结，只有 `query` 时搜视频，两个都没给直接报错。`url` 里只取 `BV[0-9A-Za-z]{10}`；拿不到 BV 号时**不发任何网络请求**（避免模型把任意网址当视频去抓）。
+没有 `required`：按“给了什么”分派——给 `url` 优先总结，只有 `query` 时搜视频，两个都没给直接报错。`url` 里只取 `BV[0-9A-Za-z]{10}`；拿不到 BV 号时**不发任何网络请求**（避免模型把任意网址当视频去抓）。`from`/`frame_at` 接受 `mm:ss`、`h:mm:ss` 或纯秒数，解析失败直接报错、不发请求。
 
 ## 附录 B：turn worker 的 `submit_state`
 

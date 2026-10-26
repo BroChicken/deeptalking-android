@@ -71,6 +71,8 @@ data class OrchestratorResult(
     val lorebookChanges: List<String> = emptyList(),
     /** File ref of a sticker the character chose to send this turn, if any. */
     val stickerFileRef: String? = null,
+    /** File ref of a picture the character wants to show inside this reply, if any. */
+    val imageFileRef: String? = null,
     /** Raw (pre-processing) model reply, for the settings debug panel. */
     val rawReply: String = "",
     /**
@@ -358,6 +360,7 @@ class ChatOrchestrator(
             proactive = proactive,
             lorebookChanges = diffLorebookChanges(character, finalCharacter),
             stickerFileRef = outcome.stickerFileRef,
+            imageFileRef = outcome.imageFileRef,
             rawReply = outcome.text,
             // Turn totals across **every** request the turn made (tool rounds + the
             // forced submit round). The first request is the one that carries a

@@ -31,6 +31,8 @@ data class LoopOutcome(
     val updatedCharacter: Character? = null,
     /** File ref of a sticker the character chose to send this turn, if any. */
     val stickerFileRef: String? = null,
+    /** File ref of a picture the character wants to show inside this reply, if any. */
+    val imageFileRef: String? = null,
     /** Token usage of the last model request, when the backend reported it. */
     val usage: com.deeptalking.engine.ondevice.TokenUsage? = null,
     /**
@@ -92,6 +94,7 @@ class AgentLoop(
         var executedCalls = 0
         var latestCharacter: Character? = null
         var latestSticker: String? = null
+        var latestImage: String? = null
         var lastUsage: com.deeptalking.engine.ondevice.TokenUsage? = null
         val roundUsages = mutableListOf<com.deeptalking.engine.ondevice.TokenUsage>()
         var lastReasoning: List<String> = emptyList()
@@ -131,6 +134,7 @@ class AgentLoop(
                     onToolActivity(toolActivityHint(call.name))
                     val toolResult = registry.execute(call, context)
                     toolResult.stickerFileRef?.let { latestSticker = it }
+                    toolResult.imageFileRef?.let { latestImage = it }
                     toolResult.updatedCharacter?.let { updated ->
                         latestCharacter = updated
                         workingCharacter = updated
@@ -167,7 +171,7 @@ class AgentLoop(
 
             val usable = responseText.ifBlank { salvaged.orEmpty() }
             if (usable.isNotBlank()) {
-                return LoopOutcome(usable, null, rounds, executedCalls, latestCharacter, latestSticker, lastUsage, roundUsages)
+                return LoopOutcome(usable, null, rounds, executedCalls, latestCharacter, latestSticker, latestImage, lastUsage, roundUsages)
             }
             if (phase == RequestPhase.AUTO) {
                 onToolActivity("正在整理回复…")
@@ -181,7 +185,7 @@ class AgentLoop(
                 onToolActivity("正在重新生成…")
                 continue
             }
-            return LoopOutcome("", null, rounds, executedCalls, latestCharacter, latestSticker, lastUsage, roundUsages)
+            return LoopOutcome("", null, rounds, executedCalls, latestCharacter, latestSticker, latestImage, lastUsage, roundUsages)
         }
     }
 

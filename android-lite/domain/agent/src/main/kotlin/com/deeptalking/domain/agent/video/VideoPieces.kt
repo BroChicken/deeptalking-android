@@ -27,6 +27,12 @@ interface VideoSummaryCache {
 fun interface VideoFrameProvider {
     /** [storyboard] 为 null 表示没有可用截图墙；返回空表表示"这次没有画面可用"。 */
     suspend fun frames(text: BiliVideoText, storyboard: BiliStoryboard?): List<String>
+
+    /**
+     * 取离 [seconds] 最近的一帧，用于把「视频里某一刻的画面」贴进回复（工具参数 `frame_at`）。
+     * 默认不支持：实现方不覆盖就没有这个能力，测试替身也不必改。
+     */
+    suspend fun frameAt(text: BiliVideoText, storyboard: BiliStoryboard?, seconds: Int): String? = null
 }
 
 /**

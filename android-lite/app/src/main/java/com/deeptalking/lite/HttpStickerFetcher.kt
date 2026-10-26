@@ -7,6 +7,7 @@ import com.deeptalking.core.model.Sticker
 import com.deeptalking.core.model.StickerCategory
 import com.deeptalking.core.network.StickerImageSearch
 import com.deeptalking.domain.agent.sticker.FetchedSticker
+import com.deeptalking.domain.agent.sticker.StickerFetchResult
 import com.deeptalking.domain.agent.sticker.StickerFetcher
 import java.time.Instant
 import java.util.UUID
@@ -15,18 +16,22 @@ import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 
-/** 视觉模型对一张候选图的结论：能当表情就带关键词和大类，否则 [keyword] 为空。 */
+/**
+ * 视觉模型对一张候选图的结论：**只给关键词和大类**。
+ *
+ * 这里刻意没有“通过/不通过”——审核不是模型的活（检索源 + 域名黑名单在前面把关），
+ * 模型只负责起名和归类，失败也不会让这张图作废。
+ */
 data class StickerLabel(
     val keyword: String,
     val category: String = StickerCategory.OTHER,
-    val accepted: Boolean = true,
 )
 
 /**
- * 主题检索 → 直接发：百度找图 → 下载 → 压成 384px/120KB → 视觉审一遍并起名 → 入库。
+ * 主题检索 → 直接发：百度找图 → 下载 → 压成 384px/120KB → 视觉起名+归类 → 入库。
  *
- * 审核和起名是**同一次**视觉调用（[label]）：既省一次请求，也保证“能发出去的表情”
- * 一定是模型看过的。第一张不合格就看下一张，最多 [AppLimits.Sticker.FETCH_CANDIDATES] 张。
+ * 每一步失败都会变成一句能转述的话（[StickerFetchResult.Failed]），让角色能如实说出
+ * “图下载不下来”还是“搜索没有结果”，而不是笼统地说“加不进去”。
  */
 class HttpStickerFetcher(
     private val search: StickerImageSearch,
@@ -36,44 +41,62 @@ class HttpStickerFetcher(
     private val label: suspend (imageRef: String) -> StickerLabel?,
 ) : StickerFetcher {
 
-    override suspend fun fetch(character: Character, query: String): FetchedSticker? {
-        if (character.stickers.size >= AppLimits.Sticker.MAX_PER_CHARACTER) return null
+    override suspend fun fetch(character: Character, query: String): StickerFetchResult {
         val q = query.trim().take(40)
-        if (q.isEmpty()) return null
+        if (q.isEmpty()) return StickerFetchResult.Failed("检索词是空的，没法找图")
 
         val candidates = runCatching {
             search.search(q, AppLimits.Sticker.FETCH_CANDIDATES * 2)
         }.getOrDefault(emptyList())
-        if (candidates.isEmpty()) return null
+        if (candidates.isEmpty()) {
+            return StickerFetchResult.Failed("网图搜索没有结果，换个更具体的说法再试")
+        }
 
+        var downloaded = 0
+        var duplicates = 0
         for (candidate in candidates.take(AppLimits.Sticker.FETCH_CANDIDATES)) {
             val bytes = download(candidate.imageUrl) ?: continue
+            downloaded++
             val ref = media.saveStickerBytes(bytes) ?: continue
-            // 同一张图已经在库里（按内容 hash 命名 → fileRef 相同）就直接放弃，换个来源。
-            val live = characters.get(character.id) ?: return null
-            if (live.stickers.any { it.fileRef == ref }) continue
+            // 同一张图已经在库里（按内容 hash 命名 → fileRef 相同）就换下一张。
+            val live = characters.get(character.id) ?: return StickerFetchResult.Failed("这个角色已经不在了")
+            if (live.stickers.any { it.fileRef == ref }) {
+                duplicates++
+                continue
+            }
 
-            val verdict = runCatching { label(ref) }.getOrNull() ?: continue
-            if (!verdict.accepted) continue
-
-            val keyword = sanitizeKeyword(verdict.keyword).ifEmpty { sanitizeKeyword(q) }
+            // 起名/归类是锦上添花：模型超时、不支持看图、输出不是 JSON 都不影响入库。
+            val verdict = runCatching { label(ref) }.getOrNull()
+            val keyword = sanitizeKeyword(verdict?.keyword.orEmpty()).ifEmpty { sanitizeKeyword(q) }
             val sticker = Sticker(
                 id = UUID.randomUUID().toString(),
                 keyword = keyword,
-                category = verdict.category.takeIf(StickerCategory::isValid) ?: StickerCategory.OTHER,
+                category = verdict?.category?.takeIf(StickerCategory::isValid) ?: StickerCategory.OTHER,
                 fileRef = ref,
                 source = "web",
                 origin = candidate.pageUrl,
                 createdAt = Instant.now().toString(),
             )
-            val written = characters.mutate(character.id) { row ->
-                if (row.stickers.size >= AppLimits.Sticker.MAX_PER_CHARACTER) row
-                else row.copy(stickers = row.stickers + sticker)
-            } ?: return null
-            if (written.stickers.none { it.fileRef == ref }) return null
-            return FetchedSticker(sticker.keyword, sticker.category, ref)
+            val written = characters.mutate(character.id) { row -> row.copy(stickers = row.stickers + sticker) }
+                ?: return StickerFetchResult.Failed("表情入库失败")
+            if (written.stickers.none { it.fileRef == ref }) {
+                return StickerFetchResult.Failed("表情入库失败")
+            }
+            return StickerFetchResult.Stored(
+                FetchedSticker(
+                    keyword = sticker.keyword,
+                    category = sticker.category,
+                    fileRef = ref,
+                    total = written.stickers.size,
+                ),
+            )
         }
-        return null
+
+        return when {
+            downloaded == 0 -> StickerFetchResult.Failed("候选图都下载失败，稍后再试")
+            duplicates > 0 -> StickerFetchResult.Failed("搜到的都是库里已有的图，换个说法再试")
+            else -> StickerFetchResult.Failed("候选图都没能存下来，稍后再试")
+        }
     }
 
     private suspend fun download(url: String): ByteArray? = withContext(Dispatchers.IO) {

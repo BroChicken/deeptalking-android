@@ -27,6 +27,12 @@ data class AgentToolResult(
      * it so the UI can append the assistant sticker message.
      */
     val stickerFileRef: String? = null,
+    /**
+     * Set by tools that produce a picture the character wants to show **in this reply**
+     * (`bilibili_video` 的 `frame_at`：把某一帧贴出来）。The orchestrator surfaces it so the
+     * UI can append an assistant image bubble.
+     */
+    val imageFileRef: String? = null,
 )
 
 /**

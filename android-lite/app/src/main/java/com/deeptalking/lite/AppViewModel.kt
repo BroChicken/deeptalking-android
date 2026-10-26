@@ -1490,16 +1490,13 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     /**
      * 长按对话里的图片 → 收进当前角色的表情库。
      * 同一张图（内容 hash 相同）已经存在就提示一下，不重复入库。
+     * 张数不设上限：加多少、删哪些由用户自己决定。
      */
     fun collectSticker(path: String) {
         val id = activeIdState.value ?: return
         viewModelScope.launch {
             val character = core.data.characters.get(id) ?: return@launch
-            if (character.stickers.size >= AppLimits.Sticker.MAX_PER_CHARACTER) {
-                eventsState.tryEmit(UiEvent("表情库满了（${AppLimits.Sticker.MAX_PER_CHARACTER} 张），先删几张"))
-                return@launch
-            }
-            val stored = media.saveStickerFromFile(path) ?: run {
+            val stored = media.saveStickerFromRef(path) ?: run {
                 eventsState.tryEmit(UiEvent("这张图存不下来"))
                 return@launch
             }
@@ -1518,10 +1515,6 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
     private suspend fun stowAndLabel(id: String, path: String, source: String) {
         val character = core.data.characters.get(id) ?: return
         if (character.stickers.any { it.fileRef == path }) return
-        if (character.stickers.size >= AppLimits.Sticker.MAX_PER_CHARACTER) {
-            eventsState.tryEmit(UiEvent("表情库满了（${AppLimits.Sticker.MAX_PER_CHARACTER} 张），先删几张"))
-            return
-        }
         val sticker = com.deeptalking.core.model.Sticker(
             id = UUID.randomUUID().toString(),
             keyword = "",
@@ -1979,6 +1972,21 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                             content = "",
                             timestamp = Instant.now().toString(),
                             attachments = listOf(MessageAttachment(MessageAttachment.Kind.Sticker, ref)),
+                        ),
+                    )
+                }
+                // 工具产出的图片（比如 B 站视频的某一帧）：作为这条回复的附图单独成一条。
+                finalResult.imageFileRef?.let { ref ->
+                    // 抽帧写的是缓存目录，先复制成持久的对话图片，免得清缓存后聊天里留下破图。
+                    val stored = media.persistImageFromRef(ref) ?: ref
+                    core.data.chat.append(
+                        id,
+                        ChatMessage(
+                            id = UUID.randomUUID().toString(),
+                            role = Role.Assistant,
+                            content = "",
+                            timestamp = Instant.now().toString(),
+                            attachments = listOf(MessageAttachment(MessageAttachment.Kind.Image, stored)),
                         ),
                     )
                 }

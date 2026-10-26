@@ -34,4 +34,4 @@ jobs:
       - name: Unit tests
         working-directory: android-lite
         run: |
-          gradle :engine:ondevice:test :engine:audio:testDebugUnitTest :engine:cosyvoice:testDebugUnitTest :engine:remote-tts:testDebugUnitTest :domain:agent:test :core:network:test :domain:memory:test :core:data:testDebugUnitTest :core:model:test :feature:characters:testDebugUnitTest :feature:settings:testDebugUnitTest :feature:richtext:testDebugUnitTest --stacktrace
+          gradle :engine:ondevice:test :engine:audio:testDebugUnitTest :engine:cosyvoice:testDebugUnitTest :engine:remote-tts:testDebugUnitTest :domain:agent:test :core:network:test :domain:memory:test :core:data:testDebugUnitTest :core:model:test :feature:characters:testDebugUnitTest :feature:chat:testDebugUnitTest :feature:settings:testDebugUnitTest :feature:richtext:testDebugUnitTest --stacktrace

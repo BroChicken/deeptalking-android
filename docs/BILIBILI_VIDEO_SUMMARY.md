@@ -31,7 +31,8 @@
 - 截图存 `<bvid>-f<帧号>.jpg`（JPEG 82，宽度上限 640），与总结 JSON 放在同一个缓存目录。
 - **失败一律降级为空表**：没有截图墙、下载超时、内存不足都不会让总结失败，只是变成纯文字。
 - 抽到的帧作为 `input_image` 喂给辅助调用；模型不支持看图（400）时自动退回纯文字重试一次。
-- **无字幕时另外回 1~2 张给主模型**：这时候画面本身就是证据，直接把帧塞进工具结果（`input_text` + `input_image(detail:low)`），让能识图的模型自己看、自己说；有字幕时不塞（文字信息足够，图片纯占上下文）。缓存里只存纯文字，所以命中缓存永远不带 base64。
+- **无字幕时另外回 3~4 张给主模型**：这时候画面本身就是证据，直接把帧塞进工具结果（`input_text` + `input_image(detail:low)`），让能识图的模型自己看、自己说；有字幕时不塞（文字信息足够，图片纯占上下文）。回给主模型的帧是**按位置均匀挑**的（`spreadPick`）——以前是"时间最靠前的两张"，等于只给开头，模型自然只会说开头。缓存里只存纯文字，所以命中缓存永远不带 base64。
+- **按需取单帧（`frame_at`）**：工具参数 `frame_at="3:20"` 时用 `nearestStoryboardFrame` 找到时间轴上最近的一帧，裁出来存盘，作为 `AgentToolResult.imageFileRef` 回给上层，由 `AppViewModel` 追加成一条**助手图片消息**（并 `persistImageFromRef` 从缓存目录复制到 `filesDir/images`，免得清缓存后聊天里留破图）。
 
 ## 3. 本地缓存（7 天）
 
@@ -39,7 +40,8 @@
 
 - 命中 → 直接把上次的结果返回，`cached=true`；不抓字幕、不抽帧、不调模型。
 - 过期 → 读的时候删掉（连同它的截图），下次重新抓。
-- 带 `focus` 的提问**不读也不写缓存**：问题不同，答案不能复用。
+- 带 `focus` 的提问**不读也不写缓存**：问题不同，答案不能复用。带 `from` 的续读同样不读不写（它只覆盖后段，覆盖写会把泛总结弄残）；`refresh=true` 强制重看一遍、不看缓存。
+- 工具结果里带 `cached=true` 时说明这是旧结果。
 - 为什么用文件而不是 Room 表：内容既有 JSON 又有截图，文件天然匹配；而当前 Room 库还是 version 1、没有迁移历史，为一张缓存表升库要手写 Migration（列类型/可空性对不上会让老用户装完直接崩），风险远大于收益——缓存本来就允许丢。目录用 `cacheDir`，系统空间紧张时可以清掉。
 
 **字幕原文与截图只留本机缓存**：不进数据库、不进备份导出、不进聊天历史（历史是追加式的，塞进去会跟着后面每一轮重新计费）。
@@ -48,11 +50,13 @@
 
 有字幕：
 
-- ≤ `CHUNK_CHARS`(14000 字) → 一次补全出「一句话 + 3~6 条带 `mm:ss` 的要点」。实测 28 分钟视频（637 句 / 7730 字，加时间戳前缀约 12.8k 字符）落在一次调用内。
-- 更长 → 按行切成最多 `MAX_CHUNKS`(4) 段，逐段提要点后合并成 4~8 条（超出部分丢弃，摘要里保留总时长，追问后段时可如实说只看了一部分）。
+- 产出结构固定为**「一句话 + 整体脉络 + 关键节点」**：一句话说清讲了什么（≤40 字），整体脉络 3~5 句按时间顺序说清怎么展开、最后得出什么结论（这是"领会整体内容"的关键），关键节点 2~8 条带 `mm:ss`。只有要点、没有脉络时模型只能念几条点，看起来就像"只看了开头"。
+- ≤ `CHUNK_CHARS`(14000 字) → 一次补全。实测 28 分钟视频（637 句 / 7730 字，加时间戳前缀约 12.8k 字符）落在一次调用内。
+- 更长 → 按行切成最多 `MAX_CHUNKS`(8) 段，逐段提要点（每段第一行先概括"本段在讲什么"）后合并成整体脉络 + 3~8 条。
+- **截断不再静默**：`VideoDigest.coveredUntilSec` 报出真正读到的最后一条字幕，工具据此在结果里写 `covered_until` / `unread_sec` / `can_continue`，并在 `note` 里要求模型"没看完就说清看到哪，用户要继续就带 `from=<covered_until>`"。`from` 参数只把该时间点之后的字幕喂给总结，不会从头再讲一遍。
 - 补全走 `:app` 的辅助通道（`trackedComplete`，`auxiliary=true` 90s 超时），并在 `requestMetrics` 里记一条 `video_summary`（任务名保留旧值，便于和历史指标对比），失败带原因。
 
-没字幕（`source=metadata`）：只给标题/简介/章节标签/画面截图，系统提示词要求"第一句就带保留说法、严禁编造具体观点/数据/人名、不要假装看过"，要点 2~4 条。工具结果里 `has_subtitle=false`，提示词要求角色转述时说清"没字幕"。
+没字幕（`source=metadata`）：只给标题/简介/章节标签/画面截图，系统提示词要求"第一句就带保留说法、严禁编造具体观点/数据/人名、不要假装看过"，要点 2~4 条。工具结果里 `has_subtitle=false`、`mode=shallow`，提示词要求角色转述时说清"没字幕"。
 
 ## 5. 登录态（SESSDATA）
 
@@ -72,10 +76,11 @@
 
 - **无字幕视频的逐句内容**：需要端侧 ASR（`playurl` 的 DASH 音频流免登录可取 → Media3 解 PCM → sherpa-onnx Paraformer，模型约 227MB 按需下载）。工作量与体积都大，暂缓；当前用"画面 + 简介/章节"兜底。
 - **时间戳跳转**：摘要里带 `mm:ss`，模型可拼 `https://www.bilibili.com/video/<bvid>?t=<秒>`，但界面还没做成可点按钮。
-- **追问复用**：带 `focus` 的问题每次重新总结（不读泛总结缓存），没有"摘要 + 相关片段"的二次检索。
+- **追问复用**：带 `focus` 的问题每次重新总结（不读泛总结缓存）；续读靠 `from` 参数一段段往前推，没有"摘要 + 相关片段"的二次检索，也不会把整条字幕留在历史里（那样每轮都要重新计费）。
+- **`frame_at` 只有一个时间点**：要贴多张图就多调几次（每轮最多 `MAX_RESULT_FRAMES`(4) 张，工具结果里另外塞给主模型的截图也按这个上限）。
 
 ## 8. 代码锚点
 
-- `:core:network` 的 `BiliWbi`（签名）、`BiliVideoSource.kt`（`HttpBiliVideoSource` / 字幕·章节·截图墙解析 / `pickStoryboardFrames` / `BiliLinks` / `formatBiliClock`）
-- `:domain:agent` 的 `video/VideoSummaryService`（两条总结路径）、`video/VideoPieces.kt`（`VideoSummaryCache` / `VideoFrameProvider` 接口）、`tools/VideoSummaryTool`（编排 + 缓存短路）
-- `:app` 的 `BiliVideoCache`（7 天文件缓存）、`BiliFrameExtractor`（截图墙裁帧）、`NativeCore`（`biliVideoSource` / `videoSummarizer` / `probeBiliLogin`）、`AppViewModel`（`saveBiliCookie` / `testBiliLogin`）、`feature:settings` 的「B 站视频总结」分区
+- `:core:network` 的 `BiliWbi`（签名）、`BiliVideoSource.kt`（`HttpBiliVideoSource` / 字幕·章节·截图墙解析 / `pickStoryboardFrames` / `nearestStoryboardFrame` / `spreadPick` / `BiliLinks` / `formatBiliClock` / `parseBiliDurationClock`）
+- `:domain:agent` 的 `video/VideoSummaryService`（两条总结路径 + `coveredUntilSec`）、`video/VideoPieces.kt`（`VideoSummaryCache` / `VideoFrameProvider.frames|frameAt` 接口）、`tools/BilibiliVideoTool`（编排 + 缓存短路 + `from`/`refresh`/`frame_at`）
+- `:app` 的 `BiliVideoCache`（7 天文件缓存）、`BiliFrameExtractor`（截图墙裁帧 + 单帧）、`NativeCore`（`biliVideoSource` / `videoSummarizer` / `probeBiliLogin`）、`AppViewModel`（`saveBiliCookie` / `testBiliLogin` / 助手附图消息）、`feature:settings` 的「B 站视频总结」分区

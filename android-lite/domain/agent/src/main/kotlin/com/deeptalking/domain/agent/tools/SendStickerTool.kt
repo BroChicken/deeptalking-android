@@ -5,6 +5,7 @@ import com.deeptalking.core.model.StickerCategory
 import com.deeptalking.domain.agent.AgentContext
 import com.deeptalking.domain.agent.AgentTool
 import com.deeptalking.domain.agent.AgentToolResult
+import com.deeptalking.domain.agent.sticker.StickerFetchResult
 import com.deeptalking.domain.agent.sticker.StickerFetcher
 import com.deeptalking.engine.ondevice.ToolCall
 import com.deeptalking.engine.ondevice.ToolDefinition
@@ -57,8 +58,12 @@ class SendStickerTool(
         )
     }
 
+    /**
+     * 有表情能力就启用，**不看库里有没有**：空库的角色也得能靠 `query` 现找第一张，
+     * 否则新建角色永远没有表情。群组仍然不启用（群组不维护表情库，也没有共享池）。
+     */
     override fun isEnabled(context: AgentContext): Boolean =
-        stickersEnabled && context.character.stickers.isNotEmpty()
+        stickersEnabled && !context.character.isGroup
 
     override suspend fun execute(call: ToolCall, context: AgentContext): AgentToolResult {
         val args = ToolArgs.parse(call.arguments)
@@ -71,17 +76,19 @@ class SendStickerTool(
             if (chosen != null) return sent(chosen, fetched = false)
         }
 
-        // 库里没有 → 只有给了 query 才联网找一张；找不到就回退成“报可用关键词”。
+        // 库里没有 → 只有给了 query 才联网找一张；失败原因原样回给模型，能直接转述。
         val fetch = fetcher
-        if (query.isNotEmpty() && fetch != null &&
-            stickers.size < com.deeptalking.core.common.AppLimits.Sticker.MAX_PER_CHARACTER
-        ) {
-            val fetched = runCatching { fetch.fetch(context.character, query) }.getOrNull()
-            if (fetched != null) {
-                return AgentToolResult(
-                    contentJson = """{"ok":true,"keyword":${quote(fetched.keyword)},"source":"web","sent":true}""",
-                    stickerFileRef = fetched.fileRef,
-                )
+        if (query.isNotEmpty() && fetch != null) {
+            when (val outcome = runCatching { fetch.fetch(context.character, query) }.getOrNull()) {
+                is StickerFetchResult.Stored -> {
+                    val sticker = outcome.sticker
+                    return AgentToolResult(
+                        contentJson = """{"ok":true,"keyword":${quote(sticker.keyword)},"source":"web","sent":true,"total":${sticker.total}}""",
+                        stickerFileRef = sticker.fileRef,
+                    )
+                }
+                is StickerFetchResult.Failed -> return AgentToolResult(errorJson(outcome.reason))
+                null -> Unit
             }
         }
 

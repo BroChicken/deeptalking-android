@@ -1340,16 +1340,16 @@ class NativeCore(context: Context) {
     }
 
     /**
-     * 看一眼图，判断它能不能当表情包，能的话同时给出**关键词（≤7 字）+ 大类**。
-     * 返回 null = 模型觉得不适合（裸露/血腥/政治敏感/纯文字长截图/重水印/拼图），调用方据此换下一张。
+     * 看一眼图，只做两件事：起一个**关键词（≤7 字）**、归一个**大类**。
      *
-     * 一次调用干两件事（审核 + 起名），既省一次请求，也保证能被发出去的表情一定是看过的。
+     * 这里不判断“能不能当表情”——检索源与域名黑名单在前面把关，模型不承担审核。
+     * 返回 null 只表示“这次没起出名字”，调用方会退回用检索词当关键词，图照样入库。
      */
     suspend fun labelSticker(config: AppConfig, imageRef: String): StickerLabel? {
         if (MediaRef.toDataUri(appContext, imageRef) == null) return null
         val message = ChatMessage(
             role = Role.User,
-            content = "看看这张表情。",
+            content = "给这张表情起个关键词，并归一个大类。",
             attachments = listOf(com.deeptalking.core.model.MessageAttachment(com.deeptalking.core.model.MessageAttachment.Kind.Image, imageRef)),
         )
         val result = trackedComplete(
@@ -1360,7 +1360,7 @@ class NativeCore(context: Context) {
                 instructions = STICKER_LABEL_INSTRUCTIONS,
                 input = listOf(message),
                 temperature = 0.2,
-                maxOutputTokens = 64,
+                maxOutputTokens = 128,
                 reasoningEffort = "none",
                 apiPlatform = config.apiPlatform,
                 sessionId = "deeptalking-general",
@@ -1369,11 +1369,10 @@ class NativeCore(context: Context) {
             ),
         )
         val json = extractJsonObject(result.text) ?: return null
-        if (json.str("kind") != "sticker") return null
         val keyword = sanitizeKeyword(json.str("keyword"))
         if (keyword.isEmpty()) return null
         val category = json.str("category").takeIf(StickerCategory::isValid) ?: StickerCategory.OTHER
-        return StickerLabel(keyword = keyword, category = category, accepted = true)
+        return StickerLabel(keyword = keyword, category = category)
     }
 
     /** Parses the model's group/member JSON into [GroupMember]s (tolerating prose/fences). */
@@ -1533,14 +1532,13 @@ class NativeCore(context: Context) {
         (this[key] as? JsonPrimitive)?.contentOrNull.orEmpty().trim()
 
     private companion object {
-        /** 表情入库/审核提示词：一次调用同时判「能不能用」和「叫什么、归哪类」。 */
+        /** 表情起名/归类提示词：**只**给关键词和大类，不做审核（审核不是模型的活）。 */
         val STICKER_LABEL_INSTRUCTIONS = """
-            你是表情包助理。看这张图，判断它能不能当聊天表情包；能的话给它起一个关键词。
+            你是表情包助理。看这张图，给它起一个关键词，并归一个大类。
             只输出 JSON，不要任何解释、旁白或代码块标记：
-            {"kind":"sticker","keyword":"7 字以内的中文短句","category":"happy"}
+            {"keyword":"7 字以内的中文短句","category":"happy"}
             category 只能选一个 id：happy 开心 / speechless 无语 / angry 生气 / sad 难过 / shy 害羞 / affection 亲密 / smug 得意 / surprise 惊讶 / cheer 鼓励 / tired 疲惫 / animal 动物 / other 其他。
             关键词要求：不超过 7 个字；一眼能想起这张图，写具体的情绪或梗（例如「吓死我了」「搬砖去了」「无语凝噎」），不要写「开心」「难过」这种泛词；不要标点、引号、空格。
-            如果这张图不适合当表情包（真人裸露、血腥、政治敏感、纯文字长截图、严重水印、多图拼贴），只输出 {"kind":"reject"}。
         """.trimIndent()
 
         val QUICK_GEN_INSTRUCTIONS = """

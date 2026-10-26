@@ -191,6 +191,28 @@ class BiliVideoSourceTest {
     }
 
     @Test
+    fun nearestFrameFollowsTheStoryboardTimeline() {
+        val storyboard = requireNotNull(parseBiliStoryboard(STORYBOARD_JSON))
+        // 时间轴是每帧 5 秒（第 60 帧 = 300 秒）。
+        assertEquals(60, nearestStoryboardFrame(storyboard, 300))
+        assertEquals(60, nearestStoryboardFrame(storyboard, 302))
+        assertEquals(61, nearestStoryboardFrame(storyboard, 304))
+        assertEquals(0, nearestStoryboardFrame(storyboard, 0))
+        assertEquals(0, nearestStoryboardFrame(storyboard, -10))
+        assertEquals(199, nearestStoryboardFrame(storyboard, 99_999))
+    }
+
+    @Test
+    fun spreadPickCoversStartAndEndInsteadOfTheOpening() {
+        val refs = (0 until 10).map { "f$it" }
+        assertEquals(listOf("f0", "f3", "f6", "f9"), spreadPick(refs, 4))
+        assertEquals(listOf("f5"), spreadPick(refs, 1))
+        assertEquals(refs, spreadPick(refs, 20))
+        assertEquals(listOf("f0", "f9"), spreadPick(listOf("f0", "f9"), 2))
+        assertTrue(spreadPick(emptyList(), 3).isEmpty())
+    }
+
+    @Test
     fun viewPointsBecomeChapters() {
         val root = """
             {"code":0,"data":{"view_points":[

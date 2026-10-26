@@ -470,6 +470,42 @@ fun formatBiliClock(seconds: Int): String {
     }
 }
 
+/**
+ * 离 [seconds] 最近的一帧（按截图墙自带的时间轴）。用于「把这个视频第几分钟的画面贴出来」。
+ * 没有截图墙、时间轴为空或越界时返回 null。
+ */
+fun nearestStoryboardFrame(storyboard: BiliStoryboard, seconds: Int): Int? {
+    val total = storyboard.frameCount
+    if (total <= 0) return null
+    val target = seconds.coerceAtLeast(0)
+    var best: Int? = null
+    var bestDelta = Int.MAX_VALUE
+    for (frame in 0 until total) {
+        val stamp = storyboard.timestamps.getOrNull(frame) ?: continue
+        val delta = kotlin.math.abs(stamp - target)
+        if (delta < bestDelta) {
+            bestDelta = delta
+            best = frame
+        }
+    }
+    return best
+}
+
+/**
+ * 从列表里按位置均匀挑 [count] 个（含首尾、去重）。
+ *
+ * 视频截图就是靠它覆盖整段时间：以前直接 `take(2)` 只拿到时间最靠前的两张，
+ * 画面证据全在开头，模型自然只会说"开头"。
+ */
+fun spreadPick(items: List<String>, count: Int): List<String> {
+    if (count <= 0 || items.isEmpty()) return emptyList()
+    if (items.size <= count) return items
+    if (count == 1) return listOf(items[items.size / 2])
+    return (0 until count)
+        .map { step -> items[(step.toLong() * (items.size - 1) / (count - 1)).toInt()] }
+        .distinct()
+}
+
 /** 从用户给的链接/裸号里取 BV 号（`BV1xx411c7mD`）。 */
 object BiliLinks {
     private val BV = Regex("BV[0-9A-Za-z]{10}")

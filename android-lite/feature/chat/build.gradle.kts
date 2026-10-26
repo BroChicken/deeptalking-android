@@ -33,4 +33,6 @@ dependencies {
     implementation(libs.navigation.compose)
     implementation(libs.coil.compose)
     debugImplementation(libs.compose.ui.tooling)
+
+    testImplementation(libs.junit)
 }

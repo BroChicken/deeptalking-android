@@ -106,6 +106,22 @@ class VideoSummaryServiceTest {
     }
 
     @Test
+    fun digestReportsHowFarItActuallyRead() = runBlocking {
+        val lines = (0 until 3).map { line(it * 10, "内容") }
+        val digest = VideoSummaryService(RecordingSummarizer()).digest(videoText(lines))
+        // 读了哪些行必须报出来：工具据此在结果里写"已看到 X:XX"，而不是假装看完了。
+        assertEquals(20, digest?.coveredUntilSec)
+    }
+
+    @Test
+    fun cappedChunksStillReportTheLastLineThatWasRead() {
+        val lines = (0 until 6).map { line(it * 60, "x".repeat(30)) }
+        val capped = VideoSummaryService.chunkTranscript(lines, chunkChars = 40, maxChunks = 2)
+        assertEquals(2, capped.size)
+        assertEquals(60, capped.last().lines.last().fromSec)
+    }
+
+    @Test
     fun aFailedCallYieldsNullInsteadOfAFabricatedDigest() = runBlocking {
         val summarizer = RecordingSummarizer(reply = { null })
         assertNull(VideoSummaryService(summarizer).digest(videoText(listOf(line(1, "内容")))))

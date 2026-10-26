@@ -20,8 +20,9 @@ import kotlinx.coroutines.withContext
  * file path, which is what [com.deeptalking.core.model.MessageAttachment.uri]
  * holds for [com.deeptalking.core.model.MessageAttachment.Kind.Image]/Sticker.
  *
- * [saveStickerBytes] / [saveStickerFromFile] are the two non-picker entries:
- * 联网抓到的图按字节进，对话里的图按已有路径进（“长按收进表情包”）。
+ * [saveStickerBytes] / [saveStickerFromRef] / [persistImageFromRef] are the non-picker entries：
+ * 联网抓到的图按字节进，对话里的图按已有引用进（“长按收进表情包”），工具产出的临时图按引用复制成
+ * 持久对话图片（B 站帧）。
  */
 class MediaStore(private val context: Context) {
 
@@ -50,14 +51,49 @@ class MediaStore(private val context: Context) {
         storeSticker(decodeBytes(bytes))
     }
 
-    /** 对话里已有的图片（filesDir 下的绝对路径）：复制成一张表情。 */
-    suspend fun saveStickerFromFile(path: String): String? = withContext(Dispatchers.IO) {
-        val bytes = runCatching { File(path).readBytes() }.getOrNull() ?: return@withContext null
-        storeSticker(decodeBytes(bytes))
+    /**
+     * 对话里已有的图片 → 复制成一张表情。
+     *
+     * 注意 [ref] 的形态：当前格式是 `images/<sha>.jpg` 这种**相对** key（相对 `filesDir`），
+     * 老数据可能是绝对路径或 `file://`。这里统一解析——以前直接 `File(ref)` 会失败，
+     * 表现就是长按收图永远提示“这张图存不下来”。
+     */
+    suspend fun saveStickerFromRef(ref: String): String? = withContext(Dispatchers.IO) {
+        val file = resolveRef(ref) ?: return@withContext null
+        storeSticker(decodeFile(file))
     }
+
+    /**
+     * 把工具生成的临时图片（B 站截图墙裁出来的帧）落成一条**持久**的对话图片，
+     * 免得缓存目录被清掉后聊天记录里留下破图。已经是 `images/` key 时原样返回。
+     */
+    suspend fun persistImageFromRef(ref: String): String? = withContext(Dispatchers.IO) {
+        if (ref.startsWith("images/", ignoreCase = true)) return@withContext ref
+        val file = resolveRef(ref) ?: return@withContext null
+        val directory = File(context.filesDir, "images").apply { mkdirs() }
+        val bytes = runCatching { file.readBytes() }.getOrNull() ?: return@withContext null
+        if (bytes.isEmpty()) return@withContext null
+        val out = File(directory, sha256Hex(bytes) + ".jpg")
+        runCatching {
+            if (!out.isFile) out.writeBytes(bytes)
+            "images/${out.name}"
+        }.getOrNull()
+    }
+
+    /** 相对 key（`images/x.jpg`）→ `filesDir`；绝对路径/`file://` 原样。 */
+    private fun resolveRef(ref: String): File? = when {
+        ref.startsWith("file:", ignoreCase = true) ->
+            runCatching { Uri.parse(ref).path }.getOrNull()?.let(::File)
+        File(ref).isAbsolute -> File(ref)
+        else -> File(context.filesDir, ref)
+    }?.takeIf { it.isFile }
 
     private fun decodeBytes(bytes: ByteArray): Bitmap? =
         runCatching { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }.getOrNull()
+
+    /** 大图走 decodeFile 直接按文件解码，避免把整张原图读成 byte[] 再解一次。 */
+    private fun decodeFile(file: File): Bitmap? =
+        runCatching { BitmapFactory.decodeFile(file.absolutePath) }.getOrNull()
 
     /** Sticker variant of [compressToFile] that starts from an already decoded bitmap. */
     private fun storeSticker(original: Bitmap?): String? {
