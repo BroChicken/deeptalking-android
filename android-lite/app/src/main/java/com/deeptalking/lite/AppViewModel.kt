@@ -51,6 +51,7 @@ import com.deeptalking.engine.ondevice.TtsSpeaker
 import com.deeptalking.engine.ondevice.TtsTurn
 import com.deeptalking.engine.remote.RemoteTtsProbe
 import com.deeptalking.engine.remote.RemoteVoiceInfo
+import com.deeptalking.engine.remote.RemoteVoicePolicy
 import com.deeptalking.engine.remote.RemoteVoiceUpload
 import com.deeptalking.feature.characters.CharacterParity
 import kotlinx.coroutines.CancellationException
@@ -2684,6 +2685,12 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         const val MEMORY_CLEANUP_PENDING_KEY = "deeptalking_memory_cleanup_pending_v1"
         /** How long the bubble shows the "done" tick before reverting to idle. */
         const val TTS_DONE_LINGER_MS = 1_000L
+
+        /**
+         * Minimum gap between two passive `/v1/voices` pulls (opening the settings page).
+         * Explicit actions call `refreshRemoteManifest(force = true)` and ignore it.
+         */
+        const val REMOTE_MANIFEST_REFRESH_MS = 10_000L
     }
 
     // ------------------------------------------------------------------- theme
@@ -2741,6 +2748,58 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         )
     }
 
+    /** Millis of the last `/v1/voices` pull; throttles the passive refreshes. */
+    private var remoteManifestFetchedAt = 0L
+
+    /** True while a manifest pull is in flight, so tab flipping cannot stack requests. */
+    private var remoteManifestFetching = false
+
+    /**
+     * Re-pulls the PC's voice manifest (`GET /v1/voices`) so the picker shows the
+     * server's CURRENT ids and display names.
+     *
+     * The manifest used to be fetched only by "test connection" / "sync" / "discover", so
+     * after a restart the PC-only voices disappeared from the picker and renamed display
+     * names silently fell back to the bare ids. It is triggered when the settings page is
+     * opened (`AppRoot`'s `sidebarTab == 1`), when the remote engine is selected, and after
+     * a successful discovery.
+     *
+     * [force] is for explicit user actions (engine switch / discovery); the default form is
+     * throttled by [REMOTE_MANIFEST_REFRESH_MS], so re-entering settings does not send a
+     * request every time.
+     */
+    fun refreshRemoteManifest(force: Boolean = false) {
+        val state = ttsState.value
+        if (state.busy || remoteManifestFetching) return
+        if (!force && state.remoteVoices.isNotEmpty() &&
+            System.currentTimeMillis() - remoteManifestFetchedAt < REMOTE_MANIFEST_REFRESH_MS
+        ) {
+            return
+        }
+        remoteManifestFetching = true
+        viewModelScope.launch {
+            try {
+                // Read the URL from the persisted config: right after "自动发现" the state's
+                // copy is still the old (blank) one, and an unconfigured server must not be
+                // probed.
+                val cfg = core.currentConfig()
+                if (cfg.ttsRemoteUrl.isBlank()) return@launch
+                val manifest = runCatching { core.listTtsVoices(cfg) }.getOrDefault(emptyList())
+                remoteManifestFetchedAt = System.currentTimeMillis()
+                // An empty answer means "no manifest endpoint" (old PC server / WebUI mode)
+                // or an unreachable server - not "the PC has no voices" - so keep what we
+                // already know.
+                if (manifest.isEmpty()) return@launch
+                ttsState.value = ttsState.value.copy(
+                    remoteVoices = manifest.map { it.id },
+                    remoteVoiceNames = manifest.associate { it.id to it.name },
+                )
+            } finally {
+                remoteManifestFetching = false
+            }
+        }
+    }
+
     fun setTtsBackend(backend: String) {
         viewModelScope.launch {
             val cfg = core.currentConfig()
@@ -2749,8 +2808,10 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
             // Switching to the remote engine should be a one-tap affair: with USB
             // tethering there is no address to type, so look for the PC right away
             // when none is configured yet (the user can still override it by hand).
-            if (backend == TTS_BACKEND_REMOTE && cfg.ttsRemoteUrl.isBlank()) {
-                discoverTtsServer()
+            // Otherwise the picker needs the PC's current voice manifest right away,
+            // not only after a "test connection".
+            if (backend == TTS_BACKEND_REMOTE) {
+                if (cfg.ttsRemoteUrl.isBlank()) discoverTtsServer() else refreshRemoteManifest(force = true)
             }
         }
     }
@@ -3044,23 +3105,118 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
         }
     }
 
-    /** Renames a server-side display name without changing its speaker ID. */
+    /**
+     * Renames a server-side display name without changing its speaker ID.
+     *
+     * A rename must be visible on both ends:
+     *  - the phone's catalog gets the same name for a voice with the same stem (only the
+     *    `index.json` display name - the gguf file name IS the speaker id and must not
+     *    move, or the two ends would stop matching);
+     *  - the server's answer is authoritative, so the manifest is re-pulled instead of
+     *    keeping an optimistic local guess (which is also what made a PC-side rename look
+     *    like it never happened).
+     */
     fun renameRemoteVoice(id: String, name: String) {
         val trimmed = name.trim()
         if (id.isBlank() || trimmed.isEmpty()) return
         viewModelScope.launch {
             val error = runCatching { core.renameTtsVoice(core.currentConfig(), id, trimmed) }
                 .getOrElse { it.message ?: "重命名失败" }
-            ttsState.value = if (error == null) {
+            if (error != null) {
+                ttsState.value = ttsState.value.copy(remoteStatus = "重命名失败：$error")
+                return@launch
+            }
+            val localVoices = runCatching { core.cosyVoice.listVoices() }.getOrDefault(emptyList())
+            val localFile = localVoices.firstOrNull { voiceStemOf(it.file) == id }?.file
+            if (localFile != null) runCatching { core.cosyVoice.renameVoice(localFile, trimmed) }
+            val refreshed = runCatching { core.listTtsVoices(core.currentConfig()) }
+                .getOrDefault(emptyList())
+            ttsState.value = if (refreshed.isNotEmpty()) {
+                remoteManifestFetchedAt = System.currentTimeMillis()
+                ttsState.value.copy(
+                    remoteVoices = refreshed.map { it.id },
+                    remoteVoiceNames = refreshed.associate { it.id to it.name },
+                    remoteStatus = "已重命名电脑音色：$trimmed",
+                )
+            } else {
                 ttsState.value.copy(
                     remoteVoiceNames = ttsState.value.remoteVoiceNames + (id to trimmed),
                     remoteStatus = "已重命名电脑音色：$trimmed",
                 )
-            } else {
-                ttsState.value.copy(remoteStatus = "重命名失败：$error")
             }
+            refreshTtsState(core.currentConfig())
         }
     }
+
+    /**
+     * Deletes one voice from the PC (`DELETE /v1/voices/<id>`); the phone's copy is kept.
+     *
+     * The selection has to be re-resolved: `AppConfig.ttsRemoteVoice` is read as
+     * `ttsRemoteVoice.ifBlank { on-device stem }`, so deleting the voice in use must move
+     * the selection to one that still exists - leaving it empty would resolve back to the
+     * stem that was just deleted and 404 on the next read-aloud. When nothing is left the
+     * status line says so ("电脑端已无可用音色") instead of silently blanking it; there is
+     * no config field for "remote read-aloud off", and adding one would need a migration.
+     */
+    fun deleteRemoteVoice(id: String) {
+        val deletedId = id.trim()
+        if (deletedId.isEmpty() || ttsState.value.busy) return
+        ttsState.value = ttsState.value.copy(busy = true, remoteStatus = "正在删除电脑音色…")
+        viewModelScope.launch {
+            val error = runCatching { core.deleteTtsVoice(core.currentConfig(), deletedId) }
+                .getOrElse { it.message ?: "删除失败" }
+            if (error != null) {
+                ttsState.value = ttsState.value.copy(busy = false, remoteStatus = "删除失败：$error")
+                return@launch
+            }
+            val cfg = core.currentConfig()
+            val previous = ttsState.value
+            val deletedName = previous.remoteVoiceNames[deletedId].orEmpty().trim().ifBlank { deletedId }
+            val remaining = previous.remoteVoices.filterNot { it == deletedId }
+            val localVoices = runCatching { core.cosyVoice.listVoices() }.getOrDefault(emptyList())
+            val next = RemoteVoicePolicy.nextAfterDelete(
+                deletedId = deletedId,
+                selectedId = cfg.ttsRemoteVoice,
+                followStem = localVoiceStem(cfg),
+                remaining = remaining,
+            )
+            if (next != cfg.ttsRemoteVoice) {
+                core.data.config.update(core.currentConfig().copy(ttsRemoteVoice = next))
+            }
+            // The server is authoritative for the manifest; the local removal is only a
+            // fallback for a server that cannot answer (old one answers 404 to /v1/voices).
+            val refreshed = runCatching { core.listTtsVoices(core.currentConfig()) }.getOrDefault(emptyList())
+            val voices = if (refreshed.isNotEmpty()) refreshed.map { it.id } else remaining
+            val names = if (refreshed.isNotEmpty()) refreshed.associate { it.id to it.name }
+            else previous.remoteVoiceNames - deletedId
+            val stillLocal = localVoices.any { voiceStemOf(it.file) == deletedId }
+            ttsState.value = ttsState.value.copy(
+                busy = false,
+                remoteVoices = voices,
+                remoteVoiceNames = names,
+                remoteStatus = buildString {
+                    append("已从电脑端删除「$deletedName」")
+                    if (voices.isEmpty()) {
+                        append("；电脑端已无可用音色：请先上传本机音色，或切回端侧朗读")
+                    }
+                    if (stillLocal) {
+                        // Shared voices stay on the phone; the next "同步音色和名称" would
+                        // upload this one again - say so instead of surprising the user.
+                        append("；只从电脑删了，本机还留着，下次同步会重新上传")
+                    }
+                },
+            )
+            refreshTtsState(core.currentConfig())
+        }
+    }
+
+    /** The on-device selection as a bare speaker stem; mirrors `NativeCore.remoteTtsConfig`. */
+    private fun localVoiceStem(cfg: AppConfig): String = voiceStemOf(cfg.ttsVoiceFile)
+
+    private fun voiceStemOf(file: String): String = file.trim()
+        .substringAfterLast('/')
+        .substringAfterLast('\\')
+        .removeSuffix(".gguf")
 
     private fun uniqueVoiceName(base: String, used: Collection<String>): String {
         if (base !in used) return base
@@ -3101,7 +3257,10 @@ class AppViewModel(private val core: NativeCore) : ViewModel() {
                     remoteStatus = "没有找到服务器。请确认电脑已启动 cosyvoice-server，且手机已开启 USB 网络共享、蓝牙网络共享或手机热点",
                 )
             }
+            // A fresh server means a fresh manifest: the picker must not keep the ids of
+            // whatever server was configured before.
             refreshTtsState(core.currentConfig())
+            if (found != null) refreshRemoteManifest(force = true)
         }
     }
 

@@ -168,7 +168,8 @@ curl.exe -sS -o out.pcm -w "%{http_code}`n" -X POST http://<IP>:8080/v1/audio/sp
 |---|---|
 | 服务器地址 | **可留空**。点「查找并测试电脑」即可——USB 网络共享下不需要知道电脑 IP |
 | 模型名 | 与 `--served-model-name` 一致（默认 `cosyvoice-3`，脚本已对齐） |
-| 音色 | **下拉选择，与端侧同一套音色**（显示端侧音色名，括号里是服务端用的文件名）。默认项「跟随端侧音色」= 用端侧当前音色向服务端要同名音色；服务端没有的会标注「服务端未注册」 |
+| 音色 | **下拉选择，与端侧同一套音色**（默认显示端侧音色名，括号里是服务端用的文件名）。默认项「跟随端侧音色」= 用端侧当前音色向服务端要同名音色。两端都有的音色：电脑端显示名与手机名不同则显示 **`电脑名（手机名）`**（电脑名在前，因为「重命名电脑音色」改的就是它），相同则保持 `名字（文件名）`；服务端没有的标注「服务端未注册」，只在电脑端的标注「仅服务端」 |
+| 重命名 / 删除电脑音色 | 只作用于**当前音色**（显式选中的远侧音色，或「跟随端侧」时的端侧音色）；端侧音色还没上传到电脑时两个按钮禁用并提示「该音色还没上传到电脑」，**不会**去猜一个别的音色。删除只删电脑端（见第 8 节），有确认框 |
 | 高级选项 | **两端共用**的 8 个合成旋钮（见 4.1），访问口令也在里面（仅远程时显示） |
 | 上传本机音色到电脑 | 把端侧每个音色的 gguf 按同名传到服务端并注册，见第 8 节 |
 
@@ -364,6 +365,12 @@ New-NetFirewallRule -DisplayName 'cosyvoice-server' -Direction Inbound -Protocol
   并明确提示“电脑端服务端版本过旧，只能上传，不能同步名称/下载”。
 - **服务端持久化**：显示名保存在 `--voice-dir/names.json`，重启后仍保留；音色文件仍是
   `<--voice-dir>/<id>.gguf`。
+- **清单刷新**：手机端只在内存里存音色清单，所以打开设置页（或切到远程引擎、自动发现成功后）
+  会重新拉一次 `GET /v1/voices`，用服务端的 id / 显示名覆盖本地（重启后 PC 独有音色不会消失，
+  电脑端改名也能看到）。被动刷新有 10 秒节流，不会每轮发请求。
+- **删除电脑音色**：`DELETE /v1/voices/<id>`，**只删电脑端**——手机端同名音色文件保留，因此
+  「同步音色和名称」会再次把它上传（删除后的状态行会写明这一点）。如果删的正好是当前正在用的
+  音色，选择会自动移到电脑端剩下的第一个音色；电脑端一个都不剩时会提示「电脑端已无可用音色」。
 - PC → 手机的手工方式仍可用：WebUI 的「Save speaker」导出 `.gguf`，放进手机 `voices/` 目录后重启 App
   即出现在音色列表。
 
@@ -380,6 +387,8 @@ curl.exe -sS -X POST "http://10.84.116.224:8080/v1/voices?name=builtin_1_v2&disp
 # 只改显示名（JSON body，UTF-8）
 curl.exe -sS -X PUT "http://10.84.116.224:8080/v1/voices/builtin_1_v2" `
   -H "Content-Type: application/json" --data-binary "{\"displayName\":\"内置音色 1\"}"
+# 删除某个音色（只删电脑端，手机端副本不受影响）
+curl.exe -sS -X DELETE "http://10.84.116.224:8080/v1/voices/builtin_1_v2"
 # 也支持 multipart：-F "name=..." -F "display_name=..." -F "file=@...gguf"
 ```
 
@@ -388,9 +397,10 @@ curl.exe -sS -X PUT "http://10.84.116.224:8080/v1/voices/builtin_1_v2" `
 - 落盘目录由 `--voice-dir` 指定（`run-server.ps1` 传 `voices/`），因此**重启后依然在**：
   脚本启动时会把 `voices/*.gguf` 全部映射成 `--voice-prompt`。
 - 这套接口是本仓库对上游 checkout 的**本地补丁**（`D:\cosyvoice-server\src\tools\server\`：
-  清单/下载/改名 + `POST /v1/voices` + `--voice-dir`）；改完需重新 `cmake --build`，并把
+  清单/下载/改名/删除 + `POST /v1/voices` + `--voice-dir`）；改完需重新 `cmake --build`，并把
   `build\bin\cosyvoice-server.exe`/`cosyvoice.dll` 复制到 `tools/.work/cosyvoice-server/bin`。
-  旧版服务端会返回 404，App 会降级为“只上传”并明确提示。
+  旧版服务端会返回 404，App 会降级为“只上传”并明确提示；`DELETE` 缺失时提示
+  「电脑端不支持删除（需更新 PC 端服务）」。
 
 ### 8.1 铁律：参考文本必须是参考音频的转写
 
@@ -522,7 +532,7 @@ PC 端合成吃满 CUDA。实测（RTX 4060 Laptop 8GB）：**开着《天国拯
 
 | 补丁 | 文件 | 作用 |
 |---|---|---|
-| 音色上传接口 | `tools/server/cosyvoice-server.cpp`（`--voice-dir`）、`tools/server/cosyvoice-server.h`（`voice_dir`）、`tools/server/cosyvoice-server-backend.cpp`（`POST /v1/voices`） | 见第 8 节；没有它 App 的「上传本机音色到电脑」会返回 404 |
+| 音色上传接口 | `tools/server/cosyvoice-server.cpp`（`--voice-dir`）、`tools/server/cosyvoice-server.h`（`voice_dir`）、`tools/server/cosyvoice-server-backend.cpp`（`GET`/`POST`/`PUT`/`DELETE /v1/voices`） | 见第 8 节；没有它 App 的「上传本机音色到电脑」会返回 404，「删除电脑音色」也无法使用 |
 | **每请求重置生成状态** | `tools/server/cosyvoice-server-backend.cpp`、`src/cosyvoice-tts.cpp` | 见 10.1；没有它朗读会越念越长，最后把服务端进程打崩 |
 
 改完用 VS 开发者环境重编，然后把产物同步到启动器的 `bin/`（**`cosyvoice.dll` 也要同步**，

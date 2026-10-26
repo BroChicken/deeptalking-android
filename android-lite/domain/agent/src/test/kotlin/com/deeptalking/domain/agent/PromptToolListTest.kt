@@ -83,10 +83,23 @@ class PromptToolListTest {
         assertTrue(prompt.contains("【语气】"))
         // 签名标记是底色，不是每轮配额：这一条锁住“别再要求凑 2 处”，否则模型会为凑数反复用同一批词。
         assertTrue(prompt.contains("签名标记（口癖、句尾助词、称呼）是底色"))
-        assertTrue(prompt.contains("不得向默认 AI 助手腔靠拢"))
-        // 与角色无关的“像真人说话”规则必须留在静态 system 里（RULE_7）。
-        assertTrue(prompt.contains("像真人说话，不像写文章"))
-        assertTrue(prompt.contains("不用每段都以问句收尾"))
+        // 语气行只发朗读能执行的具体指示，不再要求“别向助手腔靠拢/别中和成书面语”——
+        // 那两句会把模型往古风、书面语那一侧推，正是要治的方向的反面。
+        assertTrue(prompt.contains("不要写成通用播报腔"))
+        // 与角色无关的语域规则并进第 2 条（第 7 条已删除）：点名模型自带的腔，并保留“卡里写了就按卡来”的让步。
+        assertTrue(prompt.contains("语域是当代日常口语"))
+        assertTrue(prompt.contains("伪古风"))
+        assertTrue(prompt.contains("不刻意儿化"))
+        assertTrue(prompt.contains("角色卡里写明口音、方言或年代感的，按卡来"))
+    }
+
+    @Test
+    fun theCardIsLabelledAsDataNotAsOutputFormat() {
+        val prompt = systemPrompt()
+        assertTrue(prompt.contains("【角色卡】"))
+        // 卡里用 markdown 分章，必须同时说明“别模仿排版”，否则模型会开始输出标题和列表。
+        assertTrue(prompt.contains("不是输出格式"))
+        assertTrue(prompt.contains("不写标题、列表、加粗、引用块"))
     }
 
     @Test

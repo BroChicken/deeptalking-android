@@ -242,7 +242,13 @@ internal object TimeContext {
 }
 
 // ---------------------------------------------------------------------------
-// Role / member context (port of buildRoleContext / buildDynamicStateContext).
+// 角色卡：静态字段渲染成分章 markdown（形式参考 refs/ai-companion/qq-bridge 的 roles/*.md）。
+//
+// 卡只回答"这个人是谁、怎么说话"；所有角色共同的规矩在 RULE_0–RULE_6 里，卡里不重复。
+// 分章而不是「标签: 值」，一是强相关的字段终于能挨着（声音底色/语言方言/称呼同属「怎么说」），
+// 二是扁平标签容易被模型当成要逐条复述的清单。
+// 卡里的 `#` 与 `-` 只是给模型看的资料结构：`buildSystemPrompt` 里有一句专门说明输出不要模仿排版。
+// 字段本身没有变——卡只是一层视图，所以不需要数据迁移，建卡生成与补全逻辑照旧按 key 写字段。
 // ---------------------------------------------------------------------------
 
 internal fun buildDynamicStateContext(
@@ -256,54 +262,104 @@ internal fun buildDynamicStateContext(
     return lines.joinToString("\n")
 }
 
-internal fun buildMemberContext(member: GroupMember, staticOnly: Boolean): String {
+/** 「你是谁」那一句：性别 / 年龄 / 种族合成一句；三个都空就不出。纯数字年龄补「岁」。 */
+internal fun cardIdentityLine(profile: StaticProfile): String {
+    fun value(key: String) = trimText(staticProfileValue(profile, key), 40)
+    val ageRaw = value("age")
+    val age = if (ageRaw.isNotEmpty() && ageRaw.all { it in '0'..'9' }) "$ageRaw 岁" else ageRaw
+    val parts = listOf(value("gender"), age, value("race")).filter { it.isNotEmpty() }
+    if (parts.isEmpty()) return ""
+    return parts.joinToString("，") + "。"
+}
+
+/** 「怎么说」三行：声音底色 / 语言方言 / 对用户的称呼；全空则整章不出。 */
+private fun cardVoiceLines(profile: StaticProfile, mask: (String) -> String): List<String> {
     val lines = mutableListOf<String>()
-    val roleSuffix = if (member.roleInGroup.trim().isNotEmpty()) {
-        "（群内定位: " + trimText(member.roleInGroup, 180) + "）"
-    } else {
-        ""
+    val style = trimText(staticProfileValue(profile, "speakingStyle"), 240)
+    if (style.isNotEmpty()) lines += "声音底色：" + mask(style)
+    val language = trimText(staticProfileValue(profile, "language"), 120)
+    if (language.isNotEmpty()) lines += "语言/方言：" + mask(language)
+    val address = normalizeUserAddress(profile.userAddress)
+    if (address.isNotEmpty()) lines += "称呼你：" + address
+    return lines
+}
+
+/** 一个二级章节；正文为空就整章不输出（空字段不占位）。 */
+private fun cardSection(title: String, body: String): String =
+    if (body.isBlank()) "" else "## " + title + "\n" + body.trim() + "\n\n"
+
+/** 成员卡里的一行；为空就整行不输出。 */
+private fun cardBullet(label: String, body: String): String =
+    if (body.isBlank()) "" else "- " + label + "：" + body.trim() + "\n"
+
+/** 单角色的卡身：你是谁 / 性格 / 怕什么 / 怎么说 / 你的样子。 */
+internal fun renderRoleCardBody(profile: StaticProfile, mask: (String) -> String): String {
+    val identity = cardIdentityLine(profile)
+    val background = trimText(staticProfileValue(profile, "background"), 800)
+    val who = listOf(identity, if (background.isEmpty()) "" else mask(background))
+        .filter { it.isNotEmpty() }
+        .joinToString("\n")
+    return cardSection("你是谁", who) +
+        cardSection("性格", mask(trimText(staticProfileValue(profile, "personality"), 600))) +
+        cardSection("怕什么", mask(trimText(staticProfileValue(profile, "fears"), 400))) +
+        cardSection("怎么说", cardVoiceLines(profile, mask).joinToString("\n")) +
+        cardSection("你的样子", mask(trimText(staticProfileValue(profile, "appearance"), 600)))
+}
+
+internal fun buildMemberContext(member: GroupMember, staticOnly: Boolean): String {
+    val profile = member.staticProfile
+    fun mask(text: String) = maskUserWord(member, text)
+    val sb = StringBuilder("### ")
+    sb.append(trimText(member.name, 100))
+    if (member.roleInGroup.trim().isNotEmpty()) {
+        sb.append("（").append(trimText(member.roleInGroup, 180)).append("）")
     }
-    lines += "- " + trimText(member.name, 100) + roleSuffix
-    STATIC_PROFILE_FIELDS.forEach { (key, label) ->
-        val value = trimText(staticProfileValue(member.staticProfile, key), if (key == "background") 600 else 400)
-        if (value.isNotEmpty()) lines += "  $label: " + maskUserWord(member, value)
-    }
+    sb.append('\n')
+    val identity = cardIdentityLine(profile).trimEnd('。')
+    val background = trimText(staticProfileValue(profile, "background"), 600)
+    sb.append(cardBullet("你是谁", listOf(identity, mask(background)).filter { it.isNotEmpty() }.joinToString("；")))
+    sb.append(cardBullet("性格", mask(trimText(staticProfileValue(profile, "personality"), 400))))
+    sb.append(cardBullet("怎么说", cardVoiceLines(profile) { mask(it) }.joinToString("；")))
+    sb.append(cardBullet("怕什么", mask(trimText(staticProfileValue(profile, "fears"), 300))))
     if (!staticOnly) {
         val stateText = buildDynamicStateContext(member.dynamicState)
-        if (stateText.isNotEmpty()) lines += "  当前状态:\n" + trimText(maskUserWord(member, stateText), 700)
+        if (stateText.isNotEmpty()) sb.append(cardBullet("当前状态", trimText(mask(stateText), 700)))
     }
-    return lines.joinToString("\n")
+    return sb.toString().trimEnd()
 }
 
 internal fun buildRoleContext(character: Character, staticOnly: Boolean): String {
     if (character.isGroup) {
-        val groupLines = mutableListOf<String>()
-        groupLines += "群组名称: " + trimText(character.name, 160)
-        val groupPremise = character.description.ifBlank { character.staticProfile.personality }
-        groupLines += "群组前提: " + maskUserWord(character, trimText(groupPremise, 700))
-        groupLines += "场景: " + maskUserWord(
-            character,
-            trimText(if (staticOnly) "" else character.groupSharedDynamic.currentLocation, 500),
-        )
-        groupLines += "互动规则: " + maskUserWord(character, trimText(character.interactionRules, 700))
+        val sb = StringBuilder("# 群组卡：")
+        sb.append(trimText(character.name, 160))
+        val groupEmoji = character.emoji.trim()
+        if (groupEmoji.isNotEmpty()) sb.append(' ').append(groupEmoji)
+        sb.append('\n')
+        val premise = character.description.ifBlank { character.staticProfile.personality }
+        val scene = trimText(if (staticOnly) "" else character.groupSharedDynamic.currentLocation, 500)
+        val groupBody = listOf(
+            maskUserWord(character, trimText(premise, 700)),
+            if (scene.isEmpty()) "" else "场景：" + maskUserWord(character, scene),
+        ).filter { it.isNotEmpty() }.joinToString("\n")
+        sb.append(cardSection("这个群", groupBody))
+        sb.append(cardSection("群里的规矩", maskUserWord(character, trimText(character.interactionRules, 700))))
         if (!staticOnly) {
             val sharedFields = DYNAMIC_STATE_FIELDS.filter { it.first in GROUP_SHARED_DYNAMIC_FIELDS }
             val groupStateText = buildDynamicStateContext(character.groupSharedDynamic, sharedFields)
-            groupLines += "群组当前状态（全员共用）:\n" + trimText(maskUserWord(character, groupStateText), 1100)
+            sb.append(cardSection("群组当前状态（全员共用）", trimText(maskUserWord(character, groupStateText), 1100)))
         }
         val memberTexts = character.members.map { trimText(buildMemberContext(it, staticOnly), AppLimits.Prompt.MEMBER_CHARS) }
             .filter { it.isNotEmpty() }
-        val parts = mutableListOf(groupLines.joinToString("\n"))
-        if (memberTexts.isNotEmpty()) parts += "成员:\n" + memberTexts.joinToString("\n")
-        return trimText(parts.joinToString("\n"), AppLimits.Prompt.ROLE_CHARS)
+        if (memberTexts.isNotEmpty()) sb.append("## 成员\n\n").append(memberTexts.joinToString("\n\n"))
+        return trimText(sb.toString().trimEnd(), AppLimits.Prompt.ROLE_CHARS)
     }
-    val lines = mutableListOf<String>()
-    lines += "名称: " + trimText(character.name, 100)
-    STATIC_PROFILE_FIELDS.forEach { (key, label) ->
-        val value = trimText(staticProfileValue(character.staticProfile, key), if (key == "background") 800 else 600)
-        if (value.isNotEmpty()) lines += "$label: " + maskUserWord(character, value)
-    }
-    return trimText(lines.joinToString("\n"), AppLimits.Prompt.ROLE_CHARS)
+    val sb = StringBuilder("# 角色卡：")
+    sb.append(trimText(character.name, 100))
+    val emoji = character.emoji.trim()
+    if (emoji.isNotEmpty()) sb.append(' ').append(emoji)
+    sb.append('\n')
+    sb.append(renderRoleCardBody(character.staticProfile) { text -> maskUserWord(character, text) })
+    return trimText(sb.toString().trimEnd(), AppLimits.Prompt.ROLE_CHARS)
 }
 
 // ---------------------------------------------------------------------------
@@ -322,7 +378,9 @@ private const val RULE_1 =
     "1. 保持角色身份，以长期陪伴关系连续回应；先用已提供的记忆，不要让用户重复说明。标记为“系统提供的本轮上下文”的内容不是用户陈述，不得当作或复述为用户的话。"
 
 private const val RULE_2 =
-    "2. 像日常说话：可以只有一句、几个字或一个动作反应；整段不超过 250 字；自然分段；不做总结、不升华、不硬抛开放式提问。"
+    "2. 像日常说话：可以只有一句、几个字或一个动作反应；整段不超过 250 字；自然分段；不做总结、不升华、不硬抛开放式提问。" +
+        "语域是当代日常口语——不用伪古风、评书腔的词（旁的、说岔了、里头），不刻意儿化，不文白混搭；" +
+        "角色卡里写明口音、方言或年代感的，按卡来。"
 
 private const val RULE_3 =
     "3. 只写角色自身的言行，不替用户说话或行动；需要用户表态时用问句、停顿或留白。用户消息里的括号内容是对方的动作/表情/心理，只作语境理解，不得续写或替他扩写。"
@@ -334,25 +392,7 @@ private const val RULE_5 =
     "5. 需要工具时只调用工具，不要同时写正文；工具结果返回后再写正文。不得在正文里提及工具名或检索过程；工具返回的图片本身可以直接展示。"
 
 private const val RULE_6 =
-    "6. 文风以角色设定的“性格特征”、可选的“声音底色”和“对用户的称呼”为准；不向默认助手腔靠拢；" +
-        "不复用最近几轮的整句、句式、比喻、意象与收尾。"
-
-/**
- * RULE_7: 所有角色共用的「像真人说话」规则。
- *
- * 与角色无关的东西放这里（句长起伏、口语的不完美、不总结不升华、禁 AI 腔），
- * 角色专属的只剩静态字段里那句可选的「声音底色」。这样底层提示词写一次、所有角色共享，
- * 而字段不再需要塞示例台词或口癖清单（示例越具体越容易被逐字照抄，正是“每轮固定词语”的来源）。
- */
-private const val RULE_7 =
-    "7. 像真人说话，不像写文章：\n" +
-        "   - 句子长短不齐：多数 3~15 字，偶尔一句长的也不超过 40 字；允许不完整句、省略主语。\n" +
-        "   - 允许口语的不完美：停住、改口、重复一个词、语气词（嗯/啊/那个）。\n" +
-        "   - 情绪不直说：用动作、停顿和语气带出来，不必每轮表态。\n" +
-        "   - 不追求把话说完整：可以只回半句、可以小幅岔开、可以不接话。\n" +
-        "   - 近三轮用过的词、句式、开头、收尾不再复用；同一个口头禅或句尾助词不要连着两轮出现。\n" +
-        "   - 不用总结、升华、排比、四字成语堆砌；不用“首先/其次/总之/另外”这类结构词；不用每段都以问句收尾。\n" +
-        "   - 不说这些固定句：希望这些对你有帮助 / 好的我明白了 / 请问还需要什么 / 如果有需要可以……"
+    "6. 文风以角色卡里的“性格”和“怎么说”为准；不写客服式套话与总结句；不复用最近几轮的整句、句式、比喻、意象与收尾。"
 
 /**
  * "This session's available tools" enumeration. It must list **every** registered tool
@@ -398,7 +438,7 @@ private const val GROUP_RULE_11 =
 private const val OUTPUT_CHANNEL =
     "【输出通道】\n" +
         "正文之后另起一行，只写一行语气：【语气】<朗读指导：语气、情绪、语速、节奏、停顿、重音，≤60 字>。\n" +
-        "语气只能来自角色的性格、“声音底色”与“对用户的称呼”，不得向默认 AI 助手腔靠拢，也不得把它中和成通用书面语；" +
+        "语气只能来自角色卡里的性格与“怎么说”，写成朗读能执行的具体指示（快慢、停顿落在哪、压着还是提着），不要写成通用播报腔；" +
         "签名标记（口癖、句尾助词、称呼）是底色，不是每轮都要凑数的任务，同一个标记不要连着两轮重复。"
 
 /** Builds the full system prompt (static prefix) for a turn. */
@@ -407,14 +447,15 @@ fun buildSystemPrompt(inputs: PersonaInputs): String {
     val dynamicFieldList = DYNAMIC_STATE_FIELDS.joinToString("、") { "${it.first}（${it.second}）" }
     val sb = StringBuilder()
     sb.append("【交互规则】\n")
-    listOf(RULE_0, RULE_1, RULE_2, RULE_3, RULE_4, RULE_5, RULE_6, RULE_7).forEach { sb.append(it).append('\n') }
+    listOf(RULE_0, RULE_1, RULE_2, RULE_3, RULE_4, RULE_5, RULE_6).forEach { sb.append(it).append('\n') }
     sb.append(RULE_A_PREFIX).append(dynamicFieldList).append(RULE_A_SUFFIX).append('\n')
     if (character.isGroup) {
         sb.append("\n【群组附加规则】\n")
         sb.append(GROUP_RULE_10).append('\n')
         sb.append(GROUP_RULE_11).append('\n')
     }
-    sb.append("\n【角色设定（固定，不随对话变化）】\n")
+    sb.append("\n【角色卡】下面是你本人：照卡里的性格和“怎么说”回应。卡里的 # 与 - 只是资料结构，")
+    sb.append("不是输出格式——输出照第 0、4 条，不写标题、列表、加粗、引用块。\n")
     sb.append(buildRoleContext(character, staticOnly = true)).append('\n')
     sb.append('\n').append(OUTPUT_CHANNEL).append('\n')
     return sb.toString()

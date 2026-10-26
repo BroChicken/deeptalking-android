@@ -338,6 +338,10 @@ class NativeCore(context: Context) {
     suspend fun renameTtsVoice(config: AppConfig, id: String, displayName: String): String? =
         withContext(Dispatchers.IO) { remoteTtsClient.renameVoice(remoteTtsConfig(config), id, displayName) }
 
+    /** Deletes one voice from the PC (`DELETE /v1/voices/<id>`); null on success. */
+    suspend fun deleteTtsVoice(config: AppConfig, id: String): String? =
+        withContext(Dispatchers.IO) { remoteTtsClient.deleteVoice(remoteTtsConfig(config), id) }
+
     suspend fun uploadTtsVoice(
         config: RemoteTtsConfig,
         name: String,

@@ -119,7 +119,7 @@ private fun speakingStyleSummary(style: String): String {
  * alike. A blank speaking style contributes nothing (自动补全字段 later fills it).
  *
  * **未接线**：生产路径不再调用它——尾部现在只发 `Prompts.voiceSpec()` 的声音底色摘要
- * （不发示例台词），"像真人说话"的通用规则在 `RULE_7`。保留这里是因为它包含"只借语气、
+ * （不发示例台词），通用语域规则在 `RULE_2`（原第 7 条已并入）。保留这里是因为它包含"只借语气、
  * 不要照抄字面"的措辞，可作为以后重写契约的参考；如果决定彻底不用，连同
  * `buildGroupVoiceContract` / `buildStyleReview` / `buildStyleCorrectionReminder` 一起删。
  */

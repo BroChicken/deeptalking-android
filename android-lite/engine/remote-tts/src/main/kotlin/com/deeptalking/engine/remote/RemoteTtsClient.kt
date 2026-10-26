@@ -10,6 +10,8 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
@@ -100,6 +102,22 @@ data class RemoteVoiceUpload(
     val message: String = "",
 )
 
+/** One HTTP exchange reduced to what the small voice endpoints (`PUT`/`DELETE`) need. */
+data class RemoteHttpResponse(val code: Int, val body: String = "")
+
+/**
+ * Seam over the HTTP stack for the whole-item voice endpoints, so their
+ * status -> message mapping is testable on the JVM without a socket. [RemoteTtsClient]
+ * uses an OkHttp implementation; tests substitute a fake and return canned responses.
+ */
+fun interface RemoteHttpTransport {
+    /**
+     * Executes [method] against [url] with the raw [token] (the implementation adds the
+     * `Bearer` header). Returns null only when the request itself could not be made.
+     */
+    fun execute(method: String, url: String, token: String?, jsonBody: String?): RemoteHttpResponse?
+}
+
 /**
  * OpenAI Speech-compatible HTTP client for `cosyvoice-server`
  * (`POST /v1/audio/speech`, optional `Authorization: Bearer <--api-key>`).
@@ -110,6 +128,8 @@ data class RemoteVoiceUpload(
 class RemoteTtsClient(
     private val userAgent: String = "DeepTalking-Lite",
     dns: Dns = Dns.SYSTEM,
+    /** Transport for the whole-item voice endpoints (`PUT`/`DELETE`); faked in tests. */
+    private val transport: RemoteHttpTransport = OkHttpRemoteHttpTransport(userAgent, dns),
 ) : RemoteTtsAudioSource {
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
@@ -317,26 +337,14 @@ class RemoteTtsClient(
         val base = config.normalizedBaseUrl
         if (base.isEmpty()) return emptyList()
         val body = getBody(probeClient, "$base/v1/voices", config) ?: return emptyList()
-        return runCatching {
-            json.parseToJsonElement(body).jsonObject["voices"]?.jsonArray.orEmpty().mapNotNull { element ->
-                val obj = element as? kotlinx.serialization.json.JsonObject ?: return@mapNotNull null
-                val id = obj["id"]?.jsonPrimitive?.contentOrNull.orEmpty()
-                if (id.isBlank()) return@mapNotNull null
-                RemoteVoiceInfo(
-                    id = id,
-                    name = obj["name"]?.jsonPrimitive?.contentOrNull.orEmpty().ifBlank { id },
-                    size = obj["size"]?.jsonPrimitive?.longOrNull ?: 0L,
-                    hash = obj["hash"]?.jsonPrimitive?.contentOrNull.orEmpty(),
-                )
-            }
-        }.getOrDefault(emptyList())
+        return parseVoiceManifest(body)
     }
 
     /** Downloads one prompt-speech gguf (`GET /v1/voices/<id>`); null on any failure. */
     fun downloadVoice(config: RemoteTtsConfig, id: String): ByteArray? {
         val base = config.normalizedBaseUrl
         if (base.isEmpty() || id.isBlank()) return null
-        val url = "$base/v1/voices/${URLEncoder.encode(id, Charsets.UTF_8.name())}"
+        val url = voiceItemUrl(base, id)
         val request = Request.Builder()
             .url(url)
             .get()
@@ -355,21 +363,27 @@ class RemoteTtsClient(
     /** Renames only the display name (`PUT /v1/voices/<id>`); null on success. */
     fun renameVoice(config: RemoteTtsConfig, id: String, displayName: String): String? {
         val base = config.normalizedBaseUrl
-        if (base.isEmpty() || id.isBlank() || displayName.isBlank()) return "音色名不能为空"
+        if (base.isEmpty()) return "未配置服务器地址"
+        if (id.isBlank() || displayName.isBlank()) return "音色名不能为空"
         val body = buildJsonObject { put("displayName", displayName) }.toString()
-        val url = "$base/v1/voices/${URLEncoder.encode(id, Charsets.UTF_8.name())}"
-        val request = Request.Builder()
-            .url(url)
-            .put(body.toRequestBody(JSON_MEDIA_TYPE))
-            .header("User-Agent", userAgent)
-            .apply { bearerToken(config.token)?.let { header("Authorization", it) } }
-            .build()
-        return runCatching {
-            streamClient.newCall(request).execute().use { response ->
-                if (response.isSuccessful) null
-                else "HTTP ${response.code}${errorDetail(response)}"
-            }
-        }.getOrElse { it.message ?: "重命名失败" }
+        val response = transport.execute("PUT", voiceItemUrl(base, id), config.token, body)
+            ?: return "重命名失败：网络不可达"
+        return if (response.code in 200..299) null else "HTTP ${response.code}${bodySuffix(response.body)}"
+    }
+
+    /**
+     * Deletes one server-side voice (`DELETE /v1/voices/<id>`); null on success.
+     *
+     * A server that predates the endpoint answers 404, which is mapped to an actionable
+     * message instead of a bare HTTP code. Never throws.
+     */
+    fun deleteVoice(config: RemoteTtsConfig, id: String): String? {
+        val base = config.normalizedBaseUrl
+        if (base.isEmpty()) return "未配置服务器地址"
+        if (id.isBlank()) return "音色名为空"
+        val response = transport.execute("DELETE", voiceItemUrl(base, id), config.token, null)
+            ?: return "删除失败：网络不可达"
+        return deleteVoiceError(response.code, response.body)
     }
 
     private fun apiProbe(base: String, config: RemoteTtsConfig): RemoteTtsProbe {
@@ -498,5 +512,112 @@ class RemoteTtsClient(
 
         /** Longest silence tolerated mid-utterance before the request is failed. */
         const val STREAM_IDLE_TIMEOUT_MS = 60_000L
+    }
+}
+
+/* ------------------------------------------------------------------------------------
+ * Voice endpoints: pure parsing / mapping (testable without a socket)
+ * ------------------------------------------------------------------------------------ */
+
+/** JSON reader for `/v1/voices`; unknown fields are ignored, so newer servers keep working. */
+private val voiceManifestJson = Json { ignoreUnknownKeys = true; isLenient = true }
+
+/**
+ * Parses a `GET /v1/voices` body: `{"voices":[{"id","name","size","hash"}]}`.
+ *
+ * [RemoteVoiceInfo.id] is the *stable* speaker name (also the file name on the server),
+ * so an entry without a usable id is dropped; a missing/blank `name` falls back to the id
+ * (display names were added later than ids). A body that is not the expected shape - a
+ * server predating the endpoint answering HTML, or a proxy error page - yields an empty
+ * list rather than an exception, and junk fields inside an otherwise valid entry do not
+ * discard the whole manifest.
+ */
+internal fun parseVoiceManifest(body: String): List<RemoteVoiceInfo> = runCatching {
+    voiceManifestJson.parseToJsonElement(body).jsonObject["voices"]?.jsonArray.orEmpty()
+        .mapNotNull { element -> runCatching { parseVoiceEntry(element) }.getOrNull() }
+}.getOrDefault(emptyList())
+
+private fun parseVoiceEntry(element: JsonElement): RemoteVoiceInfo? {
+    val obj = element as? JsonObject ?: return null
+    val id = obj["id"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
+    if (id.isEmpty()) return null
+    return RemoteVoiceInfo(
+        id = id,
+        // The server persists names.json and trims what it stores; mirror that here so the
+        // app never shows a name with incidental whitespace and never re-renames over it.
+        name = obj["name"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty().ifBlank { id },
+        size = obj["size"]?.jsonPrimitive?.longOrNull ?: 0L,
+        hash = obj["hash"]?.jsonPrimitive?.contentOrNull.orEmpty(),
+    )
+}
+
+/** `：<server message>` suffix for an error body, capped so a log page cannot flood the UI. */
+private fun bodySuffix(body: String): String =
+    body.trim().take(VOICE_ERROR_CHARS).takeIf { it.isNotEmpty() }?.let { "：$it" }.orEmpty()
+
+/**
+ * Maps a `DELETE /v1/voices/<id>` response to the message the settings screen shows;
+ * null means the voice is gone.
+ *
+ * 404 is deliberate: the delete endpoint is part of the same local patch as the manifest
+ * and rename endpoints, so an older `cosyvoice-server` simply does not have it - telling
+ * the user to update the PC side is actionable, "HTTP 404" is not.
+ */
+internal fun deleteVoiceError(code: Int, body: String): String? = when {
+    code in 200..299 -> null
+    code == 404 -> "电脑端不支持删除（需更新 PC 端服务）"
+    code == 401 || code == 403 -> "访问口令缺失或错误"
+    else -> "HTTP $code${bodySuffix(body)}"
+}
+
+private const val VOICE_ERROR_CHARS = 300
+
+/**
+ * [RemoteHttpTransport] over OkHttp: same DoH policy, User-Agent and bearer handling as
+ * the rest of the client, but its own short timeouts (these calls return a tiny JSON/text
+ * body, so a dead server must not inherit the long synthesis read timeout).
+ */
+internal class OkHttpRemoteHttpTransport(
+    private val userAgent: String,
+    dns: Dns,
+) : RemoteHttpTransport {
+
+    private val client: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(ENDPOINT_CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        .readTimeout(ENDPOINT_READ_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        .callTimeout(ENDPOINT_CALL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        .dns(dns)
+        .build()
+
+    override fun execute(
+        method: String,
+        url: String,
+        token: String?,
+        jsonBody: String?,
+    ): RemoteHttpResponse? = runCatching {
+        val builder = Request.Builder()
+            .url(url)
+            .header("User-Agent", userAgent)
+            .apply { bearerToken(token)?.let { header("Authorization", it) } }
+        val request = when (method.uppercase()) {
+            "GET" -> builder.get().build()
+            "DELETE" -> builder.delete().build()
+            "PUT" -> builder.put((jsonBody ?: "").toRequestBody(ENDPOINT_JSON_MEDIA_TYPE)).build()
+            else -> builder.method(method.uppercase(), jsonBody?.toRequestBody(ENDPOINT_JSON_MEDIA_TYPE)).build()
+        }
+        client.newCall(request).execute().use { response ->
+            RemoteHttpResponse(
+                code = response.code,
+                body = runCatching { response.body?.string() }.getOrNull()
+                    .orEmpty().trim().take(VOICE_ERROR_CHARS),
+            )
+        }
+    }.getOrNull()
+
+    private companion object {
+        val ENDPOINT_JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+        const val ENDPOINT_CONNECT_TIMEOUT_MS = 4_000L
+        const val ENDPOINT_READ_TIMEOUT_MS = 4_000L
+        const val ENDPOINT_CALL_TIMEOUT_MS = 6_000L
     }
 }

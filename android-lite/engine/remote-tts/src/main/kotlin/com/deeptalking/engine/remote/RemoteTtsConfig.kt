@@ -129,6 +129,16 @@ internal fun voiceUploadUrl(baseUrl: String, name: String): String =
     baseUrl.trim().trimEnd('/') + "/v1/voices?name=" +
         java.net.URLEncoder.encode(name, Charsets.UTF_8.name())
 
+/**
+ * `{base}/v1/voices/<id>` - one registered voice. Shared by the three item endpoints so
+ * download (`GET`), rename (`PUT`) and delete (`DELETE`) can never drift apart; [id] is
+ * percent-encoded as a path segment, and a `+` from `URLEncoder` is turned back into
+ * `%20` (a `+` means "space" only in a query string, not in a path).
+ */
+internal fun voiceItemUrl(baseUrl: String, id: String): String =
+    baseUrl.trim().trimEnd('/') + "/v1/voices/" +
+        java.net.URLEncoder.encode(id, Charsets.UTF_8.name()).replace("+", "%20")
+
 /** Whole-value header token, tolerant of a user pasting `Bearer sk-...`. */
 internal fun bearerToken(token: String?): String? {
     val trimmed = token?.trim().orEmpty()

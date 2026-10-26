@@ -135,6 +135,14 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
     // Legacy mobile sidebar is min(88vw, 21rem); mirror that here.
     val sidebarWidth = minOf(LocalConfiguration.current.screenWidthDp.dp * 0.88f, 340.dp)
 
+    // Opening the settings tab re-pulls the PC's voice manifest. The list used to be fetched
+    // only by "test connection"/"sync"/"discover", so after a restart the PC-only voices
+    // disappeared and renamed display names fell back to the bare ids
+    // (`AppViewModel.refreshRemoteManifest` is throttled, so tab flipping is cheap).
+    LaunchedEffect(sidebarTab) {
+        if (sidebarTab == 1) vm.refreshRemoteManifest()
+    }
+
     LaunchedEffect(Unit) {
         vm.events.collect { snackbarHostState.showSnackbar(it.message) }
     }
@@ -321,6 +329,7 @@ private fun AppContent(core: NativeCore, vm: AppViewModel) {
                         onUploadTtsVoices = vm::uploadVoicesToRemote,
                         onSyncTtsVoices = vm::syncTtsVoices,
                         onRenameTtsRemoteVoice = vm::renameRemoteVoice,
+                        onDeleteTtsRemoteVoice = vm::deleteRemoteVoice,
                     )
                 }
             }

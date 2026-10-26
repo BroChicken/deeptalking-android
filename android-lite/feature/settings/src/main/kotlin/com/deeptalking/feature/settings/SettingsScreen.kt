@@ -149,6 +149,7 @@ fun SettingsScreen(
     onUploadTtsVoices: () -> Unit = {},
     onSyncTtsVoices: () -> Unit = {},
     onRenameTtsRemoteVoice: (String, String) -> Unit = { _, _ -> },
+    onDeleteTtsRemoteVoice: (String) -> Unit = {},
     /**
      * Rolling request metrics from the independent metrics store (`:core:data`
      * `MetricsRepository`), used by the debug panel. `config.requestMetrics` is a legacy
@@ -323,6 +324,7 @@ fun SettingsScreen(
             onUploadVoices = onUploadTtsVoices,
             onSyncVoices = onSyncTtsVoices,
             onRenameRemoteVoice = onRenameTtsRemoteVoice,
+            onDeleteRemoteVoice = onDeleteTtsRemoteVoice,
         )
 
         SectionLabel("B 站视频总结（可选）")

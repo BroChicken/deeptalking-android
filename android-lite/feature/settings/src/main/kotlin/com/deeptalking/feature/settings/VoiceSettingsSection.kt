@@ -151,6 +151,7 @@ fun VoiceSettingsSection(
     onUploadVoices: () -> Unit = {},
     onSyncVoices: () -> Unit = {},
     onRenameRemoteVoice: (String, String) -> Unit = { _, _ -> },
+    onDeleteRemoteVoice: (String) -> Unit = {},
 ) {
     val legacy = MaterialTheme.legacy
     val remote = backend == TTS_BACKEND_REMOTE
@@ -166,27 +167,19 @@ fun VoiceSettingsSection(
     var renameTarget by remember { mutableStateOf<VoiceOption?>(null) }
     var remoteRenameId by remember { mutableStateOf("") }
     var remoteRenameName by remember { mutableStateOf("") }
+    var remoteDeleteId by remember { mutableStateOf("") }
     var testText by remember { mutableStateOf("你好呀，今天过得怎么样？") }
     var tokenDraft by remember(backend) { mutableStateOf("") }
 
     val active = voices.firstOrNull { it.id == activeVoiceId }
     // The remote engine speaks with the SAME voices the phone has: the server registers
-    // one prompt-speech file per voice, named after the on-device file (minus ".gguf"),
-    // so the picker below lists the on-device catalog by display name and marks what the
-    // PC does not have yet (see docs/REMOTE_TTS.md section 8).
-    val followLabel = "跟随端侧音色" + (active?.let { "（${it.name}）" } ?: "")
-    val voiceChoices = buildList {
-        add(followLabel to "")
-        voices.forEach { v ->
-            val stem = v.id.removeSuffix(".gguf")
-            val missing = remoteVoices.isNotEmpty() && !remoteVoices.contains(stem)
-            val shown = if (v.name == stem) stem else "${v.name}（$stem）"
-            add((if (missing) "$shown · 服务端未注册" else shown) to stem)
-        }
-        // Voices that only exist on the PC (registered there, not on the phone).
-        remoteVoices.filter { s -> voices.none { it.id.removeSuffix(".gguf") == s } }
-            .forEach { add("${remoteVoiceNames[it] ?: it} · 仅服务端" to it) }
-    }
+    // one prompt-speech file per voice, named after the on-device file (minus ".gguf").
+    // The label rules (PC name first, "仅服务端", "服务端未注册") live in a pure function so
+    // they are unit-tested; see docs/REMOTE_TTS.md section 8.
+    val voiceChoices = remoteVoiceChoices(voices, activeVoiceId, remoteVoices, remoteVoiceNames)
+    val followLabel = voiceChoices.first().label
+    // Rename/delete must act on the voice actually in use, never on a guessed one.
+    val editTarget = remoteVoiceEditTarget(remoteVoice, activeVoiceId, remoteVoices)
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
@@ -317,12 +310,12 @@ fun VoiceSettingsSection(
 
         Text("音色", fontSize = 12.sp, color = legacy.textMuted)
         LegacyDropdown(
-            selected = voiceChoices.firstOrNull { it.second == remoteVoice }?.first ?: followLabel,
-            options = voiceChoices.map { it.first },
+            selected = voiceChoices.firstOrNull { it.id == remoteVoice }?.label ?: followLabel,
+            options = voiceChoices.map { it.label },
             expanded = remoteVoiceMenuOpen,
             onExpandedChange = { remoteVoiceMenuOpen = it },
             onSelect = { label ->
-                voiceChoices.firstOrNull { it.first == label }?.let { onChangeRemoteVoice(it.second) }
+                voiceChoices.firstOrNull { it.label == label }?.let { onChangeRemoteVoice(it.id) }
                 remoteVoiceMenuOpen = false
             },
         )
@@ -332,17 +325,28 @@ fun VoiceSettingsSection(
             enabled = !busy,
             modifier = Modifier.fillMaxWidth(),
         ) { Text("只上传本机音色到电脑", fontSize = 12.sp) }
-        TextButton(
-            onClick = {
-                val id = remoteVoice.ifBlank { remoteVoices.firstOrNull().orEmpty() }
-                if (id.isNotEmpty()) {
-                    remoteRenameId = id
-                    remoteRenameName = remoteVoiceNames[id] ?: id
-                }
-            },
-            enabled = !busy && remoteVoices.isNotEmpty(),
-            modifier = Modifier.fillMaxWidth(),
-        ) { Text("重命名电脑音色", fontSize = 12.sp) }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            TextButton(
+                onClick = {
+                    if (editTarget.isNotEmpty()) {
+                        remoteRenameId = editTarget
+                        remoteRenameName = remoteVoiceNames[editTarget].orEmpty().trim().ifBlank { editTarget }
+                    }
+                },
+                enabled = canRenameRemoteVoice(busy, editTarget),
+                modifier = Modifier.weight(1f),
+            ) { Text("重命名电脑音色", fontSize = 12.sp) }
+            TextButton(
+                onClick = { if (editTarget.isNotEmpty()) remoteDeleteId = editTarget },
+                enabled = canDeleteRemoteVoice(busy, editTarget, remoteVoices),
+                modifier = Modifier.weight(1f),
+            ) { Text("删除电脑音色", fontSize = 12.sp) }
+        }
+        if (remoteVoices.isNotEmpty() && voices.isNotEmpty() && editTarget.isEmpty()) {
+            // The on-device voice was never uploaded: renaming/deleting a guessed entry
+            // would hit an unrelated voice, so the buttons stay disabled and say why.
+            Text("该音色还没上传到电脑", fontSize = 11.sp, color = legacy.textMuted)
+        }
 
     } else {
         if (!modelReady) {
@@ -491,6 +495,26 @@ fun VoiceSettingsSection(
                 ) { Text("确定") }
             },
             dismissButton = { TextButton(onClick = { remoteRenameId = "" }) { Text("取消") } },
+        )
+    }
+
+    if (remoteDeleteId.isNotEmpty()) {
+        val deleteName = remoteVoiceNames[remoteDeleteId].orEmpty().trim().ifBlank { remoteDeleteId }
+        AlertDialog(
+            onDismissRequest = { remoteDeleteId = "" },
+            // Name the exact voice being deleted: it is irreversible on the PC (the phone's
+            // copy is kept), so a bare "确定" would be too easy to hit by mistake.
+            title = { Text("删除电脑音色") },
+            text = { Text("将从电脑端删除「$deleteName」。\n只影响电脑端，本机音色不受影响。") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onDeleteRemoteVoice(remoteDeleteId)
+                        remoteDeleteId = ""
+                    },
+                ) { Text("删除") }
+            },
+            dismissButton = { TextButton(onClick = { remoteDeleteId = "" }) { Text("取消") } },
         )
     }
 }
