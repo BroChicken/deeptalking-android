@@ -39,6 +39,26 @@ if (-not $gradleExe -or -not (Test-Path -LiteralPath $gradleExe)) {
   exit 1
 }
 
+# Release signing must be explicit. app/build.gradle.kts falls back to the DEBUG key when
+# ANDROID_KEYSTORE_PASSWORD is absent, and a debug-signed APK cannot be installed over an
+# already-installed release build - so refuse to build one instead of shipping it.
+if ($Release) {
+  if (-not $env:ANDROID_KEYSTORE_PASSWORD) {
+    $env:ANDROID_KEYSTORE_PASSWORD = [Environment]::GetEnvironmentVariable('ANDROID_KEYSTORE_PASSWORD', 'User')
+  }
+  if (-not $env:ANDROID_KEYSTORE_PASSWORD) {
+    $env:ANDROID_KEYSTORE_PASSWORD = [Environment]::GetEnvironmentVariable('ANDROID_KEYSTORE_PASSWORD', 'Machine')
+  }
+  if (-not $env:ANDROID_KEYSTORE_PASSWORD) {
+    Write-Host 'ANDROID_KEYSTORE_PASSWORD is not set (process/User/Machine).' -ForegroundColor Red
+    Write-Host 'Refusing to build: Gradle would silently sign the release APK with the debug key.' -ForegroundColor Red
+    Write-Host 'Set it - the User environment variable is enough - and re-run.' -ForegroundColor Red
+    exit 1
+  }
+  # android-lite/keystore/CREDENTIALS.txt: key password is the same as the store password.
+  if (-not $env:ANDROID_KEY_PASSWORD) { $env:ANDROID_KEY_PASSWORD = $env:ANDROID_KEYSTORE_PASSWORD }
+}
+
 function Invoke-Gradle {
   param([string[]]$Tasks, [string]$Label)
   $log = Join-Path $env:TEMP ('native-build-' + [Guid]::NewGuid().ToString('N') + '.log')
@@ -86,6 +106,30 @@ if ($apk) {
     Write-Host 'Nothing to publish: no APK in ' + $apkDir -ForegroundColor Red
     exit 1
   }
+}
+
+# Never publish a release APK without checking WHICH key signed it.
+if ($Release -and $apk) {
+  $apksigner = Get-ChildItem -LiteralPath (Join-Path $env:ANDROID_SDK_ROOT 'build-tools') -Directory -ErrorAction SilentlyContinue |
+    Sort-Object Name -Descending |
+    ForEach-Object { Join-Path $_.FullName 'apksigner.bat' } |
+    Where-Object { Test-Path -LiteralPath $_ } |
+    Select-Object -First 1
+  if (-not $apksigner) {
+    Write-Host 'apksigner not found under ANDROID_SDK_ROOT/build-tools - cannot verify signing.' -ForegroundColor Red
+    exit 1
+  }
+  $certs = (& $apksigner verify --print-certs $apk.FullName 2>$null | Out-String)
+  if ($certs -match 'Android Debug') {
+    Write-Host 'RELEASE APK IS DEBUG-SIGNED - refusing to archive or publish it.' -ForegroundColor Red
+    exit 1
+  }
+  $dn = ($certs -split "`n" | Where-Object { $_ -match 'Signer #1 certificate DN' } | Select-Object -First 1)
+  if (-not $dn) {
+    Write-Host 'Could not verify the release APK signature (apksigner reported no signer).' -ForegroundColor Red
+    exit 1
+  }
+  Write-Host ('Signature OK: ' + $dn.Trim()) -ForegroundColor Green
 }
 
 if ($Publish) {

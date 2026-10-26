@@ -28,7 +28,10 @@
   2. `powershell -File tools/native-verify.ps1` 全绿；
   3. **本地出包并发布**：`powershell -File tools/native-build.ps1 -Release -Publish`
      —— 本机 keystore 签名构建 release APK，归档 `apk/DeepTalking-lite-v<版本>.apk`，
-     再用 `gh` 把**这个本地包**创建/覆盖上传到 GitHub Release（tag `v<版本>`）；
+     再用 `gh` 把**这个本地包**创建/覆盖上传到 GitHub Release（tag `v<版本>`）。
+     脚本自己解析 `ANDROID_KEYSTORE_PASSWORD`（process → User → Machine）；**取不到就直接失败**，
+     因为 Gradle 缺这个变量会静默改用 debug key 签名；签完还会用 `apksigner` 校验，
+     debug 签名的包一律拒绝归档/发布；
   4. 提交版本改动并 `git push`。
   - **如果 `git push` 因网络不可达失败**：不要反复重试、不要改写历史或强推；保留本地提交，向用户报告提交 SHA 和「推送失败」，等网络恢复后再推即可。
   CI（`.github/workflows/verify-lite.yml`）只跑「编译 + 单测」当门禁，**不出包、不发布**。
