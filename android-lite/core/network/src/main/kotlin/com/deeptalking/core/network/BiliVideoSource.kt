@@ -58,6 +58,25 @@ data class BiliStoryboard(
 
 data class FrameLocation(val imageIndex: Int, val column: Int, val row: Int)
 
+/** 一个分P（`pages[]`）；[p] 从 1 开始，[cid] 是这一 P 的播放 id（字幕/截图墙都按它取）。 */
+data class BiliPage(
+    val p: Int,
+    val cid: Long,
+    val title: String,
+    val durationSec: Int,
+)
+
+/** 合集/系列里的一集（`ugc_season.sections[].episodes[]`）。 */
+data class BiliSeasonEpisode(
+    val order: Int,
+    val bvid: String,
+    val title: String,
+    val durationSec: Int,
+)
+
+/** 视频所属的合集（`ugc_season`）：标题 + 按播放顺序排好的分集。 */
+data class BiliSeason(val title: String, val episodes: List<BiliSeasonEpisode>)
+
 /** 一个 B 站视频里所有能喂给模型的文本。 */
 data class BiliVideoText(
     val bvid: String,
@@ -76,6 +95,12 @@ data class BiliVideoText(
     val officialOutline: List<BiliSubtitleLine> = emptyList(),
     /** `view_points` 的章节标签（不需要登录就能拿到），无字幕时它是唯一的"结构"信息。 */
     val chapters: List<BiliSubtitleLine> = emptyList(),
+    /** 分P 列表；单 P 视频为空表。 */
+    val pages: List<BiliPage> = emptyList(),
+    /** 视频所属的合集（`ugc_season`）；不在任何合集里为 null。 */
+    val season: BiliSeason? = null,
+    /** 这次看的是第几 P（1 起）。 */
+    val page: Int = 1,
 ) {
     enum class Source { Subtitle, OfficialSummary, Metadata }
 
@@ -97,7 +122,11 @@ sealed interface BiliVideoTextResult {
 
 /** 取一个 B 站视频的可总结材料（字幕 / 官方总结 / 只有元信息 + 章节）。 */
 interface BiliVideoSource {
-    suspend fun load(bvid: String): BiliVideoTextResult
+    /**
+     * [page] 是要看第几 P（1 起）。有多个分P时按它选 `cid`（字幕、截图墙都绑这一 P）；
+     * 越界或单 P 视频按第 1 P 处理。
+     */
+    suspend fun load(bvid: String, page: Int = 1): BiliVideoTextResult
 
     /** 截图墙（抽帧用）；接口不可用或没有截图时返回 null。默认不支持，便于测试替身。 */
     suspend fun storyboard(bvid: String, cid: Long): BiliStoryboard? = null
@@ -129,7 +158,7 @@ class HttpBiliVideoSource(
 
     private data class WbiKeys(val imgKey: String, val subKey: String, val day: String)
 
-    override suspend fun load(bvid: String): BiliVideoTextResult = withContext(Dispatchers.IO) {
+    override suspend fun load(bvid: String, page: Int): BiliVideoTextResult = withContext(Dispatchers.IO) {
         val id = bvid.trim()
         if (id.isEmpty()) return@withContext BiliVideoTextResult.Failure("缺少视频号（BV 号）")
         try {
@@ -142,18 +171,27 @@ class HttpBiliVideoSource(
             }
             val data = view["data"] as? JsonObject
                 ?: return@withContext BiliVideoTextResult.Failure("B站视频详情为空")
-            val cid = data["cid"].longOrZero().takeIf { it > 0 }
-                ?: ((data["pages"] as? JsonArray)?.firstOrNull() as? JsonObject)?.get("cid").longOrZero()
+            // 分P 与合集都是同一个 `view` 响应里带的，不需要额外请求。
+            val pages = parseBiliPages(data)
+            val season = parseBiliSeason(data)
+            val wanted = page.coerceAtLeast(1)
+            val selectedPage = pages.firstOrNull { it.p == wanted } ?: pages.firstOrNull()
+            val cid = selectedPage?.cid?.takeIf { it > 0 }
+                ?: data["cid"].longOrZero().takeIf { it > 0 }
                 ?: 0L
             val owner = data["owner"] as? JsonObject
             val meta = Meta(
                 bvid = data["bvid"].textOrEmpty().ifEmpty { id },
                 title = data["title"].textOrEmpty(),
                 author = owner?.get("name").textOrEmpty(),
-                durationSec = data["duration"].intOrZero(),
+                // 多 P 视频的 `duration` 是整体时长；看第 N P 时要用那一 P 自己的时长。
+                durationSec = selectedPage?.durationSec?.takeIf { it > 0 } ?: data["duration"].intOrZero(),
                 cid = cid,
                 upMid = owner?.get("mid").longOrZero() ?: 0L,
                 desc = data["desc"].textOrEmpty(),
+                pages = pages,
+                season = season,
+                page = selectedPage?.p ?: wanted,
             )
 
             // 1) 字幕优先：逐句文本能回答"某个细节在第几分钟"，官方总结做不到。
@@ -213,6 +251,9 @@ class HttpBiliVideoSource(
         val cid: Long,
         val upMid: Long,
         val desc: String,
+        val pages: List<BiliPage> = emptyList(),
+        val season: BiliSeason? = null,
+        val page: Int = 1,
     )
 
     private fun Meta.toText(
@@ -235,6 +276,9 @@ class HttpBiliVideoSource(
         officialSummary = summary,
         officialOutline = if (source == BiliVideoText.Source.OfficialSummary) lines else emptyList(),
         chapters = chapters,
+        pages = pages,
+        season = season,
+        page = page,
     )
 
     /**
@@ -378,6 +422,59 @@ internal fun parseBiliViewPoints(rootJson: String): List<BiliSubtitleLine> {
 }
 
 /**
+ * 解析 `view` 响应里的分P 列表（`data.pages[]`，不需要登录）。
+ *
+ * 单 P 视频也会返回一个 `page`，调用方按"表长 > 1 才算多 P"判断；[BiliPage.cid] 是这一 P
+ * 的播放 id，字幕与截图墙都绑它，选错就等于讲了另一段内容。
+ */
+internal fun parseBiliPages(data: JsonObject?): List<BiliPage> {
+    val items = data?.get("pages") as? JsonArray ?: return emptyList()
+    return items.mapNotNull { element ->
+        val obj = element as? JsonObject ?: return@mapNotNull null
+        val p = obj["page"].intOrZero()
+        val cid = obj["cid"].longOrZero()
+        if (p <= 0 || cid <= 0L) return@mapNotNull null
+        BiliPage(
+            p = p,
+            cid = cid,
+            title = obj["part"].textOrEmpty().trim(),
+            durationSec = obj["duration"].intOrZero(),
+        )
+    }.sortedBy { it.p }
+}
+
+/**
+ * 解析合集/系列（`data.ugc_season`，不需要登录）。
+ *
+ * 结构是 `sections[].episodes[]`（一个合集可以有多段），每集才带自己的 `bvid` 与
+ * `arc.duration`。不在任何合集里的普通视频没有这个字段，返回 null——别把它当"没有结果"。
+ */
+internal fun parseBiliSeason(data: JsonObject?): BiliSeason? {
+    val season = data?.get("ugc_season") as? JsonObject ?: return null
+    val sections = season["sections"] as? JsonArray ?: return null
+    val episodes = mutableListOf<BiliSeasonEpisode>()
+    for (section in sections) {
+        val items = (section as? JsonObject)?.get("episodes") as? JsonArray ?: continue
+        for (element in items) {
+            val obj = element as? JsonObject ?: continue
+            val bvid = obj["bvid"].textOrEmpty().trim()
+            if (bvid.isEmpty()) continue
+            val arc = obj["arc"] as? JsonObject
+            episodes += BiliSeasonEpisode(
+                order = episodes.size + 1,
+                bvid = bvid,
+                title = obj["title"].textOrEmpty().trim()
+                    .ifEmpty { arc?.get("title").textOrEmpty().trim() },
+                durationSec = arc?.get("duration").intOrZero() ?: 0,
+            )
+        }
+    }
+    if (episodes.isEmpty()) return null
+    val title = season["title"].textOrEmpty().trim()
+    return BiliSeason(title = title.ifEmpty { "合集" }, episodes = episodes)
+}
+
+/**
  * AI 中文字幕优先（`ai-zh`），其次任意中文轨，最后退回第一条。
  * AI 字幕通常比 UP 上传的 CC 更完整，且语言与本应用对得上。
  */
@@ -509,8 +606,19 @@ fun spreadPick(items: List<String>, count: Int): List<String> {
 /** 从用户给的链接/裸号里取 BV 号（`BV1xx411c7mD`）。 */
 object BiliLinks {
     private val BV = Regex("BV[0-9A-Za-z]{10}")
+    private val PAGE = Regex("[?&]p=(\\d{1,3})")
 
     fun bvidOf(input: String): String? = BV.find(input.trim())?.value
+
+    /**
+     * 链接里的分P 序号（`?p=3`，1 起）；没写或写坏都按第 1 P。
+     *
+     * 只认 `?p=` / `&p=`：B 站视频页的分P 就是这个参数，短链（`b23.tv`）跳过去后也带它。
+     */
+    fun pageOf(input: String): Int {
+        val match = PAGE.find(input.trim()) ?: return 1
+        return match.groupValues[1].toIntOrNull()?.takeIf { it >= 1 } ?: 1
+    }
 }
 
 /**

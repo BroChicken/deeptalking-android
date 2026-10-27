@@ -1,5 +1,8 @@
 package com.deeptalking.core.network
 
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonObject
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
@@ -12,6 +15,8 @@ import kotlin.test.assertTrue
  * 也看不出来，只有配上 Cookie 之后才会 403。
  */
 class BiliVideoSourceTest {
+
+    private val JSON = Json { isLenient = true; ignoreUnknownKeys = true }
 
     // B 站公开文档里的固定向量（img/sub 两张 wbi 图名 → mixin key → w_rid）。
     private val imgKey = "7cd084941338484aae1ad9425b84077c"
@@ -152,6 +157,68 @@ class BiliVideoSourceTest {
         assertEquals("BV1ZKn267EY3", BiliLinks.bvidOf("BV1ZKn267EY3"))
         assertEquals("BV1ZKn267EY3", BiliLinks.bvidOf(" https://b23.tv/BV1ZKn267EY3 "))
         assertNull(BiliLinks.bvidOf("https://www.bilibili.com/video/av12345"))
+    }
+
+    @Test
+    fun pageNumberOfALinkIsReadOrDefaultsToOne() {
+        assertEquals(2, BiliLinks.pageOf("https://www.bilibili.com/video/BV1ZKn267EY3?p=2&t=30"))
+        assertEquals(7, BiliLinks.pageOf("https://www.bilibili.com/video/BV1ZKn267EY3?vd_source=x&p=7"))
+        assertEquals(1, BiliLinks.pageOf("https://www.bilibili.com/video/BV1ZKn267EY3"))
+        assertEquals(1, BiliLinks.pageOf("BV1ZKn267EY3?p=0"), "p=0 不合法就当第 1 P")
+        assertEquals(1, BiliLinks.pageOf("BV1ZKn267EY3?p=abc"))
+    }
+
+    // ---- 分P / 合集（都来自同一个 view 响应，不需要额外请求） -----------------------
+
+    private val viewData = run {
+        val view = JSON.parseToJsonElement(
+            """
+            {"data":{
+              "bvid":"BV1ZKn267EY3","title":"猫的一天","duration":1200,
+              "pages":[
+                {"page":2,"cid":111,"part":"下集","duration":700},
+                {"page":1,"cid":222,"part":"上集","duration":500}
+              ],
+              "ugc_season":{"id":9,"title":"猫猫宇宙","sections":[
+                {"episodes":[
+                  {"bvid":"BV1ZKn267EY3","title":"第一集 猫的清晨","arc":{"duration":754}},
+                  {"bvid":"BV1AAAAAAAAA","title":"第二集 猫的黄昏","arc":{"duration":640}}
+                ]}
+              ]}
+            }}
+            """.trimIndent(),
+        ).jsonObject
+        view["data"] as JsonObject
+    }
+
+    @Test
+    fun pagesAreParsedAndSortedByPartNumber() {
+        val pages = parseBiliPages(viewData)
+        assertEquals(listOf(1, 2), pages.map { it.p })
+        // cid 是这一 P 的播放 id：字幕/截图墙都绑它，选错就是讲了另一段。
+        assertEquals(222L, pages[0].cid)
+        assertEquals("上集", pages[0].title)
+        assertEquals(500, pages[0].durationSec)
+    }
+
+    @Test
+    fun seasonIsParsedIntoTitledEpisodes() {
+        val season = parseBiliSeason(viewData)
+        requireNotNull(season)
+        assertEquals("猫猫宇宙", season.title)
+        assertEquals(listOf(1, 2), season.episodes.map { it.order })
+        assertEquals("BV1AAAAAAAAA", season.episodes[1].bvid)
+        assertEquals("第二集 猫的黄昏", season.episodes[1].title)
+        assertEquals(640, season.episodes[1].durationSec)
+    }
+
+    @Test
+    fun aVideoOutsideAnyCollectionHasNoSeasonAndNoPages() {
+        val plain = JSON.parseToJsonElement("""{"data":{"bvid":"BV1","title":"单P"}}""").jsonObject
+        val data = plain["data"] as JsonObject
+        assertTrue(parseBiliPages(data).isEmpty())
+        assertNull(parseBiliSeason(data))
+        assertNull(parseBiliSeason(null))
     }
 
     @Test

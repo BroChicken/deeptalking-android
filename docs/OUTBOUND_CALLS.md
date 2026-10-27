@@ -351,7 +351,7 @@ tool: { content: <工具结果 JSON>, toolCallId }
 - parameters：附录 A-9
 
 ```text
-B 站视频：按关键词搜视频，或总结一个视频讲了什么。① 给 query → 搜视频，返回 BV 号、标题、UP主、时长、播放量、简介与封面，可据此挑一个；② 给 url（B 站链接或 BV 号）→ 总结它，返回一句话、整体脉络和带时间戳的关键节点，并写明看到哪了（mode=summary 是摘要、shallow 是没字幕只能看个大概）；③ 用户说“继续 / 后面呢”时带 from=<上次的 covered_until> 再调一次，别重复总结同一段；④ 用户想看某一刻的画面就带 frame_at（如 3:20），那一帧会作为附图贴进你的回复。总结只依据字幕/站方 AI 总结/画面截图；没字幕时不得当成逐句事实，也不要凭标题编造。两个都给时按 url 总结。
+B 站视频：按关键词搜视频，或总结一个视频讲了什么。① 给 query → 搜视频，返回 BV 号、标题、UP主、时长、播放量、简介与封面，可据此挑一个；② 给 url（B 站链接或 BV 号）→ 总结它，返回一句话、整体脉络和带时间戳的关键节点，并写明看到哪了（mode=summary 是摘要、shallow 是没字幕只能看个大概）；③ 用户说“继续 / 后面呢”时带 from=<上次的 covered_until> 再调一次，别重复总结同一段；④ 用户想看某一刻的画面就带 frame_at（如 3:20），那一帧会作为附图贴进你的回复；⑤ 视频有多个分P 时带 p 看第几 P（url 里的 ?p=3 也认）；返回里的 pages 是分P 列表、season 是所属合集（系列）的分集、chapters 是视频自己标的分段——用户问“第几段讲什么 / 下一集 / 这个系列还有哪些”就按这些回答，不要凭印象编。总结只依据字幕/站方 AI 总结/画面截图；没字幕时不得当成逐句事实，也不要凭标题编造。两个都给时按 url 总结。
 ```
 
 搜视频（`query`）：
@@ -363,10 +363,12 @@ B 站视频：按关键词搜视频，或总结一个视频讲了什么。① �
 
 总结（`url`）：
 ```json
-{"ok":true,"platform":"bilibili","bvid":"BV1xx411c7mD","title":"…","author":"…","duration":"12:34","duration_sec":754,"source":"subtitle","mode":"summary","has_subtitle":true,"frames":6,"cached":false,"covered_until":"12:30","unread_sec":4,"can_continue":false,"summary":"一句话：…\n整体脉络：先…然后…最后…\n关键节点：\n- 01:15 …","note":"…这是摘要，不是全文…"}
+{"ok":true,"platform":"bilibili","bvid":"BV1xx411c7mD","title":"…","author":"…","duration":"12:34","duration_sec":754,"source":"subtitle","mode":"summary","has_subtitle":true,"frames":6,"cached":false,"page":2,"page_count":2,"pages":[{"p":1,"title":"上集","duration":"05:00"},{"p":2,"title":"下集","duration":"12:34"}],"chapters":[{"from":"00:00","title":"开场"},{"from":"02:00","title":"矛盾的起点"}],"season":{"title":"猫猫宇宙","count":2,"current":1,"episodes":[{"order":1,"bvid":"BV1xx411c7mD","title":"第一集 猫的清晨","duration":"12:34"}]},"covered_until":"12:30","unread_sec":4,"can_continue":false,"summary":"一句话：…\n整体脉络：先…然后…最后…\n关键节点：\n- 01:15 …","note":"…这是摘要，不是全文…"}
 ```
 
 `source` 取值：`subtitle`（逐句字幕经 `VideoSummaryService` 分块总结）、`official`（直接采用 B 站官方 AI 总结，零 LLM 调用）、`metadata`（没有字幕，只能靠简介/章节/画面看个大概）。`has_subtitle=false` 时必须在回复里说清"没字幕"。`mode=summary` 表示这是摘要不是全文；`covered_until`（读到哪）/`unread_sec`（还剩多少秒没读）/`can_continue` 一起告诉模型有没有看完——`can_continue=true` 时 `note` 会要求模型如实说看到哪，用户要继续就带 `from=<covered_until>`。`frames` 是这次抽到的截图数量（`0` 表示没抽到或模型不支持看图）。带 `frame_at` 时还有 `frame_at`/`frame_attached`：`frame_attached=true` 表示那一帧已经作为附图贴出。`cached=true` 表示命中 7 天本地缓存，没有重新抓取。失败时返回 `{"ok":false,"reason":…}`。
+
+**结构字段（分P / 合集 / 分段）**：`page` 是这次看的第几 P；多 P 视频才带 `page_count` + `pages`（每项 `p`/`title`/`duration`，最多 50 条）；`chapters` 是 `view_points` 的分段标签（`from`/`title`，免登录可取）；`season` 是 `ugc_season` 合集（`title`/`count`/`current` 当前第几集/`episodes` 每项 `order`/`bvid`/`title`/`duration`，最多 50 条）。三者都来自**同一个** `view` 响应，不额外发请求；`note` 会附带"怎么用"（换第几 P 带 `p`、要看某一集给那集 BV 号、分段直接按 `chapters` 回答）。缓存键：第 1 P 用裸 BV 号（历史缓存继续有效），第 N>1 P 用 `<bvid>#p<N>`，互不串味。
 
 **无字幕时结果不是纯文本**：抽到截图且 `has_subtitle=false` 时，工具结果是内容数组——第一项 `input_text`（上面的 JSON），后面最多 4 项 `input_image`（`detail:"low"`，即视频画面本身，**按时间均匀挑**，覆盖开头/中段/结尾）。能识图的模型可以直接看画面，再结合简介/章节说"看个大概"。有字幕时只给纯文本（图片对文字信息没有增量）；命中缓存时也一定是纯文本（缓存只存文字，不存 base64）。
 
@@ -1241,7 +1243,8 @@ speakingStyle 写“声音底色”：1~2 句，只写语速、用词层次、�
     "type": "object",
     "properties": {
         "query": { "type": "string", "description": "检索关键词（搜视频时用，从用户意图提取）" },
-        "url": { "type": "string", "description": "B 站视频链接或 BV 号（总结时用；必须来自上下文里真实存在的视频，禁止编造）" },
+        "url": { "type": "string", "description": "B 站视频链接或 BV 号（总结时用；必须来自上下文里真实存在的视频，禁止编造）；链接里的 ?p=3 会自动当作第 3 P" },
+        "p": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "分P序号（1 起）：多 P 视频看第几 P，默认 1" },
         "focus": { "type": "string", "description": "总结时用户特别想了解的点，如“结论是什么”（可选）" },
         "from": { "type": "string", "description": "从第几分钟开始看（如 12:30 或 750 秒）；用于视频太长只看了一段之后继续看后段（可选）" },
         "frame_at": { "type": "string", "description": "把视频某一刻的画面贴进回复（如 3:20）；只取一张，会作为附图发出（可选）" },
@@ -1252,7 +1255,7 @@ speakingStyle 写“声音底色”：1~2 句，只写语速、用词层次、�
 }
 ```
 
-没有 `required`：按“给了什么”分派——给 `url` 优先总结，只有 `query` 时搜视频，两个都没给直接报错。`url` 里只取 `BV[0-9A-Za-z]{10}`；拿不到 BV 号时**不发任何网络请求**（避免模型把任意网址当视频去抓）。`from`/`frame_at` 接受 `mm:ss`、`h:mm:ss` 或纯秒数，解析失败直接报错、不发请求。
+没有 `required`：按“给了什么”分派——给 `url` 优先总结，只有 `query` 时搜视频，两个都没给直接报错。`url` 里只取 `BV[0-9A-Za-z]{10}`；拿不到 BV 号时**不发任何网络请求**（避免模型把任意网址当视频去抓）。分P 序号取显式 `p`，没给则读 `url` 的 `?p=`，都没有按第 1 P。`from`/`frame_at` 接受 `mm:ss`、`h:mm:ss` 或纯秒数，解析失败直接报错、不发请求。
 
 ## 附录 B：turn worker 的 `submit_state`
 

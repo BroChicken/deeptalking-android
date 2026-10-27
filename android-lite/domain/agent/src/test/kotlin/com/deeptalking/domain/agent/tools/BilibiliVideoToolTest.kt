@@ -1,6 +1,9 @@
 package com.deeptalking.domain.agent.tools
 
 import com.deeptalking.core.model.Character
+import com.deeptalking.core.network.BiliPage
+import com.deeptalking.core.network.BiliSeason
+import com.deeptalking.core.network.BiliSeasonEpisode
 import com.deeptalking.core.network.BiliStoryboard
 import com.deeptalking.core.network.BiliSubtitleLine
 import com.deeptalking.core.network.BiliVideoSource
@@ -34,9 +37,11 @@ class BilibiliVideoToolTest {
         private val storyboard: BiliStoryboard? = null,
     ) : BiliVideoSource {
         val requested = mutableListOf<String>()
+        val requestedPages = mutableListOf<Int>()
 
-        override suspend fun load(bvid: String): BiliVideoTextResult {
+        override suspend fun load(bvid: String, page: Int): BiliVideoTextResult {
             requested += bvid
+            requestedPages += page
             return result
         }
 
@@ -74,12 +79,18 @@ class BilibiliVideoToolTest {
     }
 
     private class FakeCache(private val stored: String? = null) : VideoSummaryCache {
+        val reads = mutableListOf<String>()
+        val writtenKeys = mutableListOf<String>()
         var written: String? = null
         var writes = 0
 
-        override suspend fun read(bvid: String): String? = stored
+        override suspend fun read(bvid: String): String? {
+            reads += bvid
+            return stored
+        }
 
         override suspend fun write(bvid: String, payload: String) {
+            writtenKeys += bvid
             written = payload
             writes++
         }
@@ -569,6 +580,88 @@ class BilibiliVideoToolTest {
         assertTrue(result.contentJson.contains("\"ok\":false"))
         assertTrue(result.contentJson.contains("frame_at"))
         assertTrue(source.requested.isEmpty())
+    }
+
+    // ------------------------------------------------------- 分P / 合集(系列) / 分段
+
+    private fun multiPartText() = subtitleText().copy(
+        page = 2,
+        pages = listOf(
+            BiliPage(1, 43032511529L, "上集：清晨", 300),
+            BiliPage(2, 43032511530L, "下集：黄昏", 454),
+        ),
+        chapters = listOf(BiliSubtitleLine(0, "开场"), BiliSubtitleLine(120, "矛盾的起点")),
+    )
+
+    private fun seasonText() = multiPartText().copy(
+        season = BiliSeason(
+            "猫猫宇宙",
+            listOf(
+                BiliSeasonEpisode(1, "BV1ZKn267EY3", "第一集 猫的清晨", 754),
+                BiliSeasonEpisode(2, "BV1AAAAAAAAA", "第二集 猫的黄昏", 640),
+            ),
+        ),
+    )
+
+    @Test
+    fun thePayloadCarriesPagesChaptersAndSeason() = runBlocking {
+        val tool = BilibiliVideoTool(
+            FakeSource(BiliVideoTextResult.Ok(seasonText())),
+            summary = VideoSummaryService(RecordingSummarizer()),
+        )
+
+        val body = tool.execute(call("""{"url":"BV1ZKn267EY3","p":2}"""), context).contentJson
+
+        assertTrue("当前第几P：$body", body.contains("\"page\":2"))
+        assertTrue(body.contains("\"page_count\":2"))
+        assertTrue(body.contains("\"pages\""))
+        assertTrue(body.contains("下集：黄昏"))
+        assertTrue("分段：$body", body.contains("\"chapters\""))
+        assertTrue(body.contains("矛盾的起点"))
+        assertTrue("合集：$body", body.contains("\"season\""))
+        assertTrue(body.contains("猫猫宇宙"))
+        assertEquals("第一集在合集里的序号", true, body.contains("\"current\":1"))
+        // note 要教模型怎么用这些结构，否则它会把列表当正文念出来。
+        assertTrue(body.contains("分P"))
+    }
+
+    @Test
+    fun explicitPageAndUrlPageAreBothHonoured() = runBlocking {
+        val byArg = FakeSource(BiliVideoTextResult.Ok(multiPartText()))
+        BilibiliVideoTool(byArg, summary = VideoSummaryService(RecordingSummarizer()))
+            .execute(call("""{"url":"BV1ZKn267EY3","p":3}"""), context)
+        assertEquals(listOf(3), byArg.requestedPages)
+
+        val byUrl = FakeSource(BiliVideoTextResult.Ok(multiPartText()))
+        BilibiliVideoTool(byUrl, summary = VideoSummaryService(RecordingSummarizer()))
+            .execute(call("""{"url":"https://www.bilibili.com/video/BV1ZKn267EY3?p=4"}"""), context)
+        assertEquals(listOf(4), byUrl.requestedPages)
+
+        val plain = FakeSource(BiliVideoTextResult.Ok(subtitleText()))
+        BilibiliVideoTool(plain, summary = VideoSummaryService(RecordingSummarizer()))
+            .execute(call("""{"url":"BV1ZKn267EY3"}"""), context)
+        assertEquals(listOf(1), plain.requestedPages)
+    }
+
+    @Test
+    fun eachPartKeepsItsOwnCacheEntry() = runBlocking {
+        val partTwo = FakeCache()
+        BilibiliVideoTool(
+            FakeSource(BiliVideoTextResult.Ok(multiPartText())),
+            summary = VideoSummaryService(RecordingSummarizer()),
+            cache = partTwo,
+        ).execute(call("""{"url":"BV1ZKn267EY3","p":2}"""), context)
+        assertEquals(listOf("BV1ZKn267EY3#p2"), partTwo.reads)
+        assertEquals(listOf("BV1ZKn267EY3#p2"), partTwo.writtenKeys)
+
+        // 第 1 P 沿用裸 BV 号做键：历史缓存继续有效。
+        val partOne = FakeCache()
+        BilibiliVideoTool(
+            FakeSource(BiliVideoTextResult.Ok(subtitleText())),
+            summary = VideoSummaryService(RecordingSummarizer()),
+            cache = partOne,
+        ).execute(call("""{"url":"BV1ZKn267EY3"}"""), context)
+        assertEquals(listOf("BV1ZKn267EY3"), partOne.writtenKeys)
     }
 
     // -------------------------------------------------------------- registration

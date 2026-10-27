@@ -60,9 +60,12 @@ class BilibiliVideoTool(
             "UP主、时长、播放量、简介与封面，可据此挑一个；② 给 url（B 站链接或 BV 号）→ 总结它，返回一句话、" +
             "整体脉络和带时间戳的关键节点，并写明看到哪了（mode=summary 是摘要、shallow 是没字幕只能看个大概）；" +
             "③ 用户说“继续 / 后面呢”时带 from=<上次的 covered_until> 再调一次，别重复总结同一段；" +
-            "④ 用户想看某一刻的画面就带 frame_at（如 3:20），那一帧会作为附图贴进你的回复。" +
+            "④ 用户想看某一刻的画面就带 frame_at（如 3:20），那一帧会作为附图贴进你的回复；" +
+            "⑤ 视频有多个分P 时带 p 看第几 P（url 里的 ?p=3 也认）；返回里的 pages 是分P 列表、season 是所属合集" +
+            "（系列）的分集、chapters 是视频自己标的分段——用户问“第几段讲什么 / 下一集 / 这个系列还有哪些”就按这些回答，" +
+            "不要凭印象编。" +
             "总结只依据字幕/站方 AI 总结/画面截图；没字幕时不得当成逐句事实，也不要凭标题编造。",
-        parametersJson = """{"type":"object","properties":{"query":{"type":"string","description":"检索关键词（搜视频时用，从用户意图提取）"},"url":{"type":"string","description":"B 站视频链接或 BV 号（总结时用；必须来自上下文里真实存在的视频，禁止编造）"},"focus":{"type":"string","description":"总结时用户特别想了解的点，如“结论是什么”（可选）"},"from":{"type":"string","description":"从第几分钟开始看（如 12:30 或 750 秒）；用于视频太长只看了一段之后继续看后段（可选）"},"frame_at":{"type":"string","description":"把视频某一刻的画面贴进回复（如 3:20）；只取一张，会作为附图发出（可选）"},"refresh":{"type":"boolean","description":"true = 忽略本地缓存重新看一遍（可选）"},"limit":{"type":"integer","minimum":1,"maximum":20,"description":"搜索条数，默认 6（总结时忽略）"}},"additionalProperties":false}""",
+        parametersJson = """{"type":"object","properties":{"query":{"type":"string","description":"检索关键词（搜视频时用，从用户意图提取）"},"url":{"type":"string","description":"B 站视频链接或 BV 号（总结时用；必须来自上下文里真实存在的视频，禁止编造）；链接里的 ?p=3 会自动当作第 3 P"},"p":{"type":"integer","minimum":1,"maximum":1000,"description":"分P序号（1 起）：多 P 视频看第几 P，默认 1"},"focus":{"type":"string","description":"总结时用户特别想了解的点，如“结论是什么”（可选）"},"from":{"type":"string","description":"从第几分钟开始看（如 12:30 或 750 秒）；用于视频太长只看了一段之后继续看后段（可选）"},"frame_at":{"type":"string","description":"把视频某一刻的画面贴进回复（如 3:20）；只取一张，会作为附图发出（可选）"},"refresh":{"type":"boolean","description":"true = 忽略本地缓存重新看一遍（可选）"},"limit":{"type":"integer","minimum":1,"maximum":20,"description":"搜索条数，默认 6（总结时忽略）"}},"additionalProperties":false}""",
     )
 
     override suspend fun execute(call: ToolCall, context: AgentContext): AgentToolResult {
@@ -87,7 +90,9 @@ class BilibiliVideoTool(
                 parseBiliDurationClock(frameRaw)
                     ?: return AgentToolResult(errorJson("frame_at 要写成 mm:ss 或秒数，例如 3:20"))
             }
-            return summarize(rawUrl, focus, fromSec, frameAt, refresh)
+            // 显式 `p` 优先；没给就看链接里的 `?p=`（用户直接贴第 3 P 的链接时不要悄悄讲第 1 P）。
+            val page = ToolArgs.int(args, "p")?.takeIf { it >= 1 } ?: BiliLinks.pageOf(rawUrl)
+            return summarize(rawUrl, page, focus, fromSec, frameAt, refresh)
         }
         if (query.isNotEmpty()) {
             val limit = (ToolArgs.int(args, "limit") ?: DEFAULT_LIMIT).coerceIn(1, MAX_LIMIT)
@@ -107,6 +112,7 @@ class BilibiliVideoTool(
 
     private suspend fun summarize(
         rawUrl: String,
+        page: Int,
         focus: String?,
         fromSec: Int,
         frameAtSec: Int?,
@@ -118,15 +124,22 @@ class BilibiliVideoTool(
 
         // 只缓存"从头看的泛总结"：带 focus / from 的问题每次都得重新问，
         // 否则“继续看”会命中上一次的同一份摘要（这就是用户觉得它在敷衍的直接原因）。
+        val key = cacheKey(bvid, page)
         if (focus == null && fromSec == 0 && !refresh) {
-            cache?.read(bvid)?.let { cached -> return AgentToolResult(withCached(cached)) }
+            cache?.read(key)?.let { cached -> return AgentToolResult(withCached(cached)) }
         }
 
-        return when (val result = provider.load(bvid)) {
+        return when (val result = provider.load(bvid, page)) {
             is BiliVideoTextResult.Failure -> AgentToolResult(errorJson(failureReason(result)))
             is BiliVideoTextResult.Ok -> render(provider, result.text, focus, fromSec, frameAtSec)
         }
     }
+
+    /**
+     * 缓存键：同一 BV 号的第 2 P 与第 1 P 是两个不同的视频，不能互相命中。
+     * 第 1 P 保持裸 BV 号，历史缓存继续有效。
+     */
+    private fun cacheKey(bvid: String, page: Int): String = if (page > 1) "$bvid#p$page" else bvid
 
     private suspend fun render(
         provider: BiliVideoSource,
@@ -178,7 +191,7 @@ class BilibiliVideoTool(
             frameAttached = frameRef != null,
         )
         // 缓存里只放纯文字结果（不带 base64 截图），命中时再补上"已缓存"标记。
-        if (focus == null && fromSec == 0) runCatching { cache?.write(text.bvid, payload) }
+        if (focus == null && fromSec == 0) runCatching { cache?.write(cacheKey(text.bvid, text.page), payload) }
         return AgentToolResult(
             contentJson = attachFrames(payload, text, imageRefs, digest.imagesAccepted),
             imageFileRef = frameRef,
@@ -271,6 +284,60 @@ class BilibiliVideoTool(
             put("has_subtitle", text.hasSubtitle)
             put("frames", frameCount)
             put("cached", false)
+            put("page", text.page)
+            if (text.pages.size > 1) {
+                put("page_count", text.pages.size)
+                put(
+                    "pages",
+                    buildJsonArray {
+                        text.pages.take(MAX_LISTED_PAGES).forEach { item ->
+                            add(buildJsonObject {
+                                put("p", item.p)
+                                if (item.title.isNotEmpty()) put("title", item.title)
+                                put("duration", formatBiliClock(item.durationSec))
+                            })
+                        }
+                    },
+                )
+            }
+            if (text.chapters.isNotEmpty()) {
+                put(
+                    "chapters",
+                    buildJsonArray {
+                        text.chapters.forEach { chapter ->
+                            add(buildJsonObject {
+                                put("from", formatBiliClock(chapter.fromSec))
+                                put("title", chapter.text)
+                            })
+                        }
+                    },
+                )
+            }
+            text.season?.let { season ->
+                put(
+                    "season",
+                    buildJsonObject {
+                        put("title", season.title)
+                        put("count", season.episodes.size)
+                        // 当前视频在合集里的序号（1 起）；对不上就省略，别写 0。
+                        season.episodes.indexOfFirst { it.bvid == text.bvid }
+                            .takeIf { it >= 0 }?.let { put("current", it + 1) }
+                        put(
+                            "episodes",
+                            buildJsonArray {
+                                season.episodes.take(MAX_LISTED_EPISODES).forEach { episode ->
+                                    add(buildJsonObject {
+                                        put("order", episode.order)
+                                        put("bvid", episode.bvid)
+                                        put("title", episode.title)
+                                        put("duration", formatBiliClock(episode.durationSec))
+                                    })
+                                }
+                            },
+                        )
+                    },
+                )
+            }
             if (fromSec > 0) put("from", formatBiliClock(fromSec))
             if (covered != null) put("covered_until", formatBiliClock(covered))
             if (unread != null) put("unread_sec", unread)
@@ -291,9 +358,31 @@ class BilibiliVideoTool(
                     unread = unread,
                     frameAt = frameAtSec,
                     frameAttached = frameAttached,
-                ),
+                ) + structureNote(text),
             )
         }.toString()
+    }
+
+    /**
+     * 结构信息的"怎么用"提示：分P / 合集 / 分段。
+     *
+     * 不给这句，模型要么无视这些字段，要么把 pages/chapters 当成剧情内容念出来。
+     */
+    private fun structureNote(text: BiliVideoText): String = buildString {
+        if (text.pages.size > 1) {
+            append("。这个视频有 ").append(text.pages.size).append(" 个分P，这次看的是第 ")
+                .append(text.page).append(" P；用户要别的分P 时带 url=<bvid>&p=<序号>（或直接给 p），")
+                .append("不要拿这一 P 的内容当整个视频")
+        }
+        text.season?.let { season ->
+            val current = season.episodes.indexOfFirst { it.bvid == text.bvid }
+            append("。它属于合集「").append(season.title).append("」，共 ").append(season.episodes.size).append(" 集")
+            if (current >= 0) append("，当前是第 ").append(current + 1).append(" 集")
+            append("；用户问「下一集/这个系列还有什么」就按 season.episodes 回答，要看某一集就给那一集的 BV 号")
+        }
+        if (text.chapters.isNotEmpty()) {
+            append("。chapters 是视频自己标的分段；用户问「第几段讲什么、大概怎么分」直接按它回答，不要凭印象编")
+        }
     }
 
     private fun noteFor(
@@ -352,5 +441,11 @@ class BilibiliVideoTool(
 
         const val DEFAULT_LIMIT = 6
         const val MAX_LIMIT = 20
+
+        /** 回给主模型的分P 列表条数上限：够回答"有哪几P"，又不至于把结果撑爆。 */
+        const val MAX_LISTED_PAGES = 50
+
+        /** 合集分集列表条数上限（几百集的合集会截断，note 里说明当前是第几集）。 */
+        const val MAX_LISTED_EPISODES = 50
     }
 }

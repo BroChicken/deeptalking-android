@@ -58,21 +58,21 @@ class VideoSummaryService(private val summarizer: VideoSummarizer) {
         val chunks = chunkTranscript(text.lines)
         if (chunks.isEmpty()) return null
         val covered = chunks.lastOrNull()?.lines?.lastOrNull()?.fromSec
-        val header = headerOf(text, focus)
+        val header = headerOf(text, focus, includeChapters = true)
         if (chunks.size == 1) {
             val user = header + transcriptBlock(chunks[0].lines) + framesBlock(imageRefs)
             return summarizer.complete(WRITER_SYSTEM + framesRule(imageRefs.size), user, imageRefs)
                 ?.normalized(covered)
         }
         val partials = chunks.mapNotNull { chunk ->
-            val user = headerOf(text, null) +
+            val user = headerOf(text, null, includeChapters = true) +
                 "（第 " + chunk.index + "/" + chunks.size + " 段）\n" +
                 transcriptBlock(chunk.lines)
             summarizer.complete(MAP_SYSTEM, user, emptyList())?.normalized()
         }
         if (partials.isEmpty()) return null
         val reduceUser = buildString {
-            append(headerOf(text, focus))
+            append(headerOf(text, focus, includeChapters = true))
             append("【分段要点】\n")
             partials.forEachIndexed { position, partial ->
                 append("第 ").append(position + 1).append(" 段：\n").append(partial.text).append('\n')
@@ -116,12 +116,36 @@ class VideoSummaryService(private val summarizer: VideoSummarizer) {
         )?.normalized()
     }
 
-    private fun headerOf(text: BiliVideoText, focus: String?): String = buildString {
+    /**
+     * 给总结模型的视频头部信息。
+     *
+     * [includeChapters] 只给"有字幕"的路径用：无字幕路径（[digestShallow]）自己会拼一份
+     * 【章节标签】，再叠一次就成了重复上下文。
+     */
+    private fun headerOf(text: BiliVideoText, focus: String?, includeChapters: Boolean = false): String = buildString {
         append("【视频】").append(text.title)
         if (text.author.isNotEmpty()) append("　UP主：").append(text.author)
         append("　时长：").append(formatBiliClock(text.durationSec)).append('\n')
         val desc = text.desc.trim().replace(Regex("\\s+"), " ").take(200)
         if (desc.isNotEmpty()) append("【简介】").append(desc).append('\n')
+        if (text.pages.size > 1) {
+            val current = text.pages.firstOrNull { it.p == text.page }
+            append("【分P】第 ").append(text.page).append('/').append(text.pages.size).append(" P")
+            if (current != null && current.title.isNotEmpty()) append("：").append(current.title)
+            append("（总结只针对这一 P，别当成整个视频）\n")
+        }
+        text.season?.let { season ->
+            append("【合集】").append(season.title).append("（共 ").append(season.episodes.size).append(" 集")
+            val index = season.episodes.indexOfFirst { it.bvid == text.bvid }
+            if (index >= 0) append("，当前第 ").append(index + 1).append(" 集")
+            append("）\n")
+        }
+        if (includeChapters && text.chapters.isNotEmpty()) {
+            append("【分段】\n")
+            text.chapters.forEach { chapter ->
+                append("- ").append(formatBiliClock(chapter.fromSec)).append(' ').append(chapter.text).append('\n')
+            }
+        }
         val wanted = focus?.trim()?.takeIf { it.isNotEmpty() }
         if (wanted != null) append("【用户特别想知道】").append(wanted).append('\n')
     }
