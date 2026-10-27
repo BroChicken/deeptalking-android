@@ -71,19 +71,6 @@ import com.deeptalking.core.model.LorebookOrigin
 import com.deeptalking.core.model.StaticProfile
 import java.util.UUID
 
-private val STATIC_FIELDS = listOf(
-    "gender" to "性别",
-    "age" to "年龄",
-    "race" to "种族",
-    "appearance" to "外貌特征",
-    "personality" to "性格特征",
-    "fears" to "恐惧/弱点",
-    "background" to "个人背景",
-    "speakingStyle" to "声音底色",
-    "language" to "语言/方言",
-    "userAddress" to "对用户的称呼",
-)
-
 private val DYNAMIC_FIELDS = listOf(
     "currentSituation" to "当前处境",
     "currentLocation" to "当前位置/场景",
@@ -873,7 +860,8 @@ private fun BasicTab(
         }
     }
     var fillHint by remember { mutableStateOf("") }
-    var regenField by rememberSaveable { mutableStateOf("emoji") }
+    // 按「正在编辑的对象」记住选择：切到别的成员后不要带着上一个人的字段（那会重生成错人）。
+    var regenField by rememberSaveable(draft.id, memberIndex) { mutableStateOf("emoji") }
     var regenHint by rememberSaveable { mutableStateOf("") }
     var regenExpanded by rememberSaveable { mutableStateOf(false) }
     var regenBusy by remember { mutableStateOf(false) }
@@ -940,9 +928,9 @@ private fun BasicTab(
         }
 
         Text("重新生成字段", fontSize = 13.sp, color = MaterialTheme.legacy.textSecondary)
-        val fieldOptions = listOf("emoji" to "头像 emoji") + STATIC_FIELDS
+        val fieldOptions = regenerateFieldOptions()
         LegacyDropdown(
-            selected = fieldOptions.firstOrNull { it.first == regenField }?.second ?: "头像 emoji",
+            selected = regenerateFieldLabel(fieldOptions, regenField),
             options = fieldOptions,
             expanded = regenExpanded,
             onExpandedChange = { regenExpanded = it },
@@ -1286,6 +1274,13 @@ private fun LegacyField(
     }
 }
 
+/**
+ * 一个下拉框。
+ *
+ * `options` 的每一项是 **`(要显示的文本, 点击后回调的值)`**：`first` 只用于显示，`second`
+ * 才是调用方要的东西。两者顺序搞反不会编译报错，只会让菜单显示英文键、选中值不更新
+ * （「重新生成字段」就踩过这个坑，见 [regenerateFieldOptions]）。
+ */
 @Composable
 private fun <T> LegacyDropdown(
     selected: String,
@@ -1310,10 +1305,10 @@ private fun <T> LegacyDropdown(
             Text("▾", fontSize = 13.sp, color = legacy.textMuted)
         }
         androidx.compose.material3.DropdownMenu(expanded = expanded, onDismissRequest = { onExpandedChange(false) }) {
-            options.forEach { (label, value) ->
+            options.forEach { (optionLabel, optionValue) ->
                 androidx.compose.material3.DropdownMenuItem(
-                    text = { Text(label, color = legacy.text) },
-                    onClick = { onSelect(value) },
+                    text = { Text(optionLabel, color = legacy.text) },
+                    onClick = { onSelect(optionValue) },
                 )
             }
         }
