@@ -5,6 +5,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.intOrNull
@@ -85,6 +86,8 @@ data class BiliVideoText(
     val durationSec: Int,
     val cid: Long,
     val upMid: Long,
+    /** 视频的 `aid`（av 号）：评论区接口按它取 `oid`，**不是** cid。 */
+    val aid: Long = 0L,
     val desc: String,
     val source: Source,
     val lang: String,
@@ -120,7 +123,13 @@ sealed interface BiliVideoTextResult {
     data class Failure(val reason: String, val needsLogin: Boolean = false) : BiliVideoTextResult
 }
 
-/** 取一个 B 站视频的可总结材料（字幕 / 官方总结 / 只有元信息 + 章节）。 */
+/**
+ * 取一个 B 站视频的可总结材料（字幕 / 官方总结 / 只有元信息 + 章节），以及按需申请的周边信息。
+ *
+ * 周边信息（[comments] / [related] / [upCollections] / [collectionEpisodes] / [danmaku]）**全部有
+ * 默认实现返回 null**：它们只在调用方明确要时才发请求，老实现与测试替身因此不用改一行。
+ * 返回 null 一律表示"这次没拿到"（可能没有、可能被风控），调用方按降级处理，不要当成异常。
+ */
 interface BiliVideoSource {
     /**
      * [page] 是要看第几 P（1 起）。有多个分P时按它选 `cid`（字幕、截图墙都绑这一 P）；
@@ -130,6 +139,21 @@ interface BiliVideoSource {
 
     /** 截图墙（抽帧用）；接口不可用或没有截图时返回 null。默认不支持，便于测试替身。 */
     suspend fun storyboard(bvid: String, cid: Long): BiliStoryboard? = null
+
+    /** 评论区（置顶 + 热门），[aid] 是 `view` 里的 `aid`。需要登录态，取不到返回 null。 */
+    suspend fun comments(bvid: String, aid: Long): List<BiliComment>? = null
+
+    /** 相关推荐（免登录）。 */
+    suspend fun related(bvid: String): List<BiliRelatedVideo>? = null
+
+    /** UP 主的合集/系列总览（免登录）；[upMid] 是 `view.owner.mid`。 */
+    suspend fun upCollections(upMid: Long): List<BiliCollection>? = null
+
+    /** 某个合集/系列的全部条目（免登录）；[collectionId] 是 [BiliCollection.id]。 */
+    suspend fun collectionEpisodes(upMid: Long, collectionId: Long): List<BiliCollectionItem>? = null
+
+    /** 弹幕的「高频 + 时间线」视图（免登录），按 [cid] 取；这个视频没有弹幕时返回 null。 */
+    suspend fun danmaku(bvid: String, cid: Long): BiliDanmakuDigest? = null
 }
 
 /**
@@ -188,6 +212,7 @@ class HttpBiliVideoSource(
                 durationSec = selectedPage?.durationSec?.takeIf { it > 0 } ?: data["duration"].intOrZero(),
                 cid = cid,
                 upMid = owner?.get("mid").longOrZero() ?: 0L,
+                aid = data["aid"].longOrZero(),
                 desc = data["desc"].textOrEmpty(),
                 pages = pages,
                 season = season,
@@ -243,6 +268,96 @@ class HttpBiliVideoSource(
         parseBiliStoryboard(root.toString())
     }
 
+    /**
+     * 评论区：**唯一有风控风险的一项**（匿名请求实测直接 `-352`）。
+     *
+     * 所以走三级降级：wbi 主接口（`mode=3` 热门排序，要登录态 + 签名）→ 旧接口 → 放弃。
+     * 放弃时返回 null，工具层会写进 `extras_failed` 让模型如实说"抓不到"，而不是编评论。
+     */
+    override suspend fun comments(bvid: String, aid: Long): List<BiliComment>? = withContext(Dispatchers.IO) {
+        if (aid <= 0L) return@withContext null
+        val referer = "https://www.bilibili.com/video/$bvid"
+        val keys = wbiKeys()
+        if (keys != null) {
+            val query = BiliWbi.signedQuery(
+                params = mapOf(
+                    "oid" to aid.toString(),
+                    "type" to "1",
+                    "mode" to "3",
+                    "pagination_str" to """{"offset":""}""",
+                    "plat" to "1",
+                    "web_location" to "1315875",
+                ),
+                imgKey = keys.imgKey,
+                subKey = keys.subKey,
+                wts = nowSeconds(),
+            )
+            fetchComments("https://api.bilibili.com/x/v2/reply/wbi/main?$query", referer)
+                ?.let { return@withContext it }
+        }
+        fetchComments(
+            "https://api.bilibili.com/x/v2/reply?oid=$aid&type=1&sort=2&ps=20&pn=1&plat=1",
+            referer,
+        )
+    }
+
+    private fun fetchComments(url: String, referer: String): List<BiliComment>? {
+        val root = getJsonObject(url, referer) ?: return null
+        if (root["code"].intOrZero() != 0) return null
+        return parseBiliComments(root.toString()).takeIf { it.isNotEmpty() }
+    }
+
+    /** 相关推荐（免登录）。 */
+    override suspend fun related(bvid: String): List<BiliRelatedVideo>? = withContext(Dispatchers.IO) {
+        val root = getJsonObject(
+            url = "https://api.bilibili.com/x/web-interface/archive/related?bvid=$bvid",
+            referer = "https://www.bilibili.com/video/$bvid",
+        ) ?: return@withContext null
+        if (root["code"].intOrZero() != 0) return@withContext null
+        parseBiliRelated(root.toString()).takeIf { it.isNotEmpty() }
+    }
+
+    /** UP 主的合集/系列总览（免登录）。 */
+    override suspend fun upCollections(upMid: Long): List<BiliCollection>? = withContext(Dispatchers.IO) {
+        if (upMid <= 0L) return@withContext null
+        val root = getJsonObject(
+            url = "https://api.bilibili.com/x/polymer/web-space/seasons_series_list" +
+                "?mid=$upMid&page_num=1&page_size=20",
+            referer = "https://space.bilibili.com/$upMid",
+        ) ?: return@withContext null
+        if (root["code"].intOrZero() != 0) return@withContext null
+        parseBiliUpCollections(root.toString()).takeIf { it.isNotEmpty() }
+    }
+
+    /** 某个合集/系列的全部条目（免登录）。 */
+    override suspend fun collectionEpisodes(upMid: Long, collectionId: Long): List<BiliCollectionItem>? =
+        withContext(Dispatchers.IO) {
+            if (upMid <= 0L || collectionId <= 0L) return@withContext null
+            val root = getJsonObject(
+                url = "https://api.bilibili.com/x/polymer/web-space/seasons_archives_list" +
+                    "?mid=$upMid&season_id=$collectionId&page_num=1&page_size=30&sort_reverse=false",
+                referer = "https://space.bilibili.com/$upMid",
+            ) ?: return@withContext null
+            if (root["code"].intOrZero() != 0) return@withContext null
+            parseBiliCollectionEpisodes(root.toString()).takeIf { it.isNotEmpty() }
+        }
+
+    /**
+     * 弹幕：`comment.bilibili.com/<cid>.xml`（免登录、不受 wbi 风控）。
+     *
+     * 解析完立刻聚合成「高频 + 时间线」——原始弹幕动辄上千条，绝不回传给上层。
+     */
+    override suspend fun danmaku(bvid: String, cid: Long): BiliDanmakuDigest? = withContext(Dispatchers.IO) {
+        if (cid <= 0L) return@withContext null
+        val xml = getRaw(
+            url = "https://comment.bilibili.com/$cid.xml",
+            referer = "https://www.bilibili.com/video/$bvid",
+        ) ?: return@withContext null
+        val lines = parseBiliDanmakuXml(xml)
+        if (lines.isEmpty()) return@withContext null
+        digestBiliDanmaku(lines).takeIf { !it.isEmpty }
+    }
+
     private data class Meta(
         val bvid: String,
         val title: String,
@@ -250,6 +365,7 @@ class HttpBiliVideoSource(
         val durationSec: Int,
         val cid: Long,
         val upMid: Long,
+        val aid: Long = 0L,
         val desc: String,
         val pages: List<BiliPage> = emptyList(),
         val season: BiliSeason? = null,
@@ -269,6 +385,7 @@ class HttpBiliVideoSource(
         durationSec = durationSec,
         cid = cid,
         upMid = upMid,
+        aid = aid,
         desc = desc,
         source = source,
         lang = lang,
@@ -637,18 +754,21 @@ fun parseBiliDurationClock(text: String): Int? {
     }
 }
 
-private val JSON_FOR_PARSING = Json {
+/** 解析用的宽松 Json：B 站不同接口对同一字段的类型并不一致（数字/字符串混着来）。 */
+internal val JSON_FOR_PARSING = Json {
     ignoreUnknownKeys = true
     isLenient = true
 }
 
-private fun JsonElement?.textOrEmpty(): String {
+/** 取字符串；`null`/`JsonNull` 一律当空串（JSON 里的 `null` 会被误读成 "null"）。 */
+internal fun JsonElement?.textOrEmpty(): String {
     val primitive = this as? JsonPrimitive ?: return ""
+    if (primitive is JsonNull) return ""
     return primitive.content
 }
 
-private fun JsonElement?.intOrZero(): Int =
-    (this as? JsonPrimitive)?.let { it.intOrNull ?: it.content.toDoubleOrNull()?.toInt() } ?: 0
+internal fun JsonElement?.intOrZero(): Int =
+    (this as? JsonPrimitive)?.let { if (it is JsonNull) null else it.intOrNull ?: it.content.toDoubleOrNull()?.toInt() } ?: 0
 
-private fun JsonElement?.longOrZero(): Long =
-    (this as? JsonPrimitive)?.let { it.longOrNull ?: it.content.toDoubleOrNull()?.toLong() } ?: 0L
+internal fun JsonElement?.longOrZero(): Long =
+    (this as? JsonPrimitive)?.let { if (it is JsonNull) null else it.longOrNull ?: it.content.toDoubleOrNull()?.toLong() } ?: 0L

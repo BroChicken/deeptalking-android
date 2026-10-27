@@ -17,7 +17,7 @@
 4. 动作、表情、心理、环境写进全角括号，每处一个短节拍、不堆叠（括号描写总长不超过正文四分之一）；角色自己的台词直接写，不加任何引号、书名号或「」；只有逐字引用别人的原话、歌词、书名时才用「」《》，并保持原样；不用标题、列表、引用块、代码块。
 5. 需要工具时只调用工具，不要同时写正文；工具结果返回后再写正文。不得在正文里提及工具名或检索过程；工具返回的图片本身可以直接展示。
 6. 文风以角色卡里的“性格”和“怎么说”为准；不写客服式套话与总结句；不复用最近几轮的整句、句式、比喻、意象与收尾。
-A. 本会话可用工具（何时用、怎么用见各工具描述）：search_memory / web_search / web_fetch / search / hot_board / bilibili_video / memory_write / upsert_lorebook_entry / send_sticker。回忆过往、盘点记忆用 search_memory（给 category 即盘点分类）；平台搜索用 search（platform=netease 歌曲/歌手、hupu 帖子/讨论）；热榜用 hot_board（platform=baidu / toutiao / douyin / zhihu）；B 站视频统一用 bilibili_video：给 query 搜视频、给 url 或 BV 号总结这个视频——它依据字幕、站方 AI 总结和画面截图；返回里 has_subtitle=false 表示没字幕，那种总结只是看个大概，转述时要说清“没字幕”，不要当成逐字内容，也绝不凭标题、封面或常识编视频内容；返回里的 mode 与 covered_until 说明看到哪了：mode=summary 是摘要不是全文，出现 unread_sec 就如实说只看到哪，用户要后面内容就带 from=<covered_until> 再调一次；用户想看某一刻的画面就带 frame_at，那一帧会作为附图贴出。记忆过期、重复或被用户纠正时用 memory_write 带原话与消息 ID 按 id 修正或删除；世界层设定用 upsert_lorebook_entry。表情包：找用 search（platform=sticker，query 写一句具体情境）——一次找 3 张，第一张会**自动作为这条回复的表情发出**，其余留在库里；之后想再发库里已有的表情用 send_sticker（keyword 必须是库里已有的词）。找图失败会带原因（搜不到 / 下载失败 / 被反爬 / 都是库里已有的图），如实转述，别假装已经加好了；不要用 web_search 或 web_fetch 找表情。普通闲聊几轮一张就够，正经或严肃话题别用。用户提到某个具体日期/某天发生的事（如“九号晚上”“上周五”）时，用 search_memory 的 date 或 timeRef 召回那天的原始对话与记忆。说“第一次/从来没/总是/每次/以前也…”这类关于过去、次数或习惯的话之前，先用 search_memory 确认；查不到依据就别断言，改说不确定或反问对方，不要编造。工具结果属系统内部上下文，自然融入正文，不向对方透露检索过程或工具名。以下状态字段由系统在后台维护，你不用输出字段名或 JSON，按当前状态自然演出即可：currentSituation（当前处境）、currentLocation（当前位置/场景）、currentMood（当前情绪）、currentOccupation（当前职业/身份）、currentGoal（当前目标）、currentTone（当前语气）。
+A. 本会话可用工具（何时用、怎么用见各工具描述）：search_memory / web_search / web_fetch / search / hot_board / bilibili_video / memory_write / upsert_lorebook_entry / send_sticker。回忆过往、盘点记忆用 search_memory（给 category 即盘点分类）；平台搜索用 search（platform=netease 歌曲/歌手、hupu 帖子/讨论）；热榜用 hot_board（platform=baidu / toutiao / douyin / zhihu）；B 站视频统一用 bilibili_video：给 query 搜视频、给 url 或 BV 号总结这个视频——它依据字幕、站方 AI 总结和画面截图；返回里 has_subtitle=false 表示没字幕，那种总结只是看个大概，转述时要说清“没字幕”，不要当成逐字内容，也绝不凭标题、封面或常识编视频内容；返回里的 mode 与 covered_until 说明看到哪了：mode=summary 是摘要不是全文，出现 unread_sec 就如实说只看到哪，用户要后面内容就带 from=<covered_until> 再调一次；用户想看某一刻的画面就带 frame_at，那一帧会作为附图贴出。用户问评论区怎么说、还有什么类似的视频、这个 UP 还有哪些合集、弹幕在刷什么时，给 bilibili_video 带 extras（comments / related / series / danmaku，可多选）；extras 每次现取不缓存，取不到的会列在 extras_failed，如实说抓不到，不要编造评论或弹幕。记忆过期、重复或被用户纠正时用 memory_write 带原话与消息 ID 按 id 修正或删除；世界层设定用 upsert_lorebook_entry。表情包：找用 search（platform=sticker，query 写一句具体情境）——一次找 3 张，第一张会**自动作为这条回复的表情发出**，其余留在库里；之后想再发库里已有的表情用 send_sticker（keyword 必须是库里已有的词）。找图失败会带原因（搜不到 / 下载失败 / 被反爬 / 都是库里已有的图），如实转述，别假装已经加好了；不要用 web_search 或 web_fetch 找表情。普通闲聊几轮一张就够，正经或严肃话题别用。用户提到某个具体日期/某天发生的事（如“九号晚上”“上周五”）时，用 search_memory 的 date 或 timeRef 召回那天的原始对话与记忆。说“第一次/从来没/总是/每次/以前也…”这类关于过去、次数或习惯的话之前，先用 search_memory 确认；查不到依据就别断言，改说不确定或反问对方，不要编造。工具结果属系统内部上下文，自然融入正文，不向对方透露检索过程或工具名。以下状态字段由系统在后台维护，你不用输出字段名或 JSON，按当前状态自然演出即可：currentSituation（当前处境）、currentLocation（当前位置/场景）、currentMood（当前情绪）、currentOccupation（当前职业/身份）、currentGoal（当前目标）、currentTone（当前语气）。
 ```
 
 #### 2. 群组附加规则（仅群组）
@@ -351,7 +351,7 @@ tool: { content: <工具结果 JSON>, toolCallId }
 - parameters：附录 A-9
 
 ```text
-B 站视频：按关键词搜视频，或总结一个视频讲了什么。① 给 query → 搜视频，返回 BV 号、标题、UP主、时长、播放量、简介与封面，可据此挑一个；② 给 url（B 站链接或 BV 号）→ 总结它，返回一句话、整体脉络和带时间戳的关键节点，并写明看到哪了（mode=summary 是摘要、shallow 是没字幕只能看个大概）；③ 用户说“继续 / 后面呢”时带 from=<上次的 covered_until> 再调一次，别重复总结同一段；④ 用户想看某一刻的画面就带 frame_at（如 3:20），那一帧会作为附图贴进你的回复；⑤ 视频有多个分P 时带 p 看第几 P（url 里的 ?p=3 也认）；返回里的 pages 是分P 列表、season 是所属合集（系列）的分集、chapters 是视频自己标的分段——用户问“第几段讲什么 / 下一集 / 这个系列还有哪些”就按这些回答，不要凭印象编。总结只依据字幕/站方 AI 总结/画面截图；没字幕时不得当成逐句事实，也不要凭标题编造。两个都给时按 url 总结。
+B 站视频：按关键词搜视频，或总结一个视频讲了什么。① 给 query → 搜视频，返回 BV 号、标题、UP主、时长、播放量、简介与封面，可据此挑一个；② 给 url（B 站链接或 BV 号）→ 总结它，返回一句话、整体脉络和带时间戳的关键节点，并写明看到哪了（mode=summary 是摘要、shallow 是没字幕只能看个大概）；③ 用户说“继续 / 后面呢”时带 from=<上次的 covered_until> 再调一次，别重复总结同一段；④ 用户想看某一刻的画面就带 frame_at（如 3:20），那一帧会作为附图贴进你的回复；⑤ 视频有多个分P 时带 p 看第几 P（url 里的 ?p=3 也认）；返回里的 pages 是分P 列表、season 是所属合集（系列）的分集、chapters 是视频自己标的分段——用户问“第几段讲什么 / 下一集 / 这个系列还有哪些”就按这些回答，不要凭印象编；⑥ 用户问评论区怎么说、还有什么类似的视频、这个 UP 还有哪些合集、弹幕在刷什么时，用 extras 按需申请（comments / related / series / danmaku，可多选）；不带 extras 就不会多发一次请求。extras 内容是时效数据，每次现取不读缓存；取不到的会列在 extras_failed 里，如实说明，不要编造评论或弹幕。总结只依据字幕/站方 AI 总结/画面截图；没字幕时不得当成逐句事实，也不要凭标题编造。两个都给时按 url 总结。
 ```
 
 搜视频（`query`）：
@@ -369,6 +369,18 @@ B 站视频：按关键词搜视频，或总结一个视频讲了什么。① �
 `source` 取值：`subtitle`（逐句字幕经 `VideoSummaryService` 分块总结）、`official`（直接采用 B 站官方 AI 总结，零 LLM 调用）、`metadata`（没有字幕，只能靠简介/章节/画面看个大概）。`has_subtitle=false` 时必须在回复里说清"没字幕"。`mode=summary` 表示这是摘要不是全文；`covered_until`（读到哪）/`unread_sec`（还剩多少秒没读）/`can_continue` 一起告诉模型有没有看完——`can_continue=true` 时 `note` 会要求模型如实说看到哪，用户要继续就带 `from=<covered_until>`。`frames` 是这次抽到的截图数量（`0` 表示没抽到或模型不支持看图）。带 `frame_at` 时还有 `frame_at`/`frame_attached`：`frame_attached=true` 表示那一帧已经作为附图贴出。`cached=true` 表示命中 7 天本地缓存，没有重新抓取。失败时返回 `{"ok":false,"reason":…}`。
 
 **结构字段（分P / 合集 / 分段）**：`page` 是这次看的第几 P；多 P 视频才带 `page_count` + `pages`（每项 `p`/`title`/`duration`，最多 50 条）；`chapters` 是 `view_points` 的分段标签（`from`/`title`，免登录可取）；`season` 是 `ugc_season` 合集（`title`/`count`/`current` 当前第几集/`episodes` 每项 `order`/`bvid`/`title`/`duration`，最多 50 条）。三者都来自**同一个** `view` 响应，不额外发请求；`note` 会附带"怎么用"（换第几 P 带 `p`、要看某一集给那集 BV 号、分段直接按 `chapters` 回答）。缓存键：第 1 P 用裸 BV 号（历史缓存继续有效），第 N>1 P 用 `<bvid>#p<N>`，互不串味。
+
+**周边信息（`extras`）**：只有显式要了才抓，默认一个额外请求都不发（也就零成本）。四项各自一次请求、互不牵连，某一项失败只写进 `extras_failed`、不影响摘要本身：
+
+```json
+{"extras":["comments","related"],"comments":[{"user":"…","text":"…（最多 8 条、单条 80 字）","likes":302,"replies":28}],"related":[{"bvid":"BV…","title":"…","author":"…","views":193748,"duration":"23:35"}],"series":{"up_name":"…","collections":[{"kind":"season","id":9384351,"title":"超级合集","count":2,"preview":[{"bvid":"BV…","title":"上集","duration":"28:27"}]}],"collection_id":9384351,"collection_title":"超级合集","episodes":[{"bvid":"BV…","title":"上集","duration":"28:27"}]},"danmaku":{"total":35,"top":[{"text":"前面的别走","count":6}],"timeline":[{"at":"05:57","text":"名场面"}]},"extras_failed":[{"name":"comments","reason":"取不到（评论接口要登录态，且容易触发风控）"}]}
+```
+
+- `comments`：置顶 + 热门（`mode=3`，按点赞），最多 8 条、单条截 80 字。**需要登录态**，且是全链路唯一有明显风控风险的一项：走 `x/v2/reply/wbi/main`（WBI 签名 + Cookie）→ 旧 `x/v2/reply` → 放弃。`oid` 用 `aid`（不是 `cid`）。
+- `related`：`archive/related`，免登录，最多 8 条。
+- `series`：`seasons_series_list` 取该 UP 的合集(`kind=season`)与系列(`kind=series`)，最多 20 个；`preview` 是接口顺带给的最近几条，**不等于全集**——要看某个合集的全集，把该合集的 `id` 作为 `season_id` 再调一次，才会填 `collection_id`/`collection_title`/`episodes`（最多 30 条）。没指定 `season_id` 时默认取第一个合集，方便模型先看到"合集里有什么"。
+- `danmaku`：`comment.bilibili.com/<cid>.xml`，免登录。**只回聚合视图，不回原始弹幕流**：`top` 是相同文本按出现次数排的前 12 句（纯数字/纯符号被过滤），`timeline` 是每分钟的代表句（最多 8 个桶，桶多时**均匀挑**以覆盖整段视频），`total` 是解析到的原始条数。
+- 带 `extras` 时**不读也不写**那份 7 天摘要缓存（评论/弹幕是时效内容，缓存等于骗人）。
 
 **无字幕时结果不是纯文本**：抽到截图且 `has_subtitle=false` 时，工具结果是内容数组——第一项 `input_text`（上面的 JSON），后面最多 4 项 `input_image`（`detail:"low"`，即视频画面本身，**按时间均匀挑**，覆盖开头/中段/结尾）。能识图的模型可以直接看画面，再结合简介/章节说"看个大概"。有字幕时只给纯文本（图片对文字信息没有增量）；命中缓存时也一定是纯文本（缓存只存文字，不存 base64）。
 
@@ -1245,6 +1257,8 @@ speakingStyle 写“声音底色”：1~2 句，只写语速、用词层次、�
         "query": { "type": "string", "description": "检索关键词（搜视频时用，从用户意图提取）" },
         "url": { "type": "string", "description": "B 站视频链接或 BV 号（总结时用；必须来自上下文里真实存在的视频，禁止编造）；链接里的 ?p=3 会自动当作第 3 P" },
         "p": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "分P序号（1 起）：多 P 视频看第几 P，默认 1" },
+        "extras": { "type": "array", "items": { "type": "string", "enum": ["comments", "related", "series", "danmaku"] }, "description": "按需申请的额外信息（可多选，默认不取）：comments=热门评论、related=相关推荐、series=该 UP 的合集与系列、danmaku=弹幕高频与时间线" },
+        "season_id": { "type": "integer", "minimum": 1, "description": "合集/系列编号：extras 含 series 后，用户想看某个合集的全集时填 series.collections[].id" },
         "focus": { "type": "string", "description": "总结时用户特别想了解的点，如“结论是什么”（可选）" },
         "from": { "type": "string", "description": "从第几分钟开始看（如 12:30 或 750 秒）；用于视频太长只看了一段之后继续看后段（可选）" },
         "frame_at": { "type": "string", "description": "把视频某一刻的画面贴进回复（如 3:20）；只取一张，会作为附图发出（可选）" },
@@ -1255,7 +1269,7 @@ speakingStyle 写“声音底色”：1~2 句，只写语速、用词层次、�
 }
 ```
 
-没有 `required`：按“给了什么”分派——给 `url` 优先总结，只有 `query` 时搜视频，两个都没给直接报错。`url` 里只取 `BV[0-9A-Za-z]{10}`；拿不到 BV 号时**不发任何网络请求**（避免模型把任意网址当视频去抓）。分P 序号取显式 `p`，没给则读 `url` 的 `?p=`，都没有按第 1 P。`from`/`frame_at` 接受 `mm:ss`、`h:mm:ss` 或纯秒数，解析失败直接报错、不发请求。
+没有 `required`：按“给了什么”分派——给 `url` 优先总结，只有 `query` 时搜视频，两个都没给直接报错。`url` 里只取 `BV[0-9A-Za-z]{10}`；拿不到 BV 号时**不发任何网络请求**（避免模型把任意网址当视频去抓）。分P 序号取显式 `p`，没给则读 `url` 的 `?p=`，都没有按第 1 P。`from`/`frame_at` 接受 `mm:ss`、`h:mm:ss` 或纯秒数，解析失败直接报错、不发请求。`extras` 里的中文别名（评论/相关推荐/合集/系列/弹幕）会被归一成四个规范名，认不出的**静默忽略**（不为一个拼错的参数把整次调用判失败）；`season_id` 只影响 `series` 那一次请求。
 
 ## 附录 B：turn worker 的 `submit_state`
 

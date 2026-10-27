@@ -40,7 +40,7 @@
 
 - 命中 → 直接把上次的结果返回，`cached=true`；不抓字幕、不抽帧、不调模型。
 - 过期 → 读的时候删掉（连同它的截图），下次重新抓。
-- 带 `focus` 的提问**不读也不写缓存**：问题不同，答案不能复用。带 `from` 的续读同样不读不写（它只覆盖后段，覆盖写会把泛总结弄残）；`refresh=true` 强制重看一遍、不看缓存。
+- 带 `focus` 的提问**不读也不写缓存**：问题不同，答案不能复用。带 `from` 的续读同样不读不写（它只覆盖后段，覆盖写会把泛总结弄残）；`refresh=true` 强制重看一遍、不看缓存。**带 `extras` 的调用同样不读不写**：评论/弹幕/相关推荐是时效内容，缓存 7 天等于骗人。
 - 工具结果里带 `cached=true` 时说明这是旧结果。
 - 为什么用文件而不是 Room 表：内容既有 JSON 又有截图，文件天然匹配；而当前 Room 库还是 version 1、没有迁移历史，为一张缓存表升库要手写 Migration（列类型/可空性对不上会让老用户装完直接崩），风险远大于收益——缓存本来就允许丢。目录用 `cacheDir`，系统空间紧张时可以清掉。
 
@@ -71,31 +71,48 @@
 - 工具结果里分别是 `page` / `page_count` + `pages`、`season`（`title` / `count` / `current` / `episodes`）、`chapters`（`from` / `title`），列表各自封顶 50 条；`note` 会写明怎么用（换第几 P 带 `p`、看某一集给那集 BV 号、分段按 `chapters` 回答），否则模型容易把列表当正文念出来。
 - **总结只针对选中的那一 P**：总结提示词的头部会写"第 X/Y P"，避免把第 2 P 的摘要说成整个视频。
 - 缓存的键是"视频 + 分P"：第 1 P 保持裸 BV 号（历史缓存继续有效），第 N>1 P 用 `<bvid>#p<N>`，同一视频不同 P 不会互相命中。
-- 番剧（`pgc`）和"某个 UP 主的全部投稿/合集列表"没做：番剧走 `pgc/view/web/season`，UP 主的合集列表走 `x/polymer/web-space/seasons_series_list`，各有参数与风控，等这版上机验证过再加。
+- 番剧（`pgc`）没做：走 `pgc/view/web/season`，参数与风控都是另一套，暂不接。
 
-## 6. 登录态（SESSDATA）
+## 6. 周边信息（`extras`）
+
+字幕/总结回答"视频讲了什么"，这里回答"别人怎么评价、还有什么可看、观众在刷什么"。四项都由 `bilibili_video` 的 `extras` 参数**按需申请**，默认一个额外请求都不发——不改变原有结果、不增加成本。
+
+| extra | 接口 | 登录 | 上限 | 说明 |
+|---|---|---|---|---|
+| `comments` | `x/v2/reply/wbi/main`（`mode=3` 热门） | **要** | 8 条 / 单条 80 字 | `oid` 用 `aid`（不是 `cid`）；置顶在 `top_replies[]`、其余在 `replies[]`，按「用户+正文」去重 |
+| `related` | `archive/related?bvid=` | 免 | 8 条 | `data` 是裸数组（个别版本包成 `data.list[]`） |
+| `series` | `seasons_series_list?mid=` + `seasons_archives_list?mid=&season_id=` | 免 | 20 个合集 / 30 条分集 | `items_lists.seasons_list[]`（合集，`meta.season_id`）与 `series_list[]`（系列，`meta.series_id`）；`archives[]` 只是最近几条预览，**不等于全集** |
+| `danmaku` | `comment.bilibili.com/<cid>.xml` | 免 | 高频 12 / 时间线 8 | XML `<d p="秒,模式,…">文本</d>`；只回聚合视图，不回原始弹幕流 |
+
+- **评论是唯一有风控风险的一项**：匿名请求实测直接 `-352`，所以走三级降级——WBI 签名的主接口 → 旧 `x/v2/reply` → 放弃并写进 `extras_failed`。
+- **弹幕只给「高频 + 时间线」**：相同文本计数后取前 12（纯数字/纯符号过滤掉，它们在弹幕里占比极高但零信息量）；按分钟分桶、每桶取代表句，桶数超过 8 时**均匀挑**（不是取前 8），否则一小时视频的时间线会全挤在开头十分钟。
+- **单项失败不拖垮整次调用**：任何一项抓不到只进 `extras_failed`（`{name, reason}`），摘要照常返回，`note` 会要求模型"如实说抓不到，不要编造"。
+- `series` 带 `season_id` 时多取一次该合集的分集；不带就从第一个合集取，让模型先看到"合集里有什么"。
+
+## 7. 登录态（SESSDATA）
 
 - 用户在设置页「B 站视频总结（可选）」粘贴**整段 Cookie 或只粘 SESSDATA 的值**（`normalizeBiliCookie` 归一化）；「测试登录」打 `nav` 接口回报"已登录：昵称 / -101 已过期"，不回显 Cookie。
 - 存储：`SecretStore`（`EncryptedSharedPreferences` + Keystore）。**刻意不进 `snapshot()`**，所以不会随加密备份导出；不写数据库、不写日志、不进导出 JSON。设置页只显示"已保存/未保存"。
 - 取用：`HttpBiliVideoSource` 的 cookie 回调每次调用现取，用户改完设置下一次工具调用即生效，不用重启。
 - 没配 Cookie 也能用：只是没有逐句字幕，退化成"元信息 + 章节 + 画面"。
 
-## 7. 时效与风控
+## 8. 时效与风控
 
 - `wbi_img`（签名 key）**每天轮换**：按天缓存，跨天自动重取；签名算法在 `BiliWbi`，用公开向量单测锁住（未登录时服务端不校验 `w_rid`，写错只会在登录后暴露）。
 - 字幕 CDN 地址的 `auth_key` **分钟级过期**、URL 不能截断：必须现取现用、不可缓存分发。
 - 高频请求会吃 `-412`（风控）/`-799`（频控）：一次用户请求最多一次总结；7 天缓存本身也压住了重复请求。
+- **评论区最容易被风控**（匿名实测 `-352`）：所以它只在显式 `extras=comments` 时才请求，且失败就降级、绝不重试轰炸。
 - 站内内容只给摘要 + 原视频链接 + 时间戳，不整段展示、不跨用户共享。
 
-## 8. 已知限制（未做）
+## 9. 已知限制（未做）
 
 - **无字幕视频的逐句内容**：需要端侧 ASR（`playurl` 的 DASH 音频流免登录可取 → Media3 解 PCM → sherpa-onnx Paraformer，模型约 227MB 按需下载）。工作量与体积都大，暂缓；当前用"画面 + 简介/章节"兜底。
 - **时间戳跳转**：摘要里带 `mm:ss`，模型可拼 `https://www.bilibili.com/video/<bvid>?t=<秒>`，但界面还没做成可点按钮。
 - **追问复用**：带 `focus` 的问题每次重新总结（不读泛总结缓存）；续读靠 `from` 参数一段段往前推，没有"摘要 + 相关片段"的二次检索，也不会把整条字幕留在历史里（那样每轮都要重新计费）。
 - **`frame_at` 只有一个时间点**：要贴多张图就多调几次（每轮最多 `MAX_RESULT_FRAMES`(4) 张，工具结果里另外塞给主模型的截图也按这个上限）。
 
-## 9. 代码锚点
+## 10. 代码锚点
 
-- `:core:network` 的 `BiliWbi`（签名）、`BiliVideoSource.kt`（`HttpBiliVideoSource` / 字幕·章节·截图墙解析 / `pickStoryboardFrames` / `nearestStoryboardFrame` / `spreadPick` / `BiliLinks` / `formatBiliClock` / `parseBiliDurationClock`）
-- `:domain:agent` 的 `video/VideoSummaryService`（两条总结路径 + `coveredUntilSec`）、`video/VideoPieces.kt`（`VideoSummaryCache` / `VideoFrameProvider.frames|frameAt` 接口）、`tools/BilibiliVideoTool`（编排 + 缓存短路 + `from`/`refresh`/`frame_at`）
+- `:core:network` 的 `BiliWbi`（签名）、`BiliVideoSource.kt`（`HttpBiliVideoSource` / 字幕·章节·截图墙解析 / `pickStoryboardFrames` / `nearestStoryboardFrame` / `spreadPick` / `BiliLinks` / `formatBiliClock` / `parseBiliDurationClock`）、`BiliExtras.kt`（评论/相关/合集/弹幕的解析 + `digestBiliDanmaku` 聚合）
+- `:domain:agent` 的 `video/VideoSummaryService`（两条总结路径 + `coveredUntilSec`）、`video/VideoPieces.kt`（`VideoSummaryCache` / `VideoFrameProvider.frames|frameAt` 接口）、`tools/BilibiliVideoTool`（编排 + 缓存短路 + `from`/`refresh`/`frame_at` + `extras` 按需抓取与降级）
 - `:app` 的 `BiliVideoCache`（7 天文件缓存）、`BiliFrameExtractor`（截图墙裁帧 + 单帧）、`NativeCore`（`biliVideoSource` / `videoSummarizer` / `probeBiliLogin`）、`AppViewModel`（`saveBiliCookie` / `testBiliLogin` / 助手附图消息）、`feature:settings` 的「B 站视频总结」分区

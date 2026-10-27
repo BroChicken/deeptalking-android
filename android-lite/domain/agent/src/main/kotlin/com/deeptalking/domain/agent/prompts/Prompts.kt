@@ -414,6 +414,9 @@ internal const val RULE_A_PREFIX =
         "转述时要说清“没字幕”，不要当成逐字内容，也绝不凭标题、封面或常识编视频内容；" +
         "返回里的 mode 与 covered_until 说明看到哪了：mode=summary 是摘要不是全文，出现 unread_sec 就如实说只看到哪，" +
         "用户要后面内容就带 from=<covered_until> 再调一次；用户想看某一刻的画面就带 frame_at，那一帧会作为附图贴出。" +
+        "用户问评论区怎么说、还有什么类似的视频、这个 UP 还有哪些合集、弹幕在刷什么时，给 bilibili_video 带 " +
+        "extras（comments / related / series / danmaku，可多选）；extras 每次现取不缓存，取不到的会列在 extras_failed，" +
+        "如实说抓不到，不要编造评论或弹幕。" +
         "记忆过期、重复或被用户纠正时用 memory_write 带原话与消息 ID 按 id 修正或删除；世界层设定用 upsert_lorebook_entry。" +
         "表情包：找用 search（platform=sticker，query 写一句具体情境）——一次找 3 张，" +
         "第一张会**自动作为这条回复的表情发出**，其余留在库里；之后想再发库里已有的表情用 send_sticker（keyword 必须是库里已有的词）。" +

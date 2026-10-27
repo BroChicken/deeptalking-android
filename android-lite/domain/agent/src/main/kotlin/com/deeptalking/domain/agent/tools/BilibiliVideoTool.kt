@@ -1,6 +1,11 @@
 package com.deeptalking.domain.agent.tools
 
+import com.deeptalking.core.network.BiliCollection
+import com.deeptalking.core.network.BiliCollectionItem
+import com.deeptalking.core.network.BiliComment
+import com.deeptalking.core.network.BiliDanmakuDigest
 import com.deeptalking.core.network.BiliLinks
+import com.deeptalking.core.network.BiliRelatedVideo
 import com.deeptalking.core.network.BiliVideoSource
 import com.deeptalking.core.network.BiliVideoText
 import com.deeptalking.core.network.BiliVideoTextResult
@@ -18,6 +23,7 @@ import com.deeptalking.domain.agent.video.VideoSummaryService
 import com.deeptalking.engine.ondevice.ToolCall
 import com.deeptalking.engine.ondevice.ToolDefinition
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
@@ -63,9 +69,12 @@ class BilibiliVideoTool(
             "④ 用户想看某一刻的画面就带 frame_at（如 3:20），那一帧会作为附图贴进你的回复；" +
             "⑤ 视频有多个分P 时带 p 看第几 P（url 里的 ?p=3 也认）；返回里的 pages 是分P 列表、season 是所属合集" +
             "（系列）的分集、chapters 是视频自己标的分段——用户问“第几段讲什么 / 下一集 / 这个系列还有哪些”就按这些回答，" +
-            "不要凭印象编。" +
+            "不要凭印象编；" +
+            "⑥ 用户问评论区怎么说、还有什么类似的视频、这个 UP 还有哪些合集、弹幕在刷什么时，用 extras 按需申请" +
+            "（comments / related / series / danmaku，可多选）；不带 extras 就不会多发一次请求。extras 内容是时效数据，" +
+            "每次现取不读缓存；取不到的会列在 extras_failed 里，如实说明，不要编造评论或弹幕。" +
             "总结只依据字幕/站方 AI 总结/画面截图；没字幕时不得当成逐句事实，也不要凭标题编造。",
-        parametersJson = """{"type":"object","properties":{"query":{"type":"string","description":"检索关键词（搜视频时用，从用户意图提取）"},"url":{"type":"string","description":"B 站视频链接或 BV 号（总结时用；必须来自上下文里真实存在的视频，禁止编造）；链接里的 ?p=3 会自动当作第 3 P"},"p":{"type":"integer","minimum":1,"maximum":1000,"description":"分P序号（1 起）：多 P 视频看第几 P，默认 1"},"focus":{"type":"string","description":"总结时用户特别想了解的点，如“结论是什么”（可选）"},"from":{"type":"string","description":"从第几分钟开始看（如 12:30 或 750 秒）；用于视频太长只看了一段之后继续看后段（可选）"},"frame_at":{"type":"string","description":"把视频某一刻的画面贴进回复（如 3:20）；只取一张，会作为附图发出（可选）"},"refresh":{"type":"boolean","description":"true = 忽略本地缓存重新看一遍（可选）"},"limit":{"type":"integer","minimum":1,"maximum":20,"description":"搜索条数，默认 6（总结时忽略）"}},"additionalProperties":false}""",
+        parametersJson = """{"type":"object","properties":{"query":{"type":"string","description":"检索关键词（搜视频时用，从用户意图提取）"},"url":{"type":"string","description":"B 站视频链接或 BV 号（总结时用；必须来自上下文里真实存在的视频，禁止编造）；链接里的 ?p=3 会自动当作第 3 P"},"p":{"type":"integer","minimum":1,"maximum":1000,"description":"分P序号（1 起）：多 P 视频看第几 P，默认 1"},"extras":{"type":"array","items":{"type":"string","enum":["comments","related","series","danmaku"]},"description":"按需申请的额外信息（可多选，默认不取）：comments=热门评论、related=相关推荐、series=该 UP 的合集与系列、danmaku=弹幕高频与时间线"},"season_id":{"type":"integer","minimum":1,"description":"合集/系列编号：extras 含 series 后，用户想看某个合集的全集时填 series.collections[].id"},"focus":{"type":"string","description":"总结时用户特别想了解的点，如“结论是什么”（可选）"},"from":{"type":"string","description":"从第几分钟开始看（如 12:30 或 750 秒）；用于视频太长只看了一段之后继续看后段（可选）"},"frame_at":{"type":"string","description":"把视频某一刻的画面贴进回复（如 3:20）；只取一张，会作为附图发出（可选）"},"refresh":{"type":"boolean","description":"true = 忽略本地缓存重新看一遍（可选）"},"limit":{"type":"integer","minimum":1,"maximum":20,"description":"搜索条数，默认 6（总结时忽略）"}},"additionalProperties":false}""",
     )
 
     override suspend fun execute(call: ToolCall, context: AgentContext): AgentToolResult {
@@ -76,6 +85,8 @@ class BilibiliVideoTool(
         val fromRaw = ToolArgs.string(args, "from").trim()
         val frameRaw = ToolArgs.string(args, "frame_at").trim()
         val refresh = ToolArgs.bool(args, "refresh") ?: false
+        val extras = ToolArgs.strings(args, "extras").mapNotNull(::normalizeExtra).distinct()
+        val seasonId = ToolArgs.long(args, "season_id")?.takeIf { it > 0L }
 
         if (rawUrl.isNotEmpty()) {
             val fromSec = if (fromRaw.isEmpty()) {
@@ -92,7 +103,7 @@ class BilibiliVideoTool(
             }
             // 显式 `p` 优先；没给就看链接里的 `?p=`（用户直接贴第 3 P 的链接时不要悄悄讲第 1 P）。
             val page = ToolArgs.int(args, "p")?.takeIf { it >= 1 } ?: BiliLinks.pageOf(rawUrl)
-            return summarize(rawUrl, page, focus, fromSec, frameAt, refresh)
+            return summarize(rawUrl, page, focus, fromSec, frameAt, refresh, extras, seasonId)
         }
         if (query.isNotEmpty()) {
             val limit = (ToolArgs.int(args, "limit") ?: DEFAULT_LIMIT).coerceIn(1, MAX_LIMIT)
@@ -117,6 +128,8 @@ class BilibiliVideoTool(
         fromSec: Int,
         frameAtSec: Int?,
         refresh: Boolean,
+        extras: List<String>,
+        seasonId: Long?,
     ): AgentToolResult {
         val provider = source ?: return AgentToolResult(errorJson("B 站视频总结不可用（联网功能未启用）"))
         val bvid = BiliLinks.bvidOf(rawUrl)
@@ -124,14 +137,16 @@ class BilibiliVideoTool(
 
         // 只缓存"从头看的泛总结"：带 focus / from 的问题每次都得重新问，
         // 否则“继续看”会命中上一次的同一份摘要（这就是用户觉得它在敷衍的直接原因）。
+        // 带 extras 时**读也不读、写也不写**：评论/弹幕/相关是时效内容，缓存 7 天等于骗人。
         val key = cacheKey(bvid, page)
-        if (focus == null && fromSec == 0 && !refresh) {
+        if (focus == null && fromSec == 0 && !refresh && extras.isEmpty()) {
             cache?.read(key)?.let { cached -> return AgentToolResult(withCached(cached)) }
         }
 
         return when (val result = provider.load(bvid, page)) {
             is BiliVideoTextResult.Failure -> AgentToolResult(errorJson(failureReason(result)))
-            is BiliVideoTextResult.Ok -> render(provider, result.text, focus, fromSec, frameAtSec)
+            is BiliVideoTextResult.Ok ->
+                render(provider, result.text, focus, fromSec, frameAtSec, extras, seasonId)
         }
     }
 
@@ -147,6 +162,8 @@ class BilibiliVideoTool(
         focus: String?,
         fromSec: Int,
         frameAtSec: Int?,
+        extras: List<String> = emptyList(),
+        seasonId: Long? = null,
     ): AgentToolResult {
         val storyboard = runCatching { provider.storyboard(text.bvid, text.cid) }.getOrNull()
         val imageRefs = frames?.frames(text, storyboard).orEmpty()
@@ -161,6 +178,9 @@ class BilibiliVideoTool(
             text
         }
 
+        // 周边信息（评论/相关/合集/弹幕）：只在调用方明确要时才发请求，默认这份是空的。
+        val extrasData = if (extras.isEmpty()) ExtrasData() else fetchExtras(provider, text, extras, seasonId)
+
         if (text.source == BiliVideoText.Source.OfficialSummary) {
             val payload = payload(
                 text = text,
@@ -172,6 +192,7 @@ class BilibiliVideoTool(
                 coveredUntilSec = null,
                 frameAtSec = frameAtSec,
                 frameAttached = frameRef != null,
+                extras = extrasData,
             )
             return AgentToolResult(contentJson = payload, imageFileRef = frameRef)
         }
@@ -189,9 +210,13 @@ class BilibiliVideoTool(
             coveredUntilSec = digest.coveredUntilSec,
             frameAtSec = frameAtSec,
             frameAttached = frameRef != null,
+            extras = extrasData,
         )
         // 缓存里只放纯文字结果（不带 base64 截图），命中时再补上"已缓存"标记。
-        if (focus == null && fromSec == 0) runCatching { cache?.write(cacheKey(text.bvid, text.page), payload) }
+        // 带 extras 的结果不进缓存：那些内容 7 天后就过期了。
+        if (focus == null && fromSec == 0 && extras.isEmpty()) {
+            runCatching { cache?.write(cacheKey(text.bvid, text.page), payload) }
+        }
         return AgentToolResult(
             contentJson = attachFrames(payload, text, imageRefs, digest.imagesAccepted),
             imageFileRef = frameRef,
@@ -265,6 +290,7 @@ class BilibiliVideoTool(
         coveredUntilSec: Int?,
         frameAtSec: Int?,
         frameAttached: Boolean,
+        extras: ExtrasData = ExtrasData(),
     ): String {
         // 官方总结没有逐句字幕，"看到哪"就用大纲最后一条；字幕路径用真正读到的最后一行。
         val covered = coveredUntilSec
@@ -338,6 +364,20 @@ class BilibiliVideoTool(
                     },
                 )
             }
+            extras.fields.forEach { (name, value) -> put(name, value) }
+            if (extras.failed.isNotEmpty()) {
+                put(
+                    "extras_failed",
+                    buildJsonArray {
+                        extras.failed.forEach { (name, reason) ->
+                            add(buildJsonObject {
+                                put("name", name)
+                                put("reason", reason)
+                            })
+                        }
+                    },
+                )
+            }
             if (fromSec > 0) put("from", formatBiliClock(fromSec))
             if (covered != null) put("covered_until", formatBiliClock(covered))
             if (unread != null) put("unread_sec", unread)
@@ -358,10 +398,206 @@ class BilibiliVideoTool(
                     unread = unread,
                     frameAt = frameAtSec,
                     frameAttached = frameAttached,
-                ) + structureNote(text),
+                ) + structureNote(text) + extras.note,
             )
         }.toString()
     }
+
+    // ------------------------------------------------------------ 周边信息（extras）
+
+    /**
+     * 「按需申请」的额外信息：[extras] 里每一项最多发一次请求，失败只记名字、绝不抛出。
+     *
+     * **任何一项失败都不能让整次调用失败**：视频摘要本身已经拿到了，评论抓不到只是少一块信息；
+     * 失败项写进 `extras_failed`，并让 note 提醒模型"如实说抓不到，不要编"。
+     */
+    private suspend fun fetchExtras(
+        provider: BiliVideoSource,
+        text: BiliVideoText,
+        extras: List<String>,
+        seasonId: Long?,
+    ): ExtrasData {
+        val fields = LinkedHashMap<String, JsonElement>()
+        val failed = mutableListOf<Pair<String, String>>()
+        val note = StringBuilder()
+        for (extra in extras) {
+            when (extra) {
+                "comments" -> {
+                    val items = runCatching { provider.comments(text.bvid, text.aid) }.getOrNull()
+                    if (items.isNullOrEmpty()) {
+                        failed += "comments" to "取不到（评论接口要登录态，且容易触发风控）"
+                    } else {
+                        fields["comments"] = commentsJson(items)
+                        note.append("。comments 是按点赞排的网友观点，只能当参考，不要当成视频内容或事实")
+                    }
+                }
+                "related" -> {
+                    val items = runCatching { provider.related(text.bvid) }.getOrNull()
+                    if (items.isNullOrEmpty()) {
+                        failed += "related" to "接口没有返回相关推荐"
+                    } else {
+                        fields["related"] = relatedJson(items)
+                        note.append("。related 是站方推荐的同主题视频，用户想看别的可以按 bvid 继续")
+                    }
+                }
+                "series" -> {
+                    val collections = runCatching { provider.upCollections(text.upMid) }.getOrNull()
+                    if (collections.isNullOrEmpty()) {
+                        failed += "series" to "UP 主没有公开的合集/系列，或接口不可用"
+                    } else {
+                        // 带了 season_id 就取那个合集的分集；没带（或对不上）就取第一个合集，
+                        // 让模型先看到"这个合集里都有什么"，而不是只给一串标题。
+                        val picked = collections.firstOrNull { it.id == seasonId }
+                            ?: collections.firstOrNull { it.isSeason }
+                        val episodes = picked?.let { collection ->
+                            runCatching { provider.collectionEpisodes(text.upMid, collection.id) }.getOrNull()
+                        }
+                        fields["series"] = seriesJson(text, collections, picked, episodes)
+                        note.append("。series.collections 是这个 UP 的合集/系列（preview 只是最近几条）；")
+                        note.append("用户点了某个合集想听全集时，带 season_id=<那个合集的 id> 再调一次")
+                    }
+                }
+                "danmaku" -> {
+                    val digest = runCatching { provider.danmaku(text.bvid, text.cid) }.getOrNull()
+                    if (digest == null || digest.isEmpty) {
+                        failed += "danmaku" to "这个视频没有弹幕，或弹幕接口不可用"
+                    } else {
+                        fields["danmaku"] = danmakuJson(digest)
+                        note.append("。danmaku.top 是刷得最多的几句、danmaku.timeline 是每分钟的代表弹幕，")
+                        note.append("用来说明观众反应，不是视频内容")
+                    }
+                }
+            }
+        }
+        if (failed.isNotEmpty()) {
+            note.append("。取不到的：").append(failed.joinToString("、") { it.first })
+            note.append("（如实告诉用户抓不到，不要编造）")
+        }
+        return ExtrasData(fields = JsonObject(fields), failed = failed, note = note.toString())
+    }
+
+    private fun commentsJson(items: List<BiliComment>) = buildJsonArray {
+        items.take(MAX_LISTED_COMMENTS).forEach { comment ->
+            add(
+                buildJsonObject {
+                    put("user", comment.user)
+                    put("text", clip(comment.text, MAX_COMMENT_CHARS))
+                    put("likes", comment.likes)
+                    if (comment.replies > 0) put("replies", comment.replies)
+                },
+            )
+        }
+    }
+
+    private fun relatedJson(items: List<BiliRelatedVideo>) = buildJsonArray {
+        items.take(MAX_LISTED_RELATED).forEach { item ->
+            add(
+                buildJsonObject {
+                    put("bvid", item.bvid)
+                    put("title", item.title)
+                    if (item.author.isNotEmpty()) put("author", item.author)
+                    put("views", item.views)
+                    put("duration", formatBiliClock(item.durationSec))
+                },
+            )
+        }
+    }
+
+    private fun seriesJson(
+        text: BiliVideoText,
+        collections: List<BiliCollection>,
+        picked: BiliCollection?,
+        episodes: List<BiliCollectionItem>?,
+    ) = buildJsonObject {
+        if (text.author.isNotEmpty()) put("up_name", text.author)
+        put(
+            "collections",
+            buildJsonArray {
+                collections.take(MAX_LISTED_COLLECTIONS).forEach { collection ->
+                    add(
+                        buildJsonObject {
+                            // kind=season 是合集、series 是系列；两者编号都在 id 里，回传时用同一个字段。
+                            put("kind", collection.kind)
+                            put("id", collection.id)
+                            put("title", collection.title)
+                            put("count", collection.count)
+                            if (collection.preview.isNotEmpty()) {
+                                put(
+                                    "preview",
+                                    buildJsonArray {
+                                        collection.preview.take(MAX_COLLECTION_PREVIEW).forEach { item ->
+                                            add(
+                                                buildJsonObject {
+                                                    put("bvid", item.bvid)
+                                                    put("title", item.title)
+                                                    put("duration", formatBiliClock(item.durationSec))
+                                                },
+                                            )
+                                        }
+                                    },
+                                )
+                            }
+                        },
+                    )
+                }
+            },
+        )
+        if (picked != null && !episodes.isNullOrEmpty()) {
+            put("collection_id", picked.id)
+            put("collection_title", picked.title)
+            put(
+                "episodes",
+                buildJsonArray {
+                    episodes.take(MAX_LISTED_COLLECTION_EPISODES).forEach { item ->
+                        add(
+                            buildJsonObject {
+                                put("bvid", item.bvid)
+                                put("title", item.title)
+                                put("duration", formatBiliClock(item.durationSec))
+                            },
+                        )
+                    }
+                },
+            )
+        }
+    }
+
+    private fun danmakuJson(digest: BiliDanmakuDigest) = buildJsonObject {
+        put("total", digest.total)
+        put(
+            "top",
+            buildJsonArray {
+                digest.top.take(MAX_DANMAKU_TOP).forEach { hit ->
+                    add(
+                        buildJsonObject {
+                            put("text", hit.text)
+                            put("count", hit.count)
+                        },
+                    )
+                }
+            },
+        )
+        put(
+            "timeline",
+            buildJsonArray {
+                digest.timeline.take(MAX_DANMAKU_TIMELINE).forEach { hit ->
+                    add(
+                        buildJsonObject {
+                            put("at", formatBiliClock(hit.atSec))
+                            put("text", hit.text)
+                        },
+                    )
+                }
+            },
+        )
+    }
+
+    /** 周边信息的聚合结果：[fields] 直接并进结果 JSON，[failed] 变成 `extras_failed`。 */
+    private data class ExtrasData(
+        val fields: JsonObject = JsonObject(emptyMap()),
+        val failed: List<Pair<String, String>> = emptyList(),
+        val note: String = "",
+    )
 
     /**
      * 结构信息的"怎么用"提示：分P / 合集 / 分段。
@@ -424,6 +660,22 @@ class BilibiliVideoTool(
         }
     }
 
+    /**
+     * 把模型可能写的中文/别名统一成四个规范名；认不出的**静默忽略**——
+     * 为了一个拼错的 extras 把整次调用判失败，比少一块信息更糟。
+     */
+    private fun normalizeExtra(raw: String): String? = when (raw.trim().lowercase()) {
+        "comments", "comment", "评论", "热门评论" -> "comments"
+        "related", "相关", "相关推荐", "推荐" -> "related"
+        "series", "collection", "collections", "合集", "系列" -> "series"
+        "danmaku", "danmu", "弹幕" -> "danmaku"
+        else -> null
+    }
+
+    /** 评论正文按字数截断：一条几百字的长评会把整个结果撑爆。 */
+    private fun clip(text: String, max: Int): String =
+        if (text.length <= max) text else text.take(max) + "…"
+
     /** 命中缓存时把 `cached` 翻成 true，保留原来的其它字段。 */
     private fun withCached(payload: String): String = runCatching {
         val obj = JSON.parseToJsonElement(payload).jsonObject
@@ -447,5 +699,21 @@ class BilibiliVideoTool(
 
         /** 合集分集列表条数上限（几百集的合集会截断，note 里说明当前是第几集）。 */
         const val MAX_LISTED_EPISODES = 50
+
+        /** 热门评论条数上限 + 单条字数上限。 */
+        const val MAX_LISTED_COMMENTS = 8
+        const val MAX_COMMENT_CHARS = 80
+
+        /** 相关推荐条数上限。 */
+        const val MAX_LISTED_RELATED = 8
+
+        /** UP 合集/系列的条数上限、每个合集的预览条数、指定合集的条目上限。 */
+        const val MAX_LISTED_COLLECTIONS = 20
+        const val MAX_COLLECTION_PREVIEW = 6
+        const val MAX_LISTED_COLLECTION_EPISODES = 30
+
+        /** 弹幕聚合后的条数上限（高频 / 时间线）。 */
+        const val MAX_DANMAKU_TOP = 12
+        const val MAX_DANMAKU_TIMELINE = 8
     }
 }

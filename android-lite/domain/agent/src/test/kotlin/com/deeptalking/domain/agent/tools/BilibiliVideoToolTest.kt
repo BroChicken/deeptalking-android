@@ -1,7 +1,13 @@
 package com.deeptalking.domain.agent.tools
 
 import com.deeptalking.core.model.Character
+import com.deeptalking.core.network.BiliCollection
+import com.deeptalking.core.network.BiliCollectionItem
+import com.deeptalking.core.network.BiliComment
+import com.deeptalking.core.network.BiliDanmakuDigest
+import com.deeptalking.core.network.BiliDanmakuHit
 import com.deeptalking.core.network.BiliPage
+import com.deeptalking.core.network.BiliRelatedVideo
 import com.deeptalking.core.network.BiliSeason
 import com.deeptalking.core.network.BiliSeasonEpisode
 import com.deeptalking.core.network.BiliStoryboard
@@ -35,9 +41,17 @@ class BilibiliVideoToolTest {
     private class FakeSource(
         private val result: BiliVideoTextResult,
         private val storyboard: BiliStoryboard? = null,
+        private val comments: List<BiliComment>? = null,
+        private val related: List<BiliRelatedVideo>? = null,
+        private val collections: List<BiliCollection>? = null,
+        private val episodes: List<BiliCollectionItem>? = null,
+        private val danmaku: BiliDanmakuDigest? = null,
     ) : BiliVideoSource {
         val requested = mutableListOf<String>()
         val requestedPages = mutableListOf<Int>()
+
+        /** 记录"要过哪些 extras + 带的 season_id"，用来断言"不带 extras 就不发请求"。 */
+        val extrasAsked = mutableListOf<String>()
 
         override suspend fun load(bvid: String, page: Int): BiliVideoTextResult {
             requested += bvid
@@ -46,6 +60,31 @@ class BilibiliVideoToolTest {
         }
 
         override suspend fun storyboard(bvid: String, cid: Long): BiliStoryboard? = storyboard
+
+        override suspend fun comments(bvid: String, aid: Long): List<BiliComment>? {
+            extrasAsked += "comments:$aid"
+            return comments
+        }
+
+        override suspend fun related(bvid: String): List<BiliRelatedVideo>? {
+            extrasAsked += "related"
+            return related
+        }
+
+        override suspend fun upCollections(upMid: Long): List<BiliCollection>? {
+            extrasAsked += "series:$upMid"
+            return collections
+        }
+
+        override suspend fun collectionEpisodes(upMid: Long, collectionId: Long): List<BiliCollectionItem>? {
+            extrasAsked += "episodes:$collectionId"
+            return episodes
+        }
+
+        override suspend fun danmaku(bvid: String, cid: Long): BiliDanmakuDigest? {
+            extrasAsked += "danmaku:$cid"
+            return danmaku
+        }
     }
 
     private class RecordingSummarizer(
@@ -126,7 +165,9 @@ class BilibiliVideoToolTest {
         author = "某个UP",
         durationSec = 754,
         cid = 43032511529L,
-        upMid = 1L,
+        upMid = 16555335L,
+        // aid 才是评论区的 oid（117482388065032），和 cid 完全是两个数——取错就抓不到评论。
+        aid = 117482388065032L,
         desc = "记录一只猫的日常",
         source = BiliVideoText.Source.Subtitle,
         lang = "ai-zh",
@@ -662,6 +703,187 @@ class BilibiliVideoToolTest {
             cache = partOne,
         ).execute(call("""{"url":"BV1ZKn267EY3"}"""), context)
         assertEquals(listOf("BV1ZKn267EY3"), partOne.writtenKeys)
+    }
+
+    // ------------------------------------------------------- 周边信息（extras）
+
+    private fun hotComments() = listOf(
+        BiliComment("小紫", "置顶：这期讲得真清楚", 302, 28),
+        BiliComment("路人", "一口气看完", 41, 0),
+    )
+
+    private fun relatedVideos() = listOf(
+        BiliRelatedVideo("BV1AAAAAAAAA", "另一个视频", "某UP", 193748, 1415),
+    )
+
+    private fun upCollections() = listOf(
+        BiliCollection(
+            kind = "season",
+            id = 9384351L,
+            title = "超级中国",
+            count = 2,
+            preview = listOf(BiliCollectionItem("BV1ZKn267EY3", "上集", 1707)),
+        ),
+        BiliCollection(kind = "series", id = 45123L, title = "随手拍系列", count = 7),
+    )
+
+    private fun collectionItems() = listOf(
+        BiliCollectionItem("BV1ZKn267EY3", "上集", 1707),
+        BiliCollectionItem("BV1CCCCCCCCC", "下集", 900),
+    )
+
+    private fun danmakuDigest() = BiliDanmakuDigest(
+        total = 35,
+        top = listOf(BiliDanmakuHit("前面的别走", 6, 10)),
+        timeline = listOf(BiliDanmakuHit("开始了", 2, 0), BiliDanmakuHit("结束了", 1, 60)),
+    )
+
+    @Test
+    fun extrasAreNotFetchedUnlessAsked() = runBlocking {
+        val source = FakeSource(BiliVideoTextResult.Ok(subtitleText()))
+        val tool = BilibiliVideoTool(source, summary = VideoSummaryService(RecordingSummarizer()))
+
+        val body = tool.execute(call("""{"url":"BV1ZKn267EY3"}"""), context).contentJson
+
+        assertTrue("不带 extras 就一个额外请求都不该发：${source.extrasAsked}", source.extrasAsked.isEmpty())
+        listOf("comments", "related", "series", "danmaku", "extras_failed").forEach { field ->
+            assertFalse("默认结果里不该出现 $field：$body", body.contains("\"$field\""))
+        }
+    }
+
+    @Test
+    fun everyRequestedExtraComesBackInItsOwnField() = runBlocking {
+        val source = FakeSource(
+            result = BiliVideoTextResult.Ok(subtitleText()),
+            comments = hotComments(),
+            related = relatedVideos(),
+            collections = upCollections(),
+            episodes = collectionItems(),
+            danmaku = danmakuDigest(),
+        )
+        val tool = BilibiliVideoTool(source, summary = VideoSummaryService(RecordingSummarizer()))
+
+        val body = tool.execute(
+            call("""{"url":"BV1ZKn267EY3","extras":["comments","related","series","danmaku"]}"""),
+            context,
+        ).contentJson
+
+        assertTrue("评论：$body", body.contains("\"comments\":["))
+        assertTrue(body.contains("置顶：这期讲得真清楚"))
+        assertTrue(body.contains("\"likes\":302"))
+        assertTrue("相关：$body", body.contains("\"related\":["))
+        assertTrue(body.contains("另一个视频"))
+        assertTrue(body.contains("\"views\":193748"))
+        assertTrue("合集：$body", body.contains("\"series\":{"))
+        assertTrue(body.contains("超级中国"))
+        assertTrue(body.contains("随手拍系列"))
+        assertTrue("弹幕：$body", body.contains("\"danmaku\":{"))
+        assertTrue(body.contains("\"total\":35"))
+        assertTrue(body.contains("前面的别走"))
+        assertTrue("时间线：$body", body.contains("\"timeline\":"))
+        // 评论按 aid 取、弹幕按 cid 取，两者不能搞混。
+        assertTrue("评论 oid 必须是 aid：${source.extrasAsked}", source.extrasAsked.contains("comments:117482388065032"))
+        assertTrue(source.extrasAsked.contains("danmaku:43032511529"))
+        assertTrue(source.extrasAsked.contains("series:16555335"))
+    }
+
+    @Test
+    fun commentCountAndTextLengthAreCapped() = runBlocking {
+        val many = (1..12).map { index ->
+            BiliComment("用户$index", "很长的评论".repeat(30), 100 - index, 0)
+        }
+        val tool = BilibiliVideoTool(
+            FakeSource(BiliVideoTextResult.Ok(subtitleText()), comments = many),
+            summary = VideoSummaryService(RecordingSummarizer()),
+        )
+
+        val body = tool.execute(call("""{"url":"BV1ZKn267EY3","extras":["comments"]}"""), context).contentJson
+
+        assertEquals("评论最多 8 条", 8, Regex("\"user\":").findAll(body).count())
+        assertTrue("长评论要截断", body.contains("…"))
+        assertFalse("第 9 条之后的评论不该出现", body.contains("用户9"))
+    }
+
+    @Test
+    fun anExtraThatCannotBeFetchedIsReportedInsteadOfInvented() = runBlocking {
+        // 评论接口被 -352 风控、弹幕接口连不上：两个都得如实写进 extras_failed。
+        val tool = BilibiliVideoTool(
+            FakeSource(BiliVideoTextResult.Ok(subtitleText())),
+            summary = VideoSummaryService(RecordingSummarizer()),
+        )
+
+        val body = tool.execute(
+            call("""{"url":"BV1ZKn267EY3","extras":["comments","danmaku"]}"""),
+            context,
+        ).contentJson
+
+        assertTrue("失败清单：$body", body.contains("\"extras_failed\":["))
+        assertTrue(body.contains("\"name\":\"comments\""))
+        assertTrue(body.contains("\"name\":\"danmaku\""))
+        assertFalse("抓不到就不该有 comments 字段", body.contains("\"comments\":["))
+        assertTrue("note 要拦住编造：$body", body.contains("不要编造"))
+        assertTrue("摘要本身不能因为 extras 失败而失败", body.contains("\"ok\":true"))
+    }
+
+    @Test
+    fun extrasBypassTheCacheOnBothReadsAndWrites() = runBlocking {
+        val cache = FakeCache(stored = """{"ok":true,"cached":false,"summary":"旧结果"}""")
+        val source = FakeSource(BiliVideoTextResult.Ok(subtitleText()), comments = hotComments())
+        val tool = BilibiliVideoTool(source, summary = VideoSummaryService(RecordingSummarizer()), cache = cache)
+
+        val body = tool.execute(call("""{"url":"BV1ZKn267EY3","extras":["comments"]}"""), context).contentJson
+
+        assertTrue("评论是时效内容，不能读 7 天缓存", cache.reads.isEmpty())
+        assertTrue("也不能把评论写进缓存", cache.writes == 0)
+        assertFalse(body.contains("旧结果"))
+        assertTrue(body.contains("\"comments\":["))
+        assertEquals(listOf("BV1ZKn267EY3"), source.requested)
+    }
+
+    @Test
+    fun aSeasonIdFetchesThatCollectionsFullEpisodeList() = runBlocking {
+        val byId = FakeSource(
+            BiliVideoTextResult.Ok(subtitleText()),
+            collections = upCollections(),
+            episodes = collectionItems(),
+        )
+        val body = BilibiliVideoTool(byId, summary = VideoSummaryService(RecordingSummarizer()))
+            .execute(call("""{"url":"BV1ZKn267EY3","extras":["series"],"season_id":45123}"""), context)
+            .contentJson
+
+        assertTrue("带 season_id 就要取那个系列：${byId.extrasAsked}", byId.extrasAsked.contains("episodes:45123"))
+        assertTrue(body.contains("\"collection_id\":45123"))
+        assertTrue(body.contains("下集"))
+        assertTrue(body.contains("\"episodes\":["))
+
+        // 没指定合集时取第一个合集（让模型先看到"合集里长什么样"），不能什么都不取。
+        val auto = FakeSource(
+            BiliVideoTextResult.Ok(subtitleText()),
+            collections = upCollections(),
+            episodes = collectionItems(),
+        )
+        BilibiliVideoTool(auto, summary = VideoSummaryService(RecordingSummarizer()))
+            .execute(call("""{"url":"BV1ZKn267EY3","extras":["series"]}"""), context)
+        assertTrue(auto.extrasAsked.contains("episodes:9384351"))
+    }
+
+    @Test
+    fun chineseExtraNamesAndUnknownOnesAreHandled() = runBlocking {
+        val source = FakeSource(
+            BiliVideoTextResult.Ok(subtitleText()),
+            comments = hotComments(),
+            danmaku = danmakuDigest(),
+        )
+        val tool = BilibiliVideoTool(source, summary = VideoSummaryService(RecordingSummarizer()))
+
+        val body = tool.execute(call("""{"url":"BV1ZKn267EY3","extras":["评论","弹幕","不存在"]}"""), context)
+            .contentJson
+
+        assertTrue(body.contains("\"comments\":["))
+        assertTrue(body.contains("\"danmaku\":{"))
+        // 认不出的名字静默忽略，不该把整次调用判成失败。
+        assertTrue(body.contains("\"ok\":true"))
+        assertEquals(2, source.extrasAsked.size)
     }
 
     // -------------------------------------------------------------- registration

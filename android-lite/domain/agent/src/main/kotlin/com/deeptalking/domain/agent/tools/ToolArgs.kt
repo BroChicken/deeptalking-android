@@ -10,6 +10,7 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.longOrNull
 
 /** Shared lenient JSON helpers for tool argument parsing. */
 internal object ToolArgs {
@@ -45,6 +46,9 @@ internal object ToolArgs {
 
     fun int(obj: JsonObject, key: String): Int? =
         (obj[key] as? JsonPrimitive)?.intOrNull
+
+    fun long(obj: JsonObject, key: String): Long? =
+        (obj[key] as? JsonPrimitive)?.let { it.longOrNull ?: it.contentOrNull?.toLongOrNull() }
 
     fun double(obj: JsonObject, key: String): Double? =
         (obj[key] as? JsonPrimitive)?.doubleOrNull
