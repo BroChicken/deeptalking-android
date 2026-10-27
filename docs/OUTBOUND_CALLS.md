@@ -429,6 +429,7 @@ B 站视频：按关键词搜视频，或总结一个视频讲了什么。① �
 - 只写本轮有明确依据的内容；没有变化就省略，不凭空补全。
 - 每个字段必须有 sourceMessageIds 与 evidence；角色本轮言行用 ["current_response"]，evidence 引原句或概括。
 - currentSituation 写具体日期 + 时段，以【时间基准】的逻辑日为准。
+- currentLocation 只写地点（可带上在场的人或环境），**不写日期、时段、钟点**；角色挪了地方、进出室内外、换了场景就要更新它。
 - 快速回应必须恰好两条，是用户此刻可能原样发给角色的话；不得是角色口吻、角色提问或复述角色刚说过的话；不写 Markdown、括号动作、消息 ID。
 - 待办：只在用户提出，或角色提出且用户明确答应后建立；角色单方面说自己要做什么不算。新建必须有明确日期，日期要能在用户原话里定位（用户发起），或在角色上一轮提议 + 用户回应里定位（角色发起）；用户没回应、转移话题或拒绝都不建。角色发起填 proposer=character 并附用户答应的原话，用户发起填 proposer=user。完成、取消、改期必须引用用户原话，按【当前待办】的 ID 指认；同一件事不要重复新建。
 - 约定：只有用户明确完成或取消时才更新 promiseUpdates，按【当前约定】的 ID；到期不自动完成。
@@ -764,7 +765,7 @@ userAddress 规则：
 ```text
 下面是一个角色/成员的当前字段文本。请把它整理成新版字段结构：
 动态状态字段只能是：currentSituation、currentLocation、currentMood、currentOccupation、currentGoal、currentTone；静态设定只保留 background（仅单角色）。
-要求：①按语义归入最贴切字段，消除重复；②时间写绝对日期；③只整理已有信息，不编造；④写成自然完整的陈述句。
+要求：①按语义归入最贴切字段，消除重复；②时间写绝对日期，但 currentLocation 例外——位置只写地点，不写日期和时段；③只整理已有信息，不编造；④写成自然完整的陈述句。
 只返回JSON对象：{"dynamicState":{...},"background":"..."}。
 现有内容（JSON）：
 {"name":…,"entityType":"group|character","dynamicState":{六个字段},"background":…}
@@ -1264,7 +1265,7 @@ speakingStyle 写“声音底色”：1~2 句，只写语速、用词层次、�
         "dynamicState": {
             "type": "object",
             "additionalProperties": false,
-            "description": "只给有明确变化或需要补齐的字段，不含朗读语气；群组只写 shared 的 currentSituation/currentLocation",
+            "description": "只给有明确变化或需要补齐的字段，不含朗读语气；群组只写 shared 的 currentSituation/currentLocation。currentLocation 只写地点（如「客厅」「学校天台」），不写日期、时段或钟点——时间属于 currentSituation",
             "properties": {
                 "currentSituation": { "$field": true },
                 "currentLocation": { "$field": true },
@@ -1275,7 +1276,7 @@ speakingStyle 写“声音底色”：1~2 句，只写语速、用词层次、�
         },
         "memberDynamicState": {
             "type": "array",
-            "description": "仅群组：每位成员自己的动态状态（可含各自朗读语气；群组共享状态不含语气）",
+            "description": "仅群组：每位成员自己的动态状态（可含各自朗读语气；群组共享状态不含语气）。currentLocation 只写地点，不写日期、时段或钟点",
             "items": {
                 "type": "object",
                 "additionalProperties": false,

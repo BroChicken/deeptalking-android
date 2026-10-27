@@ -75,7 +75,7 @@ STATIC_PROFILE_FIELDS ─┬─► TurnWorker 不含静态字段（成员/本体
                        └─► LegacyMapper 的旧字段迁移（worldView→background 等）
 ```
 
-> 原生 `DYNAMIC_STATE_FIELDS` 为 **6 项**：`currentSituation` / `currentLocation` / `currentMood` / `currentOccupation` / `currentGoal` / `currentTone`。本体：前 5 项由 turn worker 写，`currentTone` 来自主调用末尾的 `【语气】` 行；群组：共享状态只有 `currentSituation` / `currentLocation`，成员的完整状态（**含各自 `currentTone`**）由 `memberDynamicState` 写入。所有 `currentTone` 都免证据门。
+> 原生 `DYNAMIC_STATE_FIELDS` 为 **6 项**：`currentSituation` / `currentLocation` / `currentMood` / `currentOccupation` / `currentGoal` / `currentTone`。本体：前 5 项由 turn worker 写，`currentTone` 来自主调用末尾的 `【语气】` 行；群组：共享状态只有 `currentSituation` / `currentLocation`，成员的完整状态（**含各自 `currentTone`**）由 `memberDynamicState` 写入。所有 `currentTone` 都免证据门。**`currentLocation` 不带时间**：写入与注入两侧都过 `stripTimeExpressions`（时间只属于 `currentSituation`）。
 >
 > 群组分段不走 `parseJsonLenient`：`parseGroupSpeechSegments`（`:core:model` 的 `GroupSpeech.kt`）是纯文本行解析，只切气泡/发言人，失败也只退化成单个无语气段，不影响正文、历史与窗口。
 

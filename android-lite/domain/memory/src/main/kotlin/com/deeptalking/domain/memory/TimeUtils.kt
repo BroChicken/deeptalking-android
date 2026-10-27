@@ -371,3 +371,34 @@ fun parseRelativeText(text: String?, base: ZonedDateTime, zone: ZoneId = base.zo
 /** Alias used by the memory pipeline: normalize relative wording before persisting a field. */
 fun cleanRelativeTimeText(text: String?, base: ZonedDateTime, zone: ZoneId = base.zone): String =
     parseRelativeText(text, base, zone)
+
+/** Clock forms ("15:30", "下午3点") that a place name never needs. */
+private val CLOCK_EXPRESSION =
+    Regex("\\d{1,2}[:：]\\d{2}|\\d{1,2}\\s*[点时](?!心)|([一二三四五六七八九十两]{1,2})\\s*[点时](?!心)")
+
+/**
+ * 去掉一段文本里的时间：`2026-10-27` / `2026年10月27日` / `10月27日` / 时段词 / 相对日词 / 钟点。
+ *
+ * 只给**地点**这类不该带时间的字段用。原因是 [parseRelativeText] 会把"下午"写成绝对日期，
+ * 而地点一旦带上日期就永远是"昨天的下午的客厅"：模型下一轮看到的是过期事实，又觉得
+ * "位置没变"，于是干脆不更新这个字段。时间属于 `currentSituation`，地点只该是地点。
+ *
+ * 全是时间时返回空串（调用方据此跳过这次写入，不拿空值覆盖旧地点）。
+ */
+fun stripTimeExpressions(value: String?): String {
+    var text = value.orEmpty()
+    if (text.isEmpty()) return text
+    text = Regex("\\d{4}-\\d{1,2}-\\d{1,2}").replace(text, " ")
+    text = Regex("\\d{4}年\\d{1,2}月\\d{1,2}日").replace(text, " ")
+    text = Regex("\\d{4}年\\d{1,2}月").replace(text, " ")
+    text = Regex("\\d{1,2}月\\d{1,2}日").replace(text, " ")
+    text = CLOCK_EXPRESSION.replace(text, " ")
+    val slotWords = (TIME_SLOTS + TIME_SLOT_ALIASES.keys).sortedByDescending { it.length }
+    text = Regex("(" + slotWords.joinToString("|") + ")").replace(text, " ")
+    text = Regex("(今天|昨天|前天|明天|后天|今晚|昨晚|今早|明早|刚才|刚刚)").replace(text, " ")
+    // 挖空之后留下的孤立标点/"的"要清掉，否则会存成"、 客厅"这种。
+    text = Regex("[，,、；;:：·•\\-—~～]+").replace(text, " ")
+    text = Regex("\\s+").replace(text, " ").trim()
+    text = text.replace(Regex("^[的\\s]+"), "").replace(Regex("[的\\s]+$"), "")
+    return text
+}

@@ -61,4 +61,24 @@ class TimeUtilsTest {
         assertFalse(tomorrow.contains("明天"))
         assertEquals("2026-09-30发生的事", parseRelativeText("前天发生的事", base, zone))
     }
+
+    // ---- 地点不带时间（stripTimeExpressions） ----------------------------------
+
+    @Test
+    fun stripTimeExpressionsDropsDatesSlotsAndClock() {
+        // parseRelativeText 先把"今天"写成绝对日期，位置里再剥掉——位置只该是地点。
+        val withTime = parseRelativeText("今天下午3点 在家里的客厅", base, zone)
+        assertTrue(withTime.contains("2026-10-02"))
+        assertEquals("在家里的客厅", stripTimeExpressions(withTime))
+        assertEquals("学校天台", stripTimeExpressions("2026-10-05 傍晚 学校天台"))
+        assertEquals("咖啡馆靠窗的位置", stripTimeExpressions("昨天 咖啡馆靠窗的位置"))
+    }
+
+    @Test
+    fun stripTimeExpressionsKeepsAPlainPlaceUntouched() {
+        assertEquals("客厅", stripTimeExpressions("客厅"))
+        assertEquals("在客厅的沙发上", stripTimeExpressions("在客厅的沙发上"))
+        assertEquals("", stripTimeExpressions("2026-10-02 下午"))
+        assertEquals("", stripTimeExpressions(""))
+    }
 }

@@ -57,6 +57,7 @@ import com.deeptalking.domain.memory.parseZoned
 import com.deeptalking.domain.memory.resolveDynamicStateSources
 import com.deeptalking.domain.memory.selfLearnMemoryImportance
 import com.deeptalking.domain.memory.parseRelativeText
+import com.deeptalking.domain.memory.stripTimeExpressions
 import com.deeptalking.domain.memory.resolveTimeRef
 import com.deeptalking.domain.memory.TimeRef
 import com.deeptalking.domain.memory.TodoPolicy
@@ -1504,7 +1505,10 @@ class BackgroundTasks(
             val obj = dynamic[key] as? JsonObject ?: return@forEach
             val raw = obj.string("value").trim()
             if (raw.isEmpty()) return@forEach
-            val value = MemoryToolSupport.cleanFieldValue(key, parseRelativeText(raw, resolveFieldBase(obj, nowBase)))
+            // 地点不带时间（同 ChatOrchestrator.applyDynamicStateFields）：带日期就会被读成过期事实。
+            val withTime = parseRelativeText(raw, resolveFieldBase(obj, nowBase))
+            val text = if (key == "currentLocation") stripTimeExpressions(withTime) else withTime
+            val value = MemoryToolSupport.cleanFieldValue(key, text)
             if (value.isEmpty()) return@forEach
             // `currentTone` is the read-aloud delivery instruction (self-referential),
             // accepted without the user-evidence gate.
@@ -1818,7 +1822,7 @@ class BackgroundTasks(
         }
         val prompt = "下面是一个角色/成员的当前字段文本。请把它整理成新版字段结构：\n" +
             "动态状态字段只能是：currentSituation、currentLocation、currentMood、currentOccupation、currentGoal、currentTone；静态设定只保留 background（仅单角色）。\n" +
-            "要求：①按语义归入最贴切字段，消除重复；②时间写绝对日期；③只整理已有信息，不编造；④写成自然完整的陈述句。\n" +
+            "要求：①按语义归入最贴切字段，消除重复；②时间写绝对日期，但 currentLocation 例外——位置只写地点，不写日期和时段；③只整理已有信息，不编造；④写成自然完整的陈述句。\n" +
             "只返回JSON对象：{\"dynamicState\":{...},\"background\":\"...\"}。\n现有内容（JSON）：\n" + json.encodeToString(payload)
         val raw = complete(FILL_SYSTEM, prompt, sessionId = sessionIdFor(character))
         val data = if (raw.isBlank()) null else ResponseParser.parseJsonLenient(raw) as? JsonObject
@@ -1827,7 +1831,8 @@ class BackgroundTasks(
         if (ds != null) {
             DYNAMIC_STATE_FIELDS.forEach { (key, _) ->
                 if (isGroup && key !in GROUP_SHARED_DYNAMIC_FIELDS) return@forEach
-                val value = (ds[key] as? JsonPrimitive)?.contentOrNull?.trim().orEmpty()
+                val rawValue = (ds[key] as? JsonPrimitive)?.contentOrNull?.trim().orEmpty()
+                val value = if (key == "currentLocation") stripTimeExpressions(rawValue) else rawValue
                 if (value.isNotEmpty()) dynamic = withDynamicField(dynamic, key, trimText(value, 700))
             }
         }

@@ -69,6 +69,24 @@ class TurnWorkerTest {
     }
 
     @Test
+    fun `the location field is documented as place-only`() {
+        // 位置带日期会让模型把它读成过期事实，于是不再更新这个字段（见 stripTimeExpressions）。
+        val schema = TurnWorker.tool.parametersJson
+        assertTrue("schema 要写明位置不写时间", schema.contains("不写日期"))
+        assertTrue(schema.contains("currentLocation"))
+        val system = TurnWorker.buildRequest(
+            config = com.deeptalking.core.model.AppConfig(),
+            character = Character(id = "c1", name = "Alice"),
+            userText = "在吗",
+            reply = "在的",
+            replyId = "a1",
+            proactive = false,
+            now = java.time.Instant.now(),
+        ).instructions.orEmpty()
+        assertTrue("worker 规则里要写清位置不带时间", system.contains("不写日期"))
+    }
+
+    @Test
     fun `todos fields document proposer and evidence`() {
         val root = kotlinx.serialization.json.Json.parseToJsonElement(TurnWorker.tool.parametersJson).jsonObject
         val todoProps = root["properties"]!!.jsonObject["todos"]!!

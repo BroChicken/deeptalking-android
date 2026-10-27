@@ -259,6 +259,8 @@ BackgroundTasks.scheduleTurn       后台：文风校对、快速回应校验/�
 
 除 `currentTone` 外，每个字段的 value 必须带 `sourceMessageIds` + `evidence` 溯源；这些字段由 turn worker 的 `submit_state` 写入。群组整体只维护 `currentSituation` + `currentLocation`（`GROUP_SHARED_DYNAMIC_FIELDS`，共享状态不含语气），成员各自的处境/位置/情绪/职业/目标写进 `memberDynamicState`；**成员的 `currentTone` 也由 worker 的 `memberDynamicState` 写入**（每句话的朗读投递各不相同），群组整体语气仍来自主调用 `【语气】` 行。朗读时取该成员的 `currentTone`，为空或成员缺失则回退群组语气（`AppViewModel.toneFor`）。`currentTone` 是朗读投递属性（自指、非事实状态），**免证据门**（`applyDynamicStateFields` 对 `currentTone` 跳过来源解析）。
 
+**`currentLocation` 不带时间**：时间只属于 `currentSituation`。写入侧（`ChatOrchestrator.applyDynamicStateFields`、`BackgroundTasks.applyDynamicStateUpdate`、字段迁移 `remapFields`）在 `parseRelativeText` 之后对位置再跑一次 `stripTimeExpressions`（`:domain:memory` 的 `TimeUtils`），把绝对日期/时段/钟点剥掉、只剩地点；全是时间就返回空串、这次写入被跳过。注入侧（`Prompts.buildStateSection`）同样剥一次，旧数据里已经存成"2026-10-27 下午的客厅"的位置在提示词里也立刻恢复成"客厅"。原因：位置一挂上日期就永远是"昨天下午的客厅"，模型每轮读到过期事实、又觉得"位置没变"，于是干脆不再更新这个字段。
+
 ### 世界书（lorebook）
 
 `char.lorebook = [{ id, name, keywords[], content, enabled, order, alwaysActive, origin, mentions, lastMentionedAt, misses }]`；`char.lorebookArchive = [...]`（归档，`GroupMember.lorebookArchive` 同理）。`misses` 仅为存档兼容保留，**已不参与任何判定**。

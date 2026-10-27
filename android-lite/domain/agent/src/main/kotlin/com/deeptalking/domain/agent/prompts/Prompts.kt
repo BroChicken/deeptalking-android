@@ -27,6 +27,7 @@ import com.deeptalking.domain.memory.MemoryService
 import com.deeptalking.domain.memory.formatAbsoluteDate
 import com.deeptalking.domain.memory.logicalDay
 import com.deeptalking.domain.memory.parseZoned
+import com.deeptalking.domain.memory.stripTimeExpressions
 import com.deeptalking.engine.ondevice.LlmRequest
 import com.deeptalking.engine.ondevice.ToolChoice
 import com.deeptalking.engine.ondevice.ToolDefinition
@@ -947,18 +948,18 @@ private fun buildStateSection(character: Character): String {
     val lines = mutableListOf<String>()
     if (!character.isGroup) {
         fields.forEach { (key, label) ->
-            val value = maskUserWord(character, trimText(dynamicStateValue(character.dynamicState, key), 60))
+            val value = maskUserWord(character, trimText(promptDynamicValue(character.dynamicState, key), 60))
             if (value.isNotEmpty()) lines += "$label: $value"
         }
     } else {
         val shared = fields.filter { it.first in GROUP_SHARED_DYNAMIC_FIELDS }.mapNotNull { (key, label) ->
-            val value = maskUserWord(character, trimText(dynamicStateValue(character.groupSharedDynamic, key), 60))
+            val value = maskUserWord(character, trimText(promptDynamicValue(character.groupSharedDynamic, key), 60))
             if (value.isEmpty()) null else "$label=$value"
         }
         if (shared.isNotEmpty()) lines += "群组: " + shared.joinToString("；")
         character.members.forEach { member ->
             val memberFields = fields.mapNotNull { (key, label) ->
-                val value = maskUserWord(member, trimText(dynamicStateValue(member.dynamicState, key), 60))
+                val value = maskUserWord(member, trimText(promptDynamicValue(member.dynamicState, key), 60))
                 if (value.isEmpty()) null else "$label=$value"
             }
             if (memberFields.isNotEmpty()) {
@@ -969,6 +970,16 @@ private fun buildStateSection(character: Character): String {
     if (lines.isEmpty()) return ""
     return "【当前状态】\n" + lines.joinToString("\n")
 }
+
+/**
+ * 注入用的动态字段值：`currentLocation` **不带时间**。
+ *
+ * 旧数据里可能已经把"2026-10-27 下午"存进了位置；把它原样喂给模型会变成一句过期事实，
+ * 模型据此认为"位置没变、不需要更新"。渲染时再剥一次，历史数据也能立刻恢复正常。
+ */
+private fun promptDynamicValue(state: DynamicState, key: String): String =
+    if (key == "currentLocation") stripTimeExpressions(dynamicStateValue(state, key))
+    else dynamicStateValue(state, key)
 
 /** `5 场景概要`: the most recent summary only (≤300), no `key` filtering. */
 private fun buildSceneSection(character: Character): String {

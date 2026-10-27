@@ -109,8 +109,49 @@ class WorkerStateTest {
         )
     }
 
-    // ------------------------------------------------------------ todos create (item 6)
+    // ------------------------------------------------------------ 地点不带时间 (item 3b)
 
+    /**
+     * `currentLocation` 一旦带上日期就永远是"昨天下午的客厅"，模型下一轮会把它读成过期
+     * 事实、进而不再更新这个字段。位置里只留地点，时间归 `currentSituation`。
+     */
+    @Test
+    fun `worker location loses its time while situation keeps it`() {
+        val reply = ChatMessage(
+            id = "a1",
+            role = Role.Assistant,
+            content = "（她把窗关上）今天下午我们就在客厅待着吧",
+            timestamp = "2026-10-27T13:00:00+08:00",
+        )
+        val character = Character(id = "c1", name = "Alice", instant = listOf(reply))
+        val state = json.parseToJsonElement(
+            """
+            {
+              "currentLocation":{"value":"2026-10-27 下午 客厅的沙发","evidence":"在客厅待着",
+                                 "sourceMessageIds":["current_response"]},
+              "currentSituation":{"value":"今天下午在家里休息","evidence":"今天下午我们就在客厅待着",
+                                 "sourceMessageIds":["current_response"]}
+            }
+            """.trimIndent(),
+        ).jsonObject
+
+        val updated = orchestrator().applyDynamicStateFields(
+            current = DynamicState(),
+            state = state,
+            host = character,
+            assistantMessage = reply,
+            sources = knownSources(character),
+            nowBase = ZonedDateTime.now(),
+        )
+
+        assertEquals("客厅的沙发", updated.currentLocation)
+        assertTrue(
+            "处境要保留时间：${updated.currentSituation}",
+            updated.currentSituation.contains("2026-"),
+        )
+    }
+
+    // ------------------------------------------------------------ todos create (item 6)
     @Test
     fun `todo create without detail keeps the entry with a blank detail`() {
         val character = userTodoCharacter()

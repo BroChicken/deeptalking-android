@@ -44,6 +44,7 @@ import com.deeptalking.domain.memory.parseZoned
 import com.deeptalking.domain.memory.resolveDynamicStateSources
 import com.deeptalking.domain.memory.resolveMemoryConflicts
 import com.deeptalking.domain.memory.resolveTimeRef
+import com.deeptalking.domain.memory.stripTimeExpressions
 import com.deeptalking.domain.memory.upsertLongTermMemory
 import com.deeptalking.engine.ondevice.LlmBackend
 import com.deeptalking.engine.ondevice.TokenUsage
@@ -518,7 +519,7 @@ class ChatOrchestrator(
     }
 
     /** Applies one `dynamicState` object through the field cleaning + evidence gate. */
-    private fun applyDynamicStateFields(
+    internal fun applyDynamicStateFields(
         current: DynamicState,
         state: JsonObject,
         host: Character,
@@ -541,7 +542,11 @@ class ChatOrchestrator(
             val obj = fieldObject(element)
             val raw = fieldValue(element)
             if (raw.isEmpty()) return@forEach
-            val value = MemoryToolSupport.cleanFieldValue(key, parseRelativeText(raw, resolveFieldBase(obj, nowBase)))
+            // 时间只属于 `currentSituation`：地点一旦带上日期，就永远是"昨天下午的客厅"，
+            // 模型下一轮看到过期事实、又觉得"位置没变"，就再也不更新这个字段了。
+            val withTime = parseRelativeText(raw, resolveFieldBase(obj, nowBase))
+            val text = if (key == "currentLocation") stripTimeExpressions(withTime) else withTime
+            val value = MemoryToolSupport.cleanFieldValue(key, text)
             if (value.isEmpty()) return@forEach
             // `currentTone` is the read-aloud delivery instruction, not a factual
             // state: it is self-referential (derived from how the character just
